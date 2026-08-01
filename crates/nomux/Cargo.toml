@@ -1,0 +1,18 @@
+[package]
+name = "nomux"
+description = "Persistent PTY sessions that survive SSH disconnects, with zero server-side install"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+nomux-proto.workspace = true
+
+[lints]
+workspace = true
