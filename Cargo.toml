@@ -26,6 +26,11 @@ panic = "abort"
 strip = "symbols"
 
 [workspace.lints.rust]
+# Promotes every lint left at warn level — including rustc's own defaults, such as
+# unused_variables — to a hard error. `priority = 1` makes it the last flag passed
+# to the compiler, so it overrides the warn levels set below rather than being
+# overridden by them. Lints explicitly set to "allow" are unaffected.
+warnings = { level = "deny", priority = 1 }
 missing_docs = "warn"
 missing_debug_implementations = "warn"
 unreachable_pub = "warn"

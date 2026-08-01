@@ -16,8 +16,8 @@ repos:
         pass_filenames: false
 
       - id: cargo-clippy
-        name: cargo clippy (warnings as errors)
-        entry: cargo clippy --workspace --all-targets -- -D warnings
+        name: cargo clippy
+        entry: cargo clippy --workspace --all-targets
         language: system
         files: '(\.rs|\.toml)$|^Cargo\.lock$'
         pass_filenames: false
@@ -25,6 +25,15 @@ repos:
       - id: cargo-nextest
         name: cargo nextest run
         entry: cargo nextest run --workspace
+        language: system
+        files: '(\.rs|\.toml)$|^Cargo\.lock$'
+        pass_filenames: false
+
+      # nextest cannot run doctests, so they need their own pass or doc
+      # examples silently go unexercised.
+      - id: cargo-doctest
+        name: cargo test --doc
+        entry: cargo test --doc --workspace
         language: system
         files: '(\.rs|\.toml)$|^Cargo\.lock$'
         pass_filenames: false

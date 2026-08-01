@@ -111,6 +111,16 @@ pub const MAX_AGENT_CHANNELS: u32 = 8;
 /// Both ends validate — the client before minting, the daemon before use. An invalid
 /// id is always a hard error; sanitising one into a valid id would silently attach
 /// the user to the wrong session.
+///
+/// # Examples
+///
+/// ```
+/// use nomux_proto::is_valid_session_id;
+///
+/// assert!(is_valid_session_id("6f1a2b3c-4d5e-6f70-8192-a3b4c5d6e7f8"));
+/// assert!(!is_valid_session_id("../etc/passwd"));
+/// assert!(!is_valid_session_id(""));
+/// ```
 #[must_use]
 pub fn is_valid_session_id(id: &str) -> bool {
     !id.is_empty()
@@ -171,6 +181,20 @@ pub const fn encode_header(ty: FrameType, len: u32) -> Result<[u8; HEADER_LEN], 
 ///
 /// [`ProtoError::UnknownFrameType`] for an unrecognised discriminant, or
 /// [`ProtoError::PayloadTooLarge`] if the declared length exceeds [`MAX_PAYLOAD`].
+///
+/// # Examples
+///
+/// ```
+/// use nomux_proto::{FrameType, Header, decode_header, encode_header};
+///
+/// let bytes = encode_header(FrameType::Output, 4096)?;
+/// assert_eq!(bytes, [0x05, 0x00, 0x10, 0x00]);
+/// assert_eq!(
+///     decode_header(&bytes)?,
+///     Header { ty: FrameType::Output, len: 4096 }
+/// );
+/// # Ok::<(), nomux_proto::ProtoError>(())
+/// ```
 pub fn decode_header(bytes: &[u8; HEADER_LEN]) -> Result<Header, ProtoError> {
     let [ty, a, b, c] = *bytes;
     let ty = FrameType::from_byte(ty).ok_or(ProtoError::UnknownFrameType(ty))?;

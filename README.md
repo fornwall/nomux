@@ -36,8 +36,13 @@ cargo clippy --workspace --all-targets
 cargo nextest run --workspace
 ```
 
-Commits are gated by [prek](https://github.com/j178/prek) on `cargo fmt --check`,
-`cargo clippy -D warnings` and `cargo nextest run`:
+Warnings are errors, configured in `Cargo.toml` via `warnings = { level = "deny",
+priority = 1 }` rather than a command-line flag — so `cargo build`, `cargo clippy`
+and every editor's rust-analyzer all agree, with no cache thrash from differing
+`RUSTFLAGS`.
+
+Commits are gated by [prek](https://github.com/j178/prek) on formatting, clippy,
+tests and doctests:
 
 ```sh
 prek install            # once, per clone
