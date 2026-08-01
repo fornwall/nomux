@@ -1,0 +1,30 @@
+# Run with prek (https://github.com/j178/prek):
+#   prek install            install .git/hooks/pre-commit
+#   prek run --all-files    run every hook over the whole tree
+#
+# Hooks are ordered cheapest-first so an obvious failure reports fast.
+# They trigger on Rust sources and on manifests, since the lint configuration
+# itself lives in Cargo.toml.
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt --check
+        entry: cargo fmt --all --check
+        language: system
+        files: '(\.rs|\.toml)$|^Cargo\.lock$'
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy (warnings as errors)
+        entry: cargo clippy --workspace --all-targets -- -D warnings
+        language: system
+        files: '(\.rs|\.toml)$|^Cargo\.lock$'
+        pass_filenames: false
+
+      - id: cargo-nextest
+        name: cargo nextest run
+        entry: cargo nextest run --workspace
+        language: system
+        files: '(\.rs|\.toml)$|^Cargo\.lock$'
+        pass_filenames: false

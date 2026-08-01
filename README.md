@@ -33,8 +33,19 @@ Requires Rust 1.97.1, pinned in `rust-toolchain.toml`.
 
 ```sh
 cargo clippy --workspace --all-targets
-cargo test --workspace
+cargo nextest run --workspace
 ```
+
+Commits are gated by [prek](https://github.com/j178/prek) on `cargo fmt --check`,
+`cargo clippy -D warnings` and `cargo nextest run`:
+
+```sh
+prek install            # once, per clone
+prek run --all-files    # run the gate manually
+```
+
+The hooks trigger on `*.rs`, `*.toml` and `Cargo.lock` — manifests included, because
+the lint configuration lives in `Cargo.toml`.
 
 The pin selects the `1.97.1` toolchain, which is a distinct rustup installation from
 `stable` even when both resolve to the same version. Targets added to `stable` are
