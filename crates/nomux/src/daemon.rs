@@ -226,9 +226,11 @@ fn arm_stop_signals() -> io::Result<OwnedFd> {
 /// Session state for the lifetime of the daemon process.
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "three of the four are the correlated client fields PLAN.md § P2 wants \
-              behind one Option; `stopping` is deliberately not folded into \
-              `linger_until`, which `on_child_exit` can overwrite in the same pass"
+    reason = "two of the four — `greeted` and `exit_sent` — are among the correlated \
+              client fields PLAN.md § P2 wants behind one Option; `repaint_ctrl_l` is \
+              a policy each client restates and belongs to no other field; and \
+              `stopping` is deliberately not folded into `linger_until`, which \
+              `on_child_exit` can overwrite in the same pass"
 )]
 struct Daemon {
     paths: SessionPaths,
@@ -482,9 +484,9 @@ fn detach_from_startup_state() {
 /// Late in the startup sequence on purpose: everything that can fail with a
 /// message worth reading has already had its chance to write one.
 ///
-/// # Errors
-///
-/// Fails if `/dev/null` cannot be opened or a descriptor cannot be replaced.
+/// The `Result` is here to chain the four calls, not to be handled: the only caller
+/// discards it, because a daemon that could not reach `/dev/null` is a daemon that
+/// writes where it should not, which is worse than a session but better than none.
 fn silence_stdio() -> io::Result<()> {
     let null = rustix::fs::open("/dev/null", OFlags::RDWR, Mode::empty())?;
     rustix::stdio::dup2_stdin(&null)?;
