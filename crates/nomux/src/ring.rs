@@ -45,28 +45,28 @@ impl Ring {
 
     /// Appends output, discarding from the front if it no longer fits.
     ///
-    /// Returns `true` if anything was discarded, meaning readers below the new
-    /// [`Ring::base`] have lost bytes and must be told.
-    pub(crate) fn push(&mut self, data: &[u8]) -> bool {
+    /// Discarding is not reported here. Whether a *reader* lost anything depends on
+    /// where that reader had got to, so it is derived per client by comparing its
+    /// position against [`Ring::base`] — which stays correct across any number of
+    /// overflows, including ones that happened while the client was away.
+    pub(crate) fn push(&mut self, mut data: &[u8]) {
         // A write larger than the whole ring keeps only its own tail: everything
-        // before it is unreachable anyway.
-        let (data, mut dropped) = match data.len().checked_sub(self.capacity) {
-            Some(excess) if excess > 0 => (data.get(excess..).unwrap_or(data), excess),
-            _ => (data, 0),
-        };
-        if dropped > 0 {
-            self.base += dropped as u64;
+        // before it is unreachable anyway. Both the head of *this* write and
+        // everything already retained are gone, and `base` has to account for both
+        // — it is the offset of the oldest surviving byte, not a count of what this
+        // branch trimmed off the input.
+        if let Some(excess) = data.len().checked_sub(self.capacity).filter(|e| *e > 0) {
+            self.base += (self.buf.len() + excess) as u64;
             self.buf.clear();
+            data = data.get(excess..).unwrap_or(data);
         }
 
         let overflow = (self.buf.len() + data.len()).saturating_sub(self.capacity);
         if overflow > 0 {
             self.buf.drain(..overflow);
             self.base += overflow as u64;
-            dropped += overflow;
         }
-        self.buf.extend(data.iter().copied());
-        dropped > 0
+        self.buf.extend(data);
     }
 
     /// Returns the retained bytes at and after `from`, as the two halves of the
@@ -100,16 +100,42 @@ mod tests {
     #[test]
     fn offsets_track_total_written_not_retained() {
         let mut ring = Ring::new(4);
-        assert!(!ring.push(b"ab"));
+        ring.push(b"ab");
         assert_eq!((ring.base(), ring.end()), (0, 2));
-        assert!(!ring.push(b"cd"));
+        ring.push(b"cd");
         assert_eq!((ring.base(), ring.end()), (0, 4));
-        assert!(ring.push(b"ef"));
+        ring.push(b"ef");
         assert_eq!(
             (ring.base(), ring.end()),
             (2, 6),
             "base advances by exactly what was dropped"
         );
+    }
+
+    /// An oversized write discards what was retained *as well as* its own head.
+    ///
+    /// Counting only its own head leaves `base` too low, and a caught-up client
+    /// then sits above it — so the overflow is invisible, no `Gap` is sent, and the
+    /// client splices a stream with a hole in it onto its scrollback believing it
+    /// contiguous. That is the one failure this whole design exists to make
+    /// impossible, so it is pinned at the arithmetic rather than end to end.
+    #[test]
+    fn an_oversized_write_accounts_for_what_it_evicts() {
+        let mut ring = Ring::new(4);
+        ring.push(b"abc");
+        let caught_up = ring.end();
+
+        ring.push(b"vwxyz");
+        assert_eq!(
+            (ring.base(), ring.end()),
+            (4, 8),
+            "offsets must still count every byte ever written"
+        );
+        assert!(
+            caught_up < ring.base(),
+            "a client that was caught up must now be below base, i.e. see a gap"
+        );
+        assert_eq!(read_from(&ring, ring.base()), b"wxyz");
     }
 
     #[test]
@@ -137,7 +163,7 @@ mod tests {
     #[test]
     fn write_larger_than_capacity_keeps_its_own_tail() {
         let mut ring = Ring::new(4);
-        assert!(ring.push(b"abcdefghij"));
+        ring.push(b"abcdefghij");
         assert_eq!(read_from(&ring, ring.base()), b"ghij");
         assert_eq!(ring.end(), 10, "offsets still count every byte written");
         assert_eq!(ring.base(), 6);
@@ -157,6 +183,8 @@ mod tests {
         assert_eq!(read_from(&ring, 5), b"fghi");
     }
 
+    /// Chunks run past the ring's own capacity, so the oversized-write branch is
+    /// exercised against the model rather than only by the case above.
     #[test]
     fn matches_a_reference_model() {
         let capacity = 16;
@@ -164,7 +192,7 @@ mod tests {
         let mut model: Vec<u8> = Vec::new();
 
         for round in 0u32..200 {
-            let len = usize::try_from(round % 11).unwrap_or(0);
+            let len = usize::try_from(round % 37).unwrap_or(0);
             let chunk: Vec<u8> = (0..len)
                 .map(|i| u8::try_from((u64::from(round) + i as u64) % 251).unwrap_or(0))
                 .collect();

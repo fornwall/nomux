@@ -10,13 +10,10 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd};
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
 use nomux_proto::MAX_AGENT_CHANNELS;
-
-use crate::rundir::SOCKET_MODE;
 
 /// Most a single channel may hold for a local peer that has stopped reading.
 ///
@@ -84,8 +81,10 @@ impl Agent {
         // Only ever reached while holding this session's id, and the daemon
         // unlinks its run files on exit, so anything still here is a leftover.
         drop(fs::remove_file(path));
-        let listener = UnixListener::bind(path)?;
-        fs::set_permissions(path, fs::Permissions::from_mode(SOCKET_MODE))?;
+        // Never briefly world-connectable: this is the socket that hands out
+        // signatures, so the window between `bind` and a `chmod` is the one that
+        // would matter most.
+        let listener = crate::rundir::bind_socket_private(path)?;
         listener.set_nonblocking(true)?;
         Ok(Self {
             listener,

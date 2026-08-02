@@ -845,6 +845,52 @@ fn a_daemon_nobody_ever_attaches_to_reaps_itself() {
     panic!("daemon outlived its first-attach timeout");
 }
 
+/// A daemon that reaps itself runs its shutdown to completion.
+///
+/// `Pty::terminate` signals the child's process group, and `kill_process_group`
+/// negates the pid itself — so passing an already-negative one both defeated the
+/// group kill and, because `Pid::from_raw` asserts its argument is non-negative,
+/// aborted the daemon partway through `shutdown` in any debug build. The visible
+/// symptom is this one: the run files outlive the session, and `list` then reports
+/// a session nobody can attach to until something else garbage-collects it.
+#[test]
+fn a_daemon_that_reaps_itself_removes_its_run_files() {
+    let session = Session::start("shutdown_cleanup");
+    let mut client = session.connect();
+    client.hello(RESUME_FROM_START, 0);
+
+    let pid_file = session
+        .root
+        .join("nomux")
+        .join(format!("{}.pid", session.id));
+    assert!(
+        pid_file.exists(),
+        "the daemon should have written its pidfile"
+    );
+
+    // The child exits, and leaving takes the linger window with it — `on_detached`
+    // collapses it once there is nobody left to serve.
+    client.send(&Frame::Input {
+        offset: 0,
+        data: b"exit 3\n",
+    });
+    client.drain_available();
+    drop(client);
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if !pid_file.exists() && !session.socket.exists() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!(
+        "run files outlived the daemon: socket={} pid={}",
+        session.socket.exists(),
+        pid_file.exists()
+    );
+}
+
 /// A session created without the flag serves no socket at all: forwarding bypasses
 /// the user's `ForwardAgent` decision, so it must never be on by default.
 #[test]

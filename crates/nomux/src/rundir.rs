@@ -6,6 +6,7 @@
 //! never change.
 
 use std::io;
+use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::{env, fs};
 
@@ -17,6 +18,29 @@ pub(crate) const DIR_MODE: u32 = 0o700;
 
 /// Permissions for every socket inside it.
 pub(crate) const SOCKET_MODE: u32 = 0o600;
+
+/// Binds a unix socket that is never, even briefly, more permissive than
+/// [`SOCKET_MODE`].
+///
+/// `bind(2)` creates the node with `0777 & ~umask`, so binding and then `chmod`ing
+/// leaves a window — a login with `umask 000` publishes a world-connectable socket
+/// for the length of one syscall. Setting the umask around the bind closes it
+/// instead of narrowing it, and avoids `chmod`ing a path that is being raced.
+///
+/// The umask is process-wide, but the daemon is single-threaded and spawns nothing
+/// while this is in effect.
+///
+/// # Errors
+///
+/// Propagates bind failures.
+pub(crate) fn bind_socket_private(path: &std::path::Path) -> io::Result<UnixListener> {
+    use rustix::fs::Mode;
+
+    let previous = rustix::process::umask(Mode::from_bits_truncate(0o777 & !SOCKET_MODE));
+    let listener = UnixListener::bind(path);
+    rustix::process::umask(previous);
+    listener
+}
 
 /// Longest label written to `<id>.label`, in bytes, per the frozen layout.
 pub(crate) const MAX_LABEL_LEN: usize = 256;
@@ -139,7 +163,8 @@ impl SessionPaths {
         fs::write(self.label(), label.as_bytes())
     }
 
-    /// `ssh-agent` socket, once agent forwarding is implemented.
+    /// `ssh-agent` socket, served for a session created with
+    /// [`nomux_proto::HELLO_AGENT_FORWARD`].
     #[must_use]
     pub(crate) fn agent(&self) -> PathBuf {
         self.with_extension("agent")
@@ -167,7 +192,7 @@ impl SessionPaths {
 /// this straight to a terminal, and a label carrying `ESC ]0;` would retitle the
 /// window of whoever ran it. Truncation is at a character boundary, so the result
 /// is always valid UTF-8.
-fn sanitize_label(label: &str) -> String {
+pub(crate) fn sanitize_label(label: &str) -> String {
     let mut out = String::new();
     for ch in label.chars().filter(|ch| !ch.is_control()) {
         if out.len() + ch.len_utf8() > MAX_LABEL_LEN {

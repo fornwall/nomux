@@ -39,6 +39,12 @@ pub(crate) struct Spawn<'a> {
     pub agent_sock: Option<&'a Path>,
 }
 
+/// How long the child's group has to act on `SIGHUP` before `SIGKILL` follows.
+const TERM_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Interval between liveness checks while waiting out [`TERM_GRACE`].
+const TERM_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// A running session: the PTY master plus the child holding its slave.
 #[derive(Debug)]
 pub(crate) struct Pty {
@@ -181,22 +187,36 @@ impl Pty {
     ///
     /// The group matters: signalling only the child leaves backgrounded
     /// grandchildren running, which is exactly the orphan case reaping exists to
-    /// prevent.
+    /// prevent. The child is its own group leader — `setsid` in `pre_exec` made it
+    /// one — so its pgid is its pid.
+    ///
+    /// `kill_process_group` takes that **positive** pid and negates it itself.
+    /// Handing it a pre-negated one double-negates back to `kill(pid)`, which
+    /// signals the child alone and quietly reintroduces the orphan case; in a debug
+    /// build it does not even get that far, because `Pid::from_raw` asserts its
+    /// argument is non-negative.
     pub(crate) fn terminate(&mut self) {
-        let pid = self.child.id();
-        if let Ok(pid) = i32::try_from(pid)
-            && let Some(pid) = rustix::process::Pid::from_raw(pid)
-        {
-            let group = rustix::process::Pid::from_raw(-pid.as_raw_nonzero().get());
-            for signal in [rustix::process::Signal::HUP, rustix::process::Signal::KILL] {
-                if let Some(group) = group {
-                    let _ = rustix::process::kill_process_group(group, signal);
+        let pid = i32::try_from(self.child.id())
+            .ok()
+            .and_then(rustix::process::Pid::from_raw);
+        if let Some(pid) = pid {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::HUP);
+            // Real grace, not a formality: checking microseconds after the signal
+            // finds everything still running, so `SIGKILL` would follow at once and
+            // no shell would ever run its exit trap or flush its history.
+            //
+            // The wait is on the *group* emptying, via a signal-0 probe, not on the
+            // direct child. By the time this runs the child has usually been reaped
+            // already, and waiting on it would return immediately while the
+            // backgrounded grandchildren this exists to collect are still there.
+            let deadline = std::time::Instant::now() + TERM_GRACE;
+            while std::time::Instant::now() < deadline {
+                if rustix::process::test_kill_process_group(pid).is_err() {
+                    break;
                 }
-                if matches!(self.child.try_wait(), Ok(Some(_))) {
-                    return;
-                }
-                let _ = rustix::process::kill_process(pid, signal);
+                std::thread::sleep(TERM_POLL_INTERVAL);
             }
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
         }
         drop(self.child.kill());
         drop(self.child.wait());

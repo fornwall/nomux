@@ -11,7 +11,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
-use crate::rundir::{SessionPaths, run_dir};
+use crate::rundir::{SessionPaths, run_dir, sanitize_label};
 
 /// How long a terminated daemon has to exit before it is killed outright.
 const TERM_GRACE: Duration = Duration::from_secs(2);
@@ -58,10 +58,12 @@ pub(crate) fn list() -> io::Result<()> {
             Liveness::Stale => paths.unlink_all(),
             Liveness::Alive => {
                 let pid = read_pid(&paths).map_or_else(|| "?".to_owned(), |pid| pid.to_string());
-                let label = fs::read_to_string(paths.label())
-                    .unwrap_or_default()
-                    .trim()
-                    .to_owned();
+                // Sanitised on read as well as on write. The file is sanitised
+                // going in, but this is the frozen layout (§ 6.6): the daemon that
+                // wrote it may be any version, and the bytes land on the terminal
+                // of whoever ran `list`. A label carrying `ESC ]0;` would retitle
+                // their window.
+                let label = sanitize_label(&fs::read_to_string(paths.label()).unwrap_or_default());
                 writeln!(out, "{id}\t{pid}\t{label}")?;
             }
         }
@@ -77,6 +79,15 @@ pub(crate) fn list() -> io::Result<()> {
 /// error — the postcondition is "no such session", which already holds.
 pub(crate) fn kill(session_id: &str) -> io::Result<()> {
     let paths = SessionPaths::new(session_id)?;
+    // Liveness first, and only then the pid. A daemon that died without unlinking —
+    // `SIGKILL`, an OOM kill, a crash — leaves its pidfile behind, and the kernel
+    // reuses pids, so signalling one read off disk without checking is how `nomux
+    // kill` ends up terminating an unrelated process of the user's. The socket is
+    // the authority on whether the daemon is still there.
+    if liveness(&paths) == Liveness::Stale {
+        paths.unlink_all();
+        return Ok(());
+    }
     let Some(pid) = read_pid(&paths) else {
         paths.unlink_all();
         return Ok(());

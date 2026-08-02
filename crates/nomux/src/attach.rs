@@ -14,7 +14,7 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use rustix::event::{PollFlags, Timespec};
+use rustix::event::PollFlags;
 use rustix::fs::{FlockOperation, Mode, OFlags};
 use rustix::pipe::SpliceFlags;
 
@@ -172,12 +172,9 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
             break;
         }
 
-        // No deadline of our own: the relay lives exactly as long as the channel.
-        let forever = Timespec {
-            tv_sec: 3600,
-            tv_nsec: 0,
-        };
-        match rustix::event::poll(&mut fds, Some(&forever)) {
+        // No deadline of our own: the relay lives exactly as long as the channel,
+        // and every wakeup it can act on is a readiness event.
+        match rustix::event::poll(&mut fds, None) {
             Ok(_) => {}
             Err(rustix::io::Errno::INTR) => continue,
             Err(err) => return Err(err.into()),
@@ -362,8 +359,11 @@ impl Pump {
 
     /// Hands the destination whatever is owed it, and forgets that it was full.
     ///
-    /// Only called once the destination has reported itself writable, which is
-    /// exactly the news that clears [`Pump::dest_full`].
+    /// Called on `POLLOUT`, and also speculatively whenever something is buffered —
+    /// an optimistic write that either saves a wakeup or costs one `EAGAIN`.
+    /// Clearing [`Pump::dest_full`] is sound either way: it only ever gates
+    /// re-reading the source, and the write below is what establishes whether the
+    /// destination has room.
     fn drain_to(&mut self, fd: BorrowedFd<'_>) -> io::Result<()> {
         self.dest_full = false;
         self.buf.drain_to(fd)

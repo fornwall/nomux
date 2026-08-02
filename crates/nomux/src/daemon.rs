@@ -9,7 +9,6 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, Write};
 use std::os::fd::{AsFd, BorrowedFd};
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -24,7 +23,7 @@ use crate::agent::{self, Agent};
 use crate::conn::Conn;
 use crate::linger;
 use crate::pty::{self, Pty};
-use crate::rundir::{SOCKET_MODE, SessionPaths};
+use crate::rundir::SessionPaths;
 
 /// Default ring capacity. See `DESIGN.md` § 10 — this bounds how long a
 /// disconnect can last before scrollback is lost, and is multiplied by the
@@ -60,6 +59,17 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// How long to keep serving after the child exits, so a client reconnecting into
 /// the race still collects the final output and status.
 const EXIT_LINGER: Duration = Duration::from_secs(5);
+
+/// How long to keep retrying `waitpid` after the PTY reports end of file before
+/// reporting a status the daemon had to invent.
+///
+/// Comfortably inside [`EXIT_LINGER`], so the `Exit` frame still goes out within
+/// the window a reconnecting client is promised.
+const REAP_GRACE: Duration = Duration::from_secs(2);
+
+/// How often to retry while waiting for the child to become reapable. The wait is
+/// normally over within microseconds; this only bounds the pathological case.
+const REAP_RETRY: Duration = Duration::from_millis(5);
 
 /// Longest the poll loop sleeps with nothing else pending.
 #[expect(
@@ -129,7 +139,11 @@ struct Daemon {
     /// Output offset already queued to the current client.
     sent_through: u64,
     win: WinSize,
-    /// `None` until the child exits.
+    /// When the PTY master reported end of file, i.e. when the child let go of the
+    /// terminal. Distinct from `exited`: the status is not readable yet at that
+    /// moment, and on this kernel usually is not.
+    child_gone: Option<Instant>,
+    /// The child's status, `None` until `waitpid` hands it over.
     exited: Option<(i32, ExitKind)>,
     /// When the session became clientless, for idle reaping.
     detached_since: Option<Instant>,
@@ -182,6 +196,7 @@ pub(crate) fn run(session_id: &str, capacity: usize, label: Option<&str>) -> io:
         pending_input: VecDeque::new(),
         sent_through: 0,
         win: WinSize::default(),
+        child_gone: None,
         exited: None,
         detached_since: Some(Instant::now()),
         linger_until: None,
@@ -234,8 +249,7 @@ fn bind_socket(paths: &SessionPaths) -> io::Result<UnixListener> {
         Err(err) => return Err(err),
     }
 
-    let listener = UnixListener::bind(&path)?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(SOCKET_MODE))?;
+    let listener = crate::rundir::bind_socket_private(&path)?;
     listener.set_nonblocking(true)?;
     Ok(listener)
 }
@@ -269,10 +283,24 @@ impl Daemon {
         let mut read_buf = vec![0u8; 64 * 1024];
 
         loop {
+            self.reap();
             if self.should_stop() {
                 return Ok(());
             }
             self.poll_once(&mut read_buf, &mut scratch)?;
+        }
+    }
+
+    /// How long this session may stay clientless before reaping itself.
+    ///
+    /// Shared by `should_stop` and `poll_timeout` so the deadline and the wakeup
+    /// that enforces it cannot drift apart — a limit nothing wakes up for is
+    /// documentation rather than behaviour.
+    const fn detach_limit(&self) -> Duration {
+        if self.pty.is_none() {
+            FIRST_ATTACH_TIMEOUT
+        } else {
+            IDLE_TIMEOUT
         }
     }
 
@@ -282,15 +310,10 @@ impl Daemon {
         {
             return true;
         }
-        if let Some(since) = self.detached_since {
-            let limit = if self.pty.is_none() {
-                FIRST_ATTACH_TIMEOUT
-            } else {
-                IDLE_TIMEOUT
-            };
-            if since.elapsed() >= limit {
-                return true;
-            }
+        if let Some(since) = self.detached_since
+            && since.elapsed() >= self.detach_limit()
+        {
+            return true;
         }
         false
     }
@@ -307,7 +330,7 @@ impl Daemon {
         // Dropped from the set once the child is gone: the master reports `HUP`
         // from then on and would spin the loop at full tilt for the whole linger
         // window, having nothing left to read.
-        if let Some(pty) = self.pty.as_ref().filter(|_| self.exited.is_none()) {
+        if let Some(pty) = self.pty.as_ref().filter(|_| self.child_gone.is_none()) {
             let mut flags = PollFlags::IN;
             if !self.pending_input.is_empty() {
                 flags |= PollFlags::OUT;
@@ -318,7 +341,14 @@ impl Daemon {
         let saturated = self.client.as_ref().is_some_and(Conn::is_write_saturated);
         if let Some(client) = self.client.as_ref() {
             let mut flags = PollFlags::IN;
-            if client.wants_write() {
+            // Ring bytes still owed count as wanting to write, not just bytes
+            // already encoded. `pump_output` stops at `MAX_PENDING_WRITE`, so a
+            // large replay routinely ends an iteration with the queue drained and
+            // the ring still ahead — and without this the daemon would then sleep
+            // until something else happened to wake it, holding output it could
+            // send. `OutputAck` papers over it in practice and is advisory (§ 3),
+            // so it cannot be what the loop relies on.
+            if client.wants_write() || (self.greeted && self.sent_through < self.ring.end()) {
                 flags |= PollFlags::OUT;
             }
             watches.push((Source::Client, client.stream().as_fd(), flags));
@@ -401,7 +431,7 @@ impl Daemon {
             self.read_pending(scratch)?;
         }
         if revents(Source::Listener).contains(PollFlags::IN) {
-            self.accept()?;
+            self.accept();
         }
         if ACCEPT_BEFORE_READ && client_events.intersects(readable) {
             self.read_client(scratch)?;
@@ -438,12 +468,12 @@ impl Daemon {
             remaining = remaining.min(deadline.saturating_duration_since(Instant::now()));
         }
         if let Some(since) = self.detached_since {
-            let limit = if self.pty.is_none() {
-                FIRST_ATTACH_TIMEOUT
-            } else {
-                IDLE_TIMEOUT
-            };
-            remaining = remaining.min(limit.saturating_sub(since.elapsed()));
+            remaining = remaining.min(self.detach_limit().saturating_sub(since.elapsed()));
+        }
+        // The child has let go of the terminal but `waitpid` has not produced its
+        // status yet; come back promptly rather than reporting one we invented.
+        if self.child_gone.is_some() && self.exited.is_none() {
+            remaining = remaining.min(REAP_RETRY);
         }
         Timespec {
             tv_sec: i64::try_from(remaining.as_secs()).unwrap_or(i64::MAX),
@@ -460,18 +490,22 @@ impl Daemon {
     /// auto-reconnect after `TAKEOVER`. So the takeover is triggered by the
     /// `Hello`, exactly as `DESIGN.md` § 6.4 words it, and a connection that never
     /// greets costs the session nothing.
-    fn accept(&mut self) -> io::Result<()> {
+    /// Never fails. `EMFILE`, `ECONNABORTED` and friends belong to one connection
+    /// and are transient; propagating them would destroy a live session over a
+    /// descriptor shortage that has nothing to do with it. § 6.4.1 states the rule —
+    /// a failing client socket is never propagated out of the event loop — and
+    /// `Agent::accept` already implements it for the other listener.
+    fn accept(&mut self) {
         loop {
             match self.listener.accept() {
+                // One at a time: an unanswered probe is replaced rather than
+                // accumulated, so nobody can queue connections at the daemon.
                 Ok((stream, _)) => {
-                    // One at a time: an unanswered probe is replaced rather than
-                    // accumulated, so nobody can queue connections at the daemon.
-                    self.pending = Some(Conn::new(stream)?);
-                    return Ok(());
+                    self.pending = Conn::new(stream).ok();
+                    return;
                 }
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
-                Err(err) => return Err(err),
+                Err(_) => return,
             }
         }
     }
@@ -563,7 +597,7 @@ impl Daemon {
         match pty::read_pty(pty.master(), buf)? {
             // Always drain, attached or not: a full ring drops its oldest bytes,
             // but a PTY that is not read blocks the child on write.
-            pty::Read::Data(n) => drop(self.ring.push(buf.get(..n).unwrap_or(&[]))),
+            pty::Read::Data(n) => self.ring.push(buf.get(..n).unwrap_or(&[])),
             pty::Read::Eof => self.on_child_exit(),
             pty::Read::WouldBlock => {}
         }
@@ -597,23 +631,50 @@ impl Daemon {
         Ok(())
     }
 
+    /// Records that the child has let go of the terminal, and starts the linger
+    /// window.
+    ///
+    /// The status is deliberately *not* resolved here. The kernel closes the
+    /// child's descriptors in `do_exit` before the task becomes reapable, so the
+    /// master reports end of file while `waitpid` still answers "not yet" — on this
+    /// kernel for about a third of exits. Committing a status at this moment
+    /// therefore invents one, and `exit 3` is reported to the client as `exit 0`.
     fn on_child_exit(&mut self) {
-        if self.exited.is_some() {
-            return;
+        if self.child_gone.is_none() {
+            self.child_gone = Some(Instant::now());
+            self.linger_until = Some(Instant::now() + EXIT_LINGER);
         }
-        let status = self
-            .pty
-            .as_mut()
-            .and_then(|pty| pty.try_wait().ok().flatten());
-        let parts = status
-            .as_ref()
-            .map_or((0, ExitKind::Exited), |s| pty::exit_parts(*s));
-        self.exited = Some(parts);
-        self.linger_until = Some(Instant::now() + EXIT_LINGER);
+        self.reap();
         // The frame itself is left to `pump_output`, which sends it once the last
         // of the child's output has gone out. Announcing the exit ahead of the
         // words that caused it is how a client ends up closing the tab on a
         // transcript it never showed.
+    }
+
+    /// Collects the child's status once `waitpid` will give it up.
+    ///
+    /// Called every pass while the status is outstanding, so the wait costs a few
+    /// milliseconds rather than a wrong answer.
+    fn reap(&mut self) {
+        let Some(gone_at) = self.child_gone else {
+            return;
+        };
+        if self.exited.is_some() {
+            return;
+        }
+        if let Some(status) = self
+            .pty
+            .as_mut()
+            .and_then(|pty| pty.try_wait().ok().flatten())
+        {
+            self.exited = Some(pty::exit_parts(status));
+        } else if gone_at.elapsed() >= REAP_GRACE {
+            // The child closed the terminal without exiting — a program that
+            // daemonises itself does exactly this — so there is no status to
+            // report and never will be. The client is still owed an `Exit` rather
+            // than a connection that simply goes quiet.
+            self.exited = Some((0, ExitKind::Exited));
+        }
     }
 
     fn read_client(&mut self, scratch: &mut Vec<u8>) -> io::Result<()> {
@@ -731,7 +792,11 @@ impl Daemon {
         let resume_from = if hello.out_offset == RESUME_FROM_START {
             base
         } else {
-            hello.out_offset.max(base)
+            // Clamped at both ends. Above `end` is a client claiming output the
+            // session never produced; left alone it would set `sent_through` past
+            // the stream and the session would look dead until the child happened
+            // to catch up.
+            hello.out_offset.clamp(base, self.ring.end())
         };
         self.sent_through = resume_from;
         self.greeted = true;
@@ -819,12 +884,23 @@ impl Daemon {
                     gapped = true;
                 }
 
+                // Both halves of the wrapped deque were addressed in one call, so
+                // the second half's offset is only correct if the first was queued
+                // whole. Stopping on short progress keeps that true; without it a
+                // saturated queue would label the second half with an offset that
+                // is too low, which is a corrupted stream rather than a slow one.
                 for part in self.ring.slices_from(self.sent_through) {
                     if part.is_empty() {
                         continue;
                     }
+                    let want = self.sent_through + part.len() as u64;
                     match client.send_output(self.sent_through, part) {
-                        Ok(next) => self.sent_through = next,
+                        Ok(next) => {
+                            self.sent_through = next;
+                            if next != want {
+                                break;
+                            }
+                        }
                         Err(_) => break,
                     }
                 }
@@ -953,8 +1029,10 @@ impl Daemon {
         // Nothing can answer a signature request with the client gone, so the
         // waiting process should fail now rather than at reattach (§ 6.7).
         self.forget_agent_channels();
-        // A session whose child already exited has nothing left to serve.
-        if self.exited.is_some() {
+        // A session whose child already exited has nothing left to serve. Keyed on
+        // the terminal being let go rather than on the status having arrived: with
+        // nobody left to tell, waiting out the reap grace buys nothing.
+        if self.child_gone.is_some() {
             self.linger_until = Some(Instant::now());
         }
     }
@@ -970,16 +1048,3 @@ impl Daemon {
         self.paths.unlink_all();
     }
 }
-
-/// Frame types a client may send. Anything else is a protocol error.
-#[expect(dead_code, reason = "documents the client-to-daemon subset for review")]
-const CLIENT_FRAMES: [FrameType; 8] = [
-    FrameType::Hello,
-    FrameType::Input,
-    FrameType::OutputAck,
-    FrameType::Resize,
-    FrameType::Detach,
-    FrameType::Ping,
-    FrameType::AgentData,
-    FrameType::AgentClose,
-];
