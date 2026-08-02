@@ -11,6 +11,7 @@ mod harness;
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -986,6 +987,118 @@ fn the_daemon_mode_detaches_itself() {
         recorded,
         Some(pid),
         "the pidfile must name the process that is actually serving"
+    );
+}
+
+/// The other half of § 6.2, which the test above never reaches.
+///
+/// `Command` never calls `setpgid`, so a daemon it starts is not a process-group
+/// leader, `setsid` succeeds outright, and the fork is unreachable from there — which
+/// makes `recorded == pid` true by construction rather than by the pidfile being
+/// written in the right order. Moving `detach_from_login_session` to after
+/// `write_pidfile` leaves that test passing, so it guards nothing. Making the child a
+/// group leader first is what forces the `EPERM` only a fork can answer, and it is
+/// the shape a shell with job control produces.
+///
+/// The daemon that survives is in nobody's process group and is nobody's child, so
+/// `wait` collects the process that started and nothing else — it has to be reaped
+/// through `nomux kill`, before the assertions rather than after them.
+#[test]
+fn a_daemon_that_leads_a_process_group_detaches_by_forking() {
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("run-fork");
+    drop(fs::remove_dir_all(&root));
+    fs::create_dir_all(&root).expect("create run root");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_nomux"));
+    command
+        .args(["daemon", "grouped"])
+        .env("XDG_RUNTIME_DIR", &root)
+        .env("SHELL", "/bin/sh")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: the closure runs in the forked child before exec, so it must be
+    // async-signal-safe. `setpgid` is, and nothing here allocates or takes a lock.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    let mut starter = command.spawn().expect("spawn daemon");
+    let original_pid = starter.id();
+
+    let pid_file = root.join("nomux").join("grouped.pid");
+    wait_for(&root.join("nomux").join("grouped.sock"));
+    wait_for(&pid_file);
+
+    // Bounded rather than a bare `wait`: if the fork never happened then the process
+    // started here *is* the daemon, and waiting on it would hang the suite instead of
+    // failing an assertion.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut starter_exited = false;
+    while Instant::now() < deadline {
+        if matches!(starter.try_wait(), Ok(Some(_))) {
+            starter_exited = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut recorded = None;
+    while Instant::now() < deadline {
+        recorded = fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok());
+        if recorded.is_some_and(|pid| {
+            stat_field(pid, StatField::Session) == Some(pid) && stdio_is_silenced(pid)
+        }) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Everything read before anything is collected, so a failing assertion cannot
+    // leave a session behind.
+    let leads_session = recorded.and_then(|pid| stat_field(pid, StatField::Session));
+    let stdio = recorded.map(stdio_targets).unwrap_or_default();
+    let alive = recorded.is_some_and(process_alive);
+    drop(
+        Command::new(env!("CARGO_BIN_EXE_nomux"))
+            .args(["kill", "grouped"])
+            .env("XDG_RUNTIME_DIR", &root)
+            .output(),
+    );
+    if !starter_exited {
+        drop(starter.kill());
+    }
+    drop(starter.wait());
+
+    assert!(
+        starter_exited,
+        "the process that started never left, so nothing forked"
+    );
+    assert_ne!(
+        recorded,
+        Some(original_pid),
+        "the pidfile names the process that started, which has since exited — \
+         `nomux kill` would signal nobody"
+    );
+    assert!(
+        alive,
+        "no live daemon behind the pidfile: it names {recorded:?}"
+    );
+    assert_eq!(
+        leads_session, recorded,
+        "the forked child must lead a session of its own"
+    );
+    assert!(
+        stdio.iter().all(|path| path == Path::new("/dev/null")),
+        "the forked child still holds the descriptors it was handed: {stdio:?}"
     );
 }
 

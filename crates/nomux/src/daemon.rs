@@ -127,10 +127,19 @@ const MAX_PENDING_INPUT: usize = 1 << 20;
 /// Signals that mean "stop", handled so that leaving runs the shutdown path
 /// (`IMPLEMENTATION.md` § 6.5) instead of the default disposition.
 ///
-/// `SIGTERM` is what `nomux kill` sends (§ 6.6). `SIGINT` joins it because the
-/// daemon can be started by hand: `nomux daemon <id>` at a shell shares that
-/// terminal's foreground group for as long as it takes to detach (§ 6.2), and a
-/// Ctrl-C landing in that window would otherwise kill it where it stands.
+/// `SIGTERM` is what `nomux kill` sends (§ 6.6). `SIGINT` joins it because it is the
+/// other signal a person sends by hand to mean stop, and a session is worth more
+/// than the keystroke that ended it: taking the shutdown path collects the child's
+/// process group and unlinks the run files, where the default disposition leaves
+/// both behind.
+///
+/// It is not what protects the window before § 6.2 has finished detaching, and no
+/// longer claims to be. Nothing is armed that early — the handlers go up right after
+/// that detachment, which is the earliest point at which a byte written here cannot
+/// be inherited by a child that never received the signal. What closes that window
+/// instead is § 6.2 itself: once the daemon holds no controlling terminal, no
+/// keystroke can reach it, and before that point it has no PTY, no child and no run
+/// files, so dying there is indistinguishable from never having started.
 ///
 /// `SIGQUIT` is deliberately left alone. Its default action is a core dump, which
 /// is the only way left to get a snapshot out of a daemon that has wedged, and
@@ -188,12 +197,27 @@ fn arm_stop_signals() -> io::Result<OwnedFd> {
     // `sighandler_t` is an integer wide enough for a pointer, and a function item
     // has to be laundered through one to reach it.
     let handler = note_stop_signal as *const () as libc::sighandler_t;
-    for signum in STOP_SIGNALS {
+    for (armed, signum) in STOP_SIGNALS.into_iter().enumerate() {
         // SAFETY: `signal` on a single-threaded process with an async-signal-safe
         // handler, installed before any thread or child exists. `exec` resets
         // handled dispositions, so the session's child is unaffected.
         if unsafe { libc::signal(signum, handler) } == libc::SIG_ERR {
-            return Err(io::Error::last_os_error());
+            let err = io::Error::last_os_error();
+            // Unwound rather than left half-installed. `run` answers this failure by
+            // carrying on with no self-pipe, and the read end goes out of scope with
+            // it — so a handler surviving here would write into a pipe nobody holds,
+            // discard the `EPIPE` as "a byte is already waiting", and swallow the
+            // signal. That is a daemon permanently deaf to `SIGTERM`, which is worse
+            // than the default disposition this exists to improve on: the default at
+            // least closes the master and hangs up the foreground group.
+            for prior in STOP_SIGNALS.into_iter().take(armed) {
+                // SAFETY: the same call, putting back the disposition the loop above
+                // replaced.
+                unsafe {
+                    libc::signal(prior, libc::SIG_DFL);
+                }
+            }
+            return Err(err);
         }
     }
     Ok(read)
@@ -274,6 +298,19 @@ pub(crate) fn run(session_id: &str, capacity: usize, label: Option<&str>) -> io:
     // whoever asked with an exit status they can see; before the pidfile, so the
     // pid `nomux kill` reads belongs to the process that survives.
     detach_from_login_session();
+
+    // Before the pidfile, because that file is what `nomux kill` (§ 6.6) reads to
+    // find this process: arming after writing it would leave a window, however
+    // narrow, where the signal it sends lands on the default disposition and the
+    // child's process group outlives the daemon. And after the fork above, so that a
+    // parent leaving through `_exit` cannot answer a signal by writing a byte into
+    // the pipe the child inherits and then reads as a stop request of its own.
+    //
+    // Without it the daemon dies on the default disposition and the child's process
+    // group outlives it — worse than today's session, but still a session, so a pipe
+    // that cannot be made is not worth refusing to start over.
+    let stop_pipe = arm_stop_signals().ok();
+
     write_pidfile(&paths)?;
     if let Some(label) = label {
         // Advisory: a session is worth more than its name in a listing.
@@ -287,11 +324,6 @@ pub(crate) fn run(session_id: &str, capacity: usize, label: Option<&str>) -> io:
     // like any login shell.
     let child_dir = pty::child_dir(std::env::current_dir().ok().as_deref());
     detach_from_startup_state();
-
-    // Without it the daemon dies on the default disposition and the child's process
-    // group outlives it — worse than today's session, but still a session, so a
-    // pipe that cannot be made is not worth refusing to start over.
-    let stop_pipe = arm_stop_signals().ok();
 
     let mut daemon = Daemon {
         paths,
@@ -323,27 +355,62 @@ pub(crate) fn run(session_id: &str, capacity: usize, label: Option<&str>) -> io:
     result
 }
 
-/// Puts the daemon in a session of its own, which is what lets it outlive the
-/// connection that started it (`IMPLEMENTATION.md` § 6.2).
+/// Puts the daemon in a session of its own *and* without a controlling terminal,
+/// which is what lets it outlive the connection that started it
+/// (`IMPLEMENTATION.md` § 6.2).
 ///
-/// Usually there is nothing to do. `attach::spawn_daemon` calls `setsid` between
-/// fork and exec, so the ordinary path arrives already detached — and calling it
-/// again there would fail with `EPERM`, because a session leader is a process-group
-/// leader by definition and `setsid` refuses those. Asking `getsid` first is what
-/// tells "already done" apart from "cannot be done", which is the whole difficulty
-/// of this function.
+/// Leading a session is not the property wanted, only half of it. A session leader
+/// may still hold a controlling terminal, and `exec`ing the daemon *from* one lands
+/// exactly there: `ssh -t host 'nomux daemon <id>'` produces it, because `bash -c`
+/// with a single command `exec`s in place instead of forking. The daemon is then the
+/// terminal's foreground process group for the session's whole life, so Ctrl-C kills
+/// it and `Ctrl-\` dumps its core — `SIGHUP` was covered, terminal-generated signals
+/// were not.
 ///
-/// A genuine refusal means one thing only: this process leads a process group
-/// somebody else made, which is `nomux daemon <id>` typed at a shell with job
-/// control. Nothing can make a group leader a session leader, so the way out is a
+/// Hence both halves in the early return. Everything after it is unchanged and still
+/// carries the weight: `setsid` leaves the caller a session leader with no
+/// controlling terminal, which is the whole property, and it refuses with `EPERM`
+/// for a process-group leader — a session leader being one by definition, so on the
+/// ordinary path, where `attach::spawn_daemon` already called `setsid` between fork
+/// and exec, calling it again looks exactly like a failure. Asking first is what
+/// tells "already done" apart from "cannot be done", and it keeps that path
+/// fork-free.
+///
+/// A genuine refusal means this process leads a process group somebody else made:
+/// `nomux daemon <id>` typed at a shell with job control, or the `ssh -t` shape
+/// above. Nothing can make a group leader a session leader, so the way out is a
 /// child that is not one. The parent leaves through `_exit`, which is why this
 /// happens before the pidfile is written — `nomux kill` must read the pid of the
 /// process that survived rather than of the one that started.
 ///
+/// `SIGHUP` is ignored first, before anything here can provoke one, and that is
+/// load-bearing rather than tidy: when the parent leaves through `_exit` it is the
+/// *session leader* of the terminal it was `exec`ed from, so the kernel hangs that
+/// terminal up and delivers `SIGHUP` to its foreground process group — which the
+/// forked child is still in for the few instructions before its own `setsid`. With
+/// the disposition inherited as ignored the race cannot be lost; without it the
+/// daemon dies during the very manoeuvre that was meant to save it, which is exactly
+/// what it did the first time this was written.
+///
+/// `TIOCNOTTY` would drop the terminal without a fork and is deliberately not used.
+/// Issued by a session leader it sends `SIGHUP` and `SIGCONT` to the foreground
+/// process group — which in the case being fixed *is* this process — and it strips
+/// the controlling terminal from every other process in the session too, which is
+/// not this program's to take.
+///
 /// Failures are not propagated. Sharing a session makes for a worse daemon, not a
 /// broken one, and refusing to start would be the worse outcome of the two.
 fn detach_from_login_session() {
-    if rustix::process::getsid(None).is_ok_and(|sid| sid == rustix::process::getpid()) {
+    // SAFETY: `signal` with SIG_IGN on a single-threaded process with no handler
+    // installed; the disposition is reset in the child before exec (see
+    // `pty::Pty::spawn`) so the session's child still dies on hangup as it should.
+    unsafe {
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+    }
+
+    let leads_session =
+        rustix::process::getsid(None).is_ok_and(|sid| sid == rustix::process::getpid());
+    if leads_session && !has_controlling_terminal() {
         return;
     }
     if rustix::process::setsid().is_ok() {
@@ -366,26 +433,43 @@ fn detach_from_login_session() {
     let _ = rustix::process::setsid();
 }
 
-/// Cuts the daemon loose from the rest of the state it inherited: the working
-/// directory, the standard descriptors and `SIGHUP`.
+/// Whether this process has a controlling terminal.
 ///
-/// `IMPLEMENTATION.md` § 6.2. `setsid` has already left the daemon without a
-/// controlling terminal, so no `SIGHUP` can currently reach it — this is the belt
-/// to that braces, since a session that dies on hangup is the one failure this
-/// whole program exists to prevent. `SIGPIPE` needs nothing: the Rust runtime
-/// ignores it at startup and restores it for the child.
+/// `/dev/tty` *is* that terminal, by definition, so opening it answers the question
+/// without having to know which descriptor — if any — reaches it. That matters here:
+/// the daemon's own stdio may already be a pipe, a socket or `/dev/null` and still
+/// leave the terminal attached, so no amount of asking about fd 0 would do.
+/// `O_NOCTTY` keeps § 6.2's rule that this binary never acquires one by opening it.
+///
+/// `ENXIO` is the kernel saying there is none, and is the only definite no. Anything
+/// else — no `/dev/tty` node in a stripped container, a mode that refuses the open —
+/// leaves the question unanswered, and unanswered is taken as yes. Being wrong that
+/// way costs one `fork` on a host where the probe cannot work; being wrong the other
+/// way costs a session that a keystroke can end.
+fn has_controlling_terminal() -> bool {
+    match rustix::fs::open(
+        "/dev/tty",
+        OFlags::RDONLY | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(_) => true,
+        Err(err) => err != rustix::io::Errno::NXIO,
+    }
+}
+
+/// Cuts the daemon loose from the rest of the state it inherited: the working
+/// directory and the standard descriptors.
+///
+/// `IMPLEMENTATION.md` § 6.2. `SIGHUP` is not among them — it is ignored earlier,
+/// in `detach_from_login_session`, because the detachment itself can provoke one.
+/// `SIGPIPE` needs nothing: the Rust runtime ignores it at startup and restores it
+/// for the child.
 ///
 /// Failures are not propagated. A daemon that cannot `chdir` still works; refusing
 /// to start over it would be a worse outcome than the mount it might pin.
 fn detach_from_startup_state() {
     let _ = rustix::process::chdir("/");
     let _ = silence_stdio();
-    // SAFETY: `signal` with SIG_IGN is safe to call on a single-threaded process
-    // with no handler installed; the disposition is reset in the child before exec
-    // (see `pty::Pty::spawn`) so the child still dies on hangup as it should.
-    unsafe {
-        libc::signal(libc::SIGHUP, libc::SIG_IGN);
-    }
 }
 
 /// Points the three standard descriptors at `/dev/null`.

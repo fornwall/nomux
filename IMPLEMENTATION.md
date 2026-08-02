@@ -395,25 +395,58 @@ only available fix, and only for variables that name a path.
 The `daemon` mode holds this itself rather than trusting whoever started it:
 
 ```
-getsid(0) == getpid()?  already detached; nothing to do
-  else setsid           refused only if we lead a process group
+ignore SIGHUP
+leads a session and holds no controlling terminal?  already detached; nothing to do
+  else setsid            refused only if we lead a process group
     else fork → parent _exit, child setsid
-      chdir "/"
-      0/1/2 → /dev/null
-      ignore SIGHUP
+chdir "/"
+0/1/2 → /dev/null
 ```
+
+The test is **no controlling terminal**, not "leads a session". A session leader may
+still hold one, and `exec`ing the daemon *from* one lands exactly there:
+`ssh -t host 'nomux daemon <id>'` produces it, because `bash -c` with a single command
+`exec`s in place rather than forking. The daemon is then the terminal's foreground
+process group for the whole life of the session — `tty_nr` set, `tpgid` equal to its
+own `pgrp` — so Ctrl-C kills it and `Ctrl-\` dumps its core. `SIGHUP` was covered;
+terminal-generated signals were not. With dash as `/bin/sh` the shell forks and the
+shape does not arise, so it is shell-dependent, and bash is the common case.
+
+The question is put to `/dev/tty`, which *is* that terminal by definition. It has to
+be: the daemon's own stdio may be a pipe, a socket or `/dev/null` and still leave a
+terminal attached, so nothing it holds a descriptor to can answer. `ENXIO` is the only
+definite no; any other failure leaves the question open and is taken as yes, which
+costs one fork on a host where the probe cannot work and is the safe direction of the
+two.
 
 `setsid(2)` refuses with `EPERM` for a process-group leader, and a session leader is
 one by definition — so on the ordinary path, where `attach` has already called
 `setsid` between fork and exec, calling it again looks exactly like a failure.
-Asking `getsid` first is what tells "already done" apart from "cannot be done".
+Asking first is what tells "already done" apart from "cannot be done", and it is what
+keeps that path fork-free: `setsid` leaves the caller a session leader *without* a
+controlling terminal, which is the whole property.
 
-The one genuine refusal is `nomux daemon <id>` typed at a shell, where job control
-makes the daemon its own process group's leader; nothing can promote one of those,
-so the way out is a child that is not one. It happens after the socket is bound, so
-a session that already exists is still reported with an exit status somebody sees,
-and before the pidfile is written, so `nomux kill` (§6.6) reads the pid of the
-process that survived rather than of the one that started.
+The genuine refusals are two. `nomux daemon <id>` typed at a shell, where job control
+makes the daemon its own process group's leader; and the `ssh -t` shape above, where it
+leads the session itself. Nothing can promote either, so the way out is a child that is
+not one. It happens after the socket is bound, so a session that already exists is
+still reported with an exit status somebody sees, and before the pidfile is written, so
+`nomux kill` (§6.6) reads the pid of the process that survived rather than of the one
+that started.
+
+`SIGHUP` is ignored before any of that, and there it is load-bearing rather than tidy.
+When the parent leaves through `_exit` it is the session leader of the terminal it was
+`exec`ed from, so the kernel hangs that terminal up and sends `SIGHUP` to its
+foreground process group — which the forked child is still in for the few instructions
+before its own `setsid`. Inherited as ignored, that race cannot be lost. Without it the
+daemon dies during the manoeuvre meant to save it, which is what it did the first time
+this was written.
+
+`TIOCNOTTY` would drop the terminal without a fork, and is deliberately not used.
+Issued by a session leader it sends `SIGHUP` and `SIGCONT` to the foreground process
+group — which in the case being fixed is the daemon itself — and it strips the
+controlling terminal from every other process in the session as well, which is not this
+program's to take.
 
 `attach` does the `setsid` and the `/dev/null` in its own `pre_exec` as well, and
 keeps doing so, because the daemon cannot reach either soon enough. Until it runs
@@ -422,23 +455,28 @@ own stdio it holds the *relay's* descriptors — where anything it writes lands 
 middle of the client's frame stream.
 
 The classic second fork is deliberately absent, and the conditional one above is not
-it. Its only purpose is to leave the daemon a non-session-leader so it cannot
-acquire a controlling terminal by opening a tty — but a controlling terminal is
-acquired only by opening one *without* `O_NOCTTY`, and this binary opens exactly two
-ttys, both with it (§6.1). The property is held by construction at the two lines
-that could break it, rather than by a fork whose reason would have to be
-rediscovered.
+it. The conditional fork exists to reach a state `setsid` cannot reach from a
+process-group leader; the classic one exists to leave the daemon a *non*-session-leader
+so it cannot acquire a controlling terminal by opening a tty. That second purpose is
+not needed here: a controlling terminal is acquired only by opening one *without*
+`O_NOCTTY`, and this binary opens exactly three ttys — the PTY master, its slave
+(§6.1), and `/dev/tty` for the probe above — all three with it. The property is held by
+construction at the three lines that could break it, rather than by a fork whose reason
+would have to be rediscovered.
 
 `chdir "/"` happens after the run-directory paths are resolved and the socket is
 bound, and the child is given its own working directory (§6.1.1) — otherwise the
 shell would start in `/` instead of the user's home. What it buys is that a session
 running for a week cannot keep a removable or network mount busy.
 
-`SIGHUP` is ignored in the daemon and restored to `SIG_DFL` in the child before
-`exec`, since an ignored disposition survives `exec` and a child that shrugs off
-`SIGHUP` would leave reaping to `SIGKILL` alone. `SIGTERM` and `SIGINT` are handled
-instead of ignored (§6.5), and need nothing in the child: `exec` resets every
-*handled* signal to its default, and only ignoring is inherited through it.
+`SIGHUP` is ignored in the daemon — first thing, for the reason above — and restored
+to `SIG_DFL` in the child before `exec`, since an ignored disposition survives `exec`
+and a child that shrugs off `SIGHUP` would leave reaping to `SIGKILL` alone. `SIGTERM`
+and `SIGINT` are handled instead of ignored (§6.5), armed immediately after the
+detachment above and before the pidfile is written, so that the pid `nomux kill` reads
+never names a process still on the default disposition. They need nothing in the child:
+`exec` resets every *handled* signal to its default, and only ignoring is inherited
+through it.
 `SIGPIPE` needs nothing either: the Rust runtime ignores it at startup and resets it
 for spawned children.
 
