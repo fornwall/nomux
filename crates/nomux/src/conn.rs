@@ -187,21 +187,41 @@ impl Conn {
         Ok(())
     }
 
-    /// Pushes out whatever is queued, giving up after [`FINAL_FLUSH_TIMEOUT`].
+    /// Pushes out whatever is queued, giving up [`FINAL_FLUSH_TIMEOUT`] after it
+    /// started.
     ///
     /// # Errors
     ///
-    /// Propagates write failures, including the timeout expiring.
+    /// Propagates write failures, including the deadline expiring.
     pub(crate) fn flush_final(&mut self) -> io::Result<()> {
         // Bounded, because the connection being flushed is frequently one that has
         // stopped reading — that is what a takeover is usually recovering from. An
         // unbounded blocking write here parks the entire daemon inside the kernel:
         // no PTY drained, no client served, no reaping, until a peer that may never
         // read again decides to.
+        //
+        // Against the whole call, not against each `write`. `SO_SNDTIMEO` restarts
+        // per syscall, so a peer reading a trickle keeps resetting it and eight
+        // megabytes — the queue this tolerates before giving up on a client — take
+        // as long as that peer likes. `nomux kill` allows the daemon two seconds to
+        // shut down before `SIGKILL`, and this runs inside them, so an overrun here
+        // is a process group left behind and run files that outlive the session.
         self.stream.set_nonblocking(false)?;
-        self.stream.set_write_timeout(Some(FINAL_FLUSH_TIMEOUT))?;
-        let pending = self.tx.get(self.tx_pos..).unwrap_or(&[]);
-        self.stream.write_all(pending)?;
+        let deadline = std::time::Instant::now() + FINAL_FLUSH_TIMEOUT;
+        while self.tx_pos < self.tx.len() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            self.stream.set_write_timeout(Some(remaining))?;
+            let pending = self.tx.get(self.tx_pos..).unwrap_or(&[]);
+            match self.stream.write(pending) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => self.tx_pos += n,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(err),
+            }
+        }
         self.tx.clear();
         self.tx_pos = 0;
         self.stream.flush()

@@ -891,6 +891,125 @@ fn a_daemon_that_reaps_itself_removes_its_run_files() {
     );
 }
 
+/// `SIGTERM` must leave through the shutdown path, not the default disposition.
+///
+/// `nomux kill` signals the daemon and gives it two seconds. Without a handler it
+/// died where it stood, so `Pty::terminate` never ran — and closing the PTY master
+/// hides that for the ordinary case, because the kernel delivers `SIGHUP` to the
+/// foreground process group on the way out. What it does not cover is a
+/// backgrounded process that ignores the hangup, which is what this starts: `trap
+/// '' HUP` before the fork, since an *ignored* disposition is inherited through
+/// `exec` where a trapped one is reset.
+///
+/// `set +m` is what puts that process where reaping can see it. An interactive
+/// shell gives every job a process group of its own, and nothing in the session
+/// ever signals those — a real gap, but a different one, and one no `SIGTERM`
+/// handler would close. With job control off the job stays in the shell's group,
+/// which is what `Pty::terminate` signals and what a script's background processes
+/// do anyway.
+#[test]
+fn a_signalled_daemon_collects_a_process_that_ignores_sighup() {
+    let session = Session::start("sigterm");
+    let mut client = session.connect();
+    let ok = client.hello(RESUME_FROM_START, 0);
+
+    // The marker trails the pid so that seeing it proves the digits already
+    // arrived, and the arithmetic keeps it out of the line discipline's echo of the
+    // command itself — which would otherwise match first, carrying `$!` unexpanded.
+    let script = b"set +m; trap '' HUP; sleep 300 & echo \"$!-NOMUX-ORPHAN-$((6*7))\"\n";
+    client.send(&Frame::Input {
+        offset: 0,
+        data: script,
+    });
+    let (seen, _) = client.read_until("-NOMUX-ORPHAN-42", ok.resume_from);
+    let orphan = trailing_pid(&seen, "-NOMUX-ORPHAN-42")
+        .unwrap_or_else(|| panic!("no background pid in the transcript: {seen:?}"));
+    assert!(
+        process_alive(orphan),
+        "the backgrounded process was gone before the session ended"
+    );
+    let shell = child_of(session.child.id()).expect("find the session shell");
+    assert_eq!(
+        stat_field(orphan, StatField::ProcessGroup),
+        Some(shell),
+        "this shell kept job control on, so nothing here is testing reaping"
+    );
+
+    let daemon = rustix::process::Pid::from_raw(session.child.id().cast_signed())
+        .expect("the daemon's own pid");
+    let pid_file = session
+        .root
+        .join("nomux")
+        .join(format!("{}.pid", session.id));
+    // Signalled directly rather than through `nomux kill`, which unlinks the run
+    // files itself and would answer the question for the daemon.
+    rustix::process::kill_process(daemon, rustix::process::Signal::TERM)
+        .expect("signal the daemon");
+
+    // Inside the two seconds `nomux kill` allows before `SIGKILL`, with room for a
+    // loaded machine: an overrun there is this same bug wearing a hat.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && (pid_file.exists() || session.socket.exists()) {
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        !pid_file.exists() && !session.socket.exists(),
+        "run files outlived the signalled daemon: socket={} pid={}",
+        session.socket.exists(),
+        pid_file.exists()
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if !process_alive(orphan) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("pid {orphan} outlived the session it was backgrounded in");
+}
+
+/// The run of digits immediately before `marker`, as a pid.
+fn trailing_pid(transcript: &str, marker: &str) -> Option<u32> {
+    let (head, _) = transcript.rsplit_once(marker)?;
+    let reversed: String = head
+        .chars()
+        .rev()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    reversed.chars().rev().collect::<String>().parse().ok()
+}
+
+/// A numeric field of `/proc/<pid>/stat`, by what it means.
+#[derive(Clone, Copy)]
+enum StatField {
+    /// The process group the process belongs to.
+    ProcessGroup = 2,
+}
+
+/// Reads one field of `/proc/<pid>/stat`.
+///
+/// Counted from the state letter that follows the parenthesised command name,
+/// because counting from the front stops working the moment a command name
+/// contains a space or a bracket — and `sh` starting `a b )` is enough.
+fn stat_field(pid: u32, field: StatField) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, tail) = stat.rsplit_once(')')?;
+    tail.split_whitespace().nth(field as usize)?.parse().ok()
+}
+
+/// Whether `pid` is still a process rather than gone or a zombie awaiting its
+/// parent. A collected process group reaches one of the latter two promptly.
+fn process_alive(pid: u32) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some((_, tail)) = stat.rsplit_once(')') else {
+        return false;
+    };
+    !tail.trim_start().starts_with('Z')
+}
+
 /// A session created without the flag serves no socket at all: forwarding bypasses
 /// the user's `ForwardAgent` decision, so it must never be on by default.
 #[test]

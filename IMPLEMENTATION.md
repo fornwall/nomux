@@ -287,7 +287,7 @@ anything that walks `/proc/self/fd` — or writes to a descriptor it did not ope
 can inject output into the stream or read the user's keystrokes. The child keeps
 its stdio regardless, because `dup2` onto 0/1/2 clears the flag on the copies.
 4. Parent sets the initial `TIOCSWINSZ` from `Hello` before the first read.
-5. Master is set non-blocking; the event loop is `poll` over {master, listener, attached client, pending connection, agent socket, one fd per agent channel}.
+5. Master is set non-blocking; the event loop is `poll` over {master, listener, attached client, pending connection, the stop-signal self-pipe (§6.5), agent socket, one fd per agent channel}.
 
 The *pending* entry is a connection accepted but not yet greeted, and it is
 load-bearing rather than incidental: it is what makes "connecting is not attaching"
@@ -354,8 +354,11 @@ running for a week cannot keep a removable or network mount busy.
 
 `SIGHUP` is ignored in the daemon and restored to `SIG_DFL` in the child before
 `exec`, since an ignored disposition survives `exec` and a child that shrugs off
-`SIGHUP` would leave reaping to `SIGKILL` alone. `SIGPIPE` needs nothing: the Rust
-runtime ignores it at startup and resets it for spawned children.
+`SIGHUP` would leave reaping to `SIGKILL` alone. `SIGTERM` and `SIGINT` are handled
+instead of ignored (§6.5), and need nothing in the child: `exec` resets every
+*handled* signal to its default, and only ignoring is inherited through it.
+`SIGPIPE` needs nothing either: the Rust runtime ignores it at startup and resets it
+for spawned children.
 
 `systemd-logind` with `KillUserProcesses=yes` kills the daemon at logout regardless.
 The only real fix is `loginctl enable-linger $USER`. The daemon detects the state
@@ -475,6 +478,31 @@ nothing to install.
 A session nobody ever attaches to is reaped after 30 s rather than the idle
 timeout: a daemon spawned by a connection that died mid-handshake has no client
 coming and would otherwise sit there for a week.
+
+`SIGTERM` and `SIGINT` reach the same exit. A handler writes one byte to a
+self-pipe whose read end is in the poll set, and the loop leaves on its next pass —
+so `nomux kill` (§6.6) collects the child's process group and unlinks the run files
+rather than dropping the daemon where it stands. Closing the PTY master hides the
+difference for the ordinary case, because the kernel then delivers `SIGHUP` to the
+foreground process group on the way out; what it does not cover is a backgrounded
+process that ignores the hangup.
+
+A self-pipe rather than `signalfd`, which reports only *blocked* signals and so
+wants a process-wide `sigprocmask` — and a blocked mask survives `exec`, so §6.1
+would have to unblock it again in the child or leave the user's shell permanently
+deaf to `SIGTERM`. `poll` returning `EINTR` loses nothing: the handler wrote its
+byte before the syscall returned, and the next pass finds the pipe readable.
+
+The budget is `nomux kill`'s two seconds, and everything on the way out is bounded
+against them: a final flush to the attached client for at most 500 ms — against the
+whole call, not per `write`, or a peer reading a trickle would reset it — and then
+`SIGHUP`, 500 ms, `SIGKILL` for the process group. An overrun would mean the daemon
+being `SIGKILL`ed mid-shutdown, which is the bug this closes, wearing a hat.
+
+`SIGQUIT` is deliberately left at its default. Its action is a core dump, which is
+the only way left to get a snapshot out of a daemon that has wedged, and `SIGKILL`
+— which nothing can handle — already means "go away now" for anyone who does not
+want one.
 
 ### 6.6 Frozen control surface
 
@@ -674,7 +702,7 @@ a floating one moves the bytes the client pinned.
 | Chaos | Randomised disconnect injection, seeded and reproducible, under an escape-heavy full-screen stream and under `yes`. | `tests/chaos.rs` |
 | Agent forwarding | Bidirectional proxying, the channel cap, ids never reused, fail-fast while detached, and off unless asked for. | `tests/session.rs` |
 | Relay | Bulk traffic both ways through `nomux attach`, byte-exact, over both the `splice` and copying paths of §7. | `tests/session.rs` |
-| Shutdown | A daemon that reaps itself runs `terminate` to completion and unlinks its run files. | `tests/session.rs` |
+| Shutdown | A daemon that reaps itself runs `terminate` to completion and unlinks its run files, and a signalled one collects a backgrounded process that ignores `SIGHUP`. | `tests/session.rs` |
 
 The two invariants that matter: **no duplicated input, ever**, and **no lost output
 unless a `Gap` was reported**.

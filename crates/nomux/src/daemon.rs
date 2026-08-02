@@ -3,15 +3,16 @@
 //! Single-threaded around `poll`. There is at most one client
 //! (`IMPLEMENTATION.md` § 6.4), so the poll set is small: the listener, the PTY
 //! master, the client if one is attached, the connection that has not greeted yet,
-//! and — when agent forwarding is on — the agent socket plus one entry per live
-//! channel.
+//! the self-pipe a stop signal writes to, and — when agent forwarding is on — the
+//! agent socket plus one entry per live channel.
 
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, Write};
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::{AsFd, BorrowedFd, IntoRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use nomux_proto::{
@@ -19,6 +20,7 @@ use nomux_proto::{
     RESUME_FROM_START, WinSize,
 };
 use rustix::event::{PollFd, PollFlags, Timespec};
+use rustix::pipe::PipeFlags;
 
 use crate::agent::{self, Agent};
 use crate::conn::Conn;
@@ -107,10 +109,97 @@ const SETTLE_BEFORE_POLL: bool = cfg!(nomux_fault_injection) || cfg!(nomux_fault
 /// How long that pause is.
 const FAULT_SETTLE: Duration = Duration::from_millis(20);
 
+/// Signals that mean "stop", handled so that leaving runs the shutdown path
+/// (`IMPLEMENTATION.md` § 6.5) instead of the default disposition.
+///
+/// `SIGTERM` is what `nomux kill` sends (§ 6.6). `SIGINT` joins it because the
+/// daemon can be started by hand: `nomux daemon <id>` at a shell shares that
+/// terminal's foreground group for as long as it takes to detach (§ 6.2), and a
+/// Ctrl-C landing in that window would otherwise kill it where it stands.
+///
+/// `SIGQUIT` is deliberately left alone. Its default action is a core dump, which
+/// is the only way left to get a snapshot out of a daemon that has wedged, and
+/// `SIGKILL` already covers "go away now" for anyone who does not want one.
+const STOP_SIGNALS: [libc::c_int; 2] = [libc::SIGTERM, libc::SIGINT];
+
+/// Write end of the self-pipe, as a raw descriptor because a signal handler may
+/// neither allocate nor take a lock. `-1` until [`arm_stop_signals`] publishes it.
+static STOP_PIPE: AtomicI32 = AtomicI32::new(-1);
+
+/// The entirety of what happens in a signal handler: one byte down the self-pipe.
+///
+/// Async-signal-safety is the constraint that shapes this. `write(2)` is on the
+/// permitted list, the descriptor is non-blocking so a pipe somebody has filled
+/// cannot park the daemon inside a handler, and a refused write means a byte is
+/// already waiting — which is the whole of the message. Nor can this perturb
+/// `errno`: rustix issues the syscall directly and reports failure through its
+/// return value, so a handler landing between a failing call in the main flow and
+/// that call's `errno` read leaves it untouched.
+extern "C" fn note_stop_signal(_signum: libc::c_int) {
+    let raw = STOP_PIPE.load(Ordering::Relaxed);
+    if raw >= 0 {
+        // SAFETY: the write end is published once, before any handler can run, and
+        // then deliberately never closed, so this descriptor number is valid for
+        // the rest of the process's life and cannot have been reused.
+        let fd = unsafe { BorrowedFd::borrow_raw(raw) };
+        let _ = rustix::io::write(fd, b"\0");
+    }
+}
+
+/// Routes [`STOP_SIGNALS`] into a descriptor the poll set can watch, and hands back
+/// its read end.
+///
+/// A self-pipe rather than `signalfd`, which reports only signals that are
+/// *blocked* and so wants a process-wide `sigprocmask` — a mask that survives
+/// `exec`, meaning `pty::Pty::spawn` would have to unblock it again in the child or
+/// leave the user's shell permanently deaf to `SIGTERM`. rustix has no binding for
+/// it either. Two descriptors and a one-line handler are the cheaper trade.
+///
+/// # Errors
+///
+/// Fails if the pipe cannot be created or a handler cannot be installed.
+fn arm_stop_signals() -> io::Result<OwnedFd> {
+    // `CLOEXEC` so the session's child never inherits either end; `NONBLOCK` so the
+    // handler above cannot block on the write.
+    let (read, write) = rustix::pipe::pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK)?;
+
+    // The write end is leaked on purpose. A signal can arrive at any point up to
+    // process exit, including after the `Daemon` has been dropped, and a handler
+    // holding a closed descriptor would write its byte into whatever was opened
+    // next. One descriptor for the life of the process is the cheaper answer than
+    // teaching the handler to be told.
+    STOP_PIPE.store(write.into_raw_fd(), Ordering::Relaxed);
+
+    // `sighandler_t` is an integer wide enough for a pointer, and a function item
+    // has to be laundered through one to reach it.
+    let handler = note_stop_signal as *const () as libc::sighandler_t;
+    for signum in STOP_SIGNALS {
+        // SAFETY: `signal` on a single-threaded process with an async-signal-safe
+        // handler, installed before any thread or child exists. `exec` resets
+        // handled dispositions, so the session's child is unaffected.
+        if unsafe { libc::signal(signum, handler) } == libc::SIG_ERR {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(read)
+}
+
 /// Session state for the lifetime of the daemon process.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "three of the four are the correlated client fields PLAN.md § P2 wants \
+              behind one Option; `stopping` is deliberately not folded into \
+              `linger_until`, which `on_child_exit` can overwrite in the same pass"
+)]
 struct Daemon {
     paths: SessionPaths,
     listener: UnixListener,
+    /// Read end of the self-pipe [`arm_stop_signals`] armed, or `None` on a host
+    /// where it could not be armed at all.
+    stop_pipe: Option<OwnedFd>,
+    /// Set once a stop signal has been seen. The loop leaves on its next pass, so
+    /// the exit goes out through `shutdown` like every other one.
+    stopping: bool,
     ring: crate::ring::Ring,
     pty: Option<Pty>,
     client: Option<Conn>,
@@ -180,9 +269,16 @@ pub(crate) fn run(session_id: &str, capacity: usize, label: Option<&str>) -> io:
     let child_dir = pty::child_dir(std::env::current_dir().ok().as_deref());
     detach_from_startup_state();
 
+    // Without it the daemon dies on the default disposition and the child's process
+    // group outlives it — worse than today's session, but still a session, so a
+    // pipe that cannot be made is not worth refusing to start over.
+    let stop_pipe = arm_stop_signals().ok();
+
     let mut daemon = Daemon {
         paths,
         listener,
+        stop_pipe,
+        stopping: false,
         ring: crate::ring::Ring::new(capacity),
         pty: None,
         client: None,
@@ -265,6 +361,8 @@ fn write_pidfile(paths: &SessionPaths) -> io::Result<()> {
 enum Source {
     /// The session socket, where clients arrive.
     Listener,
+    /// Read end of the self-pipe a stop signal writes to.
+    Signal,
     /// The PTY master.
     Pty,
     /// The attached client.
@@ -306,6 +404,9 @@ impl Daemon {
     }
 
     fn should_stop(&self) -> bool {
+        if self.stopping {
+            return true;
+        }
         if let Some(deadline) = self.linger_until
             && Instant::now() >= deadline
         {
@@ -325,8 +426,11 @@ impl Daemon {
     /// forwarding adds the socket plus one entry per live channel, and an index
     /// arithmetic bug there would silently apply one fd's readiness to another.
     fn watches(&self) -> Vec<(Source, BorrowedFd<'_>, PollFlags)> {
-        let mut watches = Vec::with_capacity(4);
+        let mut watches = Vec::with_capacity(5);
         watches.push((Source::Listener, self.listener.as_fd(), PollFlags::IN));
+        if let Some(stop) = self.stop_pipe.as_ref() {
+            watches.push((Source::Signal, stop.as_fd(), PollFlags::IN));
+        }
 
         // Dropped from the set once the child is gone: the master reports `HUP`
         // from then on and would spin the loop at full tilt for the whole linger
@@ -396,6 +500,11 @@ impl Daemon {
             let timeout = self.poll_timeout();
             match rustix::event::poll(&mut fds, Some(&timeout)) {
                 Ok(_) => {}
+                // A stop signal delivered while blocked here lands as `EINTR`, and
+                // `poll` is never restarted whatever the handler's flags say. That
+                // costs nothing: the handler wrote its byte before the syscall
+                // returned, so coming round the loop finds the pipe readable and
+                // the notification outlives being dropped on the floor here.
                 Err(rustix::io::Errno::INTR) => return Ok(()),
                 Err(err) => return Err(err.into()),
             }
@@ -413,6 +522,15 @@ impl Daemon {
                 .map_or(PollFlags::empty(), |(_, flags)| *flags)
         };
         let readable = PollFlags::IN | PollFlags::HUP | PollFlags::ERR;
+
+        // A stop request rather than an event to service, so nothing is read from
+        // the pipe: the byte says only that a signal arrived, and the loop leaves
+        // on its next pass, which is too soon for a permanently readable descriptor
+        // to spin on. The rest of this iteration still runs, so whatever the client
+        // was owed is queued before `shutdown` flushes it.
+        if revents(Source::Signal).intersects(readable) {
+            self.stopping = true;
+        }
 
         let pty_events = revents(Source::Pty);
         let client_events = revents(Source::Client);
