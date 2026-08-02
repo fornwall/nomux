@@ -70,8 +70,16 @@ Cross-linking uses `zig cc`; see [IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-bu
 
 ## Status
 
-Early. The protocol codec and CLI skeleton exist; the daemon, relay and bootstrap
-are not implemented yet.
+Working end to end on Linux: the daemon owns a PTY and ring buffer, clients resume
+by byte offset across a severed connection, `attach` spawns a daemon on demand and
+relays, and `list`/`kill` operate on the run directory alone.
+
+Not yet implemented: agent forwarding (`DESIGN.md` § 5.4 — the frame types exist,
+the daemon does not serve the socket), `getpwuid` fallback for shell selection, and
+`direct-streamlocal` is a client-side concern that has no server counterpart to
+build.
+
+Tunables: `NOMUX_RING_BYTES` overrides the 4 MiB output ring per daemon.
 
 ## License
 

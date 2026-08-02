@@ -10,6 +10,10 @@
 
 #![forbid(unsafe_code)]
 
+mod frame;
+
+pub use frame::{ErrorCode, ExitKind, Frame, Hello, HelloOk, RESUME_FROM_START, WinSize};
+
 /// Protocol revision. Bumped on any wire change, including compatible ones.
 pub const PROTOCOL_VERSION: u16 = 1;
 
@@ -139,13 +143,19 @@ pub struct Header {
     pub len: u32,
 }
 
-/// A malformed frame header.
+/// A malformed frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtoError {
     /// Discriminant is not a known [`FrameType`].
     UnknownFrameType(u8),
     /// Declared length exceeds [`MAX_PAYLOAD`].
     PayloadTooLarge(u32),
+    /// Payload ended before the frame's fixed fields were complete.
+    Truncated,
+    /// Payload continued past the end of a fixed-size frame.
+    TrailingBytes,
+    /// Structurally intact but semantically invalid.
+    Malformed(&'static str),
 }
 
 impl core::fmt::Display for ProtoError {
@@ -155,6 +165,9 @@ impl core::fmt::Display for ProtoError {
             Self::PayloadTooLarge(len) => {
                 write!(f, "payload of {len} bytes exceeds maximum of {MAX_PAYLOAD}")
             }
+            Self::Truncated => f.write_str("frame payload is truncated"),
+            Self::TrailingBytes => f.write_str("frame payload has trailing bytes"),
+            Self::Malformed(what) => write!(f, "malformed frame: {what}"),
         }
     }
 }

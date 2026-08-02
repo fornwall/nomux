@@ -1,10 +1,19 @@
 //! `nomux` — persistent PTY sessions that survive SSH disconnects.
 //!
-//! One binary, three modes (see `DESIGN.md` § 4):
+//! One binary, several modes (see `DESIGN.md` § 4):
 //!
 //! - `daemon` owns the PTY master, the child process and the output ring buffer.
 //! - `attach` is a dumb byte relay between stdio and the daemon's unix socket.
 //! - `probe` reports the information the client needs to bootstrap this host.
+//! - `list` and `kill` are the frozen, version-independent control surface.
+
+mod attach;
+mod conn;
+mod control;
+mod daemon;
+mod pty;
+mod ring;
+mod rundir;
 
 use std::env;
 use std::ffi::OsString;
@@ -13,8 +22,10 @@ use std::process::ExitCode;
 
 /// `EX_USAGE`: malformed invocation.
 const EXIT_USAGE: u8 = 64;
-/// `EX_UNAVAILABLE`: mode recognised but not yet implemented.
-const EXIT_UNAVAILABLE: u8 = 69;
+/// Session exists but is unattachable.
+const EXIT_UNATTACHABLE: u8 = 126;
+/// No such session, and it could not be started.
+const EXIT_NO_SESSION: u8 = 127;
 
 const USAGE: &str = "\
 usage: nomux <mode> [session-id]
@@ -43,6 +54,7 @@ fn main() -> ExitCode {
             print_probe();
             ExitCode::SUCCESS
         }
+        Some("list") => report(control::list()),
         Some("--version" | "-V") => {
             println!(
                 "nomux {} (protocol {})",
@@ -56,10 +68,6 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some(mode @ ("daemon" | "attach" | "kill")) => run_session_mode(mode, args.next()),
-        Some("list") => {
-            eprintln!("nomux: `list` is not implemented yet");
-            ExitCode::from(EXIT_UNAVAILABLE)
-        }
         _ => {
             eprint!("{USAGE}");
             ExitCode::from(EXIT_USAGE)
@@ -67,18 +75,43 @@ fn main() -> ExitCode {
     }
 }
 
-/// Dispatches the session-owning modes once a session id has been supplied.
+/// Dispatches the modes that take a session id.
 fn run_session_mode(mode: &str, session: Option<OsString>) -> ExitCode {
     let Some(session) = session else {
         eprintln!("nomux: `{mode}` requires a session id\n");
         eprint!("{USAGE}");
         return ExitCode::from(EXIT_USAGE);
     };
-    eprintln!(
-        "nomux: `{mode}` is not implemented yet (session {})",
-        session.to_string_lossy()
-    );
-    ExitCode::from(EXIT_UNAVAILABLE)
+    let Some(session) = session.to_str() else {
+        eprintln!("nomux: session id must be valid UTF-8");
+        return ExitCode::from(EXIT_USAGE);
+    };
+
+    match mode {
+        "daemon" => report(daemon::run(session, daemon::ring_capacity())),
+        "attach" => match attach::run(session) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("nomux: {err}");
+                ExitCode::from(match err.kind() {
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::NotFound => EXIT_NO_SESSION,
+                    _ => EXIT_UNATTACHABLE,
+                })
+            }
+        },
+        _ => report(control::kill(session)),
+    }
+}
+
+/// Maps a fallible operation onto an exit code, reporting failure on stderr.
+fn report(result: std::io::Result<()>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("nomux: {err}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Emits the bootstrap line the client parses in `IMPLEMENTATION.md` § 5.1.

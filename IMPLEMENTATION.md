@@ -39,12 +39,15 @@ skew case of [DESIGN.md § 6.4](DESIGN.md#64-version-skew).
 `len` caps at `MAX_PAYLOAD` (256 KiB); larger is a protocol error. All integers big
 endian. Header is fixed 4 bytes so the reader is a two-stage `read_exact`.
 
+*winsize* is four `u16`s — cols, rows, xpixel, ypixel — the same layout everywhere
+it appears.
+
 ### 2.2 Messages
 
 | Type | Dir | Name | Payload |
 | --- | --- | --- | --- |
-| `0x01` | C→D | `Hello` | `u16` proto, `u16` flags, `u64` out_offset, `u64` in_offset, `u16` cols, `u16` rows, `u16` term_len, term bytes |
-| `0x02` | D→C | `HelloOk` | `u16` proto, `u64` resume_from, `u64` in_applied, `u16` cols, `u16` rows, `u8` flags (bit0 = gap) |
+| `0x01` | C→D | `Hello` | `u16` proto, `u16` flags, `u64` out_offset, `u64` in_offset, winsize, `u16` term_len, term bytes |
+| `0x02` | D→C | `HelloOk` | `u16` proto, `u64` resume_from, `u64` in_applied, winsize, `u8` flags (bit0 = gap) |
 | `0x03` | C→D | `Input` | `u64` offset, bytes |
 | `0x04` | D→C | `InputAck` | `u64` applied_through |
 | `0x05` | D→C | `Output` | `u64` offset, bytes |
@@ -103,8 +106,14 @@ Rules:
 
 ## 4. Ring buffer
 
-Fixed capacity (default 4 MiB), allocated once. `VecDeque<u8>`, drained via
-`as_slices` to write vectored without copying.
+Fixed capacity, allocated once. `VecDeque<u8>`, drained via `as_slices` to write
+without copying.
+
+Capacity defaults to 4 MiB and is overridable per daemon with `NOMUX_RING_BYTES`.
+The right value is host-dependent — a machine running the §5.1 cap of eight sessions
+pays it eight times over — and an unparseable or zero value falls back to the
+default rather than refusing to start, since a mistyped tuning variable should never
+cost someone their session.
 
 ```
         base_offset                              end_offset
@@ -133,11 +142,14 @@ flowchart TD
   B -- no --> D{"out_offset < base_offset?"}
   D -- no --> E["resume_from = out_offset<br/>gap = false"]
   D -- yes --> F["resume_from = base_offset<br/>gap = true"]
-  C --> G["HelloOk"]
+  C --> G["HelloOk{resume_from, gap}"]
   E --> G
-  F --> H["Gap{base_offset}"] --> G
+  F --> G
   G --> I["stream Output[resume_from..]"]
 ```
+
+At attach time the gap is reported by `HelloOk`'s flag alone; the standalone `Gap`
+frame is for overflow that happens *mid-stream*, while a client is attached.
 
 ### 4.3 Gap handling
 
@@ -293,6 +305,22 @@ No read-only mirrors and no session sharing — there is one client per session 
 construction, and the takeover case exists only to recover from a half-dead
 connection the daemon has not yet noticed.
 
+### 6.4.1 Event ordering
+
+Within one `poll` iteration the client is serviced **before** the listener. A single
+wakeup can report both a readable client and a pending connection; accepting first
+would replace `self.client`, dropping the outgoing `Conn` while a frame it had
+already delivered was still unread in the socket buffer. Input vanished whenever a
+reconnect landed in the same iteration as a keystroke — reliably, under load.
+`accept` additionally drains the outgoing connection once more, covering the
+narrower window between the poll returning and the accept running.
+
+A failing client socket is **never** propagated out of the event loop. A client that
+closes with output still queued makes the kernel send RST, so the next read yields
+`ECONNRESET`; treating that as a daemon error terminated the session over exactly
+the kind of unclean disconnect this project exists to survive. Client I/O errors
+detach the client and nothing more.
+
 ### 6.5 Shutdown
 
 Child exit → `waitpid` → flush the ring to any attached client → `Exit` frame →
@@ -386,7 +414,7 @@ Security:
 
 `nomux attach <id>` when `direct-streamlocal` is unavailable. Deliberately dumb:
 
-- `poll` on stdin/stdout and the socket; `splice(2)` on Linux to avoid userspace copies.
+- `poll` on stdin/stdout and the socket, copying through a small userspace buffer. `splice(2)` would avoid the copy but is not yet used.
 - No frame parsing, no buffering beyond the pipe.
 - Spawns the daemon (§6.3) if the socket is absent, then connects.
 - Half-close propagation: EOF on stdin → `shutdown(SHUT_WR)` on the socket, keep draining the other direction.

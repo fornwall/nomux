@@ -47,6 +47,10 @@ nursery = { level = "warn", priority = -1 }
 cargo = { level = "warn", priority = -1 }
 # Unavoidable in any real dependency tree; not actionable.
 multiple_crate_versions = "allow"
+# Directly contradicts `unreachable_pub`: in a binary every module is private, so
+# this lint wants bare `pub` while `unreachable_pub` wants `pub(crate)`. Keep the
+# explicit form, which says what it means and greps cleanly.
+redundant_pub_crate = "allow"
 # Selected restriction lints. A daemon that panics loses the user's session.
 unwrap_used = "warn"
 expect_used = "warn"

@@ -13,6 +13,7 @@ categories.workspace = true
 
 [dependencies]
 nomux-proto.workspace = true
+rustix = { version = "1.1.4", features = ["pty", "termios", "process", "event", "fs", "stdio"] }
 
 [lints]
 workspace = true
