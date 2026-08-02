@@ -608,6 +608,114 @@ fn a_child_that_stops_reading_input_does_not_wedge_the_daemon() {
     );
 }
 
+/// A client writing faster than the child reads is back-pressured, not buffered
+/// without limit.
+///
+/// `Conn::rx` and `pending_input` had no cap, so a client could grow the daemon by
+/// however much it cared to send — and the two cheaper answers are both closed off,
+/// since `in_applied` is authoritative and exactly-once (§ 3): a byte cannot be
+/// dropped once acknowledged, and refusing one with an `InputGap` would accuse a
+/// client that had done nothing wrong. So the daemon stops reading the socket
+/// instead, exactly as the output direction always has.
+///
+/// Measured as bytes the daemon would take, which bounds what it can be holding:
+/// everything it has is a subset of what crossed the socket.
+#[test]
+fn input_the_child_never_reads_is_back_pressured_rather_than_buffered() {
+    /// Comfortably more than every buffer between the two processes put together.
+    const BLAST: usize = 32 << 20;
+    /// Room for a megabyte of queued input, a megabyte of undecoded receive buffer
+    /// and the kernel's socket buffers, and nothing like room for [`BLAST`].
+    const TOLERATED: usize = 8 << 20;
+
+    let session = Session::start("input_cap");
+    let mut client = session.connect();
+    let ok = client.hello(RESUME_FROM_START, 0);
+
+    // Raw mode is what makes the line discipline apply back pressure instead of
+    // quietly dropping the overflow: in canonical mode a line longer than the buffer
+    // is discarded and the master never stops accepting. `sleep` then holds the
+    // terminal without reading a byte of it.
+    let setup = b"echo \"NOMUX-$((6*7))-RAW\"; stty raw -echo; sleep 30\n";
+    client.send(&Frame::Input {
+        offset: 0,
+        data: setup,
+    });
+    // The arithmetic distinguishes the shell's output from the line discipline's
+    // echo of the command, which arrives first — waiting for the wrong one would
+    // start the blast while the terminal was still canonical. Seeing it also settles
+    // `in_applied` at `setup.len()`, which is where the blast has to continue from.
+    client.read_until("NOMUX-42-RAW", ok.resume_from);
+    thread::sleep(Duration::from_millis(200));
+    drop(client);
+
+    // A raw socket rather than the harness client, because the question is how much
+    // the daemon will take before it stops taking, and a blocking `write_all` has no
+    // way to say.
+    let mut blaster = UnixStream::connect(&session.socket).expect("connect");
+    let mut hello = Vec::new();
+    Frame::Hello(Hello {
+        protocol: PROTOCOL_VERSION,
+        flags: 0,
+        out_offset: RESUME_FROM_START,
+        in_offset: setup.len() as u64,
+        win: WIN,
+        term: "xterm-256color",
+    })
+    .encode(&mut hello)
+    .expect("encode hello");
+    blaster.write_all(&hello).expect("write hello");
+    blaster.set_nonblocking(true).expect("stop blocking");
+
+    let chunk = vec![b'x'; 60 * 1024];
+    let mut frames = Vec::with_capacity(BLAST + chunk.len());
+    let mut offset = setup.len() as u64;
+    while frames.len() < BLAST {
+        Frame::Input {
+            offset,
+            data: &chunk,
+        }
+        .encode(&mut frames)
+        .expect("encode input");
+        offset += chunk.len() as u64;
+    }
+
+    // Stops once the socket has refused everything for a while, which is the daemon
+    // having stopped reading — the behaviour under test rather than a timeout.
+    let mut sent = 0;
+    let mut progressed = Instant::now();
+    while sent < frames.len() && progressed.elapsed() < Duration::from_secs(3) {
+        match blaster.write(&frames[sent..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                sent += n;
+                progressed = Instant::now();
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => break,
+        }
+    }
+    assert!(
+        sent < TOLERATED,
+        "the daemon took {sent} bytes of input for a child that read none of them"
+    );
+
+    // And it is still serving. A fresh connection is never held back — that is what
+    // keeps `list` and the spawn race working (§ 6.6) — so the handshake it gets
+    // back is both proof the loop is alive and a statement about the input the
+    // daemon really did accept.
+    let mut client = session.connect();
+    let resumed = client.hello(RESUME_FROM_START, offset);
+    let applied = resumed.in_applied.saturating_sub(setup.len() as u64);
+    assert!(applied > 0, "the daemon applied none of the input it took");
+    assert!(
+        applied <= sent as u64,
+        "the daemon applied {applied} bytes of input from {sent} bytes of frames"
+    );
+}
+
 /// The daemon must not hold the directory it was started in — that pins a mount
 /// for the life of the session — while the shell must still start where sshd
 /// would have started it.
@@ -634,6 +742,85 @@ fn the_daemon_releases_its_working_directory_but_the_shell_does_not() {
         seen.contains(home),
         "shell did not start in $HOME: {seen:?}"
     );
+}
+
+/// The `daemon` mode detaches itself, rather than trusting whoever started it.
+///
+/// § 6.2 claims the property for the mode, but `setsid` and the `/dev/null` stdio
+/// lived in `attach::spawn_daemon` alone — so a daemon started any other way kept
+/// the process group and the descriptors it inherited, which for a session meant
+/// dying with the connection that started it. Started here with pipes on purpose,
+/// so what those descriptors point at afterwards is the daemon's own doing.
+///
+/// The pidfile is the other half. The interactive case cannot detach without a
+/// fork, and `nomux kill` reads that file, so the pid in it has to be the one that
+/// survived rather than the one that started.
+#[test]
+fn the_daemon_mode_detaches_itself() {
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("run-detach");
+    drop(fs::remove_dir_all(&root));
+    fs::create_dir_all(&root).expect("create run root");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_nomux"))
+        .args(["daemon", "detached"])
+        .env("XDG_RUNTIME_DIR", &root)
+        .env("SHELL", "/bin/sh")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn daemon");
+    let pid = child.id();
+    wait_for(&root.join("nomux").join("detached.sock"));
+
+    // The socket is bound before any of the detaching happens — deliberately, so a
+    // session that already exists is still reported with an exit status — so
+    // waiting for it is not barrier enough.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline
+        && (stat_field(pid, StatField::Session) != Some(pid) || !stdio_is_silenced(pid))
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Everything read before the child is killed, so a failing assertion cannot
+    // leave the daemon behind.
+    let leads_session = stat_field(pid, StatField::Session);
+    let stdio = stdio_targets(pid);
+    let recorded = fs::read_to_string(root.join("nomux").join("detached.pid"))
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok());
+    drop(child.kill());
+    drop(child.wait());
+
+    assert_eq!(
+        leads_session,
+        Some(pid),
+        "the daemon stayed in the session it was started in, so a hangup reaches it"
+    );
+    assert!(
+        stdio.iter().all(|path| path == Path::new("/dev/null")),
+        "the daemon still holds the descriptors it was handed: {stdio:?}"
+    );
+    assert_eq!(
+        recorded,
+        Some(pid),
+        "the pidfile must name the process that is actually serving"
+    );
+}
+
+/// What the three standard descriptors of `pid` point at.
+fn stdio_targets(pid: u32) -> Vec<PathBuf> {
+    (0..3)
+        .map(|fd| fs::read_link(format!("/proc/{pid}/fd/{fd}")).unwrap_or_default())
+        .collect()
+}
+
+/// Whether all three point at `/dev/null`.
+fn stdio_is_silenced(pid: u32) -> bool {
+    stdio_targets(pid)
+        .iter()
+        .all(|path| path == Path::new("/dev/null"))
 }
 
 /// Agent forwarding, end to end: the child gets a socket, a connection to it
@@ -889,6 +1076,127 @@ fn a_daemon_that_reaps_itself_removes_its_run_files() {
         session.socket.exists(),
         pid_file.exists()
     );
+}
+
+/// `SIGTERM` must leave through the shutdown path, not the default disposition.
+///
+/// `nomux kill` signals the daemon and gives it two seconds. Without a handler it
+/// died where it stood, so `Pty::terminate` never ran — and closing the PTY master
+/// hides that for the ordinary case, because the kernel delivers `SIGHUP` to the
+/// foreground process group on the way out. What it does not cover is a
+/// backgrounded process that ignores the hangup, which is what this starts: `trap
+/// '' HUP` before the fork, since an *ignored* disposition is inherited through
+/// `exec` where a trapped one is reset.
+///
+/// `set +m` is what puts that process where reaping can see it. An interactive
+/// shell gives every job a process group of its own, and nothing in the session
+/// ever signals those — a real gap, but a different one, and one no `SIGTERM`
+/// handler would close. With job control off the job stays in the shell's group,
+/// which is what `Pty::terminate` signals and what a script's background processes
+/// do anyway.
+#[test]
+fn a_signalled_daemon_collects_a_process_that_ignores_sighup() {
+    let session = Session::start("sigterm");
+    let mut client = session.connect();
+    let ok = client.hello(RESUME_FROM_START, 0);
+
+    // The marker trails the pid so that seeing it proves the digits already
+    // arrived, and the arithmetic keeps it out of the line discipline's echo of the
+    // command itself — which would otherwise match first, carrying `$!` unexpanded.
+    let script = b"set +m; trap '' HUP; sleep 300 & echo \"$!-NOMUX-ORPHAN-$((6*7))\"\n";
+    client.send(&Frame::Input {
+        offset: 0,
+        data: script,
+    });
+    let (seen, _) = client.read_until("-NOMUX-ORPHAN-42", ok.resume_from);
+    let orphan = trailing_pid(&seen, "-NOMUX-ORPHAN-42")
+        .unwrap_or_else(|| panic!("no background pid in the transcript: {seen:?}"));
+    assert!(
+        process_alive(orphan),
+        "the backgrounded process was gone before the session ended"
+    );
+    let shell = child_of(session.child.id()).expect("find the session shell");
+    assert_eq!(
+        stat_field(orphan, StatField::ProcessGroup),
+        Some(shell),
+        "this shell kept job control on, so nothing here is testing reaping"
+    );
+
+    let daemon = rustix::process::Pid::from_raw(session.child.id().cast_signed())
+        .expect("the daemon's own pid");
+    let pid_file = session
+        .root
+        .join("nomux")
+        .join(format!("{}.pid", session.id));
+    // Signalled directly rather than through `nomux kill`, which unlinks the run
+    // files itself and would answer the question for the daemon.
+    rustix::process::kill_process(daemon, rustix::process::Signal::TERM)
+        .expect("signal the daemon");
+
+    // Inside the two seconds `nomux kill` allows before `SIGKILL`, with room for a
+    // loaded machine: an overrun there is this same bug wearing a hat.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && (pid_file.exists() || session.socket.exists()) {
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        !pid_file.exists() && !session.socket.exists(),
+        "run files outlived the signalled daemon: socket={} pid={}",
+        session.socket.exists(),
+        pid_file.exists()
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if !process_alive(orphan) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("pid {orphan} outlived the session it was backgrounded in");
+}
+
+/// The run of digits immediately before `marker`, as a pid.
+fn trailing_pid(transcript: &str, marker: &str) -> Option<u32> {
+    let (head, _) = transcript.rsplit_once(marker)?;
+    let reversed: String = head
+        .chars()
+        .rev()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    reversed.chars().rev().collect::<String>().parse().ok()
+}
+
+/// A numeric field of `/proc/<pid>/stat`, by what it means.
+#[derive(Clone, Copy)]
+enum StatField {
+    /// The process group the process belongs to.
+    ProcessGroup = 2,
+    /// The session it belongs to, which is its own pid exactly when it leads one.
+    Session = 3,
+}
+
+/// Reads one field of `/proc/<pid>/stat`.
+///
+/// Counted from the state letter that follows the parenthesised command name,
+/// because counting from the front stops working the moment a command name
+/// contains a space or a bracket — and `sh` starting `a b )` is enough.
+fn stat_field(pid: u32, field: StatField) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, tail) = stat.rsplit_once(')')?;
+    tail.split_whitespace().nth(field as usize)?.parse().ok()
+}
+
+/// Whether `pid` is still a process rather than gone or a zombie awaiting its
+/// parent. A collected process group reaches one of the latter two promptly.
+fn process_alive(pid: u32) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some((_, tail)) = stat.rsplit_once(')') else {
+        return false;
+    };
+    !tail.trim_start().starts_with('Z')
 }
 
 /// A session created without the flag serves no socket at all: forwarding bypasses

@@ -3,15 +3,16 @@
 //! Single-threaded around `poll`. There is at most one client
 //! (`IMPLEMENTATION.md` § 6.4), so the poll set is small: the listener, the PTY
 //! master, the client if one is attached, the connection that has not greeted yet,
-//! and — when agent forwarding is on — the agent socket plus one entry per live
-//! channel.
+//! the self-pipe a stop signal writes to, and — when agent forwarding is on — the
+//! agent socket plus one entry per live channel.
 
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, Write};
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::{AsFd, BorrowedFd, IntoRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use nomux_proto::{
@@ -19,6 +20,8 @@ use nomux_proto::{
     RESUME_FROM_START, WinSize,
 };
 use rustix::event::{PollFd, PollFlags, Timespec};
+use rustix::fs::{Mode, OFlags};
+use rustix::pipe::PipeFlags;
 
 use crate::agent::{self, Agent};
 use crate::conn::Conn;
@@ -107,10 +110,112 @@ const SETTLE_BEFORE_POLL: bool = cfg!(nomux_fault_injection) || cfg!(nomux_fault
 /// How long that pause is.
 const FAULT_SETTLE: Duration = Duration::from_millis(20);
 
+/// Stop reading the client once this much input is already queued for a PTY that is
+/// not taking it.
+///
+/// The mirror of the output direction's budget, and for the same reason: the socket
+/// stops being drained, the bytes wait in the kernel's buffer, and the peer blocks
+/// on them. Neither of the cheaper answers is available here — `in_applied` is
+/// authoritative and exactly-once (`IMPLEMENTATION.md` § 3), so a byte cannot be
+/// dropped once acknowledged, and refusing one with an `InputGap` would tell a
+/// well-behaved client it had skipped ahead when it had not.
+///
+/// A ceiling rather than a limit: `Conn::fill` decodes everything it buffered, so
+/// one pass can carry the queue up to a receive buffer past this. What matters is
+/// that both are bounded, where neither was.
+const MAX_PENDING_INPUT: usize = 1 << 20;
+
+/// Signals that mean "stop", handled so that leaving runs the shutdown path
+/// (`IMPLEMENTATION.md` § 6.5) instead of the default disposition.
+///
+/// `SIGTERM` is what `nomux kill` sends (§ 6.6). `SIGINT` joins it because the
+/// daemon can be started by hand: `nomux daemon <id>` at a shell shares that
+/// terminal's foreground group for as long as it takes to detach (§ 6.2), and a
+/// Ctrl-C landing in that window would otherwise kill it where it stands.
+///
+/// `SIGQUIT` is deliberately left alone. Its default action is a core dump, which
+/// is the only way left to get a snapshot out of a daemon that has wedged, and
+/// `SIGKILL` already covers "go away now" for anyone who does not want one.
+const STOP_SIGNALS: [libc::c_int; 2] = [libc::SIGTERM, libc::SIGINT];
+
+/// Write end of the self-pipe, as a raw descriptor because a signal handler may
+/// neither allocate nor take a lock. `-1` until [`arm_stop_signals`] publishes it.
+static STOP_PIPE: AtomicI32 = AtomicI32::new(-1);
+
+/// The entirety of what happens in a signal handler: one byte down the self-pipe.
+///
+/// Async-signal-safety is the constraint that shapes this. `write(2)` is on the
+/// permitted list, the descriptor is non-blocking so a pipe somebody has filled
+/// cannot park the daemon inside a handler, and a refused write means a byte is
+/// already waiting — which is the whole of the message. Nor can this perturb
+/// `errno`: rustix issues the syscall directly and reports failure through its
+/// return value, so a handler landing between a failing call in the main flow and
+/// that call's `errno` read leaves it untouched.
+extern "C" fn note_stop_signal(_signum: libc::c_int) {
+    let raw = STOP_PIPE.load(Ordering::Relaxed);
+    if raw >= 0 {
+        // SAFETY: the write end is published once, before any handler can run, and
+        // then deliberately never closed, so this descriptor number is valid for
+        // the rest of the process's life and cannot have been reused.
+        let fd = unsafe { BorrowedFd::borrow_raw(raw) };
+        let _ = rustix::io::write(fd, b"\0");
+    }
+}
+
+/// Routes [`STOP_SIGNALS`] into a descriptor the poll set can watch, and hands back
+/// its read end.
+///
+/// A self-pipe rather than `signalfd`, which reports only signals that are
+/// *blocked* and so wants a process-wide `sigprocmask` — a mask that survives
+/// `exec`, meaning `pty::Pty::spawn` would have to unblock it again in the child or
+/// leave the user's shell permanently deaf to `SIGTERM`. rustix has no binding for
+/// it either. Two descriptors and a one-line handler are the cheaper trade.
+///
+/// # Errors
+///
+/// Fails if the pipe cannot be created or a handler cannot be installed.
+fn arm_stop_signals() -> io::Result<OwnedFd> {
+    // `CLOEXEC` so the session's child never inherits either end; `NONBLOCK` so the
+    // handler above cannot block on the write.
+    let (read, write) = rustix::pipe::pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK)?;
+
+    // The write end is leaked on purpose. A signal can arrive at any point up to
+    // process exit, including after the `Daemon` has been dropped, and a handler
+    // holding a closed descriptor would write its byte into whatever was opened
+    // next. One descriptor for the life of the process is the cheaper answer than
+    // teaching the handler to be told.
+    STOP_PIPE.store(write.into_raw_fd(), Ordering::Relaxed);
+
+    // `sighandler_t` is an integer wide enough for a pointer, and a function item
+    // has to be laundered through one to reach it.
+    let handler = note_stop_signal as *const () as libc::sighandler_t;
+    for signum in STOP_SIGNALS {
+        // SAFETY: `signal` on a single-threaded process with an async-signal-safe
+        // handler, installed before any thread or child exists. `exec` resets
+        // handled dispositions, so the session's child is unaffected.
+        if unsafe { libc::signal(signum, handler) } == libc::SIG_ERR {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(read)
+}
+
 /// Session state for the lifetime of the daemon process.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "three of the four are the correlated client fields PLAN.md § P2 wants \
+              behind one Option; `stopping` is deliberately not folded into \
+              `linger_until`, which `on_child_exit` can overwrite in the same pass"
+)]
 struct Daemon {
     paths: SessionPaths,
     listener: UnixListener,
+    /// Read end of the self-pipe [`arm_stop_signals`] armed, or `None` on a host
+    /// where it could not be armed at all.
+    stop_pipe: Option<OwnedFd>,
+    /// Set once a stop signal has been seen. The loop leaves on its next pass, so
+    /// the exit goes out through `shutdown` like every other one.
+    stopping: bool,
     ring: crate::ring::Ring,
     pty: Option<Pty>,
     client: Option<Conn>,
@@ -166,6 +271,10 @@ pub(crate) fn run(session_id: &str, capacity: usize, label: Option<&str>) -> io:
     paths.ensure_dir()?;
 
     let listener = bind_socket(&paths)?;
+    // After the socket, so a session that is already running is still reported to
+    // whoever asked with an exit status they can see; before the pidfile, so the
+    // pid `nomux kill` reads belongs to the process that survives.
+    detach_from_login_session();
     write_pidfile(&paths)?;
     if let Some(label) = label {
         // Advisory: a session is worth more than its name in a listing.
@@ -180,9 +289,16 @@ pub(crate) fn run(session_id: &str, capacity: usize, label: Option<&str>) -> io:
     let child_dir = pty::child_dir(std::env::current_dir().ok().as_deref());
     detach_from_startup_state();
 
+    // Without it the daemon dies on the default disposition and the child's process
+    // group outlives it — worse than today's session, but still a session, so a
+    // pipe that cannot be made is not worth refusing to start over.
+    let stop_pipe = arm_stop_signals().ok();
+
     let mut daemon = Daemon {
         paths,
         listener,
+        stop_pipe,
+        stopping: false,
         ring: crate::ring::Ring::new(capacity),
         pty: None,
         client: None,
@@ -208,10 +324,53 @@ pub(crate) fn run(session_id: &str, capacity: usize, label: Option<&str>) -> io:
     result
 }
 
-/// Cuts the daemon loose from the state it inherited: the working directory and
-/// `SIGHUP`.
+/// Puts the daemon in a session of its own, which is what lets it outlive the
+/// connection that started it (`IMPLEMENTATION.md` § 6.2).
 ///
-/// `IMPLEMENTATION.md` § 6.2. `setsid` already left the daemon without a
+/// Usually there is nothing to do. `attach::spawn_daemon` calls `setsid` between
+/// fork and exec, so the ordinary path arrives already detached — and calling it
+/// again there would fail with `EPERM`, because a session leader is a process-group
+/// leader by definition and `setsid` refuses those. Asking `getsid` first is what
+/// tells "already done" apart from "cannot be done", which is the whole difficulty
+/// of this function.
+///
+/// A genuine refusal means one thing only: this process leads a process group
+/// somebody else made, which is `nomux daemon <id>` typed at a shell with job
+/// control. Nothing can make a group leader a session leader, so the way out is a
+/// child that is not one. The parent leaves through `_exit`, which is why this
+/// happens before the pidfile is written — `nomux kill` must read the pid of the
+/// process that survived rather than of the one that started.
+///
+/// Failures are not propagated. Sharing a session makes for a worse daemon, not a
+/// broken one, and refusing to start would be the worse outcome of the two.
+fn detach_from_login_session() {
+    if rustix::process::getsid(None).is_ok_and(|sid| sid == rustix::process::getpid()) {
+        return;
+    }
+    if rustix::process::setsid().is_ok() {
+        return;
+    }
+
+    // SAFETY: this process is still single-threaded — no thread has been started
+    // and no child spawned — so the copy the child gets holds no lock and no
+    // half-initialised runtime state, and it is free to go on doing anything.
+    let forked = unsafe { libc::fork() };
+    if forked < 0 {
+        return;
+    }
+    if forked > 0 {
+        // SAFETY: the only correct exit for a forked parent. `exit` would run the
+        // atexit handlers and flush the buffered stdio a second time, emitting
+        // whatever the child has inherited and not yet written itself.
+        unsafe { libc::_exit(0) }
+    }
+    let _ = rustix::process::setsid();
+}
+
+/// Cuts the daemon loose from the rest of the state it inherited: the working
+/// directory, the standard descriptors and `SIGHUP`.
+///
+/// `IMPLEMENTATION.md` § 6.2. `setsid` has already left the daemon without a
 /// controlling terminal, so no `SIGHUP` can currently reach it — this is the belt
 /// to that braces, since a session that dies on hangup is the one failure this
 /// whole program exists to prevent. `SIGPIPE` needs nothing: the Rust runtime
@@ -221,12 +380,34 @@ pub(crate) fn run(session_id: &str, capacity: usize, label: Option<&str>) -> io:
 /// to start over it would be a worse outcome than the mount it might pin.
 fn detach_from_startup_state() {
     let _ = rustix::process::chdir("/");
+    let _ = silence_stdio();
     // SAFETY: `signal` with SIG_IGN is safe to call on a single-threaded process
     // with no handler installed; the disposition is reset in the child before exec
     // (see `pty::Pty::spawn`) so the child still dies on hangup as it should.
     unsafe {
         libc::signal(libc::SIGHUP, libc::SIG_IGN);
     }
+}
+
+/// Points the three standard descriptors at `/dev/null`.
+///
+/// Whatever started the daemon is still on the other end of them, and under
+/// `attach` that is the SSH channel: holding it keeps a connection open that has
+/// nothing left to carry, and a byte written to it — a failure to start, a
+/// backtrace — arrives in the middle of the client's frame stream.
+///
+/// Late in the startup sequence on purpose: everything that can fail with a
+/// message worth reading has already had its chance to write one.
+///
+/// # Errors
+///
+/// Fails if `/dev/null` cannot be opened or a descriptor cannot be replaced.
+fn silence_stdio() -> io::Result<()> {
+    let null = rustix::fs::open("/dev/null", OFlags::RDWR, Mode::empty())?;
+    rustix::stdio::dup2_stdin(&null)?;
+    rustix::stdio::dup2_stdout(&null)?;
+    rustix::stdio::dup2_stderr(&null)?;
+    Ok(())
 }
 
 /// Binds the session socket, replacing a stale one.
@@ -265,6 +446,8 @@ fn write_pidfile(paths: &SessionPaths) -> io::Result<()> {
 enum Source {
     /// The session socket, where clients arrive.
     Listener,
+    /// Read end of the self-pipe a stop signal writes to.
+    Signal,
     /// The PTY master.
     Pty,
     /// The attached client.
@@ -305,7 +488,15 @@ impl Daemon {
         }
     }
 
+    /// Whether the PTY queue has grown past [`MAX_PENDING_INPUT`].
+    fn input_is_saturated(&self) -> bool {
+        self.pending_input.len() >= MAX_PENDING_INPUT
+    }
+
     fn should_stop(&self) -> bool {
+        if self.stopping {
+            return true;
+        }
         if let Some(deadline) = self.linger_until
             && Instant::now() >= deadline
         {
@@ -325,8 +516,11 @@ impl Daemon {
     /// forwarding adds the socket plus one entry per live channel, and an index
     /// arithmetic bug there would silently apply one fd's readiness to another.
     fn watches(&self) -> Vec<(Source, BorrowedFd<'_>, PollFlags)> {
-        let mut watches = Vec::with_capacity(4);
+        let mut watches = Vec::with_capacity(5);
         watches.push((Source::Listener, self.listener.as_fd(), PollFlags::IN));
+        if let Some(stop) = self.stop_pipe.as_ref() {
+            watches.push((Source::Signal, stop.as_fd(), PollFlags::IN));
+        }
 
         // Dropped from the set once the child is gone: the master reports `HUP`
         // from then on and would spin the loop at full tilt for the whole linger
@@ -340,7 +534,18 @@ impl Daemon {
         }
 
         if let Some(client) = self.client.as_ref() {
-            let mut flags = PollFlags::IN;
+            // Input already queued for a PTY that is not taking it is the only back
+            // pressure signal there is: stop reading the client until it drains, and
+            // the bytes wait in the kernel's socket buffer where the peer blocks on
+            // them. The same argument the agent channels make below. Nothing can
+            // wedge here — a non-empty queue is exactly what puts the master in the
+            // set asking for `POLLOUT`, and draining it re-arms this on the pass
+            // after.
+            let mut flags = if self.input_is_saturated() {
+                PollFlags::empty()
+            } else {
+                PollFlags::IN
+            };
             // Ring bytes still owed count as wanting to write, not just bytes
             // already encoded. `pump_output` stops at `MAX_PENDING_WRITE`, so a
             // large replay routinely ends an iteration with the queue drained and
@@ -351,7 +556,14 @@ impl Daemon {
             if client.wants_write() || (self.greeted && self.sent_through < self.ring.end()) {
                 flags |= PollFlags::OUT;
             }
-            watches.push((Source::Client, client.stream().as_fd(), flags));
+            // Left out of the set entirely rather than registered wanting nothing.
+            // `HUP` is reported whatever the mask says, so a client that has closed
+            // its sending half would wake the loop on every pass for as long as the
+            // queue stayed full — and the only answer to that wakeup is a read,
+            // which is the thing being held back.
+            if !flags.is_empty() {
+                watches.push((Source::Client, client.stream().as_fd(), flags));
+            }
         }
         if let Some(pending) = self.pending.as_ref() {
             watches.push((Source::Pending, pending.stream().as_fd(), PollFlags::IN));
@@ -396,6 +608,11 @@ impl Daemon {
             let timeout = self.poll_timeout();
             match rustix::event::poll(&mut fds, Some(&timeout)) {
                 Ok(_) => {}
+                // A stop signal delivered while blocked here lands as `EINTR`, and
+                // `poll` is never restarted whatever the handler's flags say. That
+                // costs nothing: the handler wrote its byte before the syscall
+                // returned, so coming round the loop finds the pipe readable and
+                // the notification outlives being dropped on the floor here.
                 Err(rustix::io::Errno::INTR) => return Ok(()),
                 Err(err) => return Err(err.into()),
             }
@@ -413,6 +630,15 @@ impl Daemon {
                 .map_or(PollFlags::empty(), |(_, flags)| *flags)
         };
         let readable = PollFlags::IN | PollFlags::HUP | PollFlags::ERR;
+
+        // A stop request rather than an event to service, so nothing is read from
+        // the pipe: the byte says only that a signal arrived, and the loop leaves
+        // on its next pass, which is too soon for a permanently readable descriptor
+        // to spin on. The rest of this iteration still runs, so whatever the client
+        // was owed is queued before `shutdown` flushes it.
+        if revents(Source::Signal).intersects(readable) {
+            self.stopping = true;
+        }
 
         let pty_events = revents(Source::Pty);
         let client_events = revents(Source::Client);

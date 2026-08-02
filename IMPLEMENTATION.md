@@ -131,7 +131,8 @@ Ownership, not durability: the master is non-blocking (§6.1), so a child that h
 stopped reading leaves input queued for as long as it likes, and waiting for the
 write would stall the ack behind it. The queue is in the daemon's own memory and is
 never re-applied, so the client's invariant holds; and losing it means losing the
-daemon, which ends the session anyway.
+daemon, which ends the session anyway. Bounded, though — §4.1 says by what, and what
+the daemon does instead once it is full.
 
 The other half of the invariant is the client's. An `Input` frame that was written
 but not yet read is **not** safe: a client that closes with output still queued
@@ -168,6 +169,28 @@ cost someone their session.
 The PTY drain must never block on a slow or absent client. Precedence: keep reading
 the PTY, drop from the ring's head. A stalled client causes a gap, never a frozen
 shell.
+
+The input direction cannot be answered that way. `in_applied` is authoritative and
+exactly-once (§3), so a byte the daemon has acknowledged has to reach the PTY:
+dropping it is not available, and refusing it with `Error{INPUT_GAP}` would accuse a
+client that had done nothing wrong. So the daemon stops **reading the client socket**
+once a megabyte is queued for a child that is not taking it. The bytes wait in the
+kernel's buffer, where the peer blocks on them — the same argument §6.7 makes for a
+saturated agent channel. The receive buffer is capped for the same reason: filling it
+loops until `EAGAIN`, and against a peer that keeps writing that loop has no end,
+since every chunk taken frees exactly that much room to refill.
+
+While it holds, the client is left out of the poll set rather than registered wanting
+nothing: `POLLHUP` is reported whatever the mask says, and the only answer to that
+wakeup is a read. Nothing can wedge, because a non-empty queue is exactly what puts
+the master in the set asking for `POLLOUT`, and draining it re-arms the client on the
+pass after.
+
+The cost is that a client's own control frames — `Ping`, `Resize`, `Detach` — queue
+behind its own stalled input. That is accepted; it is being held back on input, and
+nothing that has to work regardless goes through this path. A *new* connection is
+never held back, since it is polled as pending rather than as the client, so `list`
+and the spawn race of §6.3 are unaffected — and `nomux kill` is a signal (§6.5).
 
 ### 4.2 Attach with `from < base_offset`
 
@@ -287,7 +310,7 @@ anything that walks `/proc/self/fd` — or writes to a descriptor it did not ope
 can inject output into the stream or read the user's keystrokes. The child keeps
 its stdio regardless, because `dup2` onto 0/1/2 clears the flag on the copies.
 4. Parent sets the initial `TIOCSWINSZ` from `Hello` before the first read.
-5. Master is set non-blocking; the event loop is `poll` over {master, listener, attached client, pending connection, agent socket, one fd per agent channel}.
+5. Master is set non-blocking; the event loop is `poll` over {master, listener, attached client, pending connection, the stop-signal self-pipe (§6.5), agent socket, one fd per agent channel}.
 
 The *pending* entry is a connection accepted but not yet greeted, and it is
 load-bearing rather than incidental: it is what makes "connecting is not attaching"
@@ -298,7 +321,8 @@ input buffer, and in raw mode the line discipline throttles rather than discardi
 — so a blocking `write` parks the whole event loop inside the kernel until the
 child reads again, freezing output for a session whose only fault was a `sleep`.
 Unwritten input waits in the daemon's queue instead, and the poll set asks for
-`POLLOUT` only while there is something to write.
+`POLLOUT` only while there is something to write — and stops asking the client for
+`POLLIN` once that queue is full (§4.1).
 
 The poll set is variable-length and each entry is tagged with what it belongs to,
 rather than being read back by position. Agent forwarding makes the size depend on
@@ -332,20 +356,42 @@ only available fix, and only for variables that name a path.
 
 ### 6.2 Detachment from the login session
 
+The `daemon` mode holds this itself rather than trusting whoever started it:
+
 ```
-fork → parent _exit
-  setsid
-    chdir "/"
-    0/1/2 → /dev/null
-    ignore SIGHUP
+getsid(0) == getpid()?  already detached; nothing to do
+  else setsid           refused only if we lead a process group
+    else fork → parent _exit, child setsid
+      chdir "/"
+      0/1/2 → /dev/null
+      ignore SIGHUP
 ```
 
-The classic second fork is deliberately absent. Its only purpose is to leave the
-daemon a non-session-leader so it cannot acquire a controlling terminal by opening
-a tty — but a controlling terminal is acquired only by opening one *without*
-`O_NOCTTY`, and this binary opens exactly two ttys, both with it (§6.1). The
-property is held by construction at the two lines that could break it, rather than
-by a fork whose reason would have to be rediscovered.
+`setsid(2)` refuses with `EPERM` for a process-group leader, and a session leader is
+one by definition — so on the ordinary path, where `attach` has already called
+`setsid` between fork and exec, calling it again looks exactly like a failure.
+Asking `getsid` first is what tells "already done" apart from "cannot be done".
+
+The one genuine refusal is `nomux daemon <id>` typed at a shell, where job control
+makes the daemon its own process group's leader; nothing can promote one of those,
+so the way out is a child that is not one. It happens after the socket is bound, so
+a session that already exists is still reported with an exit status somebody sees,
+and before the pidfile is written, so `nomux kill` (§6.6) reads the pid of the
+process that survived rather than of the one that started.
+
+`attach` does the `setsid` and the `/dev/null` in its own `pre_exec` as well, and
+keeps doing so, because the daemon cannot reach either soon enough. Until it runs
+its own `setsid` a hangup would take the session with it, and until it redirects its
+own stdio it holds the *relay's* descriptors — where anything it writes lands in the
+middle of the client's frame stream.
+
+The classic second fork is deliberately absent, and the conditional one above is not
+it. Its only purpose is to leave the daemon a non-session-leader so it cannot
+acquire a controlling terminal by opening a tty — but a controlling terminal is
+acquired only by opening one *without* `O_NOCTTY`, and this binary opens exactly two
+ttys, both with it (§6.1). The property is held by construction at the two lines
+that could break it, rather than by a fork whose reason would have to be
+rediscovered.
 
 `chdir "/"` happens after the run-directory paths are resolved and the socket is
 bound, and the child is given its own working directory (§6.1.1) — otherwise the
@@ -354,8 +400,11 @@ running for a week cannot keep a removable or network mount busy.
 
 `SIGHUP` is ignored in the daemon and restored to `SIG_DFL` in the child before
 `exec`, since an ignored disposition survives `exec` and a child that shrugs off
-`SIGHUP` would leave reaping to `SIGKILL` alone. `SIGPIPE` needs nothing: the Rust
-runtime ignores it at startup and resets it for spawned children.
+`SIGHUP` would leave reaping to `SIGKILL` alone. `SIGTERM` and `SIGINT` are handled
+instead of ignored (§6.5), and need nothing in the child: `exec` resets every
+*handled* signal to its default, and only ignoring is inherited through it.
+`SIGPIPE` needs nothing either: the Rust runtime ignores it at startup and resets it
+for spawned children.
 
 `systemd-logind` with `KillUserProcesses=yes` kills the daemon at logout regardless.
 The only real fix is `loginctl enable-linger $USER`. The daemon detects the state
@@ -492,6 +541,31 @@ nothing to install.
 A session nobody ever attaches to is reaped after 30 s rather than the idle
 timeout: a daemon spawned by a connection that died mid-handshake has no client
 coming and would otherwise sit there for a week.
+
+`SIGTERM` and `SIGINT` reach the same exit. A handler writes one byte to a
+self-pipe whose read end is in the poll set, and the loop leaves on its next pass —
+so `nomux kill` (§6.6) collects the child's process group and unlinks the run files
+rather than dropping the daemon where it stands. Closing the PTY master hides the
+difference for the ordinary case, because the kernel then delivers `SIGHUP` to the
+foreground process group on the way out; what it does not cover is a backgrounded
+process that ignores the hangup.
+
+A self-pipe rather than `signalfd`, which reports only *blocked* signals and so
+wants a process-wide `sigprocmask` — and a blocked mask survives `exec`, so §6.1
+would have to unblock it again in the child or leave the user's shell permanently
+deaf to `SIGTERM`. `poll` returning `EINTR` loses nothing: the handler wrote its
+byte before the syscall returned, and the next pass finds the pipe readable.
+
+The budget is `nomux kill`'s two seconds, and everything on the way out is bounded
+against them: a final flush to the attached client for at most 500 ms — against the
+whole call, not per `write`, or a peer reading a trickle would reset it — and then
+`SIGHUP`, 500 ms, `SIGKILL` for the process group. An overrun would mean the daemon
+being `SIGKILL`ed mid-shutdown, which is the bug this closes, wearing a hat.
+
+`SIGQUIT` is deliberately left at its default. Its action is a core dump, which is
+the only way left to get a snapshot out of a daemon that has wedged, and `SIGKILL`
+— which nothing can handle — already means "go away now" for anyone who does not
+want one.
 
 ### 6.6 Frozen control surface
 
@@ -689,10 +763,12 @@ a floating one moves the bytes the client pinned.
 | Exactly-once input | The §3 scenario, replayed from a randomly chosen earlier offset after every disconnect. | `tests/chaos.rs` |
 | Session | Spawn daemon → write → sever the socket mid-stream → reattach → assert the output resumes exactly where it left off. | `tests/session.rs` |
 | Gap | Capacity forced small; assert `Gap` is emitted and `base_offset` is exact. | `tests/session.rs`, `tests/chaos.rs` |
+| Backpressure | A client blasting input at a child that reads none of it has its socket refuse long before the daemon has taken a fraction of it, and the session still serves a new client afterwards. | `tests/session.rs` |
 | Chaos | Randomised disconnect injection, seeded and reproducible, under an escape-heavy full-screen stream and under `yes`. | `tests/chaos.rs` |
 | Agent forwarding | Bidirectional proxying, the channel cap, ids never reused, fail-fast while detached, and off unless asked for. | `tests/session.rs` |
 | Relay | Bulk traffic both ways through `nomux attach`, byte-exact, over both the `splice` and copying paths of §7. | `tests/session.rs` |
-| Shutdown | A daemon that reaps itself runs `terminate` to completion and unlinks its run files. | `tests/session.rs` |
+| Detachment | The `daemon` mode leads a session of its own, redirects the stdio it was handed, and records the surviving pid. | `tests/session.rs` |
+| Shutdown | A daemon that reaps itself runs `terminate` to completion and unlinks its run files, and a signalled one collects a backgrounded process that ignores `SIGHUP`. | `tests/session.rs` |
 | Spawn lock | Collection against a lock somebody else holds: `list` leaves the entry alone, `kill` exits non-zero rather than claiming it, and an attach whose lock file is collected while it waits goes back for the file that replaced it. | `tests/spawn_lock.rs` |
 
 The two invariants that matter: **no duplicated input, ever**, and **no lost output

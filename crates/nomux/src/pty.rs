@@ -123,7 +123,10 @@ impl Pty {
                 // The daemon ignores SIGHUP (§ 6.2) and an ignored disposition
                 // survives exec. Left alone, the child would inherit it and shrug
                 // off the SIGHUP that idle reaping and `terminate` send first,
-                // leaving SIGKILL to do all the work.
+                // leaving SIGKILL to do all the work. SIGTERM and SIGINT need no
+                // such treatment even though the daemon handles both: exec resets
+                // every *handled* signal to its default, and only ignoring is
+                // inherited through it.
                 // SAFETY: `signal` is async-signal-safe and SIG_DFL is a valid
                 // handler value.
                 if libc::signal(libc::SIGHUP, libc::SIG_DFL) == libc::SIG_ERR {
