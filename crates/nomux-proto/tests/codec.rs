@@ -20,28 +20,6 @@ use nomux_proto::{
 };
 use proptest::prelude::*;
 
-/// Every frame type, so a payload can be offered to all of them rather than to a
-/// sampled few. Sixteen decodes per case is cheaper than the shrinking proptest
-/// would need to find the one type that mishandles a given payload.
-const ALL_FRAME_TYPES: [FrameType; 16] = [
-    FrameType::Hello,
-    FrameType::HelloOk,
-    FrameType::Input,
-    FrameType::InputAck,
-    FrameType::Output,
-    FrameType::OutputAck,
-    FrameType::Resize,
-    FrameType::Gap,
-    FrameType::Exit,
-    FrameType::Detach,
-    FrameType::Ping,
-    FrameType::Pong,
-    FrameType::Error,
-    FrameType::AgentOpen,
-    FrameType::AgentData,
-    FrameType::AgentClose,
-];
-
 /// Cap on generated `data` and `term` lengths.
 ///
 /// The codec treats those fields as opaque tails, so the interesting behaviour is
@@ -275,7 +253,11 @@ fn encode_and_split(frame: Frame<'_>) -> Result<Vec<u8>, TestCaseError> {
 /// frame lets a peer smuggle bytes past anything downstream that compares
 /// encodings, and it is exactly what a hand-written test suite misses.
 fn decode_as_every_type(payload: &[u8]) -> Result<(), TestCaseError> {
-    for ty in ALL_FRAME_TYPES {
+    // Every type rather than a sampled few: a decode apiece is far cheaper than the
+    // shrinking proptest would otherwise need to find the one type that mishandles a
+    // given payload. [`FrameType::ALL`] is generated from the discriminant list, so a
+    // new frame type joins this sweep without anyone having to remember it.
+    for ty in FrameType::ALL {
         let Ok(frame) = Frame::decode(ty, payload) else {
             continue;
         };

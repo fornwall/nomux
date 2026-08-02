@@ -29,13 +29,61 @@ pub const HEADER_LEN: usize = 4;
 /// Largest permitted payload. Bounds the peer's ability to force an allocation.
 pub const MAX_PAYLOAD: u32 = 256 * 1024;
 
-/// Frame discriminant.
-///
-/// Exhaustive on purpose: both endpoints are built from this repository, so an
-/// unrecognised variant is a bug rather than a forward-compatibility case.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u8)]
-pub enum FrameType {
+// The discriminant list below is the one thing in this crate that several
+// unrelated places have to agree on, and the compiler only notices some of the
+// ways they can drift apart. `Frame::decode` matches on `FrameType` exhaustively,
+// so adding a variant here stops the build until the payload side has learnt to
+// read one. `from_byte` stops nothing: it ends in a catch-all `_ => None`, which
+// quietly absorbs a variant nobody taught it about. That combination compiles,
+// passes the suite, and is broken in the field — this end can *send* the new frame
+// but never *receives* one, because every header carrying it comes back as an
+// unknown type, and the symptom points at the peer rather than at the arm that was
+// never written. The two test suites had a hole of the same shape: both swept a
+// hand-written `[FrameType; 16]`, so a variant missing from those arrays was simply
+// never exercised, and nothing said so.
+//
+// So the list is written once, here, and everything mechanically derived from it —
+// the enum, `from_byte`, and the `ALL` the suites sweep — is generated from it.
+// This is a plain `macro_rules!` expanding to the same items that used to be typed
+// out by hand, so it costs nothing at runtime and nothing against the size budget
+// `Cargo.toml` sets out. `as_byte` is deliberately not in here: it is one line that
+// does not vary with the list, and it reads better in the ordinary `impl` below.
+macro_rules! frame_types {
+    ($($(#[$doc:meta])* $name:ident = $byte:literal,)+) => {
+        /// Frame discriminant.
+        ///
+        /// Exhaustive on purpose: both endpoints are built from this repository, so an
+        /// unrecognised variant is a bug rather than a forward-compatibility case.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        #[repr(u8)]
+        pub enum FrameType {
+            $($(#[$doc])* $name = $byte,)+
+        }
+
+        impl FrameType {
+            /// Every frame type, in wire order.
+            ///
+            /// Public because the crate's integration tests sweep it — offering every
+            /// payload to every type, and checking every discriminant round-trips —
+            /// and a test that has to be told about a new variant is a test that will
+            /// eventually not be. Nothing outside the test suites has a use for it,
+            /// but this protocol is private to this repository, so exposing it commits
+            /// to nothing.
+            pub const ALL: [Self; [$(Self::$name),+].len()] = [$(Self::$name),+];
+
+            /// Parses a wire discriminant, returning `None` if unrecognised.
+            #[must_use]
+            pub const fn from_byte(byte: u8) -> Option<Self> {
+                match byte {
+                    $($byte => Some(Self::$name),)+
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+frame_types! {
     /// Client opens a session, carrying its resume offsets and window size.
     Hello = 0x01,
     /// Daemon accepts, reporting where output will resume from.
@@ -75,30 +123,6 @@ impl FrameType {
     #[must_use]
     pub const fn as_byte(self) -> u8 {
         self as u8
-    }
-
-    /// Parses a wire discriminant, returning `None` if unrecognised.
-    #[must_use]
-    pub const fn from_byte(byte: u8) -> Option<Self> {
-        match byte {
-            0x01 => Some(Self::Hello),
-            0x02 => Some(Self::HelloOk),
-            0x03 => Some(Self::Input),
-            0x04 => Some(Self::InputAck),
-            0x05 => Some(Self::Output),
-            0x06 => Some(Self::OutputAck),
-            0x07 => Some(Self::Resize),
-            0x08 => Some(Self::Gap),
-            0x09 => Some(Self::Exit),
-            0x0a => Some(Self::Detach),
-            0x0b => Some(Self::Ping),
-            0x0c => Some(Self::Pong),
-            0x0d => Some(Self::Error),
-            0x0e => Some(Self::AgentOpen),
-            0x0f => Some(Self::AgentData),
-            0x10 => Some(Self::AgentClose),
-            _ => None,
-        }
     }
 }
 
@@ -228,28 +252,9 @@ pub fn decode_header(bytes: &[u8; HEADER_LEN]) -> Result<Header, ProtoError> {
 mod tests {
     use super::*;
 
-    const ALL: [FrameType; 16] = [
-        FrameType::Hello,
-        FrameType::HelloOk,
-        FrameType::Input,
-        FrameType::InputAck,
-        FrameType::Output,
-        FrameType::OutputAck,
-        FrameType::Resize,
-        FrameType::Gap,
-        FrameType::Exit,
-        FrameType::Detach,
-        FrameType::Ping,
-        FrameType::Pong,
-        FrameType::Error,
-        FrameType::AgentOpen,
-        FrameType::AgentData,
-        FrameType::AgentClose,
-    ];
-
     #[test]
     fn header_round_trips() {
-        for ty in ALL {
+        for ty in FrameType::ALL {
             for len in [0, 1, 255, 256, 65_535, MAX_PAYLOAD] {
                 let encoded = encode_header(ty, len).unwrap();
                 assert_eq!(decode_header(&encoded).unwrap(), Header { ty, len });
@@ -259,7 +264,7 @@ mod tests {
 
     #[test]
     fn discriminants_round_trip() {
-        for ty in ALL {
+        for ty in FrameType::ALL {
             assert_eq!(FrameType::from_byte(ty.as_byte()), Some(ty));
         }
     }

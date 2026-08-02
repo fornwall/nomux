@@ -306,11 +306,15 @@ fn documented_bytes_decode_to_their_frames() {
 
 /// Every frame type has a vector, so a new one cannot be added without writing
 /// down what it looks like on the wire.
+///
+/// Driven from [`FrameType::ALL`], which the discriminant list generates, rather
+/// than from a range of bytes written out here: a hand-written `0x01..=0x10` stops
+/// covering the protocol the moment the protocol grows, and does it quietly, which
+/// is the failure this test exists to prevent.
 #[test]
 fn every_frame_type_has_a_vector() {
     let covered: Vec<FrameType> = vectors().iter().map(|v| v.frame.frame_type()).collect();
-    for byte in 0x01..=0x10 {
-        let ty = FrameType::from_byte(byte).expect("0x01..=0x10 are the defined discriminants");
+    for ty in FrameType::ALL {
         assert!(covered.contains(&ty), "{ty:?} has no wire vector");
     }
 }
