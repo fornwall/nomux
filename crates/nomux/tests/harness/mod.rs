@@ -2,6 +2,18 @@
 //!
 //! Each integration test crate compiles its own copy of this module and uses a
 //! subset of it, so unused items here are expected rather than a smell.
+//!
+//! Every test owns a fixed run directory named after itself, and wipes it on the
+//! way in. Names are unique across both binaries, so nextest's parallelism is safe
+//! — but **two copies of the same test binary must not run at once**, in two
+//! terminals for instance: they share those directories and will delete each
+//! other's sockets, which surfaces as a scatter of unrelated failures.
+//!
+//! The obvious fix — a per-process directory — is deliberately not taken. These
+//! paths carry unix sockets, `sockaddr_un` truncates at 108 bytes, and the longest
+//! one here already sits at 89 for a checkout in a home directory. Spending a third
+//! of the remaining headroom would make the suite fail on a deeper checkout, which
+//! is both likelier and far more confusing than the case it would fix.
 
 #![allow(
     dead_code,
