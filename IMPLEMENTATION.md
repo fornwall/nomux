@@ -448,11 +448,12 @@ group — which in the case being fixed is the daemon itself — and it strips t
 controlling terminal from every other process in the session as well, which is not this
 program's to take.
 
-`attach` does the `setsid` and the `/dev/null` in its own `pre_exec` as well, and
-keeps doing so, because the daemon cannot reach either soon enough. Until it runs
-its own `setsid` a hangup would take the session with it, and until it redirects its
-own stdio it holds the *relay's* descriptors — where anything it writes lands in the
-middle of the client's frame stream.
+`attach` arranges both for the daemon it spawns — `setsid` in its own `pre_exec`,
+`/dev/null` through `Stdio::null()` on the `Command` — and keeps doing so, because
+the daemon cannot reach either soon enough. Until it runs its own `setsid` a hangup
+would take the session with it, and until it redirects its own stdio it holds the
+*relay's* descriptors, where anything it writes lands in the middle of the client's
+frame stream.
 
 The classic second fork is deliberately absent, and the conditional one above is not
 it. The conditional fork exists to reach a state `setsid` cannot reach from a
@@ -792,7 +793,7 @@ sequenceDiagram
 
 Why not refresh a symlink to sshd's socket on each attach: that requires reading the
 new connection's environment, which means running a process, which the warm resume
-path (§5.3) deliberately does not do. A socket the daemon owns is stable for the
+path ([DESIGN.md § 6.1](DESIGN.md#61-warm-resume)) deliberately does not do. A socket the daemon owns is stable for the
 session's whole life, never dangles, and needs no environment at all.
 
 Mechanics:
@@ -858,7 +859,12 @@ Targets:
 `ppc64le` / `s390x` are deliberately omitted until asked for.
 
 `scripts/build-release.sh` builds all four, writes `SHA256SUMS`, and exits non-zero
-if any binary misses the budget.
+if any binary misses the budget. It also holds each size against the per-target
+baseline recorded in `scripts/size-baseline`, prints the signed delta beside the
+size, and fails a target that has grown more than 3% against it — the cap alone
+passed a commit that grew armv7 48% in one step, since 213 KiB still fits in 400.
+`NOMUX_UPDATE_BASELINE=1` rewrites the baseline from that build and skips the growth
+gate, which puts an accepted size change in the diff a reviewer reads.
 
 **No cross toolchain.** `rust-lld` links all four, including the host target, and
 each `rust-std` component ships the musl CRT objects and `libc.a` beside it in
@@ -881,13 +887,19 @@ Size matters because the cold upload happens over cellular. Release profile:
 
 | Target | stable 1.97.1 | + `build-std` + `panic=immediate-abort` |
 | --- | --- | --- |
-| `x86_64-unknown-linux-musl` | 493 KiB | 147 KiB |
-| `aarch64-unknown-linux-musl` | 440 KiB | 139 KiB |
-| `armv7-unknown-linux-musleabihf` | 472 KiB | 141 KiB |
-| `riscv64gc-unknown-linux-musl` | 442 KiB | 121 KiB |
+| `x86_64-unknown-linux-musl` | 493 KiB | 153.1 KiB |
+| `aarch64-unknown-linux-musl` | 440 KiB | 144.4 KiB |
+| `armv7-unknown-linux-musleabihf` | 472 KiB | 213.0 KiB |
+| `riscv64gc-unknown-linux-musl` | 442 KiB | 125.7 KiB |
 
 Every stable figure is over the 400 KiB budget, armv7 included. Re-measure with
 `NOMUX_STABLE_STD=1 sh scripts/build-release.sh` rather than trusting the table.
+
+The shipping column is the same measurement `scripts/size-baseline` holds in bytes,
+and that file is the one to trust: it is rewritten by a build, where this table is
+rewritten by hand and was three releases stale — armv7 read 141 KiB here while the
+artifact was 213. armv7 carries a live regression against the other three; see
+[PLAN.md](PLAN.md).
 
 The panic machinery — formatting, backtrace symbolisation, `gimli`, `addr2line` —
 is most of that, and it cannot be dropped from a precompiled `std` however the
@@ -906,10 +918,8 @@ path, since two clean builds on one machine are byte-identical whether or not th
 paths were remapped. Three `--remap-path-prefix` flags are what make it true — for
 `$CARGO_HOME`, the sysroot and the checkout — because rustc bakes absolute paths
 into panic location strings, and an unremapped binary contains the builder's home
-directory 56 times over. Note that the obvious test lies: two builds on one machine
-match even without remapping. The real check is grepping the artifact for the
-builder's home. Release builds must pin a **dated** nightly (`NOMUX_NIGHTLY`), since
-a floating one moves the bytes the client pinned.
+directory 56 times over. Release builds must pin a **dated** nightly
+(`NOMUX_NIGHTLY`), since a floating one moves the bytes the client pinned.
 
 ## 9. Testing
 
@@ -920,7 +930,7 @@ a floating one moves the bytes the client pinned.
 | Exactly-once input | The §3 scenario, replayed from a randomly chosen earlier offset after every disconnect. | `tests/chaos.rs` |
 | Session | Spawn daemon → write → sever the socket mid-stream → reattach → assert the output resumes exactly where it left off. | `tests/session.rs` |
 | Gap | Capacity forced small; assert `Gap` is emitted and `base_offset` is exact. | `tests/session.rs`, `tests/chaos.rs` |
-| Backpressure | A client blasting input at a child that reads none of it has its socket refuse long before the daemon has taken a fraction of it, the session still serves a new client afterwards, and sixty reconnects do not raise the ceiling by a byte — the cap is enforced where the queue grows, not where the socket is read. | `tests/session.rs` |
+| Backpressure | A client blasting input at a child that reads none of it has its socket refuse long before the daemon has taken a fraction of it, the session still serves a new client afterwards, and repeated reconnects do not raise the ceiling by a byte — the cap is enforced where the queue grows, not where the socket is read. | `tests/session.rs` |
 | Chaos | Randomised disconnect injection, seeded and reproducible, under an escape-heavy full-screen stream and under `yes`. | `tests/chaos.rs` |
 | Agent forwarding | Bidirectional proxying, the channel cap, ids never reused, fail-fast while detached, and off unless asked for. | `tests/session.rs` |
 | Relay | Bulk traffic both ways through `nomux attach`, byte-exact, over both the `splice` and copying paths of §7. | `tests/session.rs` |

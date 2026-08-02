@@ -26,6 +26,14 @@ mutex out from under an attach. `list`, `kill` and `attach` all check the run
 directory before trusting a path inside it, and `/etc/passwd` is parsed over bytes,
 so one Latin-1 GECOS field no longer costs every user on the host their shell.
 
+Shutdown reaches the whole session rather than one process group: `terminate`
+follows the group kill with a `/proc` walk for the `&` jobs job control scattered
+into groups of their own, which is every job of every interactive shell. The linger
+window of § 6.5 now holds in both orderings — a client that watches the child exit
+and *then* closes no longer takes the five seconds with it. The attached client and
+the three fields that mean nothing without it are one `Option<Attached>`, so a
+takeover resets them together or not at all.
+
 92 tests, one of which waits out a real reaping timeout and is `#[ignore]`d (CI
 runs it with `--run-ignored all`), plus 2 doctests: property tests over the codec
 including malformed and near-valid input, a model-checked ring, an integration
@@ -35,26 +43,25 @@ under `yes`. The regression test guarding the event ordering of § 6.4.1 is itse
 verified, against a fault-injected build that restores the bug — and against one
 that forces only the interleaving, which must still pass.
 
-All four musl targets build reproducibly via `scripts/build-release.sh`, at 125.7,
-144.4, 153.1 and 213.0 KiB against the 400 KiB budget. The armv7 figure is a
-regression; see below.
+All four musl targets build reproducibly via `scripts/build-release.sh`, against
+the 400 KiB budget: x86_64 153.1 KiB, aarch64 144.2, armv7 213.0, riscv64gc 125.8.
+Named rather than listed, because an unlabelled list of four numbers is one that
+gets read in the wrong order — the exact figures live in `scripts/size-baseline`,
+which is written by a build rather than by hand. The script now holds each target
+against that baseline and fails a growth past 3%, so the next size regression is
+reported in the commit that causes it. The armv7 figure is one that arrived before
+the gate did; see below.
 
 Everything below is either a feature not started, a decision deliberately deferred,
 or client-side work recorded because its server-side contract is fixed here.
 
 ## P1 — known gaps
 
-The six items previously listed here are done. These replaced them, and each was
-found by review or measurement rather than by guessing.
+Two left. What sat here before was found by review or measurement rather than by
+guessing, and the same is true of these — which is worth saying because the two
+that remain are both cases where the honest answer is a known cost rather than a
+missing line of code.
 
-- **`Pty::terminate` misses every job of an interactive shell.** A shell with job
-  control gives each `&` job its own process group, so `kill_process_group(child)`
-  never reaches it — and neither does the `SIGHUP` the kernel sends when the master
-  closes, since a background group is not the foreground one. Reaping the *session*
-  is not something `kill(2)` can express; it needs a `/proc` walk. Distinct from the
-  missing `SIGTERM` handler that used to sit here, and not closed by fixing it: the
-  test for that one runs `set +m` precisely so it exercises the group path rather
-  than silently testing nothing.
 - **A hand-started daemon has a bind-to-publish window.** `attach` now holds the
   spawn lock until `<id>.pid` exists, so a session it created is never visible
   without its pidfile. `nomux daemon <id>` run directly answers `connect` from its
@@ -62,35 +69,20 @@ found by review or measurement rather than by guessing.
   between sees a live session it cannot identify. It refuses rather than unlinking,
   and waits the window out, so the outcome is an honest non-zero exit rather than a
   destroyed session — but the window is still there.
-- **The linger window collapses whenever the client detaches after the child.**
-  § 6.5 promises five seconds in which a client reconnecting into the race collects
-  the final output and status. `on_detached` sets `linger_until` to *now* when the
-  child is already gone, so that holds only in the other ordering. Verified: a
-  client that ran `echo …; exit 3`, waited 700 ms and closed left the socket gone
-  within 20 ms and the reconnect got `ENOENT`. Predates this work; the reasoning at
-  `on_detached` ("with nobody left to tell") is exactly the assumption § 6.5 says
-  not to make.
 - **The run-directory check costs armv7 67.6 KiB.** Bisected to the commit, and the
-  jump is that architecture alone: 148,292 → 215,884 bytes, against roughly 6 KiB
-  for the whole branch on each of the other three. Ruled out by probe: the two
-  dynamic error messages (168 bytes) and the `fchmod` repair (120 bytes). Removing
-  the check recovers all of it, so the cost is in the `open`/`fstat`/`Mode` path as
-  32-bit ARM codegen renders it. Under budget at 213 KiB, so this is a size
-  regression rather than a broken release — but it is 48% of the binary users
-  upload over cellular, and it went unnoticed because the release script enforces
-  the cap and not the delta.
+  jump is that architecture alone: 148,292 → 215,884 bytes, a 46% step against
+  roughly 6 KiB for the whole branch on each of the other three. Ruled out by
+  probe: the two dynamic error messages (168 bytes) and the `fchmod` repair (120
+  bytes). Removing the check recovers all of it, so the cost is in the
+  `open`/`fstat`/`Mode` path as 32-bit ARM codegen renders it. Under budget at 213
+  KiB, so this is a size regression rather than a broken release — but it is very
+  nearly a third of the binary users upload over cellular, and armv7 is the target
+  least likely to be on a fast link. It went unnoticed because the release script
+  enforced the cap and not the delta, which is now closed: the same commit today
+  would fail the 3% gate.
 
 ## P2 — structure
 
-- **Collapse the four correlated client fields into one `Option`.** `client`,
-  `greeted`, `exit_sent` and `sent_through` are meaningless without an attached
-  connection and must be reset together by hand in five places; `accept_agent`
-  writes `self.greeted && self.client.is_some()` precisely because the type permits
-  those two to disagree. An `Option<Attached { .. }>` makes the reset a single
-  assignment and removes the "field left stale across a takeover" class of bug.
-  Worth more than any file split — and the obvious split is *not* worth doing, since
-  `read_pending`, `on_hello`, `pump_output`, `handle_frame` and `watches` all touch
-  the same eight fields.
 - **`Hello.flags` could be unrepresentable rather than merely checked.** `HelloOk`
   packs typed fields (`gap: bool`, `linger: Linger`, `agent: bool`) through a private
   `flags()`, so an invalid combination cannot be built; `Hello` exposes a bare `u16`
@@ -129,10 +121,6 @@ found by review or measurement rather than by guessing.
 The four musl targets build, land under the 400 KiB budget, and are byte-reproducible;
 `scripts/build-release.sh` enforces all three. What is left is process rather than code:
 
-- **Track the size delta, not only the cap.** The script fails a build that misses
-  400 KiB and says nothing about one that grows 48% in a single commit, which is how
-  the armv7 regression above reached `main` unremarked. A recorded per-target
-  baseline, compared and reported, would have caught it in the commit that caused it.
 - Pick and pin the release nightly. The shipping build needs one ([IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)), CI names a dated one, and nothing yet decides when it moves. A floating nightly silently invalidates the SHA-256 the client pinned.
 - Publish the checksums somewhere the client reads, and decide what it does when a host already holds a binary whose hash it no longer recognises.
 

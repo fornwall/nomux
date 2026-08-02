@@ -1,0 +1,14 @@
+# Per-target size baseline for scripts/build-release.sh, in bytes: one
+# `target bytes` pair per line, blank lines and # comments ignored. The script
+# prints the signed delta against these figures and fails a build that grows a
+# target by more than 3%; NOMUX_UPDATE_BASELINE=1 rewrites the file, so
+# accepting a size change is a commit someone signs rather than a number nobody
+# looked at.
+#
+# Measured by nightly on 2026-08-02. These are toolchain-dependent —
+# a compiler bump moves them all — so a refresh belongs in the commit that moved the
+# bytes, and nowhere else.
+x86_64-unknown-linux-musl             156840
+aarch64-unknown-linux-musl            147704
+armv7-unknown-linux-musleabihf        218116
+riscv64gc-unknown-linux-musl          128904

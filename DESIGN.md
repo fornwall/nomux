@@ -102,7 +102,8 @@ flowchart LR
   DAEMON -- "PTY master" --> CHILD
 ```
 
-Three modes of one binary:
+Five modes of one binary, in four groups — `kill` and `list` are one surface with
+one contract:
 
 | Mode | Lifetime | Role |
 | --- | --- | --- |
@@ -224,7 +225,7 @@ sequenceDiagram
   participant C as Client
   participant S as sshd
   participant D as daemon
-  C->>S: exec: exec $p/nomux-$VER attach $ID ; echo NOMUX-BOOTSTRAP $(uname -sm)
+  C->>S: exec: exec $p/nomux-$VER attach $ID ; echo "NOMUX-BOOTSTRAP $(uname -s) $(uname -m) $p"
   S-->>C: NOMUX-BOOTSTRAP Linux aarch64 /home/u/.local/share/nomux
   C->>S: exec: cat to tmp, chmod, mv, then exec nomux-$VER attach $ID
   S->>D: spawn daemon, connect socket
@@ -285,7 +286,7 @@ plain SSH session and is cached per-host so it is not re-probed on every connect
 
 ## 8. Security model
 
-- **No new attack surface.** Anyone who can write `~/.local/state/nomux/` can already edit `.bashrc`. The binary being user-writable is not a new capability.
+- **No new attack surface.** Anyone who can write `~/.local/share/nomux/` — where the uploaded binary lands — can already edit `.bashrc`. The binary being user-writable is not a new capability.
 - **No new secrets.** No keys, no tokens, no crypto. Authentication is the unix socket's filesystem permissions (`0600` in a `0700` directory) plus SSH itself.
 - **No abstract sockets.** They are namespace-scoped, not permission-scoped, and would be reachable by any local user.
 - **Auditability.** A persistent shell can outlive the login session that spawned it. On hosts with session recording this is a policy question, not a technical one; it is why the feature is opt-in per host.

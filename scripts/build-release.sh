@@ -7,6 +7,16 @@
 # non-zero if any binary misses it, because a release that blows the budget is a
 # regression in the one number users feel.
 #
+# The cap on its own is not enough, which is what the armv7 regression taught: one
+# commit grew that binary 48% and nothing said a word, because 213 KiB still fits in
+# 400 KiB comfortably. A number is only watched if something compares it to what it
+# was. So the script also keeps a per-target baseline in scripts/size-baseline, prints
+# the signed delta against it beside every size, and fails a build that grows a target
+# by more than 3%. A shrink never fails, however large. When the growth is intended,
+# NOMUX_UPDATE_BASELINE=1 rewrites the baseline from this build and skips the gate —
+# which puts the new figure in the diff, so accepting a size regression becomes
+# something a reviewer sees rather than something nobody measured.
+#
 # Two things have to be true of the output:
 #
 #   1. It is byte-identical everywhere. The client pins a SHA-256 per architecture
@@ -47,12 +57,23 @@
 #
 # Set NOMUX_STABLE_STD=1 to build against the pinned stable toolchain's released std
 # instead. Expect it to fail the size gate; it is kept to make that cost visible and
-# to leave the tree buildable without nightly.
+# to leave the tree buildable without nightly. NOMUX_UPDATE_BASELINE=1 is refused
+# alongside it, since the sizes it measures are not the ones the release ships.
 #
 # Run from anywhere in the repository. Artifacts land in target/dist/.
 set -eu
 
 max_bytes=409600 # 400 KiB
+
+# Growth past 3% of the baseline fails the build. The threshold has to sit above
+# ordinary drift and well below a regression, and there is a wide gap between the two:
+# a compiler bump or a handful of new match arms moves these binaries by hundreds of
+# bytes, a few tenths of a percent of the smallest of them, while the armv7 jump this
+# gate exists to catch was 48%. Three percent is around 4 KiB on x86_64 — loose enough
+# that no honest commit trips it and nobody learns to rerun with the escape hatch out
+# of habit, tight enough that nothing on the scale of a real regression gets through.
+max_growth_pct=3
+
 targets='x86_64-unknown-linux-musl
 aarch64-unknown-linux-musl
 armv7-unknown-linux-musleabihf
@@ -60,6 +81,40 @@ riscv64gc-unknown-linux-musl'
 
 repo=$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)
 dist="$repo/target/dist"
+baseline_file="$repo/scripts/size-baseline"
+update_baseline="${NOMUX_UPDATE_BASELINE:-0}"
+
+# A stable-std build measures a binary three times the size of the one that ships, so
+# recording it would raise every baseline past the point where any later regression
+# could reach the threshold — the gate would still run and would never fire again.
+# Refuse the combination rather than write it.
+if [ "$update_baseline" = 1 ] && [ "${NOMUX_STABLE_STD:-0}" = 1 ]; then
+    echo "NOMUX_UPDATE_BASELINE=1 refuses a NOMUX_STABLE_STD=1 build:" >&2
+    echo "  its figures are not the ones the release ships, and recording them" >&2
+    echo "  would leave the growth gate unable to fire." >&2
+    exit 1
+fi
+
+# Read the baseline before building rather than when the table is printed. Parsing it
+# is the one part of this script that a typo can break, and discovering that after four
+# cross-compiles have run is discovering it twenty minutes too late. Comments and blank
+# lines are dropped here so nothing downstream has to think about them, and anything
+# that is not a target and a byte count is an error rather than a silently ignored line
+# — a baseline that quietly holds no entry for a target is a gate that passes everything.
+baselines=''
+if [ -e "$baseline_file" ]; then
+    if ! baselines=$(awk '
+        { orig = $0; sub(/#.*/, "") }
+        NF == 0 { next }
+        NF != 2 || $2 !~ /^[0-9]+$/ { bad = bad "  line " NR ": " orig "\n"; next }
+        { good = good $1 " " $2 "\n" }
+        END { if (bad != "") { printf "%s", bad; exit 1 } printf "%s", good }
+    ' "$baseline_file"); then
+        echo "malformed ${baseline_file#"$repo"/}, expected \`target bytes\` per line:" >&2
+        printf '%s\n' "$baselines" >&2
+        exit 1
+    fi
+fi
 
 # Selecting the toolchain through RUSTUP_TOOLCHAIN rather than a `+toolchain` argument
 # means every rustc and cargo call below agrees about which one it is — including the
@@ -146,26 +201,117 @@ done
 # Emitted in `sha256sum -c` format so a verifier needs no bespoke tooling.
 (cd "$dist" && sha256sum nomux-* > SHA256SUMS)
 
-status=0
+# Both gates are recorded per target and neither exits early, so one run tells you
+# everything that is wrong with the build. Bailing on the first failure would hide the
+# other three targets behind whichever one happens to be listed first, and a size
+# problem is usually not confined to one architecture — the whole point of the table is
+# to be read across.
+over_budget=''
+grown=''
+unknown=''
+measured=''
+nl='
+'
 echo
-printf '%-34s %9s %9s  %s\n' TARGET BYTES KIB SHA256
+printf '%-34s %9s %9s %9s %8s  %s\n' TARGET BYTES KIB DELTA PCT SHA256
 for target in $targets; do
     bytes=$(stat -c %s "$dist/nomux-$target")
     sha=$(sha256sum "$dist/nomux-$target" | cut -c1-16)
+    # Accumulated in the same two column widths the table above uses, so a refreshed
+    # baseline is diffable against the one it replaced instead of reflowing every line
+    # the moment one binary crosses a power of ten.
+    measured="$measured$(printf '%-34s %9d' "$target" "$bytes")$nl"
+
+    verdict=''
     if [ "$bytes" -gt "$max_bytes" ]; then
-        verdict=' OVER BUDGET'
-        status=1
-    else
-        verdict=''
+        verdict="$verdict OVER BUDGET"
+        over_budget="$over_budget $target"
     fi
-    printf '%-34s %9d %7d.%d  %s%s\n' "$target" "$bytes" \
-        "$((bytes / 1024))" "$(((bytes % 1024) * 10 / 1024))" "$sha" "$verdict"
+
+    # A target the baseline has never seen is reported, not punished: the first build
+    # of a newly added architecture has nothing to have grown against, and failing it
+    # would mean the only way to add a target is with the escape hatch already set.
+    base=$(printf '%s\n' "$baselines" | awk -v t="$target" '$1 == t { print $2; exit }')
+    if [ -z "$base" ]; then
+        delta='new'
+        pct=''
+        unknown="$unknown $target"
+    else
+        diff=$((bytes - base))
+        # The sign is carried separately and the magnitude divided as a positive
+        # number, because the truncation of a negative quotient is the sort of detail
+        # that differs between shells, and a percentage that is wrong in the last digit
+        # on someone else's machine is worse than no percentage at all.
+        if [ "$diff" -lt 0 ]; then
+            sign='-'
+            magnitude=$((-diff))
+        else
+            sign='+'
+            magnitude=$diff
+        fi
+        tenths=$((magnitude * 1000 / base))
+        delta="$sign$magnitude"
+        pct="$sign$((tenths / 10)).$((tenths % 10))%"
+        # Integer arithmetic throughout: comparing diff*100 against base*max_growth_pct
+        # asks the same question as a percentage would without rounding anything, and
+        # `sh` has no floating point to round with anyway. The printed percentage is
+        # therefore a rendering and never the thing being tested, so a figure that
+        # displays as exactly the threshold is decided by the bytes rather than by which
+        # way the tenths digit fell. Growth only — a smaller binary is the outcome this
+        # project wants and never a reason to fail, however far it drops.
+        if [ "$update_baseline" != 1 ] && [ "$diff" -gt 0 ] &&
+            [ $((diff * 100)) -gt $((base * max_growth_pct)) ]; then
+            verdict="$verdict GROWN"
+            grown="$grown $target"
+        fi
+    fi
+
+    printf '%-34s %9d %7d.%d %9s %8s  %s%s\n' "$target" "$bytes" \
+        "$((bytes / 1024))" "$(((bytes % 1024) * 10 / 1024))" \
+        "$delta" "$pct" "$sha" "$verdict"
 done
 echo
 echo "artifacts and SHA256SUMS in ${dist#"$repo"/}"
 
-if [ "$status" != 0 ]; then
-    echo "FAIL: over the $((max_bytes / 1024)) KiB budget of IMPLEMENTATION.md § 8." >&2
+if [ -n "$unknown" ]; then
+    echo "note: no baseline entry for:$unknown" >&2
+    echo "      recorded as new; rerun with NOMUX_UPDATE_BASELINE=1 to record the sizes." >&2
+fi
+
+if [ "$update_baseline" = 1 ]; then
+    if [ -n "$over_budget" ]; then
+        # Writing these figures would make the next build's delta look healthy while
+        # the binary is still too big for the one gate that is not negotiable.
+        echo "baseline left alone: a build that misses the cap is not one to record." >&2
+    else
+        {
+            cat <<EOF
+# Per-target size baseline for scripts/build-release.sh, in bytes: one
+# \`target bytes\` pair per line, blank lines and # comments ignored. The script
+# prints the signed delta against these figures and fails a build that grows a
+# target by more than $max_growth_pct%; NOMUX_UPDATE_BASELINE=1 rewrites the file, so
+# accepting a size change is a commit someone signs rather than a number nobody
+# looked at.
+#
+# Measured by $toolchain on $(date -u '+%Y-%m-%d'). These are toolchain-dependent —
+# a compiler bump moves them all — so a refresh belongs in the commit that moved the
+# bytes, and nowhere else.
+EOF
+            printf '%s' "$measured"
+        } > "$baseline_file"
+        echo "baseline refreshed in ${baseline_file#"$repo"/}; commit it with the change that moved the bytes."
+    fi
+fi
+
+if [ -n "$over_budget" ] || [ -n "$grown" ]; then
+    if [ -n "$over_budget" ]; then
+        echo "FAIL: over the $((max_bytes / 1024)) KiB budget of IMPLEMENTATION.md § 8:$over_budget" >&2
+    fi
+    if [ -n "$grown" ]; then
+        echo "FAIL: grown more than $max_growth_pct% against ${baseline_file#"$repo"/}:$grown" >&2
+        echo "      find what did it — the cost is paid on every cold upload — or accept it" >&2
+        echo "      deliberately with NOMUX_UPDATE_BASELINE=1 and commit the new baseline." >&2
+    fi
     if [ "$build_std" = 0 ]; then
         echo "note: NOMUX_STABLE_STD=1 build; the shipping build uses build-std." >&2
     fi

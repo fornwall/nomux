@@ -48,8 +48,8 @@ priority = 1 }` rather than a command-line flag — so `cargo build`, `cargo cli
 and every editor's rust-analyzer all agree, with no cache thrash from differing
 `RUSTFLAGS`.
 
-Commits are gated by [prek](https://github.com/j178/prek) on formatting, clippy,
-tests and doctests:
+Commits are gated by [prek](https://github.com/j178/prek) on shellcheck, formatting,
+clippy, tests and doctests:
 
 ```sh
 prek install            # once, per clone
@@ -57,7 +57,8 @@ prek run --all-files    # run the gate manually
 ```
 
 The hooks trigger on `*.rs`, `*.toml` and `Cargo.lock` — manifests included, because
-the lint configuration lives in `Cargo.toml`.
+the lint configuration lives in `Cargo.toml` — and on `*.sh`, because the release
+build and the takeover guard are shell and no Rust hook would ever look at them.
 
 Two things are deliberately left out of the pre-commit gate and run in CI instead,
 because both cost far more than a commit should:
@@ -79,8 +80,12 @@ The four shipping binaries come from one script:
 sh scripts/build-release.sh     # → target/dist/ plus SHA256SUMS
 ```
 
-It builds every musl target, prints a size table, and fails if any binary exceeds
-the 400 KiB budget. There is no cross toolchain to install — `rust-lld` links all
+It builds every musl target, prints a size table with the change against the
+per-target baseline in `scripts/size-baseline`, and fails if any binary exceeds the
+400 KiB budget or has grown more than 3% since that baseline — the cap on its own
+let a 48% armv7 regression through unremarked. `NOMUX_UPDATE_BASELINE=1` rewrites
+the baseline from that build and skips the growth gate, so an intended size change
+lands in the diff. There is no cross toolchain to install — `rust-lld` links all
 four and each `rust-std` component carries its own musl objects — but the shipping
 configuration rebuilds the standard library with panics compiled out, which needs
 nightly and its sources:
