@@ -43,7 +43,12 @@ pub(crate) const FILE_MODE: u32 = 0o600;
 ///
 /// The umask is process-wide, but nothing here is multi-threaded and no caller
 /// spawns a process while it is in effect.
-fn with_umask<T>(mode: u32, f: impl FnOnce() -> T) -> T {
+///
+/// Reachable from outside this module because one file in the layout is not created
+/// here: `daemon::write_pidfile` owns `<id>.pid`, and `File::create` subtracts the
+/// umask like everything else — which is what leaves the pidfile `0644` under the
+/// ordinary umask and owner-unreadable under `umask 0400`.
+pub(crate) fn with_umask<T>(mode: u32, f: impl FnOnce() -> T) -> T {
     let previous = rustix::process::umask(Mode::from_bits_truncate(0o777 & !mode));
     let result = f();
     rustix::process::umask(previous);
