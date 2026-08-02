@@ -21,25 +21,35 @@ pub(crate) const DIR_MODE: u32 = 0o700;
 /// Permissions for every socket inside it.
 pub(crate) const SOCKET_MODE: u32 = 0o600;
 
+/// Runs `f` with the umask suppressed, so that a node created at `mode` is created
+/// at exactly `mode`.
+///
+/// `mkdir(2)` and `bind(2)` both subtract the caller's umask from the mode they are
+/// given, which makes that argument an upper bound rather than a request — and both
+/// modes in this module are exact. Creating and then `chmod`ing would narrow the
+/// window rather than close it, and would `chmod` a path that is being raced.
+///
+/// The umask is process-wide, but nothing here is multi-threaded and neither caller
+/// spawns anything while it is in effect.
+fn with_umask<T>(mode: u32, f: impl FnOnce() -> T) -> T {
+    let previous = rustix::process::umask(Mode::from_bits_truncate(0o777 & !mode));
+    let result = f();
+    rustix::process::umask(previous);
+    result
+}
+
 /// Binds a unix socket that is never, even briefly, more permissive than
 /// [`SOCKET_MODE`].
 ///
 /// `bind(2)` creates the node with `0777 & ~umask`, so binding and then `chmod`ing
 /// leaves a window — a login with `umask 000` publishes a world-connectable socket
-/// for the length of one syscall. Setting the umask around the bind closes it
-/// instead of narrowing it, and avoids `chmod`ing a path that is being raced.
-///
-/// The umask is process-wide, but the daemon is single-threaded and spawns nothing
-/// while this is in effect.
+/// for the length of one syscall.
 ///
 /// # Errors
 ///
 /// Propagates bind failures.
 pub(crate) fn bind_socket_private(path: &Path) -> io::Result<UnixListener> {
-    let previous = rustix::process::umask(Mode::from_bits_truncate(0o777 & !SOCKET_MODE));
-    let listener = UnixListener::bind(path);
-    rustix::process::umask(previous);
-    listener
+    with_umask(SOCKET_MODE, || UnixListener::bind(path))
 }
 
 /// Longest label written to `<id>.label`, in bytes, per the frozen layout.
@@ -66,6 +76,166 @@ pub(crate) fn run_dir() -> io::Result<PathBuf> {
             io::Error::other("none of XDG_RUNTIME_DIR, XDG_STATE_HOME or HOME is set")
         })?;
     Ok(state.join("nomux/run"))
+}
+
+/// Creates `dir` if it is absent, and refuses it if it is not this user's alone.
+///
+/// Creating it is the easy half. It usually exists already, and that it exists says
+/// nothing about *what* exists: `$XDG_RUNTIME_DIR/nomux` may be a symlink into a
+/// directory another user owns, in which case every file the caller is about to
+/// make there — a socket that carries the session, the pidfile, the spawn lock — is
+/// made somewhere that user chose and can replace. The version this supersedes made
+/// that worse rather than better, since it answered an existing directory with an
+/// unconditional `fs::set_permissions`, which resolves the path and therefore
+/// follows the symlink: it tightened a stranger's directory to [`DIR_MODE`] on
+/// their behalf and then filled it with sockets.
+///
+/// The check runs before the creation, so the ordinary case costs one `open` and
+/// one `fstat`, and so a plain file sitting at the path is reported as what it is
+/// rather than as an `EEXIST` naming nothing.
+///
+/// # Errors
+///
+/// Fails if the directory cannot be created, is not a directory, belongs to
+/// somebody else, or is one other users can write to. Loud on purpose: the rest of
+/// this daemon degrades rather than refuses, but a run directory that is not what
+/// it claims to be is not somewhere to start a session.
+fn ensure_dir_at(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    match check_run_dir(dir) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        settled => return settled,
+    }
+    // `mkdir(2)` subtracts the umask from the mode it is given, so a login with
+    // `umask 0500` would create a run directory its owner cannot open — and the
+    // check below would then refuse what this line had just made. Suppressing the
+    // umask is what makes `DIR_MODE` a request rather than a ceiling, for the
+    // parents this creates along the way as much as for the directory itself.
+    with_umask(DIR_MODE, || {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(DIR_MODE)
+            .create(dir)
+    })?;
+    // Checked again rather than trusted: `recursive` reports an existing directory
+    // as success, so what this call created may be what another attach created a
+    // moment earlier — or, where the parent is one somebody else can write to, what
+    // they left there between the two checks.
+    check_run_dir(dir)
+}
+
+/// Opens `dir` as itself and establishes that it belongs to this user alone.
+///
+/// `O_DIRECTORY` and `O_NOFOLLOW` do most of the work: between them the kernel
+/// refuses anything that is not a directory, and refuses a symlink instead of
+/// following it, so what is left to decide here is who owns the thing and who else
+/// may create names in it. That the file type is the kernel's answer rather than a
+/// second `fstat` of ours is deliberate — a check that could disagree with the
+/// descriptor it is meant to describe is worse than no check.
+///
+/// The descriptor is dropped at the end and the run files go on being opened by
+/// path, which is a decision rather than an oversight. There is no `bindat(2)`, so
+/// the session socket and the agent socket — the two files that decide who a
+/// session is talking to — must be resolved by name whatever this function returns;
+/// a descriptor would cover the pidfile, the label and the lock, and a layout in
+/// which the three cheap files are addressed race-free while the two that matter
+/// are not would read as though the race were closed. What closes it is the
+/// property established here instead: in a directory this user owns and nobody else
+/// can write to, this user's own processes are the only ones that can put a name in
+/// it, which is what makes every path built on it safe to resolve. Keeping the
+/// descriptor for the session's lifetime would also pin the filesystem the daemon
+/// deliberately lets go of in `IMPLEMENTATION.md` § 6.2.
+///
+/// What that leaves open is a *parent* somebody else can write to — an
+/// `XDG_RUNTIME_DIR` pointed at a shared directory, say — where the whole run
+/// directory can be renamed away and replaced between this call and the next
+/// `bind`. No descriptor obtainable here would close that, because the `bind` needs
+/// the path either way.
+fn check_run_dir(dir: &Path) -> io::Result<()> {
+    let fd = rustix::fs::open(
+        dir,
+        OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|err| match err {
+        // Linux answers `O_DIRECTORY | O_NOFOLLOW` on a symlink with `ENOTDIR`
+        // rather than the `ELOOP` the manual page leads one to expect — the link is
+        // not a directory, and that is the check it fails first — so the two cases
+        // arrive as one errno and telling them apart means asking again. Worth
+        // asking: "it is a symlink" is the sentence that tells somebody what to do
+        // about it, and the extra `lstat` is paid only on the way to failing.
+        rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP => refuse(
+            dir,
+            io::ErrorKind::NotADirectory,
+            match fs::symlink_metadata(dir) {
+                Ok(meta) if meta.file_type().is_symlink() => "it is a symlink",
+                _ => "it is not a directory",
+            },
+        ),
+        other => refuse_errno(dir, other, "it could not be opened"),
+    })?;
+
+    let stat =
+        rustix::fs::fstat(&fd).map_err(|err| refuse_errno(dir, err, "it could not be examined"))?;
+    if stat.st_uid != rustix::process::getuid().as_raw() {
+        return Err(refuse(
+            dir,
+            io::ErrorKind::PermissionDenied,
+            &format!("it belongs to uid {}", stat.st_uid),
+        ));
+    }
+
+    // Write for group or other is the one loosening that is not repairable, and the
+    // only one answered the way a wrong owner is. Whoever had it could have left a
+    // socket of their own at a session id this process is about to connect to, and
+    // tightening the directory now does not un-plant it — nothing inside is evidence
+    // of anything any more. Read and execute disclose the session ids and the labels
+    // and no more, the sockets being `SOCKET_MODE` in their own right, and they are
+    // what an earlier version or an odd umask leaves behind; those are worth
+    // repairing rather than turning into a session the user cannot start. A mode
+    // missing the owner's own bits is refused with the rest, where the version this
+    // supersedes repaired it: repairing it means a `chmod` on a name that has not
+    // been checked, which is the whole of what the open above exists to avoid, and
+    // nothing creates such a directory any more.
+    let mode = Mode::from_raw_mode(stat.st_mode);
+    if mode.intersects(Mode::WGRP | Mode::WOTH) {
+        return Err(refuse(
+            dir,
+            io::ErrorKind::PermissionDenied,
+            &format!("mode {:o} lets other users create files in it", mode.bits()),
+        ));
+    }
+    if mode != Mode::from_bits_truncate(DIR_MODE) {
+        // Through the descriptor, never the path: a `chmod` by name resolves it
+        // again, and would reopen exactly the hole the `O_NOFOLLOW` above closed.
+        rustix::fs::fchmod(&fd, Mode::from_bits_truncate(DIR_MODE))
+            .map_err(|err| refuse_errno(dir, err, "its mode could not be tightened"))?;
+    }
+    Ok(())
+}
+
+/// A refusal in the terms the user needs: which directory, what is wrong with it,
+/// and what it was supposed to be.
+///
+/// This reaches them as `nomux: ...` on stderr and is the whole account they get of
+/// why a session would not start, so it names the path even where the errno beneath
+/// it names nothing at all.
+fn refuse(dir: &Path, kind: io::ErrorKind, problem: &str) -> io::Error {
+    io::Error::new(
+        kind,
+        format!(
+            "run directory {}: {problem}; expected a directory owned by this user, mode {DIR_MODE:o}",
+            dir.display()
+        ),
+    )
+}
+
+/// [`refuse`] for a failed syscall, keeping the kind the errno maps to so that a
+/// caller matching on it still can.
+fn refuse_errno(dir: &Path, err: rustix::io::Errno, problem: &str) -> io::Error {
+    let err = io::Error::from(err);
+    let kind = err.kind();
+    refuse(dir, kind, &format!("{problem}: {err}"))
 }
 
 /// The five paths belonging to one session.
@@ -102,20 +272,16 @@ impl SessionPaths {
         &self.id
     }
 
-    /// Creates the run directory with owner-only permissions.
+    /// Creates the run directory with owner-only permissions, and refuses one that
+    /// is not this user's alone.
     ///
     /// # Errors
     ///
-    /// Fails if the directory cannot be created or its mode cannot be set.
+    /// See [`ensure_dir_at`], which is where the whole of this lives so that it can
+    /// be tested against a directory of the test's choosing rather than against
+    /// whatever `XDG_RUNTIME_DIR` says on the machine running it.
     pub(crate) fn ensure_dir(&self) -> io::Result<()> {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(DIR_MODE)
-            .create(&self.dir)?;
-        // `recursive` skips the mode on an existing directory, so tighten it here
-        // in case an earlier version or a umask left it more permissive.
-        fs::set_permissions(&self.dir, fs::Permissions::from_mode(DIR_MODE))
+        ensure_dir_at(&self.dir)
     }
 
     fn with_extension(&self, extension: &str) -> PathBuf {
@@ -321,7 +487,115 @@ pub(crate) fn sanitize_label(label: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+
+    /// A scratch directory of this process's own, so concurrent test binaries do
+    /// not share one.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("nomux-{}-{name}", std::process::id()));
+        drop(fs::remove_dir_all(&dir));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The permission bits as they are on disk, never as the symlink pointing at it
+    /// would report them.
+    fn mode_of(path: &Path) -> u32 {
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    /// The one branch not tested here is a directory owned by somebody else, which
+    /// needs a second uid. Faking it would mean mocking `getuid`, and a test of a
+    /// mock is not a test of this.
+    #[test]
+    fn a_run_directory_is_created_owner_only_and_then_accepted_as_it_stands() {
+        let root = scratch("rundir-new");
+        let dir = root.join("nomux/run");
+
+        ensure_dir_at(&dir).unwrap();
+        assert_eq!(mode_of(&dir), DIR_MODE, "created owner-only");
+        assert_eq!(
+            mode_of(&root.join("nomux")),
+            DIR_MODE,
+            "and so is the parent it had to create on the way"
+        );
+
+        // The second call is the one every attach after the first makes.
+        ensure_dir_at(&dir).unwrap();
+        assert_eq!(mode_of(&dir), DIR_MODE);
+        drop(fs::remove_dir_all(&root));
+    }
+
+    /// Neither a symlink nor a plain file is a run directory, and the symlink is the
+    /// one that mattered: `fs::set_permissions` resolves the path, so the version
+    /// before this one answered it by tightening whatever it pointed at — another
+    /// user's directory — and then filling that with the session's sockets.
+    #[test]
+    fn a_symlink_or_a_file_in_place_of_the_run_directory_is_refused() {
+        let root = scratch("rundir-symlink");
+        let target = root.join("elsewhere");
+        fs::create_dir_all(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o777)).unwrap();
+        let dir = root.join("nomux");
+        std::os::unix::fs::symlink(&target, &dir).unwrap();
+
+        let err = ensure_dir_at(&dir).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotADirectory, "{err}");
+        assert!(
+            err.to_string().contains(&dir.display().to_string()),
+            "the refusal must name the path: {err}"
+        );
+        assert!(
+            err.to_string().contains("it is a symlink"),
+            "and say which of the two it is: {err}"
+        );
+        assert_eq!(
+            mode_of(&target),
+            0o777,
+            "the target's mode was never ours to change"
+        );
+
+        let file = root.join("file");
+        fs::write(&file, b"").unwrap();
+        let err = ensure_dir_at(&file).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotADirectory, "{err}");
+        assert!(err.to_string().contains("it is not a directory"), "{err}");
+        drop(fs::remove_dir_all(&root));
+    }
+
+    /// Two policies for one field, and what separates them is what the loosening
+    /// lets somebody else *do*: reading is a disclosure that tightening ends, while
+    /// writing means they could already have left a socket of their own at a session
+    /// id — which no later `chmod` undoes.
+    #[test]
+    fn a_readable_run_directory_is_tightened_and_a_writable_one_is_refused() {
+        let root = scratch("rundir-mode");
+        let dir = root.join("nomux");
+        ensure_dir_at(&dir).unwrap();
+
+        for loose in [0o755, 0o750, 0o701] {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(loose)).unwrap();
+            ensure_dir_at(&dir).unwrap();
+            assert_eq!(
+                mode_of(&dir),
+                DIR_MODE,
+                "mode {loose:o} should be tightened"
+            );
+        }
+
+        for shared in [0o770, 0o702] {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(shared)).unwrap();
+            let err = ensure_dir_at(&dir).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+            assert_eq!(
+                mode_of(&dir),
+                shared,
+                "mode {shared:o} is refused, not repaired"
+            );
+        }
+        drop(fs::remove_dir_all(&root));
+    }
 
     #[test]
     fn invalid_ids_are_refused_before_any_path_is_built() {

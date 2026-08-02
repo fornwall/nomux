@@ -446,6 +446,29 @@ Directory `0700`, socket `0600`. Filesystem sockets only — never abstract sock
 which are namespace- rather than permission-scoped and would be reachable by any
 local user.
 
+The directory is *checked* rather than merely created, because on every run but the
+first it already exists, and that it exists says nothing about what it is. It is
+opened `O_DIRECTORY | O_NOFOLLOW` and `fstat`ed: a symlink or a non-directory is
+refused, so is one belonging to another uid, and so is one that group or other can
+write to — whoever had that could have left a socket of their own at a session id
+about to be connected to, and no later `chmod` un-plants it. A merely readable mode
+is tightened instead, through the descriptor rather than the path, since that is
+what an earlier version or an odd umask leaves behind and it discloses the ids and
+the labels rather than granting anything. Refusal here is hard, where everything
+else in the daemon degrades: a run directory that is not what it claims to be is
+not somewhere to start a session.
+
+The run files are then opened by name rather than relative to that descriptor.
+There is no `bindat(2)`, so the socket and the agent socket — the two that decide
+who a session talks to — have to be resolved by path whichever way the other three
+go, and a layout in which three of the five are addressed race-free reads as though
+the race were closed. What closes it is the check itself: in a directory this user
+owns and nobody else can write to, only this user's own processes can put a name in
+it. What stays open is a *parent* somebody else can write to — an `XDG_RUNTIME_DIR`
+pointed at a shared directory — where the whole run directory can be swapped
+between the check and the next `bind`. No descriptor helps there, because the
+`bind` needs the path either way.
+
 Spawn race (two clients attaching at once): `flock(LOCK_EX)` on `<id>.lock`; the
 loser blocks there, then finds the socket the winner bound and connects to it. Only
 a process that spawns its own daemon polls, and only for its own. A stale socket is one where `connect`
@@ -769,6 +792,7 @@ a floating one moves the bytes the client pinned.
 | Relay | Bulk traffic both ways through `nomux attach`, byte-exact, over both the `splice` and copying paths of §7. | `tests/session.rs` |
 | Detachment | The `daemon` mode leads a session of its own, redirects the stdio it was handed, and records the surviving pid. | `tests/session.rs` |
 | Shutdown | A daemon that reaps itself runs `terminate` to completion and unlinks its run files, and a signalled one collects a backgrounded process that ignores `SIGHUP`. | `tests/session.rs` |
+| Run directory | A symlink in place of one is refused and whatever it points at is left untouched, a world-readable mode is tightened, a group- or other-writable one is refused rather than repaired, and both modes that create a run directory say so and exit non-zero. The remaining branch, a directory owned by another uid, needs a second uid and is not faked. | `src/rundir.rs`, `tests/session.rs` |
 | Spawn lock | Collection against a lock somebody else holds: `list` leaves the entry alone, `kill` exits non-zero rather than claiming it, and an attach whose lock file is collected while it waits goes back for the file that replaced it. | `tests/spawn_lock.rs` |
 
 The two invariants that matter: **no duplicated input, ever**, and **no lost output

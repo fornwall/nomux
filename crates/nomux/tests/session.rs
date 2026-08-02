@@ -456,6 +456,63 @@ fn invalid_session_ids_are_refused() {
     }
 }
 
+/// A run directory that is a symlink is refused, out loud, by both modes that
+/// create one.
+///
+/// The unit tests in `rundir` cover the decision; this covers the consequence,
+/// which is the half a user sees. Everything else in this daemon degrades rather
+/// than aborts, so a session that must not start has to say so with a message and
+/// an exit status rather than by quietly doing something else — and what it must
+/// not do is what the code before it did, which was to `chmod` whatever the link
+/// points at and bind a session's sockets inside it.
+#[test]
+fn a_symlinked_run_directory_is_refused_by_attach_and_daemon() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("run-symdir");
+    drop(fs::remove_dir_all(&root));
+    let target = root.join("elsewhere");
+    fs::create_dir_all(&target).expect("create the directory the link points at");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o777)).expect("loosen the target");
+    std::os::unix::fs::symlink(&target, root.join("nomux")).expect("plant the symlink");
+
+    for mode in ["attach", "daemon"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_nomux"))
+            .args([mode, "symdir"])
+            .env("XDG_RUNTIME_DIR", &root)
+            .env("SHELL", "/bin/sh")
+            .stdin(Stdio::null())
+            .output()
+            .expect("run nomux");
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            !output.status.success(),
+            "{mode} started a session in a symlinked run directory"
+        );
+        assert!(
+            stderr.contains("run directory") && stderr.contains("symlink"),
+            "{mode} must say what it refused and why, got {stderr:?}"
+        );
+    }
+
+    assert_eq!(
+        fs::symlink_metadata(&target)
+            .expect("stat the target")
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o777,
+        "the mode of a directory nomux does not own is not nomux's to change"
+    );
+    assert!(
+        fs::read_dir(&target)
+            .expect("read the target")
+            .next()
+            .is_none(),
+        "nothing may be created through the link"
+    );
+}
+
 /// Exercises the path a real bootstrap takes: `nomux attach` with no daemon
 /// running, which must spawn one under the flock and then relay transparently.
 #[test]
