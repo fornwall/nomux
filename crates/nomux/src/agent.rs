@@ -151,14 +151,13 @@ impl Agent {
         let Some(chan) = self.channels.iter_mut().find(|chan| chan.id == id) else {
             return Read::Closed;
         };
-        loop {
-            return match rustix::io::read(chan.stream.as_fd(), &mut *buf) {
-                Ok(0) => Read::Closed,
-                Ok(n) => Read::Data(n),
-                Err(rustix::io::Errno::AGAIN) => Read::WouldBlock,
-                Err(rustix::io::Errno::INTR) => continue,
-                Err(_) => Read::Closed,
-            };
+        match crate::nbio::read(chan.stream.as_fd(), buf) {
+            Ok(0) => Read::Closed,
+            Ok(n) => Read::Data(n),
+            Err(rustix::io::Errno::AGAIN) => Read::WouldBlock,
+            // Anything else is this one socket's problem, never the session's:
+            // the process on the other end is a `ssh-add` that went away.
+            Err(_) => Read::Closed,
         }
     }
 
@@ -184,18 +183,8 @@ impl Agent {
         let Some(chan) = self.channels.iter_mut().find(|chan| chan.id == id) else {
             return Flush::Gone;
         };
-        while !chan.pending.is_empty() {
-            let (front, _) = chan.pending.as_slices();
-            if front.is_empty() {
-                chan.pending.make_contiguous();
-                continue;
-            }
-            match rustix::io::write(chan.stream.as_fd(), front) {
-                Ok(0) | Err(rustix::io::Errno::AGAIN) => break,
-                Ok(n) => drop(chan.pending.drain(..n)),
-                Err(rustix::io::Errno::INTR) => {}
-                Err(_) => return Flush::Failed,
-            }
+        if crate::nbio::drain_to(&mut chan.pending, chan.stream.as_fd()).is_err() {
+            return Flush::Failed;
         }
         if chan.closing && chan.pending.is_empty() {
             Flush::Finished

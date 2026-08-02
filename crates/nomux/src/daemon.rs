@@ -32,14 +32,14 @@ use crate::rundir::SessionPaths;
 /// Default ring capacity. See `DESIGN.md` § 10 — this bounds how long a
 /// disconnect can last before scrollback is lost, and is multiplied by the
 /// per-host session cap.
-pub(crate) const DEFAULT_RING_CAPACITY: usize = 4 << 20;
+const DEFAULT_RING_CAPACITY: usize = 4 << 20;
 
 /// Environment override for the ring capacity, in bytes.
 ///
 /// Exists because the right value is host-dependent — a machine running eight
 /// sessions pays this eight times over — and because it makes overflow behaviour
 /// testable without generating megabytes of output.
-pub(crate) const RING_BYTES_ENV: &str = "NOMUX_RING_BYTES";
+const RING_BYTES_ENV: &str = "NOMUX_RING_BYTES";
 
 /// Resolves the ring capacity, honouring [`RING_BYTES_ENV`].
 ///
@@ -223,15 +223,43 @@ fn arm_stop_signals() -> io::Result<OwnedFd> {
     Ok(read)
 }
 
+/// The attached client, and the state that means nothing without one.
+///
+/// One `Option` rather than four fields on the daemon that had to be kept in
+/// agreement. The three beside the connection all belong to a *particular* one of
+/// them — how far it has been sent, whether its `Hello` has been answered, whether
+/// it has heard about the exit — so every arrival and departure has to reset all
+/// three together. Flat on the daemon that was done by hand in five places, and
+/// `accept_agent` had to ask whether `greeted` and the connection agreed, which is
+/// a question this shape cannot pose.
+#[derive(Debug)]
+struct Attached {
+    conn: Conn,
+    /// Set once this connection's `Hello` has been answered.
+    greeted: bool,
+    /// Whether this connection has already been told the child exited. Per
+    /// connection: a client that reattaches after the fact must hear it again.
+    exit_sent: bool,
+    /// Output offset already queued to this connection.
+    sent_through: u64,
+}
+
+impl Attached {
+    /// Takes over the session with a connection that has just said `Hello`.
+    ///
+    /// `sent_through` is provisional: `on_hello` resolves where this client
+    /// actually resumes from, which is the first thing that happens to it.
+    const fn new(conn: Conn) -> Self {
+        Self {
+            conn,
+            greeted: false,
+            exit_sent: false,
+            sent_through: 0,
+        }
+    }
+}
+
 /// Session state for the lifetime of the daemon process.
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "two of the four — `greeted` and `exit_sent` — are among the correlated \
-              client fields PLAN.md § P2 wants behind one Option; `repaint_ctrl_l` is \
-              a policy each client restates and belongs to no other field; and \
-              `stopping` is deliberately not folded into `linger_until`, which \
-              `on_child_exit` can overwrite in the same pass"
-)]
 struct Daemon {
     paths: SessionPaths,
     listener: UnixListener,
@@ -243,7 +271,7 @@ struct Daemon {
     stopping: bool,
     ring: crate::ring::Ring,
     pty: Option<Pty>,
-    client: Option<Conn>,
+    client: Option<Attached>,
     /// A connection that has been accepted but has not said `Hello` yet, and so
     /// has not taken the session over. Usually a liveness probe from `list`.
     pending: Option<Conn>,
@@ -257,18 +285,11 @@ struct Daemon {
     logind_linger: Linger,
     /// Post-gap repaint policy, restated by each client's `Hello`.
     repaint_ctrl_l: bool,
-    /// Set once the attached client's `Hello` has been answered.
-    greeted: bool,
-    /// Whether this client has already been told the child exited. Per connection:
-    /// a client that reattaches after the fact must hear it again.
-    exit_sent: bool,
     /// Authoritative input offset: everything below this has been accepted for the
     /// PTY and must never be applied twice.
     in_applied: u64,
     /// Input accepted but not yet written, because the PTY was not writable.
     pending_input: VecDeque<u8>,
-    /// Output offset already queued to the current client.
-    sent_through: u64,
     win: WinSize,
     /// When the PTY master reported end of file, i.e. when the child let go of the
     /// terminal. Distinct from `exited`: the status is not readable yet at that
@@ -340,11 +361,8 @@ pub(crate) fn run(session_id: &str, capacity: usize, label: Option<&str>) -> io:
         child_dir,
         logind_linger: linger::detect(),
         repaint_ctrl_l: false,
-        greeted: false,
-        exit_sent: false,
         in_applied: 0,
         pending_input: VecDeque::new(),
-        sent_through: 0,
         win: WinSize::default(),
         child_gone: None,
         exited: None,
@@ -649,7 +667,9 @@ impl Daemon {
             // until something else happened to wake it, holding output it could
             // send. `OutputAck` papers over it in practice and is advisory (§ 3),
             // so it cannot be what the loop relies on.
-            if client.wants_write() || (self.greeted && self.sent_through < self.ring.end()) {
+            if client.conn.wants_write()
+                || (client.greeted && client.sent_through < self.ring.end())
+            {
                 flags |= PollFlags::OUT;
             }
             // Registered even when the mask is empty, which is the only way to hear
@@ -659,14 +679,17 @@ impl Daemon {
             // pass — and until then the daemon would otherwise sit on a dead peer's
             // socket with the idle deadline unarmed and the agent's callers still
             // waiting (§ 6.7).
-            watches.push((Source::Client, client.stream().as_fd(), flags));
+            watches.push((Source::Client, client.conn.stream().as_fd(), flags));
         }
         if let Some(pending) = self.pending.as_ref() {
             watches.push((Source::Pending, pending.stream().as_fd(), PollFlags::IN));
         }
 
         if let Some(agent) = self.agent.as_ref() {
-            let saturated = self.client.as_ref().is_some_and(Conn::is_write_saturated);
+            let saturated = self
+                .client
+                .as_ref()
+                .is_some_and(|client| client.conn.is_write_saturated());
             watches.push((Source::AgentListener, agent.listener(), PollFlags::IN));
             for (id, fd, wants_write) in agent.watches() {
                 // A saturated client is the one back pressure signal available:
@@ -749,7 +772,10 @@ impl Daemon {
         // queue just above is itself the event that lets them through.
         let client_ready = client_events.intersects(readable)
             || (!self.input_is_saturated()
-                && self.client.as_ref().is_some_and(Conn::has_buffered_input));
+                && self
+                    .client
+                    .as_ref()
+                    .is_some_and(|client| client.conn.has_buffered_input()));
         // Before the greeting, always: one poll can report both a readable client
         // and a `Hello` from its replacement, and handling the takeover first would
         // drop the outgoing `Conn` with input still unread in its socket buffer.
@@ -792,7 +818,10 @@ impl Daemon {
 
         self.pump_output();
         if client_events.contains(PollFlags::OUT)
-            || self.client.as_ref().is_some_and(Conn::wants_write)
+            || self
+                .client
+                .as_ref()
+                .is_some_and(|client| client.conn.wants_write())
         {
             self.write_client();
         }
@@ -900,9 +929,7 @@ impl Daemon {
             drop(self.read_client(scratch));
         }
         self.evict_client();
-        self.client = self.pending.take();
-        self.greeted = false;
-        self.exit_sent = false;
+        self.client = self.pending.take().map(Attached::new);
         self.detached_since = None;
         self.on_hello(&hello)?;
         // Clients pipeline: input riding behind the `Hello` in the same read is
@@ -924,7 +951,7 @@ impl Daemon {
     /// has not yet noticed is dead (`IMPLEMENTATION.md` § 6.4).
     fn evict_client(&mut self) {
         if let Some(mut old) = self.client.take() {
-            old.send_last(&Frame::Error {
+            old.conn.send_last(&Frame::Error {
                 code: ErrorCode::Takeover,
                 message: "another client attached",
             });
@@ -952,27 +979,19 @@ impl Daemon {
         let Some(pty) = self.pty.as_ref() else {
             return Ok(());
         };
-        while !self.pending_input.is_empty() {
-            let (front, _) = self.pending_input.as_slices();
-            if front.is_empty() {
-                self.pending_input.make_contiguous();
-                continue;
+        match crate::nbio::drain_to(&mut self.pending_input, pty.master()) {
+            Ok(()) => Ok(()),
+            // The child is gone; report it rather than failing the daemon, so the
+            // attached client still receives `Exit`. The queue goes with it —
+            // there is no longer anything on the other side of the master to
+            // apply it to.
+            Err(rustix::io::Errno::IO) => {
+                self.pending_input.clear();
+                self.on_child_exit();
+                Ok(())
             }
-            match rustix::io::write(pty.master(), front) {
-                Ok(0) | Err(rustix::io::Errno::AGAIN) => break,
-                Ok(n) => drop(self.pending_input.drain(..n)),
-                Err(rustix::io::Errno::INTR) => {}
-                // The child is gone; report it rather than failing the daemon, so
-                // the attached client still receives `Exit`.
-                Err(rustix::io::Errno::IO) => {
-                    self.pending_input.clear();
-                    self.on_child_exit();
-                    break;
-                }
-                Err(err) => return Err(err.into()),
-            }
+            Err(err) => Err(err.into()),
         }
-        Ok(())
     }
 
     /// Records that the child has let go of the terminal, and starts the linger
@@ -1025,7 +1044,7 @@ impl Daemon {
         let Some(client) = self.client.as_mut() else {
             return Ok(());
         };
-        if client.fill().is_err() {
+        if client.conn.fill().is_err() {
             // A connection failing is the normal case, not a daemon failure. A
             // client that closes with output still queued makes the kernel send
             // RST, and reading that yields ECONNRESET — propagating it would kill
@@ -1048,7 +1067,7 @@ impl Daemon {
             let Some(client) = self.client.as_mut() else {
                 return Ok(());
             };
-            let ty = match client.take_frame(scratch) {
+            let ty = match client.conn.take_frame(scratch) {
                 Ok(Some(ty)) => ty,
                 Ok(None) => break,
                 Err(_) => {
@@ -1063,7 +1082,11 @@ impl Daemon {
             self.handle_frame(&frame)?;
         }
 
-        if self.client.as_ref().is_some_and(Conn::is_eof) {
+        if self
+            .client
+            .as_ref()
+            .is_some_and(|client| client.conn.is_eof())
+        {
             self.drop_client();
         }
         Ok(())
@@ -1082,7 +1105,7 @@ impl Daemon {
             Frame::OutputAck { .. } => {}
             Frame::Ping { nonce } => {
                 if let Some(client) = self.client.as_mut() {
-                    client.send_control(&Frame::Pong { nonce });
+                    client.conn.send_control(&Frame::Pong { nonce });
                 }
             }
             Frame::Detach => self.drop_client(),
@@ -1152,17 +1175,18 @@ impl Daemon {
             // to catch up.
             hello.out_offset.clamp(base, self.ring.end())
         };
-        self.sent_through = resume_from;
-        self.greeted = true;
-
         let agent = self.agent.is_some();
         let linger = self.logind_linger;
+        let in_applied = self.in_applied;
+        let win = self.win;
         if let Some(client) = self.client.as_mut() {
-            client.send_control(&Frame::HelloOk(HelloOk {
+            client.sent_through = resume_from;
+            client.greeted = true;
+            client.conn.send_control(&Frame::HelloOk(HelloOk {
                 protocol: PROTOCOL_VERSION,
                 resume_from,
-                in_applied: self.in_applied,
-                win: self.win,
+                in_applied,
+                win,
                 gap,
                 linger,
                 agent,
@@ -1209,31 +1233,34 @@ impl Daemon {
             self.pending_input.extend(data.get(skip..).unwrap_or(&[]));
             self.in_applied = end;
         }
+        let applied_through = self.in_applied;
         if let Some(client) = self.client.as_mut() {
-            client.send_control(&Frame::InputAck {
-                applied_through: self.in_applied,
-            });
+            client
+                .conn
+                .send_control(&Frame::InputAck { applied_through });
         }
     }
 
     fn pump_output(&mut self) {
-        if !self.greeted {
-            return;
-        }
+        let base = self.ring.base();
+        let end = self.ring.end();
+        let exited = self.exited;
         let mut gapped = false;
         {
             let Some(client) = self.client.as_mut() else {
                 return;
             };
-            if !client.is_write_saturated() && self.sent_through < self.ring.end() {
-                let base = self.ring.base();
-                if self.sent_through < base {
+            if !client.greeted {
+                return;
+            }
+            if !client.conn.is_write_saturated() && client.sent_through < end {
+                if client.sent_through < base {
                     // Overflowed while this client was slow or away: the stream is
                     // discontinuous and the client must reset its emulator.
-                    client.send_control(&Frame::Gap {
+                    client.conn.send_control(&Frame::Gap {
                         new_base_offset: base,
                     });
-                    self.sent_through = base;
+                    client.sent_through = base;
                     gapped = true;
                 }
 
@@ -1242,13 +1269,13 @@ impl Daemon {
                 // whole. Stopping on short progress keeps that true; without it a
                 // saturated queue would label the second half with an offset that
                 // is too low, which is a corrupted stream rather than a slow one.
-                for part in self.ring.slices_from(self.sent_through) {
+                for part in self.ring.slices_from(client.sent_through) {
                     if part.is_empty() {
                         continue;
                     }
-                    let want = self.sent_through + part.len() as u64;
-                    self.sent_through = client.send_output(self.sent_through, part);
-                    if self.sent_through != want {
+                    let want = client.sent_through + part.len() as u64;
+                    client.sent_through = client.conn.send_output(client.sent_through, part);
+                    if client.sent_through != want {
                         break;
                     }
                 }
@@ -1258,12 +1285,12 @@ impl Daemon {
             // whole point of the linger window (§ 6.5) is that a client arriving
             // into the race still collects the final output *and* the status, in
             // that order.
-            if !self.exit_sent
-                && self.sent_through >= self.ring.end()
-                && let Some((status, kind)) = self.exited
+            if !client.exit_sent
+                && client.sent_through >= end
+                && let Some((status, kind)) = exited
             {
-                client.send_control(&Frame::Exit { status, kind });
-                self.exit_sent = true;
+                client.conn.send_control(&Frame::Exit { status, kind });
+                client.exit_sent = true;
             }
         }
         // Outside the borrow above, because the repaint may write to the PTY queue
@@ -1279,14 +1306,14 @@ impl Daemon {
     fn accept_agent(&mut self) {
         // Serving means a client is attached *and* past its `Hello`: a frame sent
         // before `HelloOk` would arrive ahead of the handshake it answers.
-        let serving = self.greeted && self.client.is_some();
+        let serving = self.client.as_ref().is_some_and(|client| client.greeted);
         let Some(agent) = self.agent.as_mut() else {
             return;
         };
         if let Some(chan) = agent.accept(serving)
             && let Some(client) = self.client.as_mut()
         {
-            client.send_control(&Frame::AgentOpen { chan });
+            client.conn.send_control(&Frame::AgentOpen { chan });
         }
     }
 
@@ -1319,7 +1346,7 @@ impl Daemon {
             agent::Read::Data(n) => {
                 let data = buf.get(..n).unwrap_or(&[]);
                 if let Some(client) = self.client.as_mut() {
-                    client.send_agent_data(chan, data);
+                    client.conn.send_agent_data(chan, data);
                 }
             }
             agent::Read::Closed => self.close_agent_channel(chan),
@@ -1335,7 +1362,7 @@ impl Daemon {
     fn close_agent_channel(&mut self, chan: u32) {
         let was_open = self.agent.as_mut().is_some_and(|agent| agent.forget(chan));
         if was_open && let Some(client) = self.client.as_mut() {
-            client.send_control(&Frame::AgentClose { chan });
+            client.conn.send_control(&Frame::AgentClose { chan });
         }
     }
 
@@ -1350,7 +1377,7 @@ impl Daemon {
         let Some(client) = self.client.as_mut() else {
             return;
         };
-        if client.flush_some().is_err() || client.is_write_hopeless() {
+        if client.conn.flush_some().is_err() || client.conn.is_write_hopeless() {
             self.drop_client();
         }
     }
@@ -1358,36 +1385,38 @@ impl Daemon {
     /// Sends a final `Error` and closes the connection.
     fn reject(&mut self, code: ErrorCode, message: &'static str) {
         if let Some(mut client) = self.client.take() {
-            client.send_last(&Frame::Error { code, message });
+            client.conn.send_last(&Frame::Error { code, message });
         }
         self.on_detached();
     }
 
     fn drop_client(&mut self) {
         if let Some(mut client) = self.client.take() {
-            drop(client.flush_final());
+            drop(client.conn.flush_final());
         }
         self.on_detached();
     }
 
+    /// Stamps the session clientless. Everything that belonged to the departing
+    /// connection went with it when the `Attached` was dropped.
+    ///
+    /// `linger_until` is deliberately left alone. It was armed by `on_child_exit`
+    /// for the five seconds § 6.5 promises, and collapsing it here — on the
+    /// reasoning that there is nobody left to tell — would keep that promise only
+    /// in the ordering where the client leaves *before* the child. A client that
+    /// watched the child exit and then closed would take the window with it, and
+    /// the reconnect the window exists for would find the socket already unlinked.
+    /// The whole point is the client that has not arrived yet.
     fn on_detached(&mut self) {
-        self.greeted = false;
-        self.exit_sent = false;
         self.detached_since = Some(Instant::now());
         // Nothing can answer a signature request with the client gone, so the
         // waiting process should fail now rather than at reattach (§ 6.7).
         self.forget_agent_channels();
-        // A session whose child already exited has nothing left to serve. Keyed on
-        // the terminal being let go rather than on the status having arrived: with
-        // nobody left to tell, waiting out the reap grace buys nothing.
-        if self.child_gone.is_some() {
-            self.linger_until = Some(Instant::now());
-        }
     }
 
     fn shutdown(&mut self) {
         if let Some(mut client) = self.client.take() {
-            drop(client.flush_final());
+            drop(client.conn.flush_final());
         }
         self.pending = None;
         if let Some(mut pty) = self.pty.take() {

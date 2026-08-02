@@ -17,10 +17,10 @@ use rustix::fs::{FlockOperation, Mode, OFlags};
 
 /// Permissions for the run directory: owner-only, since it holds the sockets that
 /// grant access to live sessions.
-pub(crate) const DIR_MODE: u32 = 0o700;
+const DIR_MODE: u32 = 0o700;
 
 /// Permissions for every socket inside it.
-pub(crate) const SOCKET_MODE: u32 = 0o600;
+const SOCKET_MODE: u32 = 0o600;
 
 /// Permissions for the three plain files: the pidfile, the label and the spawn
 /// lock.
@@ -70,7 +70,7 @@ pub(crate) fn bind_socket_private(path: &Path) -> io::Result<UnixListener> {
 }
 
 /// Longest label written to `<id>.label`, in bytes, per the frozen layout.
-pub(crate) const MAX_LABEL_LEN: usize = 256;
+const MAX_LABEL_LEN: usize = 256;
 
 /// Resolves the run directory, preferring `XDG_RUNTIME_DIR`.
 ///
@@ -365,7 +365,7 @@ impl SessionPaths {
 
     /// `flock` target serialising daemon spawn.
     #[must_use]
-    pub(crate) fn lock(&self) -> PathBuf {
+    fn lock(&self) -> PathBuf {
         self.with_extension("lock")
     }
 

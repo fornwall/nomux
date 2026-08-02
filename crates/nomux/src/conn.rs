@@ -49,8 +49,25 @@ const _: () = assert!(
     "MAX_PENDING_READ must have room for a whole frame, or take_frame never completes one"
 );
 
-/// Compact the receive buffer once this many consumed bytes have accumulated.
+/// Compact a buffer once this many consumed bytes have accumulated.
 const COMPACT_THRESHOLD: usize = 64 * 1024;
+
+/// Reclaims the consumed prefix of a cursor-and-`Vec` buffer.
+///
+/// Both directions carry one, and both would otherwise grow without bound across
+/// a long session: neither cursor ever moves backwards, so the bytes below it are
+/// dead the moment they are passed. Draining on every pass would memmove the
+/// remainder for each frame, hence the threshold — and the empty case is worth
+/// separating because clearing is free where draining is not.
+fn compact(buf: &mut Vec<u8>, pos: &mut usize) {
+    if *pos == buf.len() {
+        buf.clear();
+        *pos = 0;
+    } else if *pos >= COMPACT_THRESHOLD {
+        buf.drain(..*pos);
+        *pos = 0;
+    }
+}
 
 /// Longest to spend delivering a connection's last frames before abandoning them.
 const FINAL_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
@@ -223,13 +240,7 @@ impl Conn {
                 Err(err) => return Err(err),
             }
         }
-        if self.tx_pos == self.tx.len() {
-            self.tx.clear();
-            self.tx_pos = 0;
-        } else if self.tx_pos >= COMPACT_THRESHOLD {
-            self.tx.drain(..self.tx_pos);
-            self.tx_pos = 0;
-        }
+        compact(&mut self.tx, &mut self.tx_pos);
         Ok(())
     }
 
@@ -314,13 +325,7 @@ impl Conn {
         scratch.extend_from_slice(payload);
         self.rx_pos += HEADER_LEN + len;
 
-        if self.rx_pos == self.rx.len() {
-            self.rx.clear();
-            self.rx_pos = 0;
-        } else if self.rx_pos >= COMPACT_THRESHOLD {
-            self.rx.drain(..self.rx_pos);
-            self.rx_pos = 0;
-        }
+        compact(&mut self.rx, &mut self.rx_pos);
         Ok(Some(ty))
     }
 }

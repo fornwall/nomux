@@ -202,10 +202,17 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
         if want_stdin {
             fds.push(rustix::event::PollFd::new(&stdin_fd, PollFlags::IN));
         }
-        let socket_flags = read_write_flags(
-            socket_open && to_stdout.wants_source(),
-            to_socket.wants_dest(),
-        );
+        // Built up the way `daemon::watches` builds the same mask, rather than
+        // through a helper enumerating four combinations of two booleans: one
+        // spelling for one idea, and the conditions stay next to the flag each one
+        // asks for.
+        let mut socket_flags = PollFlags::empty();
+        if socket_open && to_stdout.wants_source() {
+            socket_flags |= PollFlags::IN;
+        }
+        if to_socket.wants_dest() {
+            socket_flags |= PollFlags::OUT;
+        }
         if !socket_flags.is_empty() {
             fds.push(rustix::event::PollFd::new(&sock_fd, socket_flags));
         }
@@ -266,15 +273,6 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
 
     to_stdout.drain_to(stdout_fd)?;
     stdout.lock().flush()
-}
-
-const fn read_write_flags(want_read: bool, want_write: bool) -> PollFlags {
-    match (want_read, want_write) {
-        (true, true) => PollFlags::IN.union(PollFlags::OUT),
-        (true, false) => PollFlags::IN,
-        (false, true) => PollFlags::OUT,
-        (false, false) => PollFlags::empty(),
-    }
 }
 
 /// Reads once into `buf`. `false` means the source reached EOF.

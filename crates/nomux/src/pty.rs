@@ -163,6 +163,13 @@ impl Pty {
     /// This is the gap-recovery repaint of `IMPLEMENTATION.md` § 4.3, modelled on
     /// `dtach -r winch`. Most full-screen programs redraw; a bare shell does not.
     ///
+    /// A terminal one column wide gets the second resize alone, since there is no
+    /// narrower size to go to and a zero-column terminal is not a thing to hand a
+    /// child. That leaves the repaint weaker than it is everywhere else — one
+    /// `SIGWINCH` where the size did not change, which a program is entitled to
+    /// ignore — and is left as is: the client picks `ctrl_l` where this shape of
+    /// repaint does not suit it (§ 4.3), and nobody drives a one-column terminal.
+    ///
     /// # Errors
     ///
     /// Propagates `TIOCSWINSZ` failures.
@@ -186,44 +193,127 @@ impl Pty {
         self.child.try_wait()
     }
 
-    /// Terminates the child's process group, then the child itself.
+    /// Terminates everything the session started, then the child itself.
     ///
-    /// The group matters: signalling only the child leaves backgrounded
-    /// grandchildren running, which is exactly the orphan case reaping exists to
-    /// prevent. The child is its own group leader — `setsid` in `pre_exec` made it
-    /// one — so its pgid is its pid.
+    /// Two reaches, because neither alone covers the session. The process *group*
+    /// is the cheap one and gets the ordinary case in a single syscall: the child
+    /// is its own group leader — `setsid` in `pre_exec` made it one — so its pgid
+    /// is its pid, and a shell without job control keeps everything it runs in
+    /// that one group.
     ///
-    /// `kill_process_group` takes that **positive** pid and negates it itself.
+    /// A shell *with* job control does not. It puts each `&` job in a process
+    /// group of its own, which is the whole point of job control, and
+    /// `kill_process_group(child)` then reaches none of them — nor does the
+    /// `SIGHUP` the kernel sends when the master closes, since that goes to the
+    /// foreground group and a background job is by definition not it. So the
+    /// orphan case this exists to prevent survived the group kill exactly, and only
+    /// for the shells anybody actually uses interactively.
+    ///
+    /// What every one of those jobs *does* share is the session, because nothing a
+    /// shell does to a job calls `setsid`. `kill(2)` cannot address a session, so
+    /// [`session_members`] walks `/proc` for it. That walk is the reason the two
+    /// reaches are ordered rather than merged: it costs a directory scan and a read
+    /// per process, so it runs after the group probe says the common case is
+    /// already over, and on most shutdowns happens once.
+    ///
+    /// `kill_process_group` takes a **positive** pid and negates it itself.
     /// Handing it a pre-negated one double-negates back to `kill(pid)`, which
     /// signals the child alone and quietly reintroduces the orphan case; in a debug
     /// build it does not even get that far, because `Pid::from_raw` asserts its
     /// argument is non-negative.
     pub(crate) fn terminate(&mut self) {
-        let pid = i32::try_from(self.child.id())
-            .ok()
-            .and_then(rustix::process::Pid::from_raw);
-        if let Some(pid) = pid {
+        let raw = i32::try_from(self.child.id()).unwrap_or(0);
+        if let Some(pid) = rustix::process::Pid::from_raw(raw) {
             let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::HUP);
+            signal_session(raw, rustix::process::Signal::HUP);
             // Real grace, not a formality: checking microseconds after the signal
             // finds everything still running, so `SIGKILL` would follow at once and
             // no shell would ever run its exit trap or flush its history.
             //
-            // The wait is on the *group* emptying, via a signal-0 probe, not on the
-            // direct child. By the time this runs the child has usually been reaped
-            // already, and waiting on it would return immediately while the
-            // backgrounded grandchildren this exists to collect are still there.
+            // The wait is on the session emptying, not on the direct child. By the
+            // time this runs the child has usually been reaped already, and waiting
+            // on it would return immediately while the backgrounded grandchildren
+            // this exists to collect are still there.
             let deadline = std::time::Instant::now() + TERM_GRACE;
             while std::time::Instant::now() < deadline {
-                if rustix::process::test_kill_process_group(pid).is_err() {
+                if rustix::process::test_kill_process_group(pid).is_err()
+                    && session_members(raw).is_empty()
+                {
                     break;
                 }
                 std::thread::sleep(TERM_POLL_INTERVAL);
             }
             let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+            signal_session(raw, rustix::process::Signal::KILL);
         }
         drop(self.child.kill());
         drop(self.child.wait());
     }
+}
+
+/// Signals every live process still in session `sid`.
+///
+/// Individually, because a session is not something `kill(2)` addresses — the
+/// negative-pid form means a process *group*, and the point here is precisely the
+/// groups job control created that nobody is tracking.
+fn signal_session(sid: i32, signal: rustix::process::Signal) {
+    for member in session_members(sid) {
+        if let Some(pid) = rustix::process::Pid::from_raw(member) {
+            let _ = rustix::process::kill_process(pid, signal);
+        }
+    }
+}
+
+/// Pids of the live processes in session `sid`, from `/proc`.
+///
+/// Signalling by a number read out of `/proc` is the sort of thing that goes very
+/// wrong when it goes wrong, so this is deliberately narrow: `sid` comes from a
+/// child this process forked, and no pid is returned unless its own `stat` line
+/// claims that session. The daemon called `setsid` before spawning anything
+/// (`IMPLEMENTATION.md` § 6.2), so it is in a different session and cannot match —
+/// but it is excluded by pid regardless, because "the reaper signalled itself" is
+/// not a bug worth leaving to a syllogism.
+///
+/// Zombies are left out. One is a process that has already exited and is waiting
+/// to be collected; signalling it does nothing, and counting it would keep the
+/// caller's grace loop spinning for its whole budget over the child it is itself
+/// about to reap.
+///
+/// A pid that vanishes mid-walk is simply not in the result — the read fails and
+/// the entry is skipped — which is the correct answer to "who is still running",
+/// arrived at by the ordinary race rather than in spite of it.
+fn session_members(sid: i32) -> Vec<i32> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let self_pid = i32::try_from(std::process::id()).unwrap_or(0);
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+        .filter(|pid| *pid != self_pid)
+        .filter(|pid| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| stat_session(&stat))
+                .is_some_and(|(session, zombie)| session == sid && !zombie)
+        })
+        .collect()
+}
+
+/// The session id and whether the process is a zombie, from one `/proc/<pid>/stat`.
+///
+/// Parsed from the last `)` rather than by splitting on whitespace from the left,
+/// because field two is the executable's name in parentheses and the kernel does
+/// not escape it: a process called `foo bar) 1 2 3` is a name somebody can choose,
+/// and splitting from the left hands back whatever they put there. Everything after
+/// the final `)` is fixed-width and space-separated, so it is safe to count through
+/// — state, ppid, pgrp, then the session.
+fn stat_session(stat: &str) -> Option<(i32, bool)> {
+    let (_, rest) = stat.rsplit_once(')')?;
+    let mut fields = rest.split_whitespace();
+    let state = fields.next()?;
+    let session = fields.nth(2)?.parse().ok()?;
+    Some((session, state == "Z"))
 }
 
 const fn to_winsize(win: WinSize) -> Winsize {
@@ -321,20 +411,147 @@ pub(crate) enum Read {
 ///
 /// Propagates read failures other than `EIO`, `EAGAIN` and `EINTR`.
 pub(crate) fn read_pty(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<Read> {
-    loop {
-        return match rustix::io::read(fd, &mut *buf) {
-            Ok(0) | Err(rustix::io::Errno::IO) => Ok(Read::Eof),
-            Ok(n) => Ok(Read::Data(n)),
-            Err(rustix::io::Errno::AGAIN) => Ok(Read::WouldBlock),
-            Err(rustix::io::Errno::INTR) => continue,
-            Err(err) => Err(err.into()),
-        };
+    match crate::nbio::read(fd, buf) {
+        Ok(0) | Err(rustix::io::Errno::IO) => Ok(Read::Eof),
+        Ok(n) => Ok(Read::Data(n)),
+        Err(rustix::io::Errno::AGAIN) => Ok(Read::WouldBlock),
+        Err(err) => Err(err.into()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `comm` field is whatever the process called its executable, parentheses
+    /// and spaces included, and the fields that matter here sit after it.
+    #[test]
+    fn a_stat_line_parses_past_a_hostile_process_name() {
+        let ordinary = "42 (bash) S 1 42 42 34816 99 4194304 0 0";
+        assert_eq!(stat_session(ordinary), Some((42, false)));
+
+        // A name chosen to break a left-to-right split: it contains spaces, a
+        // closing paren, and digits that would be read as the session id.
+        let hostile = "42 (evil) 1 2 3) S 1 42 7 34816 99 4194304 0 0";
+        assert_eq!(
+            stat_session(hostile),
+            Some((7, false)),
+            "the session must come from after the *last* paren"
+        );
+
+        let zombie = "42 (sh) Z 1 42 42 0 -1 4194304 0 0";
+        assert_eq!(stat_session(zombie), Some((42, true)));
+
+        assert_eq!(stat_session("truncated"), None);
+        assert_eq!(
+            stat_session("42 (sh) S 1"),
+            None,
+            "too few fields to answer"
+        );
+    }
+
+    /// The daemon must never appear in the set it is about to signal, whatever
+    /// `/proc` says.
+    #[test]
+    fn the_walk_never_returns_this_process() {
+        let Ok(sid) = rustix::process::getsid(None) else {
+            return;
+        };
+        let sid = rustix::process::Pid::as_raw(Some(sid));
+        let members = session_members(sid);
+        let self_pid = i32::try_from(std::process::id()).unwrap_or(0);
+        assert!(
+            !members.contains(&self_pid),
+            "the reaper found itself among the reaped: {members:?}"
+        );
+    }
+
+    /// The case the process-group kill cannot reach, and the reason for the
+    /// `/proc` walk: a shell with job control gives each `&` job a process group
+    /// of its own, so the only thing still holding them together is the session.
+    ///
+    /// `set -m` is what makes this test test something. Without it the job stays
+    /// in the shell's own group, the group kill reaches it, and the test passes
+    /// against the very bug it describes. The `trap` closes the other way out —
+    /// `SIGHUP` alone must not be what collects it, or the walk is again not the
+    /// thing being exercised.
+    #[test]
+    fn terminate_collects_a_backgrounded_job_in_its_own_process_group() {
+        let config = Spawn {
+            term: "dumb",
+            win: WinSize {
+                cols: 80,
+                rows: 24,
+                xpixel: 0,
+                ypixel: 0,
+            },
+            session_id: "terminate_test",
+            cwd: Path::new("/tmp"),
+            agent_sock: None,
+        };
+        let mut pty = Pty::spawn(&config).expect("spawn a shell on a pty");
+
+        let script = "set -m\n(trap '' HUP; sleep 30) &\necho NOMUX-JOB=$!\n";
+        rustix::io::write(pty.master(), script.as_bytes()).expect("write the script");
+        let job = read_marker(&pty, "NOMUX-JOB=").expect("the shell reported its job pid");
+        assert!(
+            !collected(job),
+            "the job should be running before terminate"
+        );
+
+        pty.terminate();
+
+        // `terminate` returns only once it has signalled, but the kernel's own
+        // teardown and the reparenting reap are asynchronous, so the assertion is
+        // on the job going away rather than on it having gone already.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && !collected(job) {
+            std::thread::sleep(TERM_POLL_INTERVAL);
+        }
+        assert!(
+            collected(job),
+            "a backgrounded job in its own process group outlived the session"
+        );
+    }
+
+    /// Whether `pid` is gone, counting a zombie as gone: it has exited and is
+    /// waiting on a parent that this test does not control.
+    fn collected(pid: i32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| stat_session(&stat))
+            .is_none_or(|(_, zombie)| zombie)
+    }
+
+    /// Reads the PTY until `marker` is followed by a complete number.
+    ///
+    /// The terminal echoes input, so the literal `NOMUX-JOB=$!` of the command
+    /// arrives before the shell's answer does. Requiring digits *and* something
+    /// after them is what tells the echo from the reply, and what keeps a number
+    /// split across two reads from being taken half-finished.
+    fn read_marker(pty: &Pty, marker: &str) -> Option<i32> {
+        let mut seen = String::new();
+        let mut buf = [0u8; 4096];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            match read_pty(pty.master(), &mut buf) {
+                Ok(Read::Data(n)) => seen.push_str(&String::from_utf8_lossy(&buf[..n])),
+                Ok(Read::WouldBlock) => std::thread::sleep(TERM_POLL_INTERVAL),
+                Ok(Read::Eof) | Err(_) => break,
+            }
+            for (at, _) in seen.match_indices(marker) {
+                let tail = &seen[at + marker.len()..];
+                let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
+                if !digits.is_empty()
+                    && digits.len() < tail.len()
+                    && let Ok(pid) = digits.parse()
+                {
+                    return Some(pid);
+                }
+            }
+        }
+        None
+    }
 
     /// A shell that starts in `/` because `$HOME` was wrong is a visible
     /// regression, so every fallback step is pinned.

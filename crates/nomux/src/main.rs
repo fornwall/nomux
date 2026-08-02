@@ -13,6 +13,7 @@ mod conn;
 mod control;
 mod daemon;
 mod linger;
+mod nbio;
 mod passwd;
 mod pty;
 mod ring;

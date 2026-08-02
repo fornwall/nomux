@@ -16,8 +16,13 @@ use crate::rundir::{SessionPaths, SpawnLock, check_run_dir, run_dir, sanitize_la
 /// How long a terminated daemon has to exit before it is killed outright.
 const TERM_GRACE: Duration = Duration::from_secs(2);
 
-/// Interval between liveness checks while waiting out `TERM_GRACE`.
-const REAP_POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// How often to look again while waiting any of the three graces out.
+///
+/// One interval for all of them, rather than three tuned separately: each is a
+/// wait on another process reaching a point of its own — exiting, dropping the
+/// spawn lock, publishing a pidfile — and none of the three has a reason to be
+/// noticed sooner than the others.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// How long `kill` waits for the spawn lock before giving up on the session.
 ///
@@ -148,7 +153,7 @@ pub(crate) fn kill(session_id: &str) -> io::Result<()> {
             paths.unlink_all_locked(&lock);
             return Ok(());
         }
-        thread::sleep(REAP_POLL_INTERVAL);
+        thread::sleep(POLL_INTERVAL);
     }
 
     let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
@@ -192,7 +197,7 @@ fn hold_spawn_lock(paths: &SessionPaths) -> io::Result<SpawnLock> {
                 ),
             ));
         }
-        thread::sleep(REAP_POLL_INTERVAL);
+        thread::sleep(POLL_INTERVAL);
     }
 }
 
@@ -234,11 +239,7 @@ fn resolve(paths: &SessionPaths) -> io::Result<Target> {
         }
         match fs::read_to_string(paths.pid()) {
             Ok(body) => {
-                return body
-                    .trim()
-                    .parse::<i32>()
-                    .ok()
-                    .filter(|pid| *pid > 0)
+                return parse_pid(&body)
                     .and_then(rustix::process::Pid::from_raw)
                     .map(Target::Daemon)
                     .ok_or_else(|| unreadable(paths, &format!("it holds {body:?}")));
@@ -247,7 +248,7 @@ fn resolve(paths: &SessionPaths) -> io::Result<Target> {
                 if Instant::now() >= deadline {
                     return Err(unreadable(paths, "it never appeared"));
                 }
-                thread::sleep(REAP_POLL_INTERVAL);
+                thread::sleep(POLL_INTERVAL);
             }
             Err(err) => return Err(unreadable(paths, &err.to_string())),
         }
@@ -325,11 +326,21 @@ fn liveness(paths: &SessionPaths) -> Liveness {
     }
 }
 
+/// Reads what a session published as its pid, or nothing if it cannot be had.
+///
+/// `list` uses this, where any failure prints the same `?`. [`resolve`] keeps the
+/// body instead, because a live session whose pid will not parse is the one case
+/// that must be reported rather than shrugged off.
 fn read_pid(paths: &SessionPaths) -> Option<i32> {
-    fs::read_to_string(paths.pid())
-        .ok()?
-        .trim()
-        .parse::<i32>()
-        .ok()
-        .filter(|pid| *pid > 0)
+    parse_pid(&fs::read_to_string(paths.pid()).ok()?)
+}
+
+/// The pidfile's on-disk contract (§ 6.6), in the one place both readers share.
+///
+/// Zero and negatives are refused rather than passed on. `kill(2)` reads those as
+/// a whole process group and as every process the caller may signal, so a pidfile
+/// holding one is a number that must never reach a signal — and a daemon whose
+/// pidfile says `0` is not a daemon this can identify.
+fn parse_pid(body: &str) -> Option<i32> {
+    body.trim().parse::<i32>().ok().filter(|pid| *pid > 0)
 }

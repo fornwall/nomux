@@ -6,12 +6,18 @@
 //! the user's to run. So the daemon detects the state, reports it in `HelloOk`, and
 //! does nothing else about it.
 //!
-//! Detection is two `stat` calls rather than the `loginctl show-user -p Linger`
-//! the design sketches, because this runs on the path that starts a session:
-//! `loginctl` is a D-Bus round trip that can block for its full 25-second timeout
-//! on a busy or broken bus, which would outlast the client's spawn deadline and
-//! turn "linger is off" into "the session would not start". The files below are
-//! what `logind` itself reads, so the answer is the same one `loginctl` prints.
+//! Detection reads the filesystem rather than asking `loginctl show-user -p
+//! Linger`, as the design sketches, because this runs on the path that starts a
+//! session: `loginctl` is a D-Bus round trip that can block for its full 25-second
+//! timeout on a busy or broken bus, which would outlast the client's spawn
+//! deadline and turn "linger is off" into "the session would not start". The files
+//! below are what `logind` itself reads, so the answer is the same one `loginctl`
+//! prints.
+//!
+//! Two `stat`s and, in the worst case, one read of `/etc/passwd` — the fallback
+//! `username` takes when the environment carries no name. All three are local
+//! files that cannot block on anything but the disk, which is the property that
+//! matters here; the count is not.
 
 use std::fs;
 use std::io;
