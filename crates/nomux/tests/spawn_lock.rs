@@ -1,9 +1,11 @@
-//! Garbage collection against the spawn lock.
+//! The frozen control surface against the run directory.
 //!
-//! `<id>.lock` is both the mutex an attach holds across creating a session
-//! (`IMPLEMENTATION.md` § 6.3) and one of the five files `list` and `kill` remove
-//! (§ 6.6). These tests drive the real binary against a run directory whose lock
-//! is held by this process, which is the same position an attaching client is in.
+//! `list` and `kill` reach a session only through the five files on disk
+//! (`IMPLEMENTATION.md` § 6.6), so everything they can get wrong is here: the spawn
+//! lock they must take before removing anything (§ 6.3), the order they remove it
+//! in, what they do with a session that is alive, and the directory those files
+//! live in. These tests drive the real binary, because most of that is only wrong
+//! across process boundaries.
 //!
 //! Run directory names are kept short on purpose: they carry unix sockets, and
 //! `sockaddr_un` truncates the path at 108 bytes.
@@ -19,10 +21,10 @@
 mod harness;
 
 use std::fs::{self, File, OpenOptions};
-use std::os::unix::fs::MetadataExt;
-use std::os::unix::net::UnixListener;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -53,12 +55,35 @@ fn a_held_spawn_lock_survives_a_concurrent_list() {
     );
 
     drop(lock);
-    let listed = session.run(&["list"]);
-    assert!(listed.status.success(), "list failed: {listed:?}");
-    assert!(
-        !session.socket().exists() && !session.lock_path().exists(),
-        "the same entry must be collected once the lock is free"
-    );
+    collected_within(&session, Duration::from_secs(10));
+}
+
+/// Runs `list` until the run directory is empty, or says so loudly.
+///
+/// Asserted over a window rather than on one pass, and not because collection is
+/// unreliable. `fork` duplicates every open descriptor, and a duplicate of an
+/// `flock`ed one keeps that lock alive until it is closed — which for a child of
+/// this binary is its `exec`, a moment later. So any other test in this process
+/// that spawns a command while the descriptor above is open holds this lock for as
+/// long as that takes, and a `list` landing in the gap correctly finds it busy and
+/// correctly leaves the entry alone. That is a property of running several tests in
+/// one process, and what § 6.6 promises is what this asserts: an entry that stays
+/// dead stays collectable.
+fn collected_within(session: &StaleSession, within: Duration) {
+    let deadline = Instant::now() + within;
+    loop {
+        let listed = session.run(&["list"]);
+        assert!(listed.status.success(), "list failed: {listed:?}");
+        let left = entries(&session.dir);
+        if left.is_empty() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the entry was never collected once the lock was free: {left:?}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// `kill` reports failure rather than success when the spawn lock keeps it from
@@ -110,7 +135,8 @@ fn kill_refuses_to_leave_a_locked_session_behind() {
 fn an_attach_re_takes_a_spawn_lock_that_was_collected() {
     let session = StaleSession::empty("lk3");
     let lock = session.hold_lock();
-    let orphan = lock.metadata().expect("stat the held lock").ino();
+    let held = lock.metadata().expect("stat the held lock");
+    let orphan = held.ino();
     // A second descriptor on the same file, carrying no lock of its own: an inode
     // number is reusable the moment its last reference goes, and the attach closes
     // the orphan before reopening the path. ext4 then hands the same number
@@ -122,18 +148,18 @@ fn an_attach_re_takes_a_spawn_lock_that_was_collected() {
     // allocation policy of whichever filesystem the target directory sits on.
     let pinned = File::open(session.lock_path()).expect("pin the orphan inode");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_nomux"))
-        .args(["attach", &session.id])
-        .env("XDG_RUNTIME_DIR", &session.root)
-        .env("SHELL", "/bin/sh")
-        .env("NOMUX_RING_BYTES", "65536")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn attach");
+    let _relay = Reaped::spawn(
+        Command::new(env!("CARGO_BIN_EXE_nomux"))
+            .args(["attach", &session.id])
+            .env("XDG_RUNTIME_DIR", &session.root)
+            .env("SHELL", "/bin/sh")
+            .env("NOMUX_RING_BYTES", "65536")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    );
 
-    wait_until_blocked_on(orphan);
+    wait_until_blocked_on(held.dev(), orphan);
 
     // Exactly what collection used to do to a lock in use.
     fs::remove_file(session.lock_path()).expect("unlink the lock");
@@ -151,10 +177,162 @@ fn an_attach_re_takes_a_spawn_lock_that_was_collected() {
         "the file at the path must be a new one, not the inode that was unlinked"
     );
     drop(pinned);
+}
 
-    drop(child.kill());
-    drop(child.wait());
-    drop(session.run(&["kill", &session.id]));
+/// The lock a `kill` creates is one the *next* process must be able to open, so it
+/// is created at exactly `0600` however lax or strict the caller's umask is.
+///
+/// Left to the umask, a single `umask 0200` login publishes `<id>.lock` at `0400`
+/// — and from then on nothing can open it `O_RDWR`, so no attach can serialise
+/// against another and neither `list` nor `kill` can collect the session. A dead
+/// session becomes uncollectable for good, which is the one outcome § 6.6 exists
+/// to rule out.
+#[test]
+fn an_unopenable_spawn_lock_does_not_take_the_control_surface_with_it() {
+    let session = StaleSession::create("lk4");
+    fs::write(session.lock_path(), b"").expect("plant a lock file");
+    fs::set_permissions(session.lock_path(), fs::Permissions::from_mode(0o400))
+        .expect("make it unopenable");
+
+    let listed = session.run(&["list"]);
+    assert!(listed.status.success(), "list failed: {listed:?}");
+    assert!(
+        !session.socket().exists(),
+        "a dead session must still be collected when its lock cannot be opened: \
+         {:?}",
+        entries(&session.dir)
+    );
+
+    // And the fresh one a later session creates is openable by whoever comes next.
+    let session = StaleSession::create("lk5");
+    let killed = session.run(&["kill", "lk5"]);
+    assert!(
+        killed.status.success(),
+        "kill failed: {:?}",
+        String::from_utf8_lossy(&killed.stderr)
+    );
+}
+
+/// `kill` never unlinks a live session's files, whatever the pidfile says.
+///
+/// The socket has just answered, so there is a daemon holding the user's shell.
+/// Unlinking there — which is what an unreadable pidfile used to mean — takes that
+/// daemon's socket away without stopping it: the session answers nothing, appears
+/// in no listing, and the id is free for a second daemon to bind over. So this is
+/// an error, and the files stay exactly as they were until somebody can say which
+/// process to signal.
+#[test]
+fn kill_leaves_a_live_session_alone_when_its_pidfile_cannot_be_read() {
+    let session = LiveSession::create("lk6");
+    let before = entries(&session.run.dir);
+    fs::set_permissions(session.pid_path(), fs::Permissions::from_mode(0o000))
+        .expect("hide the pidfile");
+
+    let killed = session.run.run(&["kill", "lk6"]);
+    assert!(
+        !killed.status.success(),
+        "kill claimed to have removed a session it left running"
+    );
+    assert!(
+        String::from_utf8_lossy(&killed.stderr).contains("is running"),
+        "the refusal must say the session is still there: {:?}",
+        String::from_utf8_lossy(&killed.stderr)
+    );
+    assert!(session.is_alive(), "the daemon must still be reachable");
+    assert_eq!(
+        entries(&session.run.dir),
+        before,
+        "not one of the five files was kill's to remove"
+    );
+
+    // Repaired, the same command works: the refusal is about the pidfile, not
+    // about the session.
+    fs::set_permissions(session.pid_path(), fs::Permissions::from_mode(0o600))
+        .expect("restore the pidfile");
+    let killed = session.run.run(&["kill", "lk6"]);
+    assert!(
+        killed.status.success(),
+        "kill failed once the pidfile was readable again: {:?}",
+        String::from_utf8_lossy(&killed.stderr)
+    );
+    assert!(
+        entries(&session.run.dir).is_empty(),
+        "kill must unlink all five files"
+    );
+}
+
+/// Every mode that touches the run directory establishes that it is this user's
+/// alone *before* it trusts a name in it — including the two that only read.
+///
+/// The directory here is a symlink into one anybody can write to, with a socket, a
+/// pidfile and a label planted in it. That is the whole attack: `attach` connecting
+/// first and checking afterwards relays the user's keystrokes into a socket
+/// somebody else is listening on, `list` prints their label to the user's terminal,
+/// and `kill` reads their number out of the pidfile and signals it.
+#[test]
+fn the_control_surface_refuses_a_run_directory_that_is_not_ours() {
+    let planted = PlantedRunDir::create("lk7");
+
+    let attached = planted.run(&["attach", "imp"]);
+    assert!(!attached.status.success(), "attach used a planted socket");
+    assert!(
+        String::from_utf8_lossy(&attached.stderr).contains("it is a symlink"),
+        "attach must say what it refused: {:?}",
+        String::from_utf8_lossy(&attached.stderr)
+    );
+    assert!(
+        planted.nothing_connected(),
+        "the relay handed the session over to a socket somebody else planted"
+    );
+
+    for mode in [vec!["list"], vec!["kill", "imp"]] {
+        let out = planted.run(&mode);
+        assert!(
+            !out.status.success(),
+            "{mode:?} used a planted run directory"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("it is a symlink"),
+            "{mode:?} must say what it refused: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "{mode:?} printed a planted entry: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+}
+
+/// Being asked what sessions exist must not be what creates the place they would
+/// live.
+///
+/// `list` checks the run directory rather than ensuring it, so on a host that has
+/// never run a session it stays silent, exits 0 and leaves the filesystem as it
+/// found it. `kill` answers the same way: no run directory is "no such session",
+/// which is the postcondition already holding.
+#[test]
+fn the_control_surface_neither_creates_nor_complains_about_a_missing_run_directory() {
+    let session = StaleSession::empty("lk8");
+    fs::remove_dir(&session.dir).expect("take the run directory away again");
+
+    for mode in [vec!["list"], vec!["kill", "lk8"]] {
+        let out = session.run(&mode);
+        assert!(
+            out.status.success(),
+            "{mode:?} failed on a host with no run directory: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "{mode:?} printed something: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(
+            !session.dir.exists(),
+            "{mode:?} created the run directory it was only asked about"
+        );
+    }
 }
 
 /// A run directory holding one session, with nothing listening on its socket.
@@ -185,7 +363,7 @@ impl StaleSession {
     fn create(id: &str) -> Self {
         let session = Self::empty(id);
         drop(UnixListener::bind(session.socket()).expect("bind a socket to abandon"));
-        fs::write(session.dir.join(format!("{id}.pid")), "999999999\n").expect("write pidfile");
+        fs::write(session.pid_path(), "999999999\n").expect("write pidfile");
         fs::write(session.dir.join(format!("{id}.label")), "stale").expect("write label");
         session
     }
@@ -196,6 +374,10 @@ impl StaleSession {
 
     fn lock_path(&self) -> PathBuf {
         self.dir.join(format!("{}.lock", self.id))
+    }
+
+    fn pid_path(&self) -> PathBuf {
+        self.dir.join(format!("{}.pid", self.id))
     }
 
     /// Takes the spawn lock the way `attach` does, and keeps it until the
@@ -222,28 +404,206 @@ impl StaleSession {
     }
 }
 
+/// A session with a daemon actually running in it.
+///
+/// `attach` with stdin closed is all it takes: the relay connects, the daemon
+/// binds, publishes its pid and then waits for a `Hello` that never comes, which
+/// leaves it alive on its first-attach timeout — long enough to be the subject of a
+/// `kill` that must not destroy it. No PTY is involved, which keeps these tests out
+/// of the business of driving a shell.
+struct LiveSession {
+    run: StaleSession,
+    pid: i32,
+}
+
+impl LiveSession {
+    fn create(id: &str) -> Self {
+        let run = StaleSession::empty(id);
+        let started = Command::new(env!("CARGO_BIN_EXE_nomux"))
+            .args(["attach", id])
+            .env("XDG_RUNTIME_DIR", &run.root)
+            .env("SHELL", "/bin/sh")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run attach");
+        assert!(
+            started.status.success(),
+            "attach failed: {:?}",
+            String::from_utf8_lossy(&started.stderr)
+        );
+        wait_for(&run.pid_path());
+        let pid = fs::read_to_string(run.pid_path())
+            .expect("read the pidfile")
+            .trim()
+            .parse()
+            .expect("the pidfile holds a pid");
+        Self { run, pid }
+    }
+
+    fn pid_path(&self) -> PathBuf {
+        self.run.pid_path()
+    }
+
+    /// Whether a daemon is still answering. The same probe `list` and `kill` make,
+    /// and the same authority: the socket outlives the process that bound it, so
+    /// only a `connect` can tell.
+    fn is_alive(&self) -> bool {
+        UnixStream::connect(self.run.socket()).is_ok()
+    }
+}
+
+impl Drop for LiveSession {
+    fn drop(&mut self) {
+        // Whatever the test decided, this daemon is not the next run's business.
+        if let Some(pid) = rustix::process::Pid::from_raw(self.pid) {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        }
+    }
+}
+
+/// A run directory that is a symlink into one anybody can write to, with a
+/// session's files already planted in it.
+///
+/// The socket is bound by this process and stays bound, so anything that connects
+/// to it reaches the test rather than a refused connection — which is the whole
+/// point: a refusal would look like the same "stale socket" every other test uses.
+struct PlantedRunDir {
+    root: PathBuf,
+    listener: UnixListener,
+}
+
+impl PlantedRunDir {
+    fn create(name: &str) -> Self {
+        let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("run-{name}"));
+        drop(fs::remove_dir_all(&root));
+        let theirs = root.join("theirs");
+        fs::create_dir_all(&theirs).expect("create the planted directory");
+        fs::set_permissions(&theirs, fs::Permissions::from_mode(0o777))
+            .expect("make it world-writable");
+        fs::create_dir_all(root.join("xdg")).expect("create the runtime directory");
+        std::os::unix::fs::symlink(&theirs, root.join("xdg/nomux")).expect("plant the symlink");
+
+        let listener = UnixListener::bind(theirs.join("imp.sock")).expect("plant a socket");
+        listener
+            .set_nonblocking(true)
+            .expect("planted socket must not block the test");
+        fs::write(theirs.join("imp.pid"), "999999999\n").expect("plant a pidfile");
+        fs::write(theirs.join("imp.label"), "planted").expect("plant a label");
+        Self { root, listener }
+    }
+
+    /// Runs one mode against the planted directory, giving up on one that will not
+    /// come back.
+    ///
+    /// A relay that has been handed the planted socket does not exit: it has a peer
+    /// that never closes and nothing to make it stop waiting. The bound is what
+    /// turns the defect this test is about into a failed assertion rather than a
+    /// test run that never ends.
+    fn run(&self, args: &[&str]) -> Output {
+        let mut child = Reaped::spawn(
+            Command::new(env!("CARGO_BIN_EXE_nomux"))
+                .args(args)
+                .env("XDG_RUNTIME_DIR", self.root.join("xdg"))
+                .env("SHELL", "/bin/sh")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while child.is_running() {
+            assert!(
+                Instant::now() < deadline,
+                "`nomux {args:?}` never returned, so it is still relaying to a \
+                 socket somebody else planted"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        child
+            .into_exited()
+            .wait_with_output()
+            .expect("collect nomux output")
+    }
+
+    /// Whether the planted socket was left entirely alone. Asked only after the
+    /// process under test has exited, so a pending connection would already be in
+    /// the listener's backlog.
+    fn nothing_connected(&self) -> bool {
+        matches!(self.listener.accept(), Err(err) if err.kind() == std::io::ErrorKind::WouldBlock)
+    }
+}
+
+/// A child killed when it goes out of scope, however it goes out of scope.
+///
+/// The relay puts its daemon in a session of its own, so an assertion firing before
+/// a hand-written cleanup would leak both past the end of the run — and the daemon
+/// would go on owning a run directory the next run wipes and reuses.
+struct Reaped(Option<Child>);
+
+impl Reaped {
+    fn spawn(command: &mut Command) -> Self {
+        Self(Some(command.spawn().expect("spawn a child")))
+    }
+
+    fn is_running(&mut self) -> bool {
+        self.0
+            .as_mut()
+            .is_some_and(|child| child.try_wait().expect("wait for a child").is_none())
+    }
+
+    /// Hands back a child that has already exited, so its output can be collected.
+    fn into_exited(mut self) -> Child {
+        self.0.take().expect("the child is still held")
+    }
+}
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            drop(child.kill());
+            drop(child.wait());
+        }
+    }
+}
+
 fn inode(path: &Path) -> u64 {
     fs::metadata(path)
         .unwrap_or_else(|err| panic!("stat {}: {err}", path.display()))
         .ino()
 }
 
-/// Waits until some process is blocked on an `flock` for `ino`.
+/// What is left in a run directory, sorted, for assertions about what was removed.
+fn entries(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap_or_else(|err| panic!("read {}: {err}", dir.display()))
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort_unstable();
+    names
+}
+
+/// Waits until some process is blocked on an `flock` for `dev:ino`.
 ///
 /// Without this the test would race the attach it is trying to catch mid-wait,
 /// and would usually collect the lock before anything was waiting on it — which
 /// asserts nothing. `/proc/locks` lists blocked requests alongside granted ones,
 /// marked with `->`, so the wait is on the condition rather than on a guess.
-fn wait_until_blocked_on(ino: u64) {
+fn wait_until_blocked_on(dev: u64, ino: u64) {
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
-        let Ok(locks) = fs::read_to_string("/proc/locks") else {
-            // A kernel without `/proc/locks` leaves the assertions below intact;
-            // they just stop being guaranteed to exercise the window.
-            thread::sleep(Duration::from_millis(250));
-            return;
-        };
-        if locks.lines().any(|line| is_flock_waiter(line, ino)) {
+        // A kernel without `/proc/locks` cannot be waited on, and the assertions
+        // below would then pass without ever having reached the window they are
+        // about. Failing loudly is the point: a guard that quietly stops guarding
+        // is worse than one that is not there.
+        let locks = fs::read_to_string("/proc/locks").unwrap_or_else(|err| {
+            panic!(
+                "/proc/locks is unreadable ({err}), so nothing here can tell that \
+                    the attach ever waited for the spawn lock"
+            )
+        });
+        if locks.lines().any(|line| is_flock_waiter(line, dev, ino)) {
             return;
         }
         thread::sleep(Duration::from_millis(5));
@@ -251,19 +611,37 @@ fn wait_until_blocked_on(ino: u64) {
     panic!("nothing ever blocked on the spawn lock, inode {ino}");
 }
 
-/// Whether one `/proc/locks` line is a request waiting for an `flock` on `ino`:
+/// Whether one `/proc/locks` line is a request waiting for an `flock` on `dev:ino`:
 ///
 /// ```text
 /// 2: -> FLOCK  ADVISORY  WRITE 3390 08:01:7746 0 EOF
 /// ```
 ///
-/// The device is `MAJOR:MINOR` in hex and the inode is decimal, so the field is
-/// recognised by its shape rather than by position.
-fn is_flock_waiter(line: &str, ino: u64) -> bool {
+/// The field is recognised by its shape rather than by position, since the columns
+/// before it vary with the lock type.
+fn is_flock_waiter(line: &str, dev: u64, ino: u64) -> bool {
     line.contains("->")
         && line.contains("FLOCK")
-        && line.split_whitespace().any(|field| {
-            field.matches(':').count() == 2
-                && field.rsplit(':').next().and_then(|n| n.parse().ok()) == Some(ino)
-        })
+        && line
+            .split_whitespace()
+            .any(|field| names_the_file(field, dev, ino))
+}
+
+/// Whether a `/proc/locks` field is the `MAJOR:MINOR:INODE` of one file.
+///
+/// The kernel prints it as `%02x:%02x:%llu` — the device in hex, the inode in
+/// decimal — and all three are checked. Inode numbers are unique only within a
+/// filesystem, and `CARGO_TARGET_TMPDIR` need not be on the same one as anything
+/// else this process has open, so matching the inode alone would match a stranger's
+/// lock on a stranger's file.
+fn names_the_file(field: &str, dev: u64, ino: u64) -> bool {
+    let mut parts = field.split(':');
+    let (Some(major), Some(minor), Some(inode), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    u32::from_str_radix(major, 16) == Ok(libc::major(dev))
+        && u32::from_str_radix(minor, 16) == Ok(libc::minor(dev))
+        && inode.parse::<u64>() == Ok(ino)
 }
