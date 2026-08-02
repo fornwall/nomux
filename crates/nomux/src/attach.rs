@@ -103,8 +103,14 @@ fn is_absent(err: &io::Error) -> bool {
 
 /// Starts the daemon detached from this process's session.
 ///
-/// `setsid` is what lets it outlive the SSH connection that spawned it; stdio goes
-/// to `/dev/null` so it does not hold the SSH channel open.
+/// Both halves of that are the daemon's own job as of `IMPLEMENTATION.md` § 6.2,
+/// and both are still done here, because the daemon cannot do either of them soon
+/// enough. Between this `exec` and its own `setsid` there is a window where a
+/// hangup would take the session with it; and until it redirects its own stdio it
+/// holds *this relay's* descriptors, so anything it writes — a session that already
+/// exists, a backtrace — lands in the middle of the client's frame stream. Both
+/// windows close before the daemon exists, and cost it nothing: it finds itself
+/// already a session leader and does nothing more.
 fn spawn_daemon(session_id: &str, label: Option<&str>) -> io::Result<()> {
     let exe = env::current_exe()?;
     let mut command = Command::new(exe);

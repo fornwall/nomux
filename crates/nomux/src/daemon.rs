@@ -20,6 +20,7 @@ use nomux_proto::{
     RESUME_FROM_START, WinSize,
 };
 use rustix::event::{PollFd, PollFlags, Timespec};
+use rustix::fs::{Mode, OFlags};
 use rustix::pipe::PipeFlags;
 
 use crate::agent::{self, Agent};
@@ -255,6 +256,10 @@ pub(crate) fn run(session_id: &str, capacity: usize, label: Option<&str>) -> io:
     paths.ensure_dir()?;
 
     let listener = bind_socket(&paths)?;
+    // After the socket, so a session that is already running is still reported to
+    // whoever asked with an exit status they can see; before the pidfile, so the
+    // pid `nomux kill` reads belongs to the process that survives.
+    detach_from_login_session();
     write_pidfile(&paths)?;
     if let Some(label) = label {
         // Advisory: a session is worth more than its name in a listing.
@@ -304,10 +309,53 @@ pub(crate) fn run(session_id: &str, capacity: usize, label: Option<&str>) -> io:
     result
 }
 
-/// Cuts the daemon loose from the state it inherited: the working directory and
-/// `SIGHUP`.
+/// Puts the daemon in a session of its own, which is what lets it outlive the
+/// connection that started it (`IMPLEMENTATION.md` § 6.2).
 ///
-/// `IMPLEMENTATION.md` § 6.2. `setsid` already left the daemon without a
+/// Usually there is nothing to do. `attach::spawn_daemon` calls `setsid` between
+/// fork and exec, so the ordinary path arrives already detached — and calling it
+/// again there would fail with `EPERM`, because a session leader is a process-group
+/// leader by definition and `setsid` refuses those. Asking `getsid` first is what
+/// tells "already done" apart from "cannot be done", which is the whole difficulty
+/// of this function.
+///
+/// A genuine refusal means one thing only: this process leads a process group
+/// somebody else made, which is `nomux daemon <id>` typed at a shell with job
+/// control. Nothing can make a group leader a session leader, so the way out is a
+/// child that is not one. The parent leaves through `_exit`, which is why this
+/// happens before the pidfile is written — `nomux kill` must read the pid of the
+/// process that survived rather than of the one that started.
+///
+/// Failures are not propagated. Sharing a session makes for a worse daemon, not a
+/// broken one, and refusing to start would be the worse outcome of the two.
+fn detach_from_login_session() {
+    if rustix::process::getsid(None).is_ok_and(|sid| sid == rustix::process::getpid()) {
+        return;
+    }
+    if rustix::process::setsid().is_ok() {
+        return;
+    }
+
+    // SAFETY: this process is still single-threaded — no thread has been started
+    // and no child spawned — so the copy the child gets holds no lock and no
+    // half-initialised runtime state, and it is free to go on doing anything.
+    let forked = unsafe { libc::fork() };
+    if forked < 0 {
+        return;
+    }
+    if forked > 0 {
+        // SAFETY: the only correct exit for a forked parent. `exit` would run the
+        // atexit handlers and flush the buffered stdio a second time, emitting
+        // whatever the child has inherited and not yet written itself.
+        unsafe { libc::_exit(0) }
+    }
+    let _ = rustix::process::setsid();
+}
+
+/// Cuts the daemon loose from the rest of the state it inherited: the working
+/// directory, the standard descriptors and `SIGHUP`.
+///
+/// `IMPLEMENTATION.md` § 6.2. `setsid` has already left the daemon without a
 /// controlling terminal, so no `SIGHUP` can currently reach it — this is the belt
 /// to that braces, since a session that dies on hangup is the one failure this
 /// whole program exists to prevent. `SIGPIPE` needs nothing: the Rust runtime
@@ -317,12 +365,34 @@ pub(crate) fn run(session_id: &str, capacity: usize, label: Option<&str>) -> io:
 /// to start over it would be a worse outcome than the mount it might pin.
 fn detach_from_startup_state() {
     let _ = rustix::process::chdir("/");
+    let _ = silence_stdio();
     // SAFETY: `signal` with SIG_IGN is safe to call on a single-threaded process
     // with no handler installed; the disposition is reset in the child before exec
     // (see `pty::Pty::spawn`) so the child still dies on hangup as it should.
     unsafe {
         libc::signal(libc::SIGHUP, libc::SIG_IGN);
     }
+}
+
+/// Points the three standard descriptors at `/dev/null`.
+///
+/// Whatever started the daemon is still on the other end of them, and under
+/// `attach` that is the SSH channel: holding it keeps a connection open that has
+/// nothing left to carry, and a byte written to it — a failure to start, a
+/// backtrace — arrives in the middle of the client's frame stream.
+///
+/// Late in the startup sequence on purpose: everything that can fail with a
+/// message worth reading has already had its chance to write one.
+///
+/// # Errors
+///
+/// Fails if `/dev/null` cannot be opened or a descriptor cannot be replaced.
+fn silence_stdio() -> io::Result<()> {
+    let null = rustix::fs::open("/dev/null", OFlags::RDWR, Mode::empty())?;
+    rustix::stdio::dup2_stdin(&null)?;
+    rustix::stdio::dup2_stdout(&null)?;
+    rustix::stdio::dup2_stderr(&null)?;
+    Ok(())
 }
 
 /// Binds the session socket, replacing a stale one.

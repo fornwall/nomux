@@ -332,20 +332,42 @@ only available fix, and only for variables that name a path.
 
 ### 6.2 Detachment from the login session
 
+The `daemon` mode holds this itself rather than trusting whoever started it:
+
 ```
-fork → parent _exit
-  setsid
-    chdir "/"
-    0/1/2 → /dev/null
-    ignore SIGHUP
+getsid(0) == getpid()?  already detached; nothing to do
+  else setsid           refused only if we lead a process group
+    else fork → parent _exit, child setsid
+      chdir "/"
+      0/1/2 → /dev/null
+      ignore SIGHUP
 ```
 
-The classic second fork is deliberately absent. Its only purpose is to leave the
-daemon a non-session-leader so it cannot acquire a controlling terminal by opening
-a tty — but a controlling terminal is acquired only by opening one *without*
-`O_NOCTTY`, and this binary opens exactly two ttys, both with it (§6.1). The
-property is held by construction at the two lines that could break it, rather than
-by a fork whose reason would have to be rediscovered.
+`setsid(2)` refuses with `EPERM` for a process-group leader, and a session leader is
+one by definition — so on the ordinary path, where `attach` has already called
+`setsid` between fork and exec, calling it again looks exactly like a failure.
+Asking `getsid` first is what tells "already done" apart from "cannot be done".
+
+The one genuine refusal is `nomux daemon <id>` typed at a shell, where job control
+makes the daemon its own process group's leader; nothing can promote one of those,
+so the way out is a child that is not one. It happens after the socket is bound, so
+a session that already exists is still reported with an exit status somebody sees,
+and before the pidfile is written, so `nomux kill` (§6.6) reads the pid of the
+process that survived rather than of the one that started.
+
+`attach` does the `setsid` and the `/dev/null` in its own `pre_exec` as well, and
+keeps doing so, because the daemon cannot reach either soon enough. Until it runs
+its own `setsid` a hangup would take the session with it, and until it redirects its
+own stdio it holds the *relay's* descriptors — where anything it writes lands in the
+middle of the client's frame stream.
+
+The classic second fork is deliberately absent, and the conditional one above is not
+it. Its only purpose is to leave the daemon a non-session-leader so it cannot
+acquire a controlling terminal by opening a tty — but a controlling terminal is
+acquired only by opening one *without* `O_NOCTTY`, and this binary opens exactly two
+ttys, both with it (§6.1). The property is held by construction at the two lines
+that could break it, rather than by a fork whose reason would have to be
+rediscovered.
 
 `chdir "/"` happens after the run-directory paths are resolved and the socket is
 bound, and the child is given its own working directory (§6.1.1) — otherwise the
@@ -702,6 +724,7 @@ a floating one moves the bytes the client pinned.
 | Chaos | Randomised disconnect injection, seeded and reproducible, under an escape-heavy full-screen stream and under `yes`. | `tests/chaos.rs` |
 | Agent forwarding | Bidirectional proxying, the channel cap, ids never reused, fail-fast while detached, and off unless asked for. | `tests/session.rs` |
 | Relay | Bulk traffic both ways through `nomux attach`, byte-exact, over both the `splice` and copying paths of §7. | `tests/session.rs` |
+| Detachment | The `daemon` mode leads a session of its own, redirects the stdio it was handed, and records the surviving pid. | `tests/session.rs` |
 | Shutdown | A daemon that reaps itself runs `terminate` to completion and unlinks its run files, and a signalled one collects a backgrounded process that ignores `SIGHUP`. | `tests/session.rs` |
 
 The two invariants that matter: **no duplicated input, ever**, and **no lost output

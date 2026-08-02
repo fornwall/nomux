@@ -636,6 +636,85 @@ fn the_daemon_releases_its_working_directory_but_the_shell_does_not() {
     );
 }
 
+/// The `daemon` mode detaches itself, rather than trusting whoever started it.
+///
+/// § 6.2 claims the property for the mode, but `setsid` and the `/dev/null` stdio
+/// lived in `attach::spawn_daemon` alone — so a daemon started any other way kept
+/// the process group and the descriptors it inherited, which for a session meant
+/// dying with the connection that started it. Started here with pipes on purpose,
+/// so what those descriptors point at afterwards is the daemon's own doing.
+///
+/// The pidfile is the other half. The interactive case cannot detach without a
+/// fork, and `nomux kill` reads that file, so the pid in it has to be the one that
+/// survived rather than the one that started.
+#[test]
+fn the_daemon_mode_detaches_itself() {
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("run-detach");
+    drop(fs::remove_dir_all(&root));
+    fs::create_dir_all(&root).expect("create run root");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_nomux"))
+        .args(["daemon", "detached"])
+        .env("XDG_RUNTIME_DIR", &root)
+        .env("SHELL", "/bin/sh")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn daemon");
+    let pid = child.id();
+    wait_for(&root.join("nomux").join("detached.sock"));
+
+    // The socket is bound before any of the detaching happens — deliberately, so a
+    // session that already exists is still reported with an exit status — so
+    // waiting for it is not barrier enough.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline
+        && (stat_field(pid, StatField::Session) != Some(pid) || !stdio_is_silenced(pid))
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Everything read before the child is killed, so a failing assertion cannot
+    // leave the daemon behind.
+    let leads_session = stat_field(pid, StatField::Session);
+    let stdio = stdio_targets(pid);
+    let recorded = fs::read_to_string(root.join("nomux").join("detached.pid"))
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok());
+    drop(child.kill());
+    drop(child.wait());
+
+    assert_eq!(
+        leads_session,
+        Some(pid),
+        "the daemon stayed in the session it was started in, so a hangup reaches it"
+    );
+    assert!(
+        stdio.iter().all(|path| path == Path::new("/dev/null")),
+        "the daemon still holds the descriptors it was handed: {stdio:?}"
+    );
+    assert_eq!(
+        recorded,
+        Some(pid),
+        "the pidfile must name the process that is actually serving"
+    );
+}
+
+/// What the three standard descriptors of `pid` point at.
+fn stdio_targets(pid: u32) -> Vec<PathBuf> {
+    (0..3)
+        .map(|fd| fs::read_link(format!("/proc/{pid}/fd/{fd}")).unwrap_or_default())
+        .collect()
+}
+
+/// Whether all three point at `/dev/null`.
+fn stdio_is_silenced(pid: u32) -> bool {
+    stdio_targets(pid)
+        .iter()
+        .all(|path| path == Path::new("/dev/null"))
+}
+
 /// Agent forwarding, end to end: the child gets a socket, a connection to it
 /// becomes a channel, and bytes cross in both directions untouched.
 #[test]
@@ -985,6 +1064,8 @@ fn trailing_pid(transcript: &str, marker: &str) -> Option<u32> {
 enum StatField {
     /// The process group the process belongs to.
     ProcessGroup = 2,
+    /// The session it belongs to, which is its own pid exactly when it leads one.
+    Session = 3,
 }
 
 /// Reads one field of `/proc/<pid>/stat`.
