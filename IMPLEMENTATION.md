@@ -659,6 +659,19 @@ whole call, not per `write`, or a peer reading a trickle would reset it — and 
 `SIGHUP`, 500 ms, `SIGKILL` for the process group. An overrun would mean the daemon
 being `SIGKILL`ed mid-shutdown, which is the bug this closes, wearing a hat.
 
+One flush, not several, and the iteration the signal lands in is arranged so it cannot
+become several. `stopping` is set at the top of that iteration and the rest of it still
+runs, so whatever the client is owed is queued before the flush that delivers it — but
+the listener and the pending connection are skipped from that point on. A takeover
+arriving in the same wakeup would otherwise evict the client with a bounded 500 ms
+flush of its own, and a protocol error in the same wakeup would spend another, both on
+top of the one the shutdown itself performs: three, against a budget for two. What
+remains cannot double up, because the paths that flush early also take the client with
+them — after a `reject` or a client dropping out, the shutdown finds none. So the worst
+case is 500 ms of flush plus the 500 ms of `SIGHUP` grace. The ordinary case — an
+attached client and a shell that goes when asked — measures at 10 to 15 ms from the
+signal to the run files being unlinked.
+
 `SIGQUIT` is deliberately left at its default. Its action is a core dump, which is
 the only way left to get a snapshot out of a daemon that has wedged, and `SIGKILL`
 — which nothing can handle — already means "go away now" for anyone who does not

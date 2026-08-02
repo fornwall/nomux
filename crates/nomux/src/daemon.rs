@@ -753,11 +753,18 @@ impl Daemon {
         if client_events.intersects(PollFlags::HUP | PollFlags::ERR) && self.client.is_some() {
             self.drop_client();
         }
-        if revents(Source::Pending).intersects(readable) {
-            self.read_pending(scratch)?;
-        }
-        if revents(Source::Listener).contains(PollFlags::IN) {
-            self.accept();
+        // Nothing arriving now can be served: the loop leaves on its next pass. It is
+        // also what keeps the shutdown inside its budget (§ 6.5) — a takeover here
+        // would spend a second bounded 500 ms flush on evicting a client the daemon
+        // is about to drop anyway. Whoever knocked finds the socket unlinked and
+        // spawns a session of their own.
+        if !self.stopping {
+            if revents(Source::Pending).intersects(readable) {
+                self.read_pending(scratch)?;
+            }
+            if revents(Source::Listener).contains(PollFlags::IN) {
+                self.accept();
+            }
         }
         if ACCEPT_BEFORE_READ && client_ready {
             self.read_client(scratch)?;
