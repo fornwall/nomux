@@ -15,7 +15,7 @@ use nomux_proto::{Frame, FrameType, HEADER_LEN, Header, MAX_PAYLOAD, decode_head
 /// Stop queueing output once this much is already waiting for a slow client. The
 /// ring keeps absorbing PTY output regardless, so the effect of a stalled client is
 /// a gap, never a blocked child.
-pub(crate) const MAX_PENDING_WRITE: usize = 1 << 20;
+const MAX_PENDING_WRITE: usize = 1 << 20;
 
 /// Queue size at which a client is treated as gone rather than slow. Well clear of
 /// [`MAX_PENDING_WRITE`] plus one output chunk, so only unanswered control frames
@@ -94,38 +94,27 @@ impl Conn {
         self.tx.len() - self.tx_pos >= ABANDON_PENDING_WRITE
     }
 
-    /// Queues a frame.
+    /// Queues a frame, discarding the encode result.
     ///
-    /// # Errors
-    ///
-    /// [`nomux_proto::ProtoError`] if the frame's payload exceeds
-    /// [`MAX_PAYLOAD`]; the buffer is left unchanged in that case.
-    pub(crate) fn send(&mut self, frame: &Frame<'_>) -> Result<(), nomux_proto::ProtoError> {
-        frame.encode(&mut self.tx)
+    /// Every caller here chunks to at most [`MAX_PAYLOAD`] and passes flags this
+    /// crate defines, so the two encode failures — an oversized payload and an
+    /// undefined flag bit — are both unreachable. Threading a `Result` out to every
+    /// call site would obscure the real error paths for an impossible case.
+    fn send(&mut self, frame: &Frame<'_>) {
+        let _ = frame.encode(&mut self.tx);
     }
 
-    /// Queues a frame whose size is fixed and small, ignoring the encode result.
-    ///
-    /// The only encode failure is an oversized payload, which is unreachable for
-    /// the control frames this is used with. Threading a `Result` through every
-    /// such call site would obscure the real error paths for an impossible case.
+    /// Queues a control frame, whose size is fixed and small.
     pub(crate) fn send_control(&mut self, frame: &Frame<'_>) {
-        let _ = self.send(frame);
+        self.send(frame);
     }
 
     /// Queues raw output bytes as one or more `Output` frames, splitting at
     /// [`MAX_PAYLOAD`].
     ///
-    /// Returns the offset one past the last byte queued.
-    ///
-    /// # Errors
-    ///
-    /// Propagates encoding failures, which cannot occur for correctly chunked input.
-    pub(crate) fn send_output(
-        &mut self,
-        mut offset: u64,
-        data: &[u8],
-    ) -> Result<u64, nomux_proto::ProtoError> {
+    /// Returns the offset one past the last byte queued, which is short of
+    /// `offset + data.len()` when the queue filled partway through.
+    pub(crate) fn send_output(&mut self, mut offset: u64, data: &[u8]) -> u64 {
         // Leave room for the 8-byte offset that shares the payload.
         let chunk = MAX_PAYLOAD as usize - 8;
         for part in data.chunks(chunk) {
@@ -136,28 +125,19 @@ impl Conn {
             if self.is_write_saturated() {
                 break;
             }
-            self.send(&Frame::Output { offset, data: part })?;
+            self.send(&Frame::Output { offset, data: part });
             offset += part.len() as u64;
         }
-        Ok(offset)
+        offset
     }
 
     /// Queues agent bytes as one or more `AgentData` frames, splitting at
     /// [`MAX_PAYLOAD`].
-    ///
-    /// # Errors
-    ///
-    /// Propagates encoding failures, which cannot occur for correctly chunked input.
-    pub(crate) fn send_agent_data(
-        &mut self,
-        chan: u32,
-        data: &[u8],
-    ) -> Result<(), nomux_proto::ProtoError> {
+    pub(crate) fn send_agent_data(&mut self, chan: u32, data: &[u8]) {
         // Leave room for the 4-byte channel id that shares the payload.
         for part in data.chunks(MAX_PAYLOAD as usize - 4) {
-            self.send(&Frame::AgentData { chan, data: part })?;
+            self.send(&Frame::AgentData { chan, data: part });
         }
-        Ok(())
     }
 
     /// Reads whatever the socket has available into the receive buffer.

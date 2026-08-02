@@ -339,7 +339,6 @@ impl Daemon {
             watches.push((Source::Pty, pty.master(), flags));
         }
 
-        let saturated = self.client.as_ref().is_some_and(Conn::is_write_saturated);
         if let Some(client) = self.client.as_ref() {
             let mut flags = PollFlags::IN;
             // Ring bytes still owed count as wanting to write, not just bytes
@@ -359,6 +358,7 @@ impl Daemon {
         }
 
         if let Some(agent) = self.agent.as_ref() {
+            let saturated = self.client.as_ref().is_some_and(Conn::is_write_saturated);
             watches.push((Source::AgentListener, agent.listener(), PollFlags::IN));
             for (id, fd, wants_write) in agent.watches() {
                 // A saturated client is the one back pressure signal available:
@@ -853,8 +853,7 @@ impl Daemon {
         }
         if end > self.in_applied {
             let skip = usize::try_from(self.in_applied - offset).unwrap_or(data.len());
-            self.pending_input
-                .extend(data.get(skip..).unwrap_or(&[]).iter().copied());
+            self.pending_input.extend(data.get(skip..).unwrap_or(&[]));
             self.in_applied = end;
         }
         if let Some(client) = self.client.as_mut() {
@@ -895,14 +894,9 @@ impl Daemon {
                         continue;
                     }
                     let want = self.sent_through + part.len() as u64;
-                    match client.send_output(self.sent_through, part) {
-                        Ok(next) => {
-                            self.sent_through = next;
-                            if next != want {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
+                    self.sent_through = client.send_output(self.sent_through, part);
+                    if self.sent_through != want {
+                        break;
                     }
                 }
             }
@@ -972,7 +966,7 @@ impl Daemon {
             agent::Read::Data(n) => {
                 let data = buf.get(..n).unwrap_or(&[]);
                 if let Some(client) = self.client.as_mut() {
-                    let _ = client.send_agent_data(chan, data);
+                    client.send_agent_data(chan, data);
                 }
             }
             agent::Read::Closed => self.close_agent_channel(chan),

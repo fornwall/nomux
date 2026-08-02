@@ -117,6 +117,11 @@ pub struct Hello<'a> {
     /// Next output byte the client wants, or [`RESUME_FROM_START`].
     pub out_offset: u64,
     /// Next input byte the client intends to send.
+    ///
+    /// Informational: the daemon does not read it, because `in_applied` in the
+    /// answering [`HelloOk`] is authoritative and the client fast-forwards to that
+    /// (`IMPLEMENTATION.md` § 3). Kept on the wire because the handover sketched in
+    /// `DESIGN.md` § 10 needs a "tell me" sentinel here, mirroring the output side.
     pub in_offset: u64,
     /// Terminal dimensions.
     pub win: WinSize,
@@ -353,10 +358,18 @@ impl Frame<'_> {
         // the caller passed on the wire is never the right trade. A `TERM` this
         // long is a broken caller, and silently shortening it would open the
         // session under a terminal type nobody chose.
-        if let Self::Hello(hello) = *self
-            && u16::try_from(hello.term.len()).is_err()
-        {
-            return Err(ProtoError::Malformed("TERM exceeds 65535 bytes"));
+        if let Self::Hello(hello) = *self {
+            if u16::try_from(hello.term.len()).is_err() {
+                return Err(ProtoError::Malformed("TERM exceeds 65535 bytes"));
+            }
+            // Refused on the way out as well as on the way in. `decode` rejects
+            // undefined bits (§ 2.3), so without this a caller could build a
+            // `Hello` that encodes cleanly and earns an `Error{Protocol}` from the
+            // peer — a bug reported at the wrong end of the connection, by the
+            // process that did nothing wrong.
+            if hello.flags & !HELLO_FLAG_BITS != 0 {
+                return Err(ProtoError::Malformed("undefined Hello flag bits"));
+            }
         }
 
         let start = out.len();
@@ -877,6 +890,29 @@ mod tests {
             win: WIN,
             term: &exact,
         }));
+    }
+
+    /// Encode and decode agree about which flag bits exist.
+    ///
+    /// Without the encode-side check a caller could build a `Hello` that encodes
+    /// cleanly and is then refused by the peer, which reports the protocol error at
+    /// the wrong end of the connection — to the process that did nothing wrong.
+    #[test]
+    fn undefined_flag_bits_are_refused_by_encode_too() {
+        let mut buf = b"previous frame".to_vec();
+        let before = buf.len();
+        let err = Frame::Hello(Hello {
+            protocol: PROTOCOL_VERSION,
+            flags: HELLO_AGENT_FORWARD | 0x8000,
+            out_offset: 0,
+            in_offset: 0,
+            win: WIN,
+            term: "xterm",
+        })
+        .encode(&mut buf);
+
+        assert!(matches!(err, Err(ProtoError::Malformed(_))), "got {err:?}");
+        assert_eq!(buf.len(), before, "the buffer must be left untouched");
     }
 
     /// `decode` is public and usable without `decode_header`, so it applies the

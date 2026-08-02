@@ -175,7 +175,7 @@ impl Agent {
         let Some(chan) = self.channels.iter_mut().find(|chan| chan.id == id) else {
             return true;
         };
-        chan.pending.extend(data.iter().copied());
+        chan.pending.extend(data);
         chan.pending.len() <= MAX_CHANNEL_QUEUE
     }
 
