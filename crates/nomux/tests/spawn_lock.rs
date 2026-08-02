@@ -29,7 +29,7 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use harness::{Spawned, control, run_root, wait_for};
+use harness::{Spawned, control, poll_until, run_root, wait_for};
 
 /// A `list` that finds the spawn lock held leaves the whole entry alone, and
 /// collects it on the next pass once the lock is free.
@@ -71,20 +71,16 @@ fn a_held_spawn_lock_survives_a_concurrent_list() {
 /// one process, and what § 6.6 promises is what this asserts: an entry that stays
 /// dead stays collectable.
 fn collected_within(session: &StaleSession, within: Duration) {
-    let deadline = Instant::now() + within;
-    loop {
+    let collected = poll_until(within, || {
         let listed = session.run(&["list"]);
         assert!(listed.status.success(), "list failed: {listed:?}");
-        let left = entries(&session.dir);
-        if left.is_empty() {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the entry was never collected once the lock was free: {left:?}"
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
+        entries(&session.dir).is_empty()
+    });
+    assert!(
+        collected,
+        "the entry was never collected once the lock was free: {:?}",
+        entries(&session.dir)
+    );
 }
 
 /// `kill` reports failure rather than success when the spawn lock keeps it from
@@ -551,15 +547,11 @@ impl PlantedRunDir {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped()),
         );
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while child.is_running() {
-            assert!(
-                Instant::now() < deadline,
-                "`nomux {args:?}` never returned, so it is still relaying to a \
-                 socket somebody else planted"
-            );
-            thread::sleep(Duration::from_millis(20));
-        }
+        assert!(
+            poll_until(Duration::from_secs(10), || !child.is_running()),
+            "`nomux {args:?}` never returned, so it is still relaying to a \
+             socket somebody else planted"
+        );
         child
             .into_exited()
             .wait_with_output()

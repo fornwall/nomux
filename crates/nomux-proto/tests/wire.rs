@@ -20,7 +20,7 @@
 
 use nomux_proto::{
     ErrorCode, ExitKind, Frame, FrameType, HEADER_LEN, HELLO_AGENT_FORWARD, HELLO_REPAINT_CTRL_L,
-    Hello, HelloOk, Linger, WinSize,
+    Hello, HelloOk, Linger, RESUME_FROM_START, WinSize,
 };
 
 /// Distinct in all four fields on purpose: `cols`, `rows`, `xpixel` and `ypixel`
@@ -53,6 +53,16 @@ fn vectors() -> Vec<Vector> {
 /// Byte patterns are ascending and distinct per field so that a swap between two
 /// same-width neighbours — the failure a round-trip test cannot see — changes the
 /// expected bytes.
+///
+/// Both handshake frames appear **twice**, because distinct values catch a swap
+/// between two fields and do nothing about a swap *inside* one. A flag bit or an
+/// enumerator exercised at a single value is pinned only against being renumbered
+/// wholesale: give `Hello.flags` both of its bits at once and the two constants can
+/// trade places without moving a byte, and the same holds for `HelloOk`'s `gap` and
+/// `agent` bits, which are only ever set together. So the second vector of each is
+/// chosen to disagree with the first on every bit and every enumerator that has one
+/// — which is what makes § 2.3 a table this file actually checks, rather than one
+/// the codec merely agrees with itself about.
 fn handshake_vectors() -> Vec<Vector> {
     vec![
         // 0x01 Hello: u16 proto, u16 flags, u64 out_offset, u64 in_offset,
@@ -77,6 +87,31 @@ fn handshake_vectors() -> Vec<Vector> {
                 b'x', b't', b'e', b'r', b'm', b'-', b'2', b'5', b'6', b'c', b'o', b'l', b'o', b'r',
             ],
         },
+        // 0x01 Hello again, with bit 0 alone. Against the vector above this is
+        // what pins *which* bit is which: there, both are set, so exchanging the
+        // two constants leaves 0x0003 unchanged. Carries `RESUME_FROM_START` as
+        // well, the § 2.2 sentinel for "I have no state, send me whatever you
+        // have", which no other vector shows on the wire.
+        Vector {
+            frame: Frame::Hello(Hello {
+                protocol: 2,
+                flags: HELLO_AGENT_FORWARD,
+                out_offset: RESUME_FROM_START,
+                in_offset: 0,
+                win: WIN,
+                term: "vt100",
+            }),
+            bytes: &[
+                0x01, 0x00, 0x00, 0x23, // header: type, u24 len = 35
+                0x00, 0x02, // protocol
+                0x00, 0x01, // flags: bit 0 agent forward, bit 1 clear
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // RESUME_FROM_START
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // in_offset
+                0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
+                0x00, 0x05, // term_len = 5
+                b'v', b't', b'1', b'0', b'0',
+            ],
+        },
         // 0x02 HelloOk: u16 proto, u64 resume_from, u64 in_applied, winsize,
         // u8 flags. Note the flags field is a u8 here and a u16 in Hello — the
         // two handshake frames are deliberately not the same shape. Its 0x0d is
@@ -98,6 +133,31 @@ fn handshake_vectors() -> Vec<Vector> {
                 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, // in_applied
                 0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
                 0x0d, // flags
+            ],
+        },
+        // 0x02 HelloOk again, disagreeing with the one above on all three of its
+        // flag fields: no gap, linger unknown, agent served. `gap` and `agent`
+        // differ from each other here, which is what separates bit 0 from bit 3 —
+        // set together as they are above, they can be exchanged for free. Linger
+        // takes a second of its three values for the same reason; 0 and 2 pinned
+        // between the two vectors leaves 1 the only number left for `Disabled`.
+        Vector {
+            frame: Frame::HelloOk(HelloOk {
+                protocol: 2,
+                resume_from: 0x4142_4344_4546_4748,
+                in_applied: 0x5152_5354_5556_5758,
+                win: WIN,
+                gap: false,
+                linger: Linger::Unknown,
+                agent: true,
+            }),
+            bytes: &[
+                0x02, 0x00, 0x00, 0x1b, // header: type, u24 len = 27
+                0x00, 0x02, // protocol
+                0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, // resume_from
+                0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, // in_applied
+                0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
+                0x08, // flags: bit 3 agent, gap clear, linger 0 (unknown)
             ],
         },
     ]
@@ -316,5 +376,40 @@ fn every_frame_type_has_a_vector() {
     let covered: Vec<FrameType> = vectors().iter().map(|v| v.frame.frame_type()).collect();
     for ty in FrameType::ALL {
         assert!(covered.contains(&ty), "{ty:?} has no wire vector");
+    }
+}
+
+/// The five `Error` codes are the numbers § 2.2 gives them.
+///
+/// A frame carries one code at a time, so the vector above can pin exactly one of
+/// the five and a table is the only way to reach the rest. § 2.2 spells them out
+/// inline — `1 protocol, 2 takeover, 3 version, 4 input_gap, 5 internal` — and
+/// until this existed, exchanging any two of the four that appear in no vector
+/// changed nothing that anything in this repository compares. The daemon names
+/// them symbolically and so does the suite, so both ends would have agreed on the
+/// wrong number and only the client, built from the table, would have disagreed.
+///
+/// The two directions are checked separately for the reason the module doc gives:
+/// `from_u16(as_u16(c)) == c` holds under any renumbering that is consistent with
+/// itself, which is precisely the class of bug this file exists to catch.
+#[test]
+fn error_codes_are_the_numbers_the_table_gives_them() {
+    for (code, number) in [
+        (ErrorCode::Protocol, 1),
+        (ErrorCode::Takeover, 2),
+        (ErrorCode::Version, 3),
+        (ErrorCode::InputGap, 4),
+        (ErrorCode::Internal, 5),
+    ] {
+        assert_eq!(
+            code.as_u16(),
+            number,
+            "{code:?} does not encode to the number IMPLEMENTATION.md § 2.2 gives it"
+        );
+        assert_eq!(
+            ErrorCode::from_u16(number),
+            Some(code),
+            "{number} does not decode to the code IMPLEMENTATION.md § 2.2 gives it"
+        );
     }
 }

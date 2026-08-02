@@ -19,12 +19,12 @@ use std::{fs, thread};
 
 use nomux_proto::{
     ErrorCode, Frame, FrameType, HELLO_AGENT_FORWARD, HELLO_REPAINT_CTRL_L, Hello,
-    MAX_AGENT_CHANNELS, PROTOCOL_VERSION, RESUME_FROM_START,
+    MAX_AGENT_CHANNELS, PROTOCOL_VERSION, RESUME_FROM_START, WinSize,
 };
 
 use harness::{
-    Rng, Session, Spawned, control, hello_frame, push_until_refused, run_root, wait_for,
-    write_frame,
+    Rng, Session, Spawned, accept_within, control, hello_frame, poll_until, push_until_refused,
+    reconnect_until_gap, run_root, wait_for, write_frame,
 };
 
 #[test]
@@ -76,6 +76,61 @@ fn output_resumes_contiguously_after_a_reconnect() {
     assert!(seen.contains("NOMUX-AFTER"), "post-resume output: {seen:?}");
 }
 
+/// A client claiming output the session never produced is clamped down to the end of
+/// the stream rather than believed (`IMPLEMENTATION.md` § 4.2).
+///
+/// `resume_from` is clamped at *both* ends, and only the lower clamp is otherwise
+/// exercised — the test above it resumes from where it left off, and the gap tests
+/// resume from below `base_offset`. Without the upper one the daemon sets
+/// `sent_through` past everything it holds, and the documented consequence is that
+/// the session looks dead: no output at all until the child happens to write enough
+/// to catch up. Nothing is reported as a gap either, because nothing was dropped —
+/// there was never anything there.
+#[test]
+fn an_out_offset_past_the_end_of_the_stream_is_clamped_rather_than_believed() {
+    /// Comfortably past anything a shell echoing one line has ever written.
+    const FAR: u64 = 1 << 20;
+
+    let (session, mut client, ok) = Session::attached("clamp_high");
+
+    let first = b"echo NOMUX-BEFORE-CLAMP\n";
+    client.send(&Frame::Input {
+        offset: 0,
+        data: first,
+    });
+    let (_, end) = client.read_until("NOMUX-BEFORE-CLAMP", ok.resume_from);
+    drop(client);
+
+    let mut client = session.connect();
+    let resumed = client.hello(end + FAR, first.len() as u64);
+    assert!(
+        !resumed.gap,
+        "nothing was dropped, so nothing may be reported as a gap"
+    );
+    assert!(
+        resumed.resume_from < end + FAR,
+        "an out_offset past the end of the stream must be clamped to it: \
+         resumed from {} against the {} claimed",
+        resumed.resume_from,
+        end + FAR
+    );
+    assert_eq!(
+        resumed.in_applied,
+        first.len() as u64,
+        "the session's input position must survive a client claiming output it \
+         never received"
+    );
+
+    // And it is a live session rather than one that has gone quiet behind a resume
+    // point past its own stream, which is the whole shape of the fault.
+    client.send(&Frame::Input {
+        offset: resumed.in_applied,
+        data: b"echo NOMUX-AFTER-CLAMP\n",
+    });
+    let (seen, _) = client.read_until("NOMUX-AFTER-CLAMP", resumed.resume_from);
+    assert!(seen.contains("NOMUX-AFTER-CLAMP"), "transcript: {seen:?}");
+}
+
 /// The invariant that matters most: a client replaying input it already sent —
 /// because the `InputAck` was lost with the connection — must not run it twice.
 #[test]
@@ -120,6 +175,40 @@ fn replayed_input_is_applied_exactly_once() {
     );
 }
 
+/// Input above `in_applied` is a hole in the input stream, and the daemon refuses it
+/// and closes rather than guessing at what is missing (`IMPLEMENTATION.md` § 3).
+///
+/// The one error code with nothing else exercising it end to end. Refusing is the
+/// only answer available: applying the frame would run keystrokes with a gap in the
+/// middle, and the client is the side that is wrong — `in_applied` is authoritative,
+/// so a client that skipped ahead has lost track of its own stream and has to start
+/// again from what the daemon reports.
+#[test]
+fn input_that_skips_ahead_is_refused_and_the_connection_closed() {
+    let (_session, mut client, _) = Session::attached("input_gap");
+
+    // Nothing has been sent yet, so `in_applied` is zero and this claims a keystroke
+    // the daemon never saw.
+    client.send(&Frame::Input {
+        offset: 1,
+        data: b"echo NOMUX-NEVER-RUN\n",
+    });
+
+    let payload = client.next_of(FrameType::Error);
+    let refusal = Frame::decode(FrameType::Error, &payload).expect("decode the refusal");
+    assert!(
+        matches!(
+            refusal,
+            Frame::Error {
+                code: ErrorCode::InputGap,
+                ..
+            }
+        ),
+        "input above in_applied must be refused as an input gap, got {refusal:?}"
+    );
+    client.expect_eof("an Error{InputGap}");
+}
+
 #[test]
 fn overflow_is_reported_as_a_gap_rather_than_silently_truncated() {
     let (session, mut client, ok) = Session::attached("gap");
@@ -137,27 +226,41 @@ fn overflow_is_reported_as_a_gap_rather_than_silently_truncated() {
     drop(client);
 
     // The daemon must keep draining the PTY while detached, so the ring overflows
-    // even with nobody listening. Poll rather than guessing at a fixed delay.
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
+    // even with nobody listening. Waited for rather than slept through.
+    let (_client, resumed) = reconnect_until_gap(&session, 0, ok.resume_from, filler.len() as u64);
+    assert!(
+        resumed.resume_from > ok.resume_from,
+        "resume point must advance past the discarded bytes"
+    );
+}
+
+/// A `NOMUX_RING_BYTES` the daemon cannot use falls back to the default rather than
+/// refusing to start (`IMPLEMENTATION.md` § 4).
+///
+/// `Ring::new` asserts its capacity is non-zero, so this does not degrade if the
+/// filter that rejects a zero is ever lost: the daemon aborts before it binds
+/// anything, and every session on a host with that variable exported stops starting
+/// at once. A mistyped tuning variable should never cost somebody their session, so
+/// the value is dropped and the default used.
+#[test]
+fn a_ring_capacity_the_daemon_cannot_use_falls_back_to_the_default() {
+    for (name, value) in [("ring_zero", "0"), ("ring_garbage", "not-a-number")] {
+        let session = Session::start_with_raw_ring(name, value);
         let mut client = session.connect();
-        let resumed = client.hello(ok.resume_from, filler.len() as u64);
-        if resumed.gap {
-            assert!(
-                resumed.resume_from > ok.resume_from,
-                "resume point must advance past the discarded bytes"
-            );
-            return;
-        }
-        drop(client);
+        let ok = client.hello(RESUME_FROM_START, 0);
+
+        // Serving, rather than merely having bound a socket. The socket is bound
+        // before the ring is built, so a daemon that aborted on the assertion leaves
+        // the file behind and `wait_for` is satisfied by a corpse.
+        client.send(&Frame::Input {
+            offset: 0,
+            data: b"echo NOMUX-DEFAULT-RING\n",
+        });
+        let (seen, _) = client.read_until("NOMUX-DEFAULT-RING", ok.resume_from);
         assert!(
-            Instant::now() < deadline,
-            "ring never overflowed: base={} in_applied={} (sent {} input bytes)",
-            resumed.resume_from,
-            resumed.in_applied,
-            filler.len()
+            seen.contains("NOMUX-DEFAULT-RING"),
+            "NOMUX_RING_BYTES={value:?} left the session unable to serve: {seen:?}"
         );
-        thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -257,6 +360,104 @@ fn a_connection_that_does_not_greet_first_is_refused_alone() {
     });
     let (seen, _) = client.read_until("NOMUX-UNDISTURBED", ok.resume_from);
     assert!(seen.contains("NOMUX-UNDISTURBED"), "transcript: {seen:?}");
+}
+
+/// `Resize` reaches the child's terminal, and every attach restates the geometry
+/// (`IMPLEMENTATION.md` § 2.2).
+///
+/// Nothing else in the suite sends a `0x07`, and nothing looks at the winsize
+/// `HelloOk` carries back. Both halves matter to the same user: the window is
+/// resized while attached, and the session is then picked up from a terminal of a
+/// different size — which is the ordinary case for this project, since the whole
+/// point is reattaching from somewhere else. The daemon takes the arriving `Hello`'s
+/// winsize as authoritative and says so in its reply, so a client never has to guess
+/// whether its size was applied.
+#[test]
+fn a_resize_reaches_the_child_and_every_attach_restates_the_geometry() {
+    let (session, mut client, ok) = Session::attached("resize");
+    assert_eq!(
+        ok.win,
+        harness::WIN,
+        "the greeting must confirm the geometry the client asked for"
+    );
+
+    let wider = WinSize {
+        cols: 132,
+        rows: 43,
+        xpixel: 0,
+        ypixel: 0,
+    };
+    client.send(&Frame::Resize(wider));
+    // `stty size` reports rows then columns, and the line discipline's echo of the
+    // command carries neither number — so seeing them is the child's own answer.
+    let command = b"stty size\n";
+    client.send(&Frame::Input {
+        offset: 0,
+        data: command,
+    });
+    let (seen, _) = client.read_until("43 132", ok.resume_from);
+    assert!(
+        seen.contains("43 132"),
+        "the child's terminal kept its old size across a Resize: {seen:?}"
+    );
+    drop(client);
+
+    // A client arriving from a terminal of the original size gets it back, in the
+    // greeting and in the child.
+    let mut client = session.connect();
+    let resumed = client.hello(RESUME_FROM_START, command.len() as u64);
+    assert_eq!(
+        resumed.win,
+        harness::WIN,
+        "the reply must carry the geometry of the client it is answering"
+    );
+    client.send(&Frame::Input {
+        offset: resumed.in_applied,
+        data: b"stty size\n",
+    });
+    let (seen, _) = client.read_until("24 80", resumed.resume_from);
+    assert!(
+        seen.contains("24 80"),
+        "the child kept the previous client's geometry across an attach: {seen:?}"
+    );
+}
+
+/// `Detach` gives the connection up without giving up the session
+/// (`IMPLEMENTATION.md` § 2.2).
+///
+/// Never sent by anything else here — every other departure in the suite is a socket
+/// being dropped, which is the *unclean* case. This is the deliberate one, and what
+/// separates them is that nothing may be lost: the daemon closes the connection and
+/// keeps the input position, so the client that comes back is told where it was
+/// rather than starting the stream again.
+#[test]
+fn a_detach_ends_the_connection_but_not_the_session() {
+    let (session, mut client, ok) = Session::attached("detach_frame");
+
+    let command = b"echo NOMUX-BEFORE-DETACH\n";
+    client.send(&Frame::Input {
+        offset: 0,
+        data: command,
+    });
+    client.read_until("NOMUX-BEFORE-DETACH", ok.resume_from);
+
+    client.send(&Frame::Detach);
+    client.expect_eof("a Detach");
+    drop(client);
+
+    let mut client = session.connect();
+    let resumed = client.hello(RESUME_FROM_START, command.len() as u64);
+    assert_eq!(
+        resumed.in_applied,
+        command.len() as u64,
+        "a detach must leave the session's input position where it was"
+    );
+    client.send(&Frame::Input {
+        offset: resumed.in_applied,
+        data: b"echo NOMUX-AFTER-DETACH\n",
+    });
+    let (seen, _) = client.read_until("NOMUX-AFTER-DETACH", resumed.resume_from);
+    assert!(seen.contains("NOMUX-AFTER-DETACH"), "transcript: {seen:?}");
 }
 
 /// The child's last words come before its status.
@@ -407,7 +608,16 @@ fn invalid_session_ids_are_refused() {
     let root = run_root("bad_ids");
     for id in ["../escape", "with/slash", "with space"] {
         let output = control(&root, &["attach", id]);
-        assert!(!output.status.success(), "id {id:?} should be rejected");
+        // The exit status, not merely a non-zero one: § 10 gives a malformed
+        // invocation `EX_USAGE`, and the distinction is the whole behaviour. A client
+        // caches "unattachable" per host on 126, so an id that could never have named
+        // a session must not come back wearing that number.
+        assert_eq!(
+            output.status.code(),
+            Some(64),
+            "id {id:?} should be refused as EX_USAGE, got {:?}",
+            output.status
+        );
         assert!(
             String::from_utf8_lossy(&output.stderr).contains("invalid session id"),
             "id {id:?} should be rejected by name"
@@ -826,13 +1036,11 @@ fn the_daemon_mode_detaches_itself() {
     // The socket is bound before any of the detaching happens — deliberately, so a
     // session that already exists is still reported with an exit status — so
     // waiting for it is not barrier enough.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline
-        && (stat_field(pid, StatField::Session) != Some(pid)
-            || !stdio_is_silenced(&stdio_targets(pid)))
-    {
-        thread::sleep(Duration::from_millis(10));
-    }
+    // No assertion on the outcome: the reads below are what judge the daemon, and
+    // this only keeps them from judging it before it has finished detaching.
+    poll_until(Duration::from_secs(10), || {
+        stat_field(pid, StatField::Session) == Some(pid) && stdio_is_silenced(&stdio_targets(pid))
+    });
 
     // Everything read before the child is killed, so a failing assertion cannot
     // leave the daemon behind.
@@ -904,30 +1112,20 @@ fn a_daemon_that_leads_a_process_group_detaches_by_forking() {
     // Bounded rather than a bare `wait`: if the fork never happened then the process
     // started here *is* the daemon, and waiting on it would hang the suite instead of
     // failing an assertion.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut starter_exited = false;
-    while Instant::now() < deadline {
-        if !starter.is_running() {
-            starter_exited = true;
-            break;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
+    let starter_exited = poll_until(Duration::from_secs(10), || !starter.is_running());
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // `recorded` outlives the wait because the assertions below are about the pid the
+    // last look found, whether or not it ever satisfied the condition.
     let mut recorded = None;
-    while Instant::now() < deadline {
+    poll_until(Duration::from_secs(10), || {
         recorded = fs::read_to_string(&pid_file)
             .ok()
             .and_then(|text| text.trim().parse::<u32>().ok());
-        if recorded.is_some_and(|pid| {
+        recorded.is_some_and(|pid| {
             stat_field(pid, StatField::Session) == Some(pid)
                 && stdio_is_silenced(&stdio_targets(pid))
-        }) {
-            break;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
+        })
+    });
 
     // Everything read before anything is collected, so a failing assertion cannot
     // leave a session behind.
@@ -975,6 +1173,18 @@ fn stdio_targets(pid: u32) -> Vec<PathBuf> {
 /// to say about it afterwards.
 fn stdio_is_silenced(targets: &[PathBuf]) -> bool {
     targets.iter().all(|path| path == Path::new("/dev/null"))
+}
+
+/// A session created without the flag serves no socket at all: forwarding bypasses
+/// the user's `ForwardAgent` decision, so it must never be on by default.
+#[test]
+fn agent_forwarding_is_off_unless_asked_for() {
+    let (session, _client, ok) = Session::attached("agent_off");
+    assert!(!ok.agent);
+    assert!(
+        !session.agent_socket().exists(),
+        "no agent socket should exist for a session that did not ask for one"
+    );
 }
 
 /// Agent forwarding, end to end: the child gets a socket, a connection to it
@@ -1025,15 +1235,35 @@ fn agent_forwarding_proxies_a_connection_in_both_directions() {
 /// With no client attached there is nothing to answer a signature request, so a
 /// connection is accepted and closed at once: `git push` fails with the same error
 /// as a missing agent instead of hanging until the user reattaches.
+///
+/// § 6.7 says it of both halves — the connection that arrives while detached, and
+/// the channel that was already open the moment the client went. The second is the
+/// one with somebody actually waiting on it: a `git push` mid-signature when the
+/// network drops learns now, rather than at whatever hour the user reattaches, and
+/// the daemon cannot hold the channel for a client that will come back with no idea
+/// the channel exists (ids are never reissued).
 #[test]
 fn agent_connections_fail_fast_while_detached() {
-    let (session, client, _) = Session::attached_with("agent_detached", HELLO_AGENT_FORWARD);
+    let (session, mut client, _) = Session::attached_with("agent_detached", HELLO_AGENT_FORWARD);
+
+    // Open before the client leaves, and confirmed open — otherwise the read below
+    // could be answered by a socket the daemon had not yet accepted.
+    let mut mid_flight = session.connect_agent();
+    let _chan = client.next_chan(FrameType::AgentOpen);
     drop(client);
 
-    let mut agent = session.connect_agent();
     let mut buf = [0u8; 1];
     assert_eq!(
-        agent.read(&mut buf).expect("read from agent socket"),
+        mid_flight
+            .read(&mut buf)
+            .expect("read from the open channel"),
+        0,
+        "a channel that was open when the client left must be closed, not held"
+    );
+
+    let mut arriving = session.connect_agent();
+    assert_eq!(
+        arriving.read(&mut buf).expect("read from agent socket"),
         0,
         "a detached session must close agent connections immediately"
     );
@@ -1109,14 +1339,11 @@ fn repaint_transcript(name: &str, flags: u16) -> String {
     in_offset += filler.len() as u64;
     client.wait_for_input_ack(in_offset);
     drop(client);
-    thread::sleep(Duration::from_millis(300));
 
-    let mut client = session.connect();
-    let resumed = client.hello_with(flags, offset, in_offset);
-    assert!(
-        resumed.gap,
-        "the ring should have overflowed while detached"
-    );
+    // The repaint is the daemon's answer to a gap, so the gap has to have happened
+    // before there is anything to look at. Waited for rather than slept through:
+    // whether the ring has overflowed yet is a question about the scheduler.
+    let (mut client, resumed) = reconnect_until_gap(&session, flags, offset, in_offset);
 
     // A fence bounds the wait: whatever the repaint was going to be has been
     // echoed by the time this comes back.
@@ -1124,8 +1351,54 @@ fn repaint_transcript(name: &str, flags: u16) -> String {
         offset: in_offset,
         data: b"FENCE\n",
     });
-    let (seen, _) = client.read_until("FENCE", resumed.resume_from);
-    seen
+    read_past_gaps(&mut client, "FENCE", resumed.resume_from)
+}
+
+/// Collects the child's output until `needle` appears, following the ring over any
+/// overflow it hits on the way.
+///
+/// `Client::read_until` refuses a `Gap`, which is right everywhere else in this
+/// suite: an unannounced discontinuity is most of what these tests exist to catch.
+/// It is wrong here. The ring is a kilobyte on purpose and the child is still
+/// echoing tens of kilobytes of filler when the client comes back, so overflow
+/// *while attached* is the ordinary case rather than a surprise — and waiting for
+/// the child to fall quiet first is exactly the sleep this was written to be rid of.
+/// What the caller is looking for survives it either way: the repaint keystroke and
+/// the fence behind it are the last few bytes the child writes, and the newest
+/// kilobyte is the one thing the ring never discards.
+#[expect(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "the allow-*-in-tests settings in clippy.toml reach `#[test]` bodies, \
+              not a helper an integration test crate keeps beside them"
+)]
+fn read_past_gaps(client: &mut harness::Client, needle: &str, from: u64) -> String {
+    let mut seen = Vec::new();
+    let mut offset = from;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        let (ty, payload) = client.next_frame();
+        match Frame::decode(ty, &payload).expect("decode frame") {
+            Frame::Output { offset: at, data } => {
+                assert_eq!(
+                    at, offset,
+                    "output must be contiguous unless a gap said otherwise"
+                );
+                offset += data.len() as u64;
+                seen.extend_from_slice(data);
+                if String::from_utf8_lossy(&seen).contains(needle) {
+                    return String::from_utf8_lossy(&seen).into_owned();
+                }
+            }
+            Frame::Gap { new_base_offset } => offset = new_base_offset,
+            Frame::InputAck { .. } | Frame::Pong { .. } => {}
+            other => panic!("unexpected {other:?} while awaiting {needle:?}"),
+        }
+    }
+    panic!(
+        "timed out waiting for {needle:?}; saw: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
 }
 
 /// The post-gap repaint is the client's choice, and `ctrl_l` reaches the child as
@@ -1160,14 +1433,10 @@ fn a_daemon_nobody_ever_attaches_to_reaps_itself() {
     let session = Session::start("unattached");
     assert!(session.socket.exists());
 
-    let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(45) {
-        if !session.socket.exists() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(200));
-    }
-    panic!("daemon outlived its first-attach timeout");
+    assert!(
+        poll_until(Duration::from_secs(45), || !session.socket.exists()),
+        "daemon outlived its first-attach timeout"
+    );
 }
 
 /// A daemon that reaps itself runs its shutdown to completion.
@@ -1200,14 +1469,9 @@ fn a_daemon_that_reaps_itself_removes_its_run_files() {
     client.drain_available();
     drop(client);
 
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while Instant::now() < deadline {
-        if !pid_file.exists() && !session.socket.exists() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    panic!(
+    assert!(
+        poll_until(Duration::from_secs(15), || !pid_file.exists()
+            && !session.socket.exists()),
         "run files outlived the daemon: socket={} pid={}",
         session.socket.exists(),
         pid_file.exists()
@@ -1269,25 +1533,18 @@ fn a_signalled_daemon_collects_a_process_that_ignores_sighup() {
 
     // Inside the two seconds `nomux kill` allows before `SIGKILL`, with room for a
     // loaded machine: an overrun there is this same bug wearing a hat.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline && (pid_file.exists() || session.socket.exists()) {
-        thread::sleep(Duration::from_millis(25));
-    }
     assert!(
-        !pid_file.exists() && !session.socket.exists(),
+        poll_until(Duration::from_secs(10), || !pid_file.exists()
+            && !session.socket.exists()),
         "run files outlived the signalled daemon: socket={} pid={}",
         session.socket.exists(),
         pid_file.exists()
     );
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        if !process_alive(orphan) {
-            return;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    panic!("pid {orphan} outlived the session it was backgrounded in");
+    assert!(
+        poll_until(Duration::from_secs(10), || !process_alive(orphan)),
+        "pid {orphan} outlived the session it was backgrounded in"
+    );
 }
 
 /// A session with nothing left running is torn down at once, rather than waiting
@@ -1324,25 +1581,22 @@ fn a_signalled_daemon_with_a_quiet_child_does_not_wait_out_the_grace_period() {
     rustix::process::kill_process(daemon, rustix::process::Signal::TERM)
         .expect("signal the daemon");
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        if session
+    let exited = poll_until(Duration::from_secs(10), || {
+        session
             .child
             .try_wait()
             .expect("wait for the daemon")
             .is_some()
-        {
-            let elapsed = began.elapsed();
-            assert!(
-                elapsed < Duration::from_millis(400),
-                "shutdown took {elapsed:?}, at or over the 500 ms grace period it \
-                 should only pay when something is still running"
-            );
-            return;
-        }
-        thread::sleep(Duration::from_millis(2));
-    }
-    panic!("the signalled daemon never exited");
+    });
+    // Read before the assertions, since the first of them is about how long the
+    // second one took to become true.
+    let elapsed = began.elapsed();
+    assert!(exited, "the signalled daemon never exited");
+    assert!(
+        elapsed < Duration::from_millis(400),
+        "shutdown took {elapsed:?}, at or over the 500 ms grace period it \
+         should only pay when something is still running"
+    );
 }
 
 /// Kills a pid when it goes out of scope.
@@ -1404,18 +1658,6 @@ fn process_alive(pid: u32) -> bool {
         return false;
     };
     !tail.trim_start().starts_with('Z')
-}
-
-/// A session created without the flag serves no socket at all: forwarding bypasses
-/// the user's `ForwardAgent` decision, so it must never be on by default.
-#[test]
-fn agent_forwarding_is_off_unless_asked_for() {
-    let (session, _client, ok) = Session::attached("agent_off");
-    assert!(!ok.agent);
-    assert!(
-        !session.agent_socket().exists(),
-        "no agent socket should exist for a session that did not ask for one"
-    );
 }
 
 /// Regression: a reconnect racing with in-flight input must not discard it.
@@ -1530,11 +1772,18 @@ fn an_abrupt_client_disconnect_does_not_kill_the_session() {
         data: command,
     });
 
-    // Let output pile up unread, then drop: unread data at close forces RST.
-    thread::sleep(Duration::from_millis(250));
+    // The daemon owns the command before the connection goes, so the assertion below
+    // is about what the session kept rather than about what it managed to read in
+    // the time somebody guessed at.
+    client.wait_for_input_ack(command.len() as u64);
+    // And it has written something nobody read, which is what makes the close an RST
+    // rather than an orderly FIN — that reset is the whole fault under test.
+    client.wait_for_unread_bytes();
     drop(client);
-    thread::sleep(Duration::from_millis(250));
 
+    // Straight into the reconnect: the handshake is itself the wait for the daemon to
+    // have dealt with the disconnect, since `in_applied` in the reply is authoritative
+    // and the takeover path runs before it is answered.
     let mut client = session.connect();
     let ok = client.hello(RESUME_FROM_START, 0);
     assert_eq!(
@@ -1588,7 +1837,11 @@ fn the_relay_moves_bulk_traffic_both_ways_without_losing_a_byte() {
             .stderr(Stdio::piped()),
     );
 
-    let peer = Arc::new(listener.accept().expect("attach never connected").0);
+    let peer = Arc::new(accept_within(
+        &listener,
+        Duration::from_secs(10),
+        "`nomux attach` to connect to the session socket",
+    ));
     let mut stdin = child.stdin.take().expect("stdin");
     let mut stdout = child.stdout.take().expect("stdout");
     let mut stderr = child.stderr.take().expect("stderr");
@@ -1684,7 +1937,11 @@ fn the_relay_exits_when_its_stdout_dies_with_the_destination_latched_full() {
             .stderr(Stdio::null()),
     );
 
-    let mut peer = listener.accept().expect("attach never connected").0;
+    let mut peer = accept_within(
+        &listener,
+        Duration::from_secs(10),
+        "`nomux attach` to connect to the session socket",
+    );
     // Stdin stays open and idle throughout. It is in the poll set the whole time,
     // which is the point: the wakeups being spun on come from stdout, so a relay
     // that blocked on stdin instead would hide the bug.
@@ -1709,14 +1966,10 @@ fn the_relay_exits_when_its_stdout_dies_with_the_destination_latched_full() {
     // waiting for it to become writable. Now take away the reader.
     drop(stdout);
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        if !child.is_running() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    panic!("the relay was still running with its stdout gone and its buffer empty");
+    assert!(
+        poll_until(Duration::from_secs(10), || !child.is_running()),
+        "the relay was still running with its stdout gone and its buffer empty"
+    );
 }
 
 /// Compares by first difference rather than by value: a failure here is megabytes

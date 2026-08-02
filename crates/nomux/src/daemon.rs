@@ -5,14 +5,16 @@
 //! master, the client if one is attached, the connection that has not greeted yet,
 //! the self-pipe a stop signal writes to, and — when agent forwarding is on — the
 //! agent socket plus one entry per live channel.
+//!
+//! What this process does to *itself* on the way in — leaving the login session,
+//! arming that self-pipe — is `startup`, since none of it touches session state.
 
 use std::collections::VecDeque;
 use std::fs;
-use std::io::{self, Write};
-use std::os::fd::{AsFd, BorrowedFd, IntoRawFd, OwnedFd};
+use std::io;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use nomux_proto::{
@@ -20,14 +22,13 @@ use nomux_proto::{
     RESUME_FROM_START, WinSize,
 };
 use rustix::event::{PollFd, PollFlags, Timespec};
-use rustix::fs::{Mode, OFlags};
-use rustix::pipe::PipeFlags;
 
 use crate::agent::{self, Agent};
 use crate::conn::Conn;
 use crate::linger;
 use crate::pty::{self, Pty};
 use crate::rundir::SessionPaths;
+use crate::startup::{arm_stop_signals, leave_login_session, release_startup_state};
 
 /// Default ring capacity. See `DESIGN.md` § 10 — this bounds how long a
 /// disconnect can last before scrollback is lost, and is multiplied by the
@@ -44,8 +45,11 @@ const RING_BYTES_ENV: &str = "NOMUX_RING_BYTES";
 /// Resolves the ring capacity, honouring [`RING_BYTES_ENV`].
 ///
 /// An unparseable or zero value falls back to the default rather than failing:
-/// a mistyped tuning variable should not stop a session from starting.
-pub(crate) fn ring_capacity() -> usize {
+/// a mistyped tuning variable should not stop a session from starting. Zero in
+/// particular has to be filtered here rather than passed on, since `Ring::new`
+/// asserts a non-zero capacity — a ring that makes every write a gap is not a
+/// tuning choice.
+fn ring_capacity() -> usize {
     std::env::var(RING_BYTES_ENV)
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
@@ -69,11 +73,11 @@ const EXIT_LINGER: Duration = Duration::from_secs(5);
 ///
 /// Comfortably inside [`EXIT_LINGER`], so the `Exit` frame still goes out within
 /// the window a reconnecting client is promised.
-const REAP_GRACE: Duration = Duration::from_secs(2);
+const STATUS_GRACE: Duration = Duration::from_secs(2);
 
 /// How often to retry while waiting for the child to become reapable. The wait is
 /// normally over within microseconds; this only bounds the pathological case.
-const REAP_RETRY: Duration = Duration::from_millis(5);
+const STATUS_RETRY: Duration = Duration::from_millis(5);
 
 /// Longest the poll loop sleeps with nothing else pending.
 #[expect(
@@ -124,105 +128,6 @@ const FAULT_SETTLE: Duration = Duration::from_millis(20);
 /// the last one decoded can carry the queue up to `MAX_PAYLOAD` past it.
 const MAX_PENDING_INPUT: usize = 1 << 20;
 
-/// Signals that mean "stop", handled so that leaving runs the shutdown path
-/// (`IMPLEMENTATION.md` § 6.5) instead of the default disposition.
-///
-/// `SIGTERM` is what `nomux kill` sends (§ 6.6). `SIGINT` joins it because it is the
-/// other signal a person sends by hand to mean stop, and a session is worth more
-/// than the keystroke that ended it: taking the shutdown path collects the child's
-/// process group and unlinks the run files, where the default disposition leaves
-/// both behind.
-///
-/// It is not what protects the window before § 6.2 has finished detaching, and no
-/// longer claims to be. Nothing is armed that early — the handlers go up right after
-/// that detachment, which is the earliest point at which a byte written here cannot
-/// be inherited by a child that never received the signal. What closes that window
-/// instead is § 6.2 itself: once the daemon holds no controlling terminal, no
-/// keystroke can reach it, and before that point it has no PTY, no child and no run
-/// files, so dying there is indistinguishable from never having started.
-///
-/// `SIGQUIT` is deliberately left alone. Its default action is a core dump, which
-/// is the only way left to get a snapshot out of a daemon that has wedged, and
-/// `SIGKILL` already covers "go away now" for anyone who does not want one.
-const STOP_SIGNALS: [libc::c_int; 2] = [libc::SIGTERM, libc::SIGINT];
-
-/// Write end of the self-pipe, as a raw descriptor because a signal handler may
-/// neither allocate nor take a lock. `-1` until [`arm_stop_signals`] publishes it.
-static STOP_PIPE: AtomicI32 = AtomicI32::new(-1);
-
-/// The entirety of what happens in a signal handler: one byte down the self-pipe.
-///
-/// Async-signal-safety is the constraint that shapes this. `write(2)` is on the
-/// permitted list, the descriptor is non-blocking so a pipe somebody has filled
-/// cannot park the daemon inside a handler, and a refused write means a byte is
-/// already waiting — which is the whole of the message. Nor can this perturb
-/// `errno`: rustix issues the syscall directly and reports failure through its
-/// return value, so a handler landing between a failing call in the main flow and
-/// that call's `errno` read leaves it untouched.
-extern "C" fn note_stop_signal(_signum: libc::c_int) {
-    let raw = STOP_PIPE.load(Ordering::Relaxed);
-    if raw >= 0 {
-        // SAFETY: the write end is published once, before any handler can run, and
-        // then deliberately never closed, so this descriptor number is valid for
-        // the rest of the process's life and cannot have been reused.
-        let fd = unsafe { BorrowedFd::borrow_raw(raw) };
-        let _ = rustix::io::write(fd, b"\0");
-    }
-}
-
-/// Routes [`STOP_SIGNALS`] into a descriptor the poll set can watch, and hands back
-/// its read end.
-///
-/// A self-pipe rather than `signalfd`, which reports only signals that are
-/// *blocked* and so wants a process-wide `sigprocmask` — a mask that survives
-/// `exec`, meaning `pty::Pty::spawn` would have to unblock it again in the child or
-/// leave the user's shell permanently deaf to `SIGTERM`. rustix has no binding for
-/// it either. Two descriptors and a one-line handler are the cheaper trade.
-///
-/// # Errors
-///
-/// Fails if the pipe cannot be created or a handler cannot be installed.
-fn arm_stop_signals() -> io::Result<OwnedFd> {
-    // `CLOEXEC` so the session's child never inherits either end; `NONBLOCK` so the
-    // handler above cannot block on the write.
-    let (read, write) = rustix::pipe::pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK)?;
-
-    // The write end is leaked on purpose. A signal can arrive at any point up to
-    // process exit, including after the `Daemon` has been dropped, and a handler
-    // holding a closed descriptor would write its byte into whatever was opened
-    // next. One descriptor for the life of the process is the cheaper answer than
-    // teaching the handler to be told.
-    STOP_PIPE.store(write.into_raw_fd(), Ordering::Relaxed);
-
-    // `sighandler_t` is an integer wide enough for a pointer, and a function item
-    // has to be laundered through one to reach it.
-    let handler = note_stop_signal as *const () as libc::sighandler_t;
-    for (armed, signum) in STOP_SIGNALS.into_iter().enumerate() {
-        // SAFETY: `signal` on a single-threaded process with an async-signal-safe
-        // handler, installed before any thread or child exists. `exec` resets
-        // handled dispositions, so the session's child is unaffected.
-        if unsafe { libc::signal(signum, handler) } == libc::SIG_ERR {
-            let err = io::Error::last_os_error();
-            // Unwound rather than left half-installed. `run` answers this failure by
-            // carrying on with no self-pipe, and the read end goes out of scope with
-            // it — so a handler surviving here would write into a pipe nobody holds,
-            // discard the `EPIPE` as "a byte is already waiting", and swallow the
-            // signal. That is a daemon permanently deaf to `SIGTERM`, which is worse
-            // than the default disposition this exists to improve on: the default at
-            // least closes the master and hangs up the foreground group.
-            for prior in STOP_SIGNALS.into_iter().take(armed) {
-                // SAFETY: the same call, putting back the disposition the loop above
-                // replaced.
-                unsafe {
-                    libc::signal(prior, libc::SIG_DFL);
-                }
-            }
-            return Err(err);
-        }
-    }
-    Ok(read)
-}
-
 /// The attached client, and the state that means nothing without one.
 ///
 /// One `Option` rather than four fields on the daemon that had to be kept in
@@ -263,8 +168,8 @@ impl Attached {
 struct Daemon {
     paths: SessionPaths,
     listener: UnixListener,
-    /// Read end of the self-pipe [`arm_stop_signals`] armed, or `None` on a host
-    /// where it could not be armed at all.
+    /// Read end of the self-pipe [`crate::startup::arm_stop_signals`] armed, or
+    /// `None` on a host where it could not be armed at all.
     stop_pipe: Option<OwnedFd>,
     /// Set once a stop signal has been seen. The loop leaves on its next pass, so
     /// the exit goes out through `shutdown` like every other one.
@@ -281,7 +186,8 @@ struct Daemon {
     /// Where the child starts, captured before the daemon moved to `/`.
     child_dir: PathBuf,
     /// Whether `logind` will let this session outlive the user's logout, for
-    /// `HelloOk`. Unrelated to `linger_until`, which is the post-exit grace period.
+    /// `HelloOk`. Unrelated to [`Daemon::exit_deadline`], which is the post-exit
+    /// grace period.
     logind_linger: Linger,
     /// Post-gap repaint policy, restated by each client's `Hello`.
     repaint_ctrl_l: bool,
@@ -299,8 +205,6 @@ struct Daemon {
     exited: Option<(i32, ExitKind)>,
     /// When the session became clientless, for idle reaping.
     detached_since: Option<Instant>,
-    /// Deadline after the child exits.
-    linger_until: Option<Instant>,
 }
 
 /// Runs the daemon for `session_id` until the child exits or the session is reaped.
@@ -312,7 +216,7 @@ struct Daemon {
 ///
 /// Fails if the run directory or socket cannot be created, or if another daemon
 /// already owns this session.
-pub(crate) fn run(session_id: &str, capacity: usize, label: Option<&str>) -> io::Result<()> {
+pub(crate) fn run(session_id: &str, label: Option<&str>) -> io::Result<()> {
     let paths = SessionPaths::new(session_id)?;
     paths.ensure_dir()?;
 
@@ -320,7 +224,7 @@ pub(crate) fn run(session_id: &str, capacity: usize, label: Option<&str>) -> io:
     // After the socket, so a session that is already running is still reported to
     // whoever asked with an exit status they can see; before the pidfile, so the
     // pid `nomux kill` reads belongs to the process that survives.
-    detach_from_login_session();
+    leave_login_session();
 
     // Before the pidfile, because that file is what `nomux kill` (§ 6.6) reads to
     // find this process: arming after writing it would leave a window, however
@@ -334,7 +238,7 @@ pub(crate) fn run(session_id: &str, capacity: usize, label: Option<&str>) -> io:
     // that cannot be made is not worth refusing to start over.
     let stop_pipe = arm_stop_signals().ok();
 
-    write_pidfile(&paths)?;
+    paths.write_pid()?;
     if let Some(label) = label {
         // Advisory: a session is worth more than its name in a listing.
         drop(paths.write_label(label));
@@ -346,14 +250,14 @@ pub(crate) fn run(session_id: &str, capacity: usize, label: Option<&str>) -> io:
     // could be days. The child does not follow — it starts in the user's home,
     // like any login shell.
     let child_dir = pty::child_dir(std::env::current_dir().ok().as_deref());
-    detach_from_startup_state();
+    release_startup_state();
 
     let mut daemon = Daemon {
         paths,
         listener,
         stop_pipe,
         stopping: false,
-        ring: crate::ring::Ring::new(capacity),
+        ring: crate::ring::Ring::new(ring_capacity()),
         pty: None,
         client: None,
         pending: None,
@@ -367,150 +271,11 @@ pub(crate) fn run(session_id: &str, capacity: usize, label: Option<&str>) -> io:
         child_gone: None,
         exited: None,
         detached_since: Some(Instant::now()),
-        linger_until: None,
     };
 
     let result = daemon.event_loop();
     daemon.shutdown();
     result
-}
-
-/// Puts the daemon in a session of its own *and* without a controlling terminal,
-/// which is what lets it outlive the connection that started it
-/// (`IMPLEMENTATION.md` § 6.2).
-///
-/// Leading a session is not the property wanted, only half of it. A session leader
-/// may still hold a controlling terminal, and `exec`ing the daemon *from* one lands
-/// exactly there: `ssh -t host 'nomux daemon <id>'` produces it, because `bash -c`
-/// with a single command `exec`s in place instead of forking. The daemon is then the
-/// terminal's foreground process group for the session's whole life, so Ctrl-C kills
-/// it and `Ctrl-\` dumps its core — `SIGHUP` was covered, terminal-generated signals
-/// were not.
-///
-/// Hence both halves in the early return. Everything after it is unchanged and still
-/// carries the weight: `setsid` leaves the caller a session leader with no
-/// controlling terminal, which is the whole property, and it refuses with `EPERM`
-/// for a process-group leader — a session leader being one by definition, so on the
-/// ordinary path, where `attach::spawn_daemon` already called `setsid` between fork
-/// and exec, calling it again looks exactly like a failure. Asking first is what
-/// tells "already done" apart from "cannot be done", and it keeps that path
-/// fork-free.
-///
-/// A genuine refusal means this process leads a process group somebody else made:
-/// `nomux daemon <id>` typed at a shell with job control, or the `ssh -t` shape
-/// above. Nothing can make a group leader a session leader, so the way out is a
-/// child that is not one. The parent leaves through `_exit`, which is why this
-/// happens before the pidfile is written — `nomux kill` must read the pid of the
-/// process that survived rather than of the one that started.
-///
-/// `SIGHUP` is ignored first, before anything here can provoke one, and that is
-/// load-bearing rather than tidy: when the parent leaves through `_exit` it is the
-/// *session leader* of the terminal it was `exec`ed from, so the kernel hangs that
-/// terminal up and delivers `SIGHUP` to its foreground process group — which the
-/// forked child is still in for the few instructions before its own `setsid`. With
-/// the disposition inherited as ignored the race cannot be lost; without it the
-/// daemon dies during the very manoeuvre that was meant to save it, which is exactly
-/// what it did the first time this was written.
-///
-/// `TIOCNOTTY` would drop the terminal without a fork and is deliberately not used.
-/// Issued by a session leader it sends `SIGHUP` and `SIGCONT` to the foreground
-/// process group — which in the case being fixed *is* this process — and it strips
-/// the controlling terminal from every other process in the session too, which is
-/// not this program's to take.
-///
-/// Failures are not propagated. Sharing a session makes for a worse daemon, not a
-/// broken one, and refusing to start would be the worse outcome of the two.
-fn detach_from_login_session() {
-    // SAFETY: `signal` with SIG_IGN on a single-threaded process with no handler
-    // installed; the disposition is reset in the child before exec (see
-    // `pty::Pty::spawn`) so the session's child still dies on hangup as it should.
-    unsafe {
-        libc::signal(libc::SIGHUP, libc::SIG_IGN);
-    }
-
-    let leads_session =
-        rustix::process::getsid(None).is_ok_and(|sid| sid == rustix::process::getpid());
-    if leads_session && !has_controlling_terminal() {
-        return;
-    }
-    if rustix::process::setsid().is_ok() {
-        return;
-    }
-
-    // SAFETY: this process is still single-threaded — no thread has been started
-    // and no child spawned — so the copy the child gets holds no lock and no
-    // half-initialised runtime state, and it is free to go on doing anything.
-    let forked = unsafe { libc::fork() };
-    if forked < 0 {
-        return;
-    }
-    if forked > 0 {
-        // SAFETY: the only correct exit for a forked parent. `exit` would run the
-        // atexit handlers and flush the buffered stdio a second time, emitting
-        // whatever the child has inherited and not yet written itself.
-        unsafe { libc::_exit(0) }
-    }
-    let _ = rustix::process::setsid();
-}
-
-/// Whether this process has a controlling terminal.
-///
-/// `/dev/tty` *is* that terminal, by definition, so opening it answers the question
-/// without having to know which descriptor — if any — reaches it. That matters here:
-/// the daemon's own stdio may already be a pipe, a socket or `/dev/null` and still
-/// leave the terminal attached, so no amount of asking about fd 0 would do.
-/// `O_NOCTTY` keeps § 6.2's rule that this binary never acquires one by opening it.
-///
-/// `ENXIO` is the kernel saying there is none, and is the only definite no. Anything
-/// else — no `/dev/tty` node in a stripped container, a mode that refuses the open —
-/// leaves the question unanswered, and unanswered is taken as yes. Being wrong that
-/// way costs one `fork` on a host where the probe cannot work; being wrong the other
-/// way costs a session that a keystroke can end.
-fn has_controlling_terminal() -> bool {
-    match rustix::fs::open(
-        "/dev/tty",
-        OFlags::RDONLY | OFlags::NOCTTY | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(_) => true,
-        Err(err) => err != rustix::io::Errno::NXIO,
-    }
-}
-
-/// Cuts the daemon loose from the rest of the state it inherited: the working
-/// directory and the standard descriptors.
-///
-/// `IMPLEMENTATION.md` § 6.2. `SIGHUP` is not among them — it is ignored earlier,
-/// in `detach_from_login_session`, because the detachment itself can provoke one.
-/// `SIGPIPE` needs nothing: the Rust runtime ignores it at startup and restores it
-/// for the child.
-///
-/// Failures are not propagated. A daemon that cannot `chdir` still works; refusing
-/// to start over it would be a worse outcome than the mount it might pin.
-fn detach_from_startup_state() {
-    let _ = rustix::process::chdir("/");
-    let _ = silence_stdio();
-}
-
-/// Points the three standard descriptors at `/dev/null`.
-///
-/// Whatever started the daemon is still on the other end of them, and under
-/// `attach` that is the SSH channel: holding it keeps a connection open that has
-/// nothing left to carry, and a byte written to it — a failure to start, a
-/// backtrace — arrives in the middle of the client's frame stream.
-///
-/// Late in the startup sequence on purpose: everything that can fail with a
-/// message worth reading has already had its chance to write one.
-///
-/// The `Result` is here to chain the four calls, not to be handled: the only caller
-/// discards it, because a daemon that could not reach `/dev/null` is a daemon that
-/// writes where it should not, which is worse than a session but better than none.
-fn silence_stdio() -> io::Result<()> {
-    let null = rustix::fs::open("/dev/null", OFlags::RDWR, Mode::empty())?;
-    rustix::stdio::dup2_stdin(&null)?;
-    rustix::stdio::dup2_stdout(&null)?;
-    rustix::stdio::dup2_stderr(&null)?;
-    Ok(())
 }
 
 /// Binds the session socket, replacing a stale one.
@@ -539,20 +304,6 @@ fn bind_socket(paths: &SessionPaths) -> io::Result<UnixListener> {
     Ok(listener)
 }
 
-/// Records the pid `nomux kill` will signal, at a mode its owner can read back.
-///
-/// `File::create` asks for `0666`, so the umask alone decides what this ends up
-/// as: `0644` under an ordinary one, and `0266` under `umask 0400` — a pidfile
-/// its own owner cannot read. `kill` refuses to unlink a live session whose pid
-/// it cannot read, correctly, so the session would be unkillable until somebody
-/// noticed and `chmod`ed it. The directory is `0700` either way; this is about
-/// the file staying legible to the process that has to act on it.
-fn write_pidfile(paths: &SessionPaths) -> io::Result<()> {
-    let mut file =
-        crate::rundir::with_umask(crate::rundir::FILE_MODE, || fs::File::create(paths.pid()))?;
-    writeln!(file, "{}", std::process::id())
-}
-
 /// What one entry of the poll set belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Source {
@@ -579,7 +330,7 @@ impl Daemon {
         let mut read_buf = vec![0u8; 64 * 1024];
 
         loop {
-            self.reap();
+            self.collect_status();
             if self.should_stop() {
                 return Ok(());
             }
@@ -600,6 +351,22 @@ impl Daemon {
         }
     }
 
+    /// When the post-exit linger window closes, if the child has already gone.
+    ///
+    /// Derived rather than stored, for the reason [`Daemon::detach_limit`] gives:
+    /// `should_stop` and `poll_timeout` both need it, and a deadline kept in a field
+    /// is a deadline two call sites can disagree about. Deriving it also settles a
+    /// question a field had to answer by hand — the window is armed by the child
+    /// exiting and is *not* collapsed by the client leaving. Doing that on the
+    /// reasoning that there is nobody left to tell keeps § 6.5's promise only in the
+    /// ordering where the client goes first: a client that watched the child exit and
+    /// then closed would take the window with it, and the reconnect the window exists
+    /// for would find the socket already unlinked. The whole point is the client that
+    /// has not arrived yet.
+    fn exit_deadline(&self) -> Option<Instant> {
+        self.child_gone.map(|gone| gone + EXIT_LINGER)
+    }
+
     /// Whether the PTY queue has grown past [`MAX_PENDING_INPUT`].
     fn input_is_saturated(&self) -> bool {
         self.pending_input.len() >= MAX_PENDING_INPUT
@@ -609,7 +376,7 @@ impl Daemon {
         if self.stopping {
             return true;
         }
-        if let Some(deadline) = self.linger_until
+        if let Some(deadline) = self.exit_deadline()
             && Instant::now() >= deadline
         {
             return true;
@@ -712,35 +479,49 @@ impl Daemon {
         watches
     }
 
-    fn poll_once(&mut self, read_buf: &mut [u8], scratch: &mut Vec<u8>) -> io::Result<()> {
-        if SETTLE_BEFORE_POLL {
-            std::thread::sleep(FAULT_SETTLE);
+    /// Blocks until something in the poll set is ready, and returns what.
+    ///
+    /// Split out so that [`Daemon::poll_once`] is the § 6.4.1 ordering policy and
+    /// nothing else: which source is serviced before which, and why, is the part of
+    /// this file worth reading, and it was previously preceded by forty lines of
+    /// poll mechanics. `None` is the `EINTR` case, which is not an event.
+    ///
+    /// The borrows of `self` are confined here, which is what lets the caller take
+    /// `&mut self` freely while handling what this returns.
+    fn wait(&self) -> io::Result<Option<Vec<(Source, PollFlags)>>> {
+        let watches = self.watches();
+        let mut fds: Vec<PollFd<'_>> = watches
+            .iter()
+            .map(|(_, fd, flags)| PollFd::from_borrowed_fd(*fd, *flags))
+            .collect();
+
+        let timeout = self.poll_timeout();
+        match rustix::event::poll(&mut fds, Some(&timeout)) {
+            Ok(_) => {}
+            // A stop signal delivered while blocked here lands as `EINTR`, and
+            // `poll` is never restarted whatever the handler's flags say. That
+            // costs nothing: the handler wrote its byte before the syscall
+            // returned, so coming round the loop finds the pipe readable and
+            // the notification outlives being dropped on the floor here.
+            Err(rustix::io::Errno::INTR) => return Ok(None),
+            Err(err) => return Err(err.into()),
         }
-        // The borrows of `self` end with this block, before anything is handled.
-        let events = {
-            let watches = self.watches();
-            let mut fds: Vec<PollFd<'_>> = watches
-                .iter()
-                .map(|(_, fd, flags)| PollFd::from_borrowed_fd(*fd, *flags))
-                .collect();
 
-            let timeout = self.poll_timeout();
-            match rustix::event::poll(&mut fds, Some(&timeout)) {
-                Ok(_) => {}
-                // A stop signal delivered while blocked here lands as `EINTR`, and
-                // `poll` is never restarted whatever the handler's flags say. That
-                // costs nothing: the handler wrote its byte before the syscall
-                // returned, so coming round the loop finds the pipe readable and
-                // the notification outlives being dropped on the floor here.
-                Err(rustix::io::Errno::INTR) => return Ok(()),
-                Err(err) => return Err(err.into()),
-            }
-
+        Ok(Some(
             watches
                 .iter()
                 .zip(fds.iter())
                 .map(|((source, _, _), fd)| (*source, fd.revents()))
-                .collect::<Vec<_>>()
+                .collect(),
+        ))
+    }
+
+    fn poll_once(&mut self, read_buf: &mut [u8], scratch: &mut Vec<u8>) -> io::Result<()> {
+        if SETTLE_BEFORE_POLL {
+            std::thread::sleep(FAULT_SETTLE);
+        }
+        let Some(events) = self.wait()? else {
+            return Ok(());
         };
         let revents = |want: Source| {
             events
@@ -837,7 +618,7 @@ impl Daemon {
     /// simply quiet.
     fn poll_timeout(&self) -> Timespec {
         let mut remaining = IDLE_TICK;
-        if let Some(deadline) = self.linger_until {
+        if let Some(deadline) = self.exit_deadline() {
             remaining = remaining.min(deadline.saturating_duration_since(Instant::now()));
         }
         if let Some(since) = self.detached_since {
@@ -846,7 +627,7 @@ impl Daemon {
         // The child has let go of the terminal but `waitpid` has not produced its
         // status yet; come back promptly rather than reporting one we invented.
         if self.child_gone.is_some() && self.exited.is_none() {
-            remaining = remaining.min(REAP_RETRY);
+            remaining = remaining.min(STATUS_RETRY);
         }
         Timespec {
             tv_sec: i64::try_from(remaining.as_secs()).unwrap_or(i64::MAX),
@@ -861,8 +642,9 @@ impl Daemon {
     /// spawn race in § 6.3 — if that counted as a takeover, listing sessions would
     /// evict the user from all of them, and the client is told never to
     /// auto-reconnect after `TAKEOVER`. So the takeover is triggered by the
-    /// `Hello`, exactly as `IMPLEMENTATION.md` § 6.4 words it, and a connection that never
-    /// greets costs the session nothing.
+    /// `Hello`, exactly as `IMPLEMENTATION.md` § 6.4 words it, and a connection that
+    /// never greets costs the session nothing.
+    ///
     /// Never fails. `EMFILE`, `ECONNABORTED` and friends belong to one connection
     /// and are transient; propagating them would destroy a live session over a
     /// descriptor shortage that has nothing to do with it. § 6.4.1 states the rule —
@@ -1016,17 +798,18 @@ impl Daemon {
     /// Records that the child has let go of the terminal, and starts the linger
     /// window.
     ///
-    /// The status is deliberately *not* resolved here. The kernel closes the
-    /// child's descriptors in `do_exit` before the task becomes reapable, so the
-    /// master reports end of file while `waitpid` still answers "not yet" — on this
-    /// kernel for about a third of exits. Committing a status at this moment
-    /// therefore invents one, and `exit 3` is reported to the client as `exit 0`.
+    /// No status is *invented* here. The kernel closes the child's descriptors in
+    /// `do_exit` before the task becomes reapable, so the master reports end of file
+    /// while `waitpid` still answers "not yet" — on this kernel for about a third of
+    /// exits. Committing a status at this moment therefore makes one up, and `exit 3`
+    /// is reported to the client as `exit 0`. The call below takes a real status
+    /// where `waitpid` already has one, which is the other two thirds and saves them
+    /// a [`STATUS_RETRY`] round trip; the rest wait.
     fn on_child_exit(&mut self) {
         if self.child_gone.is_none() {
             self.child_gone = Some(Instant::now());
-            self.linger_until = Some(Instant::now() + EXIT_LINGER);
         }
-        self.reap();
+        self.collect_status();
         // The frame itself is left to `pump_output`, which sends it once the last
         // of the child's output has gone out. Announcing the exit ahead of the
         // words that caused it is how a client ends up closing the tab on a
@@ -1037,7 +820,7 @@ impl Daemon {
     ///
     /// Called every pass while the status is outstanding, so the wait costs a few
     /// milliseconds rather than a wrong answer.
-    fn reap(&mut self) {
+    fn collect_status(&mut self) {
         let Some(gone_at) = self.child_gone else {
             return;
         };
@@ -1050,7 +833,7 @@ impl Daemon {
             .and_then(|pty| pty.try_wait().ok().flatten())
         {
             self.exited = Some(pty::exit_parts(status));
-        } else if gone_at.elapsed() >= REAP_GRACE {
+        } else if gone_at.elapsed() >= STATUS_GRACE {
             // The child closed the terminal without exiting — a program that
             // daemonises itself does exactly this — so there is no status to
             // report and never will be. The client is still owed an `Exit` rather
@@ -1121,6 +904,12 @@ impl Daemon {
                     drop(pty.resize(win));
                 }
             }
+            // Empty on purpose, and load-bearing for it. `OutputAck` is advisory
+            // (§ 3): it never trims the ring, and the daemon tracks what it has sent
+            // by itself. What the frame does is *arrive* — which wakes the loop, and
+            // is what lets a replay that stopped on a full socket resume without
+            // waiting for the child to say something. Acting on its contents is what
+            // would be wrong here, not ignoring them.
             Frame::OutputAck { .. } => {}
             Frame::Ping { nonce } => {
                 if let Some(client) = self.client.as_mut() {
@@ -1145,6 +934,42 @@ impl Daemon {
         Ok(())
     }
 
+    /// Binds the agent socket and spawns the child, on the `Hello` that creates the
+    /// session.
+    ///
+    /// Separated from [`Daemon::on_hello`] because the two answer unrelated
+    /// questions that merely arrive together: what this session *is*, decided once
+    /// and never again, against where this particular client resumes from, decided
+    /// on every attach. They shared only `hello.win`.
+    fn start_session(&mut self, hello: &Hello<'_>) -> io::Result<()> {
+        // Only the creating `Hello` can turn forwarding on: `SSH_AUTH_SOCK` goes
+        // into the child's environment, and a running process's environment cannot
+        // be changed afterwards (`DESIGN.md` § 5.3).
+        if hello.agent_forward() {
+            match Agent::bind(&self.paths.agent()) {
+                Ok(agent) => self.agent = Some(agent),
+                // A session without an agent is worth having; one that refuses to
+                // start is not. `HelloOk` reports the outcome either way.
+                Err(_) => self.agent = None,
+            }
+        }
+        let config = pty::Spawn {
+            term: hello.term,
+            win: hello.win,
+            session_id: self.paths.id(),
+            cwd: &self.child_dir,
+            agent_sock: self.agent.as_ref().map(Agent::path),
+        };
+        match Pty::spawn(&config) {
+            Ok(pty) => self.pty = Some(pty),
+            Err(err) => {
+                self.reject(ErrorCode::Internal, "failed to start the session shell");
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
     fn on_hello(&mut self, hello: &Hello<'_>) -> io::Result<()> {
         if hello.protocol != PROTOCOL_VERSION {
             self.reject(ErrorCode::Version, "protocol version mismatch");
@@ -1154,31 +979,7 @@ impl Daemon {
         self.repaint_ctrl_l = hello.repaint_ctrl_l();
 
         if self.pty.is_none() {
-            // Only the creating `Hello` can turn forwarding on: `SSH_AUTH_SOCK`
-            // goes into the child's environment, and a running process's
-            // environment cannot be changed afterwards (`DESIGN.md` § 5.3).
-            if hello.agent_forward() {
-                match Agent::bind(&self.paths.agent()) {
-                    Ok(agent) => self.agent = Some(agent),
-                    // A session without an agent is worth having; one that refuses
-                    // to start is not. `HelloOk` reports the outcome either way.
-                    Err(_) => self.agent = None,
-                }
-            }
-            let config = pty::Spawn {
-                term: hello.term,
-                win: hello.win,
-                session_id: self.paths.id(),
-                cwd: &self.child_dir,
-                agent_sock: self.agent.as_ref().map(Agent::path),
-            };
-            match Pty::spawn(&config) {
-                Ok(pty) => self.pty = Some(pty),
-                Err(err) => {
-                    self.reject(ErrorCode::Internal, "failed to start the session shell");
-                    return Err(err);
-                }
-            }
+            self.start_session(hello)?;
         } else if let Some(pty) = self.pty.as_ref() {
             drop(pty.resize(hello.win));
         }

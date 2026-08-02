@@ -4,104 +4,40 @@ Backlog. Rationale: [DESIGN.md](DESIGN.md). Mechanics: [IMPLEMENTATION.md](IMPLE
 
 ## Status
 
-The daemon, attach relay, control surface and agent forwarding work on Linux.
-Sessions survive a severed connection, resume by absolute byte offset, trim
-replayed input, and report overflow as an explicit gap. The PTY master is
-non-blocking, so a child that stops reading cannot wedge the event loop; the daemon
-holds no working directory, ignores `SIGHUP`, keeps its PTY out of the child's
-descriptor table, and reports through `HelloOk` whether `logind` will let the
-session outlive the user's logout. Protocol revision 2, which gave both flag fields
-meaning. The relay moves bytes with `splice(2)` where the host allows it.
+Everything below this section is a feature not started, a decision deliberately
+deferred, or client-side work recorded because its server-side contract is fixed
+here. This section is the standing state; the deltas that produced it are what
+`git log` is for.
 
-The `daemon` mode now holds its own detachment rather than borrowing the caller's:
-it leads a session, holds no controlling terminal, and redirects the stdio it was
-handed, forking only when it cannot do so in place. It leaves on `SIGTERM` and
-`SIGINT` through the shutdown path, so `nomux kill` collects the child's process
-group instead of dropping the daemon where it stands. Both queue directions are
-bounded, the input one where the queue grows rather than where the socket is read.
+Working end to end on Linux, protocol revision 2. The daemon owns a PTY, a child and
+a bounded ring buffer; clients resume by absolute byte offset across a severed
+connection, replayed input is trimmed rather than re-applied, and overflow is
+reported as an explicit gap rather than papered over. Agent forwarding proxies
+`ssh-agent` to the client as a sub-channel of the same connection. `attach` spawns a
+daemon on demand and relays bytes to it, knowing nothing of the protocol. `list` and
+`kill` act on the run directory alone, so any build can manage any daemon whatever
+protocol it speaks. Mechanics: [IMPLEMENTATION.md](IMPLEMENTATION.md).
 
-The five files of a session are removed only by a process holding `<id>.lock`,
-which is removed last and revalidated by inode, so collection cannot take the spawn
-mutex out from under an attach. `list`, `kill` and `attach` all check the run
-directory before trusting a path inside it, and `/etc/passwd` is parsed over bytes,
-so one Latin-1 GECOS field no longer costs every user on the host their shell.
-
-Shutdown reaches the whole session rather than one process group: `terminate`
-follows the group kill with a `/proc` walk for the `&` jobs job control scattered
-into groups of their own, which is every job of every interactive shell. The linger
-window of § 6.5 now holds in both orderings — a client that watches the child exit
-and *then* closes no longer takes the five seconds with it. The attached client and
-the three fields that mean nothing without it are one `Option<Attached>`, so a
-takeover resets them together or not at all.
-
-Four defects found by review since then, each now with a test that fails without
-its fix. The relay spun at the speed of the scheduler when its stdout died with a
-`splice` latched on a full destination — reachable whenever the network drops with
-output backed up, which is the shape this project exists for. `Pty::terminate` paid
-its whole 500 ms grace on *every* shutdown, because an unreaped zombie still
-answers for its own process group and the group probe short-circuits the `/proc`
-walk that would have disagreed. A `Hello` carrying the wrong protocol version was
-refused only after the takeover had already evicted the working client, so a newer
-client's failed handshake left the session running with nobody attached and a
-client § 6.4 forbids from reconnecting. And `kill` refused a healthy session whose
-pidfile it caught between creation and first write.
-
-Two smaller ones went with them, both about answering the right way rather than
-about behaviour anybody would notice twice: the relay now acts on a bare `POLLERR`
-from stdin, as the socket direction and the daemon's own poll loop already did, and
-`attach` reports a malformed session id as § 10's `EX_USAGE` rather than as a
-session that resisted attaching — the client caches the latter per host, and would
-have cached it off its own typo.
-
-103 tests, one of which waits out a real reaping timeout and is `#[ignore]`d (CI
-runs it with `--run-ignored all`), plus 2 doctests: property tests over the codec
-including malformed and near-valid input, hand-written wire vectors that pin the
-§ 2.2 byte layout, a model-checked ring, an integration suite driving the real
-binary over its socket, and a seeded chaos suite that severs the connection at
-generated points under an escape-heavy full-screen stream and under `yes`. Two of
-them are verified against builds that restore the bug they guard: the event
-ordering of § 6.4.1, against a fault-injected binary and against one that forces
-only the interleaving, which must still pass; and the session reach of
-`Pty::terminate`, against a build with the `/proc` walk removed.
-
-The wire vectors are the newest of those and close the widest hole the suite had.
-Every other codec test compared a frame to a frame, so the codec was only ever
-checked against itself: swapping `Hello.out_offset` with `Hello.in_offset` on both
-sides passed all 23 of them. The client is a separate codebase built from the § 2.2
-table, so "encode and decode agree" was never the property that mattered.
-
-The suite runs beside itself. Each test's run directory is named for a hash of the
-test and the pid of the process running it, so a second copy of a binary in a
-second terminal no longer deletes the first's sockets, and every process this
-suite starts is killed and collected by a `Drop` guard rather than by a line the
-author remembered to write. Both halves of the name are short on purpose: what the
-suite adds to `CARGO_TARGET_TMPDIR` is 38 bytes against `sockaddr_un`'s 108, which
-is what makes a worktree under `.claude/worktrees/` runnable.
-
-All four musl targets build reproducibly via `scripts/build-release.sh`, against
-the 400 KiB budget, and the largest of them — armv7, a little over 215 KiB — has
-the least headroom by a wide margin. The other three are not repeated here: they
-live in
-`scripts/size-baseline`, which a build writes, and the two places that used to
-copy them had both gone stale, one of them twice. The script holds each target
-against
-that baseline and fails a growth past 3%, so the next size regression is reported
-in the commit that causes it — and the baseline now records the resolved `rustc
---version` rather than the toolchain alias it was asked for, since `nightly` floats
-and two builds a day apart can both answer to it while disagreeing about every
-figure. A missing baseline is refused outright rather than treated as "none yet",
-which used to turn the gate off silently. The armv7 figure is one that arrived
-before the gate did; see below.
-
-Everything below is either a feature not started, a decision deliberately deferred,
-or client-side work recorded because its server-side contract is fixed here.
+- **Platform** — Linux only, by construction. Everything else degrades to plain SSH
+  ([DESIGN.md § 7](DESIGN.md#7-degradation)).
+- **Suite** — 107 tests plus 2 doctests, and a per-test timeout in
+  `.config/nextest.toml` so a hang is a failure rather than a hung run. One test is
+  `#[ignore]`d because it sits out the real 30 s first-attach reap, and CI runs it
+  with `--run-ignored all`. What each layer covers, and the two invariants the whole
+  thing exists to protect: [IMPLEMENTATION.md § 9](IMPLEMENTATION.md#9-testing).
+- **Release** — all four musl targets build reproducibly, inside the 400 KiB budget
+  and against a per-target growth gate, from `scripts/build-release.sh`. armv7 has by
+  far the least headroom, for the reason in P1. The sizes live in
+  `scripts/size-baseline`, which a build writes — and not in prose here, which is
+  where every stale copy of them has been found so far.
+- **Not started** — the release process of P3, and the client, which is a separate
+  repository and whose server-side contract is the last section of this file.
 
 ## P1 — known gaps
 
-Two left. What sat here before was found by review or measurement rather than by
-guessing, and the same is true of these — which is worth saying because the two
-that remain are both cases where the honest answer is a known cost rather than a
-missing line of code.
+Two, and in both the honest answer is a known cost rather than a missing line of
+code. Each was found by review or by measurement rather than by guessing, which is
+the bar for landing here.
 
 - **A hand-started daemon has a bind-to-publish window.** `attach` holds the spawn
   lock until `<id>.pid` exists, so a session it created is never visible without its
@@ -109,35 +45,40 @@ missing line of code.
   and publishes the pidfile a few syscalls later, so a `kill` landing in between
   sees a live session it cannot identify. It refuses rather than unlinking, and
   waits the window out, so the outcome is an honest non-zero exit rather than a
-  destroyed session — but the window is still there.
-
-  One half of it turned out to be reachable from the ordinary spawn too, and is now
-  closed: `write_pidfile` creates the file and fills it a syscall later, and `attach`
-  releases the lock at the first of those, so a `kill` could read a zero-length
-  pidfile. That read as a *corrupt* pidfile and was refused at once, where a missing
-  one was patiently waited out. Both halves are waited out now, which leaves only
-  the hand-started case this item is about.
+  destroyed session — but the window is still there. Only the hand-started case:
+  a session `attach` spawned is never visible without its pidfile, and a pidfile
+  caught between creation and its first write is waited out like a missing one.
 - **The run-directory check costs armv7 66 KiB.** Bisected to the commit, and the
   jump is that architecture alone: 148,292 → 215,884 bytes, a 46% step against
   roughly 6 KiB for the whole branch on each of the other three. Ruled out by
   probe: the two dynamic error messages (168 bytes) and the `fchmod` repair (120
   bytes). Removing the check recovers all of it, so the cost is in the
-  `open`/`fstat`/`Mode` path as 32-bit ARM codegen renders it. Under budget at 215
-  KiB, so this is a size regression rather than a broken release — but it is very
+  `open`/`fstat`/`Mode` path as 32-bit ARM codegen renders it. It stays inside the
+  budget, so this is a size regression rather than a broken release — but it is very
   nearly a third of the binary users upload over cellular, and armv7 is the target
   least likely to be on a fast link. It went unnoticed because the release script
-  enforced the cap and not the delta, which is now closed: the same commit today
-  would fail the 3% gate.
+  enforced the cap and not the delta; the 3% gate that now exists would fail the
+  same commit.
 
 ## P2 — structure
 
 - **`Hello.flags` could be unrepresentable rather than merely checked.** `HelloOk`
   packs typed fields (`gap: bool`, `linger: Linger`, `agent: bool`) through a private
   `flags()`, so an invalid combination cannot be built; `Hello` exposes a bare `u16`
-  and validates it on both sides instead. Matching `HelloOk` would delete
-  `HELLO_FLAG_BITS`, both accessors and the proptest's `any_hello_flags`, at the cost
-  of two adjacent booleans at six call sites where `HELLO_AGENT_FORWARD` currently
-  reads better. Worth doing if a third flag ever lands.
+  and validates it on both sides instead. Matching `HelloOk` would delete the
+  encode-side check, both accessors, the test that undefined bits are refused *by the
+  encoder*, and the proptest's `any_hello_flags`. It would **not** delete
+  `HELLO_FLAG_BITS`: §2.3 makes an undefined bit a protocol error however the struct
+  is typed, so the decode side keeps the constant and its check either way, exactly as
+  `HelloOk` does today.
+
+  The cost is two adjacent booleans threaded through every `Hello` literal and every
+  test helper that currently forwards a `flags: u16` — a wider reach than it looks,
+  and one where `HELLO_AGENT_FORWARD` presently reads better than a positional
+  `true, false`. Worth doing if a third flag ever lands, but note the shape changes
+  at that point: three booleans is worse than two, so the answer then is one `Copy`
+  `HelloFlags` value with named constructors — a single argument to thread — rather
+  than N adjacent bools.
 - **A test can hold the spawn lock without meaning to.** `fork` duplicates every
   open descriptor, and a duplicate of an `flock`ed one keeps that lock alive until it
   is closed — for a child of the test binary, until its `exec`. So any test that
@@ -152,8 +93,8 @@ missing line of code.
 The four musl targets build, land under the 400 KiB budget, and are byte-reproducible;
 `scripts/build-release.sh` enforces all three. What is left is process rather than code:
 
-- Pick and pin the release nightly. The shipping build needs one ([IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)), CI names a dated one, and nothing yet decides when it moves. A floating nightly silently invalidates the SHA-256 the client pinned.
-- Publish the checksums somewhere the client reads, and decide what it does when a host already holds a binary whose hash it no longer recognises.
+- Decide when the pinned nightly moves. It is named once now, in `scripts/nightly-version`, which the build script and CI both read — so a local build and the runner measure the same bytes against a baseline recorded by the same compiler. What is undecided is the *policy*: the toolchain and `scripts/size-baseline` have to move in one commit, because the figures are compiler-dependent and a bump that leaves the baseline behind either fails the 3% gate for no reason or hides a real regression behind a compiler that got smaller.
+- Publish the checksums somewhere the client reads, and decide what it does when a host already holds a binary whose hash it no longer recognises. Nothing does this today: `SHA256SUMS` is built and uploaded as a CI artifact, which expires and sits behind a login, and no workflow triggers on a tag.
 
 ## P4 — test depth
 

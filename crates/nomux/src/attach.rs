@@ -231,6 +231,13 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
             Err(rustix::io::Errno::INTR) => continue,
             Err(err) => return Err(err.into()),
         }
+        // Read back by position, which `daemon::watches` deliberately does not do —
+        // it tags each entry, because a poll set whose size depends on how many agent
+        // channels are live is one an index slip silently misreads. Safe here for the
+        // reason that does not hold there: the set is three fixed entries, and the
+        // same three conditions that decided whether each was pushed are reused
+        // below rather than recomputed, so a `Pump` that changed state during the
+        // `poll` cannot shift the mapping under it.
         let mut events = fds.iter().map(rustix::event::PollFd::revents);
         let stdin_events = if want_stdin {
             events.next().unwrap_or_else(PollFlags::empty)
@@ -385,8 +392,16 @@ impl Default for Pump {
 impl Pump {
     /// Whether the source is worth polling: only with the destination caught up,
     /// so nothing can overtake bytes that are already owed to it.
+    ///
+    /// Written as the negation rather than as `!has_data && !dest_full`, which is
+    /// the same predicate by De Morgan and says nothing about being the same. The
+    /// two are exclusive and exhaustive, which is exactly what the type's own doc
+    /// claims — `splice` is attempted only when the buffer is empty, so the choice
+    /// between the two directions cannot reorder anything — and stating it this way
+    /// makes it a fact about the code rather than a coincidence each reader has to
+    /// re-derive.
     const fn wants_source(&self) -> bool {
-        !self.buf.has_data() && !self.dest_full
+        !self.wants_dest()
     }
 
     /// Whether the destination is worth polling for writability.

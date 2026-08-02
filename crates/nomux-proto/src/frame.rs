@@ -650,66 +650,6 @@ mod tests {
     };
 
     #[test]
-    fn every_variant_round_trips() {
-        round_trip(Frame::Hello(Hello {
-            protocol: PROTOCOL_VERSION,
-            flags: HELLO_AGENT_FORWARD | HELLO_REPAINT_CTRL_L,
-            out_offset: RESUME_FROM_START,
-            in_offset: 0,
-            win: WIN,
-            term: "xterm-256color",
-        }));
-        round_trip(Frame::HelloOk(HelloOk {
-            protocol: PROTOCOL_VERSION,
-            resume_from: 4096,
-            in_applied: 17,
-            win: WIN,
-            gap: true,
-            linger: Linger::Enabled,
-            agent: true,
-        }));
-        round_trip(Frame::Input {
-            offset: 9,
-            data: b"ls -l\r",
-        });
-        round_trip(Frame::InputAck {
-            applied_through: 15,
-        });
-        round_trip(Frame::Output {
-            offset: u64::MAX / 2,
-            data: b"\x1b[2Jhello",
-        });
-        round_trip(Frame::OutputAck {
-            consumed_through: 1,
-        });
-        round_trip(Frame::Resize(WIN));
-        round_trip(Frame::Gap {
-            new_base_offset: 8192,
-        });
-        round_trip(Frame::Exit {
-            status: 130,
-            kind: ExitKind::Signalled,
-        });
-        round_trip(Frame::Exit {
-            status: 0,
-            kind: ExitKind::Exited,
-        });
-        round_trip(Frame::Detach);
-        round_trip(Frame::Ping { nonce: 42 });
-        round_trip(Frame::Pong { nonce: 42 });
-        round_trip(Frame::Error {
-            code: ErrorCode::Takeover,
-            message: "session taken over",
-        });
-        round_trip(Frame::AgentOpen { chan: 3 });
-        round_trip(Frame::AgentData {
-            chan: 3,
-            data: b"\0\0\0\x01\x0b",
-        });
-        round_trip(Frame::AgentClose { chan: 3 });
-    }
-
-    #[test]
     fn empty_payloads_round_trip() {
         round_trip(Frame::Input {
             offset: 0,

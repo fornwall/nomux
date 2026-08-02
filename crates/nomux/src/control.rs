@@ -63,6 +63,22 @@ enum Liveness {
 ///
 /// Fails if the run directory cannot be read. A missing directory is not an
 /// error — it simply means no session has ever been created.
+/// Turns the § 6.3 run-directory check into "is there one?" rather than an error to
+/// be matched.
+///
+/// Both modes have to make that check before they trust any name inside the
+/// directory, and both treat its absence as the question already answered: `list`
+/// prints nothing, `kill` finds its postcondition already holding. Written out at
+/// each site it was a five-line `match` per call — and `list` made two of them, for
+/// two different reasons, which left a reader unable to tell which was load-bearing.
+fn present(checked: io::Result<()>) -> io::Result<bool> {
+    match checked {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
 pub(crate) fn list() -> io::Result<()> {
     let dir = run_dir()?;
     // The same check every other path makes before it trusts this directory
@@ -73,13 +89,15 @@ pub(crate) fn list() -> io::Result<()> {
     //
     // Checked and never created: being asked what sessions exist must not be what
     // brings the place they would live into existence.
-    match check_run_dir(&dir) {
-        Ok(()) => {}
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err),
+    if !present(check_run_dir(&dir))? {
+        return Ok(());
     }
     let entries = match fs::read_dir(&dir) {
         Ok(entries) => entries,
+        // Not the same absence as the one above, which is the ordinary "this host
+        // has never run a session". The check has just opened this directory and
+        // succeeded, so reaching here means it went away in between — a race, not a
+        // state. Answered the same way because the answer is the same.
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err),
     };
@@ -128,11 +146,9 @@ pub(crate) fn kill(session_id: &str) -> io::Result<()> {
     // things below are reading a pid out of a file and sending it a signal, and in
     // a run directory somebody else can write to, that number is theirs. Checked
     // rather than ensured — `kill` has no business creating a run directory.
-    match paths.check_dir() {
-        Ok(()) => {}
-        // Nowhere for the session to be is the postcondition already holding.
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err),
+    // Nowhere for the session to be is the postcondition already holding.
+    if !present(paths.check_dir())? {
+        return Ok(());
     }
     // Held from here to the end of the function. Nothing can spawn into this id
     // while it is held (§ 6.3), which is what keeps the two halves of this
@@ -248,7 +264,8 @@ fn resolve(paths: &SessionPaths) -> io::Result<Target> {
                     .ok_or_else(|| unreadable(paths, &format!("it holds {body:?}")));
             }
             // Present but empty is the same window one syscall later, and is
-            // therefore waited out rather than reported. `write_pidfile` publishes in
+            // therefore waited out rather than reported. `SessionPaths::write_pid`
+            // publishes in
             // two steps — `File::create`, which leaves a zero-length file, then the
             // `writeln!` that fills it — so a reader can land between them. Nor is
             // this only the hand-started case: `attach` releases the spawn lock as

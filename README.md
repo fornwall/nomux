@@ -59,6 +59,10 @@ prek run --all-files    # run the gate manually
 The hooks trigger on `*.rs`, `*.toml` and `Cargo.lock` — manifests included, because
 the lint configuration lives in `Cargo.toml` — and on `*.sh`, because the release
 build and the takeover guard are shell and no Rust hook would ever look at them.
+Every hook is `language: system`, so prek installs nothing on their behalf:
+`shellcheck` and `cargo-nextest` have to be on `$PATH` already, or the first run of
+the gate in a fresh clone fails on a missing command rather than on anything in the
+tree.
 
 Two things are deliberately left out of the pre-commit gate and run in CI instead,
 because both cost far more than a commit should:
@@ -67,6 +71,10 @@ because both cost far more than a commit should:
 cargo nextest run --workspace --run-ignored all   # includes the 30 s first-attach reap
 sh scripts/verify-takeover-guard.sh               # rebuilds under fault injection
 ```
+
+CI runs a third thing that is in neither list: the whole musl release build below.
+It needs a nightly compiler and four cross targets installed, which makes it the one
+check the local hooks genuinely cannot stand in for.
 
 The chaos suite picks its disconnect points from a fixed seed, so a failure
 reproduces; `NOMUX_CHAOS_SEED=<n>` explores other interleavings, and every failure
@@ -91,8 +99,9 @@ configuration rebuilds the standard library with panics compiled out, which need
 nightly and its sources:
 
 ```sh
-rustup toolchain install nightly --component rust-src
-rustup target add --toolchain nightly \
+nightly=$(cat scripts/nightly-version)
+rustup toolchain install "$nightly" --component rust-src
+rustup target add --toolchain "$nightly" \
   x86_64-unknown-linux-musl \
   aarch64-unknown-linux-musl \
   armv7-unknown-linux-musleabihf \
@@ -101,9 +110,12 @@ rustup target add --toolchain nightly \
 
 That is not an optimisation: with the released standard library, every target
 misses the size budget. `NOMUX_STABLE_STD=1` builds against the pinned stable
-toolchain and is expected to fail the gate. `NOMUX_NIGHTLY=nightly-YYYY-MM-DD` pins
-the compiler, which a release must do — the client pins a SHA-256 per architecture,
-and a floating nightly moves it. See
+toolchain and is expected to fail the gate. The nightly is dated rather than
+floating, and `scripts/nightly-version` is where it is named: the script and CI both
+read it from there, so a local build and the runner measure the same bytes against a
+baseline recorded by the same compiler. `NOMUX_NIGHTLY` overrides it for a build that
+is not a release; a release must pin, because the client pins a SHA-256 per
+architecture and a floating compiler moves it. See
 [IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build) for the measurements.
 
 ## Status
@@ -113,12 +125,11 @@ by byte offset across a severed connection, agent forwarding proxies `ssh-agent`
 over the same channel, `attach` spawns a daemon on demand and relays, and
 `list`/`kill` operate on the run directory alone.
 
-What is left is the release process — pinning the shipping nightly and publishing
-the checksums the client verifies against — plus client-side work
-(`direct-streamlocal`, bootstrap orchestration, emulator reset on gap) and a
-handful of decisions deliberately deferred. See [PLAN.md](PLAN.md).
-
-Tunables: `NOMUX_RING_BYTES` overrides the 4 MiB output ring per daemon.
+What is left is the rest of the release process — publishing the checksums the
+client verifies against, and deciding what it does with a binary whose hash it no
+longer recognises — plus client-side work (`direct-streamlocal`, bootstrap
+orchestration, emulator reset on gap) and a handful of decisions deliberately
+deferred. See [PLAN.md](PLAN.md).
 
 ## License
 

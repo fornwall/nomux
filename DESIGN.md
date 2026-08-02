@@ -110,7 +110,7 @@ one contract:
 | `nomux daemon` | Outlives connections | Owns the PTY master, child process, ring buffer, and unix socket. Speaks the wire protocol. |
 | `nomux attach` | One connection | Dumb byte relay between stdio and the unix socket. No protocol awareness. Skipped entirely when `direct-streamlocal` is available. |
 | `nomux probe` | One-shot | Reports OS, architecture, and resolved install path for bootstrap. |
-| `nomux kill` / `nomux list` | One-shot | Frozen control surface. Acts on the run directory — pidfile and socket — never on the session protocol, so any build can manage any daemon regardless of version. |
+| `nomux kill` / `nomux list` | One-shot | Frozen control surface. Acts on the run directory — the five files per session listed in [IMPLEMENTATION.md § 6.6](IMPLEMENTATION.md#66-frozen-control-surface) — never on the session protocol, so any build can manage any daemon regardless of version. |
 
 The protocol is spoken end-to-end between the client and the daemon. `attach` is
 deliberately dumb so protocol logic exists in exactly one place.
@@ -126,7 +126,7 @@ stateDiagram-v2
   Attached --> Exiting: child exits
   Detached --> Exiting: child exits
   Detached --> Exiting: idle timeout
-  Exiting --> [*]: flush Exit, unlink socket
+  Exiting --> [*]: flush Exit, unlink run files
 ```
 
 The daemon keeps draining the PTY while detached — otherwise the child blocks on

@@ -48,9 +48,10 @@
 # cap, armv7 included — and cleared with it. So it is not an optimisation, it is the
 # only configuration that ships. The cost is a nightly compiler and panics that abort
 # with no message — acceptable only because the clippy wall in Cargo.toml already
-# denies unwrap, expect, panic and indexing. Point NOMUX_NIGHTLY at a dated nightly
-# for a real release: a floating one is a moving target, and the SHA-256 the client
-# pins would drift under it.
+# denies unwrap, expect, panic and indexing. The compiler is dated rather than
+# floating — scripts/nightly-version names it and this script defaults to it, with
+# NOMUX_NIGHTLY overriding for a one-off — because a floating one is a moving target
+# and the SHA-256 the client pins would drift under it.
 #
 # No shipping figure is written down in this comment. scripts/size-baseline holds
 # them, written by a build rather than by hand, and the copy that used to live on
@@ -63,7 +64,8 @@
 # to leave the tree buildable without nightly. NOMUX_UPDATE_BASELINE=1 is refused
 # alongside it, since the sizes it measures are not the ones the release ships.
 #
-# Run from anywhere in the repository. Artifacts land in target/dist/.
+# Run from anywhere: the script works in the repository it lives in, whatever the
+# caller's directory. Artifacts land in target/dist/.
 set -eu
 
 max_bytes=409600 # 400 KiB
@@ -83,8 +85,18 @@ armv7-unknown-linux-musleabihf
 riscv64gc-unknown-linux-musl'
 
 repo=$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)
+# Most of what this script depends on is resolved from the working directory rather
+# than from $repo: cargo finds the workspace and reads .cargo/config.toml — where
+# rust-lld is pinned for all four targets — by walking up from where it was started,
+# rustup reads rust-toolchain.toml the same way, and the copy out of $repo/target
+# below assumes cargo wrote there. From a subdirectory of the tree that walk still
+# lands on the right files; from another crate's directory it lands on that crate and
+# builds it. The cd is what makes the promise above mean what it says.
+cd "$repo"
+
 dist="$repo/target/dist"
 baseline_file="$repo/scripts/size-baseline"
+nightly_file="$repo/scripts/nightly-version"
 update_baseline="${NOMUX_UPDATE_BASELINE:-0}"
 
 # A stable-std build measures a binary three times the size of the one that ships, so
@@ -128,6 +140,17 @@ if [ -e "$baseline_file" ]; then
         exit 1
     fi
 fi
+# A file that exists and holds no entries is refused for the same reason a missing one
+# is, and it is the likelier accident of the two: a merge that keeps the comment header
+# and drops the four data lines leaves something that parses cleanly, passes every
+# check above, and reports every target as `new` — the gate present, running, and
+# unable to fail. Nothing tells that apart from a first build except this check.
+if [ -z "$baselines" ] && [ "$update_baseline" != 1 ]; then
+    echo "no entries in ${baseline_file#"$repo"/}, which is the growth gate's only reference." >&2
+    echo "      every target would be recorded as new and nothing could fail the gate." >&2
+    echo "      rerun with NOMUX_UPDATE_BASELINE=1 to record one from this build." >&2
+    exit 1
+fi
 
 # Selecting the toolchain through RUSTUP_TOOLCHAIN rather than a `+toolchain` argument
 # means every rustc and cargo call below agrees about which one it is — including the
@@ -138,7 +161,26 @@ if [ "${NOMUX_STABLE_STD:-0}" = 1 ]; then
     toolchain=$(rustup show active-toolchain | cut -d' ' -f1)
 else
     build_std=1
-    RUSTUP_TOOLCHAIN="${NOMUX_NIGHTLY:-nightly}"
+    # The release compiler is named in scripts/nightly-version and nowhere else. It
+    # used to be a literal in .github/workflows/ci.yml while this script defaulted to
+    # a floating `nightly`, so the documented local run measured whatever compiler the
+    # day handed it against a baseline recorded by a dated one. That shows up as growth
+    # nobody introduced, and the way out of it is NOMUX_UPDATE_BASELINE=1 — the exact
+    # habit the growth gate exists to prevent — or it masks a real regression under a
+    # compiler that happens to have got smaller. One file, read here and by CI, so a
+    # laptop and the runner measure the same bytes by construction. It holds the
+    # toolchain name and nothing else: both readers take the file verbatim, so a
+    # comment added to it would become the toolchain name.
+    nightly="${NOMUX_NIGHTLY:-}"
+    if [ -z "$nightly" ] && [ -r "$nightly_file" ]; then
+        nightly=$(cat "$nightly_file")
+    fi
+    if [ -z "$nightly" ]; then
+        echo "no toolchain name in ${nightly_file#"$repo"/}, which names the release compiler." >&2
+        echo "      restore it, or set NOMUX_NIGHTLY for a build that is not a release." >&2
+        exit 1
+    fi
+    RUSTUP_TOOLCHAIN="$nightly"
     export RUSTUP_TOOLCHAIN
     toolchain="$RUSTUP_TOOLCHAIN"
 fi
@@ -188,6 +230,17 @@ fi
 rm -rf "$dist"
 mkdir -p "$dist"
 
+# A run that dies partway must not leave something that looks like release output.
+# Between here and the checksums below, target/dist holds some of the four binaries
+# and no SHA256SUMS, and nothing in it says which — an upload step, or a person
+# coming back to it an hour later, cannot tell it from a complete set. So it is
+# cleared on the way out instead, on a signal as well as on a failed command: these
+# are four cross builds and Ctrl-C is an ordinary way to end one, and a shell killed
+# by a signal is not guaranteed to run its EXIT trap at all.
+dist_cleanup() { rm -rf "$dist"; }
+trap dist_cleanup EXIT
+trap 'dist_cleanup; exit 130' INT TERM HUP
+
 for target in $targets; do
     echo "building $target ($toolchain)..." >&2
     RUSTFLAGS="$rustflags" cargo build --locked --release --target "$target" --bin nomux "$@" >&2
@@ -213,6 +266,11 @@ done
 
 # Emitted in `sha256sum -c` format so a verifier needs no bespoke tooling.
 (cd "$dist" && sha256sum nomux-* > SHA256SUMS)
+
+# Complete from here, so the cleanup is disarmed: the size gates below still have to
+# be able to fail, and a build that is over budget or has grown is exactly the one
+# whose binaries someone will want to measure.
+trap - EXIT INT TERM HUP
 
 # Both gates are recorded per target and neither exits early, so one run tells you
 # everything that is wrong with the build. Bailing on the first failure would hide the
@@ -286,7 +344,10 @@ done
 echo
 echo "artifacts and SHA256SUMS in ${dist#"$repo"/}"
 
-if [ -n "$unknown" ]; then
+# Not on the run that already sets the flag: that run records these very sizes a few
+# lines below, or says why it did not, and telling someone to set a flag they have set
+# reads as the script not having noticed.
+if [ -n "$unknown" ] && [ "$update_baseline" != 1 ]; then
     echo "note: no baseline entry for:$unknown" >&2
     echo "      recorded as new; rerun with NOMUX_UPDATE_BASELINE=1 to record the sizes." >&2
 fi

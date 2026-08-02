@@ -5,7 +5,7 @@
 //! build can manage a daemon of any version. Filenames and permissions here may
 //! never change.
 
-use std::io;
+use std::io::{self, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixListener;
@@ -30,7 +30,15 @@ const SOCKET_MODE: u32 = 0o600;
 /// mode that does not depend on the umask of whoever happened to create the file:
 /// `<id>.lock` at `0400` is one that no *later* process can open for writing, and
 /// the mutex the whole control surface rests on then belongs to nobody.
-pub(crate) const FILE_MODE: u32 = 0o600;
+const FILE_MODE: u32 = 0o600;
+
+/// How many times an acquirer will re-take the lock on finding that the file it
+/// locked is no longer the file at the path.
+///
+/// Each retry costs some other process a whole collection, so more than one or
+/// two means a machine looping on `nomux list` rather than a race being lost; the
+/// cap is only here so that such a machine cannot spin an attach forever.
+const LOCK_ATTEMPTS: usize = 8;
 
 /// Runs `f` with the umask suppressed, so that a node created at `mode` is created
 /// at exactly `mode`.
@@ -43,12 +51,7 @@ pub(crate) const FILE_MODE: u32 = 0o600;
 ///
 /// The umask is process-wide, but nothing here is multi-threaded and no caller
 /// spawns a process while it is in effect.
-///
-/// Reachable from outside this module because one file in the layout is not created
-/// here: `daemon::write_pidfile` owns `<id>.pid`, and `File::create` subtracts the
-/// umask like everything else — which is what leaves the pidfile `0644` under the
-/// ordinary umask and owner-unreadable under `umask 0400`.
-pub(crate) fn with_umask<T>(mode: u32, f: impl FnOnce() -> T) -> T {
+fn with_umask<T>(mode: u32, f: impl FnOnce() -> T) -> T {
     let previous = rustix::process::umask(Mode::from_bits_truncate(0o777 & !mode));
     let result = f();
     rustix::process::umask(previous);
@@ -395,6 +398,24 @@ impl SessionPaths {
         with_umask(FILE_MODE, || fs::write(self.label(), label.as_bytes()))
     }
 
+    /// Records the pid `nomux kill` will signal, at a mode its owner can read back.
+    ///
+    /// `File::create` asks for `0666`, so without the umask suppressed it is the
+    /// umask alone that decides what this ends up as: `0644` under an ordinary one,
+    /// and `0266` under `umask 0400` — a pidfile its own owner cannot read. `kill`
+    /// refuses to unlink a live session whose pid it cannot read, correctly, so the
+    /// session would be unkillable until somebody noticed and `chmod`ed it. The
+    /// directory is `0700` either way; this is about the file staying legible to the
+    /// process that has to act on it.
+    ///
+    /// The file is created and filled a syscall apart, which `control::kill` knows
+    /// about: it waits out a zero-length pidfile rather than reporting the corrupt
+    /// one it would otherwise see.
+    pub(crate) fn write_pid(&self) -> io::Result<()> {
+        let mut file = with_umask(FILE_MODE, || fs::File::create(self.pid()))?;
+        writeln!(file, "{}", std::process::id())
+    }
+
     /// `ssh-agent` socket, served for a session created with
     /// [`nomux_proto::HELLO_AGENT_FORWARD`].
     #[must_use]
@@ -456,14 +477,16 @@ impl SessionPaths {
             };
             loop {
                 match rustix::fs::flock(&fd, operation) {
-                    Ok(()) => {}
-                    // A signal landing on a blocking `flock` is not an answer
-                    // about the lock; ask again.
-                    Err(rustix::io::Errno::INTR) => continue,
+                    // A signal landing on a blocking `flock` is not an answer about
+                    // the lock; ask again. Spelled as the one arm that continues
+                    // rather than as an `Ok` arm followed by a trailing `break`,
+                    // which is the same control flow reading as though the ordinary
+                    // path were the exception. `nbio::read` takes the same shape.
+                    Err(rustix::io::Errno::INTR) => {}
+                    Ok(()) => break,
                     Err(rustix::io::Errno::WOULDBLOCK) => return None,
                     Err(_) => return Some(SpawnLock::unavailable()),
                 }
-                break;
             }
             let lock = SpawnLock { fd: Some(fd) };
             if lock.locks_the_file_at(&path) {
@@ -532,14 +555,6 @@ impl SessionPaths {
         }
     }
 }
-
-/// How many times an acquirer will re-take the lock on finding that the file it
-/// locked is no longer the file at the path.
-///
-/// Each retry costs some other process a whole collection, so more than one or
-/// two means a machine looping on `nomux list` rather than a race being lost; the
-/// cap is only here so that such a machine cannot spin an attach forever.
-const LOCK_ATTEMPTS: usize = 8;
 
 /// A caller's exclusive standing on one session id: the right to spawn a daemon
 /// into it, and to remove its files.

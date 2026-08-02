@@ -263,13 +263,6 @@ mod tests {
     }
 
     #[test]
-    fn discriminants_round_trip() {
-        for ty in FrameType::ALL {
-            assert_eq!(FrameType::from_byte(ty.as_byte()), Some(ty));
-        }
-    }
-
-    #[test]
     fn oversized_payload_is_rejected() {
         assert_eq!(
             encode_header(FrameType::Output, MAX_PAYLOAD + 1),

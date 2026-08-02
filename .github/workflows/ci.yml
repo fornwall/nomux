@@ -50,7 +50,12 @@ jobs:
       # was local-only — so a `--no-verify` commit, or a contributor who had not
       # run `prek install`, landed unchecked shell. `shellcheck` is preinstalled
       # on the runner image.
-      - run: shellcheck --shell=sh scripts/*.sh
+      #
+      # Every tracked `*.sh`, not `scripts/*.sh`: the prek hook matches the path
+      # suffix wherever it lands, and the two sets are equal only for as long as no
+      # shell script lives outside scripts/. The gate that runs on a `--no-verify`
+      # commit is the wrong one to have checking less than the local hook does.
+      - run: git ls-files -z '*.sh' | xargs -0 -r shellcheck --shell=sh
 
       - run: cargo fmt --all --check
 
@@ -100,12 +105,17 @@ jobs:
     name: musl release builds
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      # Dated, never floating. The client pins a SHA-256 per architecture, and a
-      # compiler that moves moves those bytes underneath it.
-      NOMUX_NIGHTLY: nightly-2026-07-31
     steps:
       - uses: actions/checkout@v5
+
+      # Read rather than repeated here: scripts/build-release.sh defaults to the same
+      # file, so this job and a laptop build use one compiler and their sizes are
+      # comparable against a baseline recorded by it. A literal in this file left the
+      # script free to float, which is how a local run comes to fail on growth nobody
+      # introduced. Dated, never floating: the client pins a SHA-256 per architecture,
+      # and a compiler that moves moves those bytes underneath it.
+      - name: Read the pinned release nightly
+        run: echo "NOMUX_NIGHTLY=$(cat scripts/nightly-version)" >> "$GITHUB_ENV"
 
       # The shipping build rebuilds std with panics compiled out, which is the only
       # configuration that meets the size budget (IMPLEMENTATION.md § 8) and needs a

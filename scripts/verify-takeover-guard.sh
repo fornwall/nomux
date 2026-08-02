@@ -16,8 +16,9 @@
 #   nomux_fault_injection   forces the interleaving and restores the pre-fix
 #                           ordering. The guard must FAIL.
 #
-# Run from anywhere in the repository. Exits non-zero if either expectation is
-# broken, which means the guard has stopped guarding anything.
+# Run from anywhere: the script works in the repository it lives in, whatever the
+# caller's directory. Exits non-zero if either expectation is broken, which means the
+# guard has stopped guarding anything.
 set -eu
 
 test_name=a_takeover_never_discards_input_already_delivered
@@ -30,16 +31,29 @@ test_name=a_takeover_never_discards_input_already_delivered
 NEXTEST_TEST_FAILURE=100
 
 repo=$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)
+# cargo finds the workspace and reads .cargo/config.toml, and rustup reads
+# rust-toolchain.toml, by walking up from the working directory — so without this,
+# which tree gets tested and which compiler tests it are the caller's business rather
+# than the script's. The cd is what makes the promise above mean what it says.
+cd "$repo"
 
 # A separate target directory: RUSTFLAGS changes the fingerprint of every crate,
-# so sharing one would rebuild the whole workspace twice on every switch. Anchored
-# to the repository rather than the working directory, so the script really can be
-# run from anywhere in the tree as documented above.
+# so sharing one would rebuild the whole workspace twice on every switch. Absolute,
+# through $repo rather than a bare `target` that would name the same directory after
+# the cd above: it is exported to cargo, and a CARGO_TARGET_DIR that does not depend
+# on anyone's working directory is one less thing the two runs can disagree about.
 base_target="${CARGO_TARGET_DIR:-$repo/target}"
 
 log=$(mktemp)
 cleanup() { rm -f "$log"; }
 trap cleanup EXIT
+# INT TERM HUP as well as EXIT: each run below rebuilds the whole workspace, which is
+# long enough that Ctrl-C is an ordinary way to end one, and a shell killed by a signal
+# is not guaranteed to run its EXIT trap. Exiting from the handler is also what stops
+# the run rather than letting the interrupted cargo fall into the failure path below
+# and replay a log that has just been deleted. 130 rather than 1, so an interrupted
+# run is not read as the guard reporting a real failure.
+trap 'cleanup; exit 130' INT TERM HUP
 
 # The directory names are kept short on purpose: the integration tests bind unix
 # sockets underneath them, and `sockaddr_un` truncates at 108 bytes.

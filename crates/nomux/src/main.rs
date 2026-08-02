@@ -18,6 +18,7 @@ mod passwd;
 mod pty;
 mod ring;
 mod rundir;
+mod startup;
 
 use std::env;
 use std::ffi::OsString;
@@ -76,7 +77,9 @@ fn main() -> ExitCode {
             print!("{USAGE}");
             ExitCode::SUCCESS
         }
-        Some(mode @ ("daemon" | "attach" | "kill")) => run_session_mode(mode, args),
+        Some("daemon") => run_session_mode(Mode::Daemon, args),
+        Some("attach") => run_session_mode(Mode::Attach, args),
+        Some("kill") => run_session_mode(Mode::Kill, args),
         _ => {
             eprint!("{USAGE}");
             ExitCode::from(EXIT_USAGE)
@@ -84,8 +87,33 @@ fn main() -> ExitCode {
     }
 }
 
+/// The three modes that take a session id.
+///
+/// An enum rather than the `&str` `main` matched on, so that the dispatch below is
+/// exhaustive. Spelled as a string it needed a catch-all arm, which `kill` was
+/// reached through — and a fourth mode added to `main` would then have become
+/// `kill` silently, since the lint wall denies the `unreachable!` that would
+/// otherwise have caught it.
+#[derive(Clone, Copy)]
+enum Mode {
+    Daemon,
+    Attach,
+    Kill,
+}
+
+impl Mode {
+    /// The word the user typed, for diagnostics.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Daemon => "daemon",
+            Self::Attach => "attach",
+            Self::Kill => "kill",
+        }
+    }
+}
+
 /// Dispatches the modes that take a session id.
-fn run_session_mode(mode: &str, args: impl Iterator<Item = OsString>) -> ExitCode {
+fn run_session_mode(mode: Mode, args: impl Iterator<Item = OsString>) -> ExitCode {
     let (session, label) = match parse_session_args(args) {
         Ok(parsed) => parsed,
         Err(message) => {
@@ -95,18 +123,14 @@ fn run_session_mode(mode: &str, args: impl Iterator<Item = OsString>) -> ExitCod
         }
     };
     let Some(session) = session else {
-        eprintln!("nomux: `{mode}` requires a session id\n");
+        eprintln!("nomux: `{}` requires a session id\n", mode.name());
         eprint!("{USAGE}");
         return ExitCode::from(EXIT_USAGE);
     };
 
     match mode {
-        "daemon" => report(daemon::run(
-            &session,
-            daemon::ring_capacity(),
-            label.as_deref(),
-        )),
-        "attach" => match attach::run(&session, label.as_deref()) {
+        Mode::Daemon => report(daemon::run(&session, label.as_deref())),
+        Mode::Attach => match attach::run(&session, label.as_deref()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("nomux: {err}");
@@ -122,7 +146,7 @@ fn run_session_mode(mode: &str, args: impl Iterator<Item = OsString>) -> ExitCod
                 })
             }
         },
-        _ => report(control::kill(&session)),
+        Mode::Kill => report(control::kill(&session)),
     }
 }
 

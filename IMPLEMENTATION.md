@@ -2,6 +2,20 @@
 
 Low-level detail. Rationale and properties: [DESIGN.md](DESIGN.md).
 
+This is a reference rather than a narrative: §2.2, §6.6 and §10 are looked up, and
+the sections cross-refer constantly. Hence the index.
+
+1. [Layout](#1-layout)
+2. [Wire protocol](#2-wire-protocol) — [framing](#21-framing), [messages](#22-messages), [flags](#23-flags)
+3. [Offsets and exactly-once input](#3-offsets-and-exactly-once-input)
+4. [Ring buffer](#4-ring-buffer) — [backpressure](#41-backpressure), [attach below the base](#42-attach-with-from--base_offset), [gap handling](#43-gap-handling)
+5. [Bootstrap](#5-bootstrap) — [probe](#51-probe-and-attach-in-one-round-trip), [upload](#52-upload-and-attach-in-one-round-trip), [decision tree](#53-decision-tree)
+6. [Daemon](#6-daemon) — [PTY and child](#61-pty-and-child) ([what it runs](#611-what-the-child-runs)), [detachment](#62-detachment-from-the-login-session), [socket](#63-socket), [multiple clients](#64-multiple-clients) ([event ordering](#641-event-ordering)), [shutdown](#65-shutdown), [control surface](#66-frozen-control-surface), [agent forwarding](#67-agent-forwarding)
+7. [Attach relay](#7-attach-relay)
+8. [Build](#8-build)
+9. [Testing](#9-testing)
+10. [Exit codes](#10-exit-codes)
+
 ## 1. Layout
 
 ```
@@ -68,6 +82,13 @@ The session id is **not** in `Hello` — it is already fixed by the socket path
 
 `Hello.out_offset` of `u64::MAX` means *"I have no state, send me whatever you have"*
 — used on a fresh app launch to recover scrollback.
+
+`Hello.in_offset` is **informational and the daemon never reads it.** `HelloOk`'s
+`in_applied` is authoritative and the client fast-forwards to that (§3), so a client
+built from this table alone would otherwise implement a field with no effect. It is
+on the wire because the cross-device handover of
+[DESIGN.md § 10](DESIGN.md#10-open-questions) needs a "tell me" sentinel here,
+mirroring the output side.
 
 ### 2.3 Flags
 
@@ -170,6 +191,18 @@ The PTY drain must never block on a slow or absent client. Precedence: keep read
 the PTY, drop from the ring's head. A stalled client causes a gap, never a frozen
 shell.
 
+The queue *to* that client is bounded twice over, at two different meanings of "not
+keeping up". Past **1 MiB** pending, output stops being queued: the ring goes on
+absorbing the PTY regardless, so what a slow client costs is a gap and never a
+blocked child. Past **8 MiB** it is no longer slow but gone, and the daemon drops it.
+The second bound is needed because the first does not cover everything: holding back
+*output* still leaves the frames that answer a client — an `InputAck` per `Input`, a
+`Pong` per `Ping` — which are not optional and are queued regardless, so a peer that
+writes without ever reading grows the queue without bound. The gap between the two
+figures is deliberate: it is well clear of the first plus one output chunk, so only
+unanswered control frames can reach it. Dropping such a client costs a working one
+nothing, since reattaching replays from the ring.
+
 The input direction cannot be answered that way. `in_applied` is authoritative and
 exactly-once (§3), so a byte the daemon has acknowledged has to reach the PTY:
 dropping it is not available, and refusing it with `Error{INPUT_GAP}` would accuse a
@@ -259,7 +292,7 @@ On `gap = true` the byte stream is discontinuous and the client's emulator may b
 mid-escape-sequence. Recovery, mirroring `dtach -r`:
 
 1. Client resets its emulator locally — `ESC c` is correct but heavy-handed (drops scroll region and charset); `ESC [ ! p` + `ESC [ 2J` + `ESC [ H` is the softer default.
-2. Daemon triggers a repaint from the child via a `TIOCSWINSZ` dance: set `cols-1`, then the real `cols`. The resulting two `SIGWINCH`es make most full-screen programs redraw.
+2. Daemon triggers a repaint from the child via a `TIOCSWINSZ` dance: set `cols-1`, then the real `cols`. The resulting two `SIGWINCH`es make most full-screen programs redraw. A terminal one column wide gets the second alone — there is no narrower size to go to, and a zero-column terminal is not a thing to hand a child — which leaves the repaint weaker there than everywhere else, and is accepted: nobody drives a one-column terminal, and the client picks `ctrl_l` where this shape does not suit it.
 3. Repaint policy is the client's, restated in each `Hello` (§2.3): `winch` (default) or `ctrl_l` (write `0x0c` to the PTY — better for a bare shell prompt, destructive inside an editor). Only the client knows whether the user is looking at an editor or a prompt, and it costs nothing to say so on every attach.
 
 `ctrl_l` goes through the same queue as client input rather than straight to the
@@ -378,7 +411,7 @@ doubled `\r\n` translation and broken raw mode. The channel is a raw byte pipe a
 nomux owns the only PTY — which is also why `TERM` arrives in `Hello` (§2.2) rather
 than from sshd.
 
-### 6.1.1 What the child runs
+#### 6.1.1 What the child runs
 
 Whatever a plain `ssh host` would have run, because nomux is *already inside* an SSH
 session and inherits its setup rather than reconstructing it. PAM has run, and
@@ -624,6 +657,17 @@ told never to auto-reconnect after `TAKEOVER`. A connection that greets with
 anything other than `Hello` is refused on its own terms and the session keeps its
 client. Only one connection may be pending at a time; a second replaces it.
 
+**A `Hello` this daemon cannot answer is refused before the eviction, not after.**
+The `Hello.protocol` check therefore runs on the pending connection rather than
+inside the handshake it would otherwise be part of. Deferred to the handshake — which
+only runs once the takeover has already happened — a newer client's *failed* greeting
+threw the working client off with `Error{TAKEOVER}` and then dropped the newcomer
+too, leaving the session running with nobody attached. That is worse than losing a
+handshake: the rule above tells a client never to auto-reconnect after a takeover, so
+the session the user was in went quiet until they went looking for it by hand. This
+is the one place [DESIGN.md § 6.4](DESIGN.md#64-version-skew)'s skew story touches
+the daemon, and it is why it is safe.
+
 The eviction's final write is bounded by a deadline. The connection being replaced
 is usually one that has *stopped reading* — that is what a takeover recovers from —
 and an unbounded blocking write to it would park the entire daemon in the kernel:
@@ -635,7 +679,7 @@ No read-only mirrors and no session sharing — there is one client per session 
 construction, and the takeover case exists only to recover from a half-dead
 connection the daemon has not yet noticed.
 
-### 6.4.1 Event ordering
+#### 6.4.1 Event ordering
 
 Within one `poll` iteration the client is serviced **before** the listener. A single
 wakeup can report both a readable client and a pending connection; accepting first
@@ -683,9 +727,28 @@ the child said on its way out.
 Idle reaping ([DESIGN.md § 5.2](DESIGN.md#52-reaping)) is self-inflicted, not
 external: the daemon stamps `last_detach` on losing a client and arms a `poll`
 timeout against it. On expiry it sends `SIGHUP` then, after a grace period,
-`SIGKILL` to the child's process *group* — not just the child, or backgrounded
-grandchildren survive — and exits through the same path. No cron, no supervisor,
-nothing to install.
+`SIGKILL`, and exits through the same path. No cron, no supervisor, nothing to
+install.
+
+Both signals go out **twice**, because neither reach alone covers the session. The
+process *group* is the cheap one and gets the ordinary case in a single syscall:
+`setsid` in the child's `pre_exec` (§6.1) made it its own group leader, so its pgid
+is its pid, and a shell without job control keeps everything it runs in that one
+group.
+
+A shell *with* job control does not. It puts each `&` job in a process group of its
+own — which is the whole point of job control — so a group kill aimed at the child
+reaches none of them, and neither does the `SIGHUP` the kernel sends when the master
+closes, since that goes to the foreground group and a background job is by
+definition not it. The orphan case the reaping exists to prevent therefore survived
+the group kill exactly, and only for the shells anybody actually uses
+interactively.
+
+What every one of those jobs *does* share is the session, because nothing a shell
+does to a job calls `setsid`. `kill(2)` cannot address a session, so the second
+reach walks `/proc` and signals each member. It is ordered after the group probe
+rather than merged with it: the walk costs a directory scan and a read per process,
+and on most shutdowns the common case is already over before it runs.
 
 A session nobody ever attaches to is reaped after 30 s rather than the idle
 timeout: a daemon spawned by a connection that died mid-handshake has no client
@@ -693,8 +756,8 @@ coming and would otherwise sit there for a week.
 
 `SIGTERM` and `SIGINT` reach the same exit. A handler writes one byte to a
 self-pipe whose read end is in the poll set, and the loop leaves on its next pass —
-so `nomux kill` (§6.6) collects the child's process group and unlinks the run files
-rather than dropping the daemon where it stands. Closing the PTY master hides the
+so `nomux kill` (§6.6) collects the child's process group and session, and unlinks
+the run files, rather than dropping the daemon where it stands. Closing the PTY master hides the
 difference for the ordinary case, because the kernel then delivers `SIGHUP` to the
 foreground process group on the way out; what it does not cover is a backgrounded
 process that ignores the hangup.
@@ -708,7 +771,7 @@ byte before the syscall returned, and the next pass finds the pipe readable.
 The budget is `nomux kill`'s two seconds, and everything on the way out is bounded
 against them: a final flush to the attached client for at most 500 ms — against the
 whole call, not per `write`, or a peer reading a trickle would reset it — and then
-`SIGHUP`, 500 ms, `SIGKILL` for the process group. An overrun would mean the daemon
+`SIGHUP`, 500 ms, `SIGKILL`, each to both reaches above. An overrun would mean the daemon
 being `SIGKILL`ed mid-shutdown, which is the bug this closes, wearing a hat.
 
 One flush, not several, and the iteration the signal lands in is arranged so it cannot
@@ -746,7 +809,7 @@ $RUNDIR/<id>.agent   ssh-agent socket, 0600 (§6.7)
 ```
 
 - Both establish first that the run directory is this user's alone (§6.3), before any name in it is read, connected to or signalled. Neither creates it: on a host that has never run a session, `list` prints nothing and exits 0, and `kill` reports the "no such session" that already holds.
-- `list` reads the directory and probes each socket with `connect`; `ECONNREFUSED` means stale, and stale entries are unlinked. The probe is safe because connecting is not attaching (§6.4) — it costs a live session nothing.
+- `list` reads the directory and probes each socket with `connect`; `ECONNREFUSED` — or a socket that is no longer there at all — means stale, and stale entries are unlinked. The probe is safe because connecting is not attaching (§6.4) — it costs a live session nothing.
 - Unlinking happens under `<id>.lock`, and the probe is repeated once it is held, since that is the only point at which the answer cannot change between being read and being acted on. An entry whose lock somebody else holds is skipped: it is a session being started rather than garbage, and it stays collectable for as long as it stays dead. An entry whose lock is not *obtainable at all* is collected anyway, per §6.3 — a collector that stops collecting because of the mutex protecting it leaks under exactly the conditions it exists for.
 - `kill` takes `<id>.lock` first and holds it to the end, so nothing can spawn into the id it is removing; then probes the socket, reads the pidfile, sends `SIGTERM`, waits up to 2 s, then `SIGKILL`, then unlinks all five files. It waits up to 2 s for that lock — which is long enough to win the race against an attach creating the session, rather than merely lose it.
 - **A live session's files are never unlinked.** Where the socket answers and the pidfile cannot be read, `kill` exits non-zero and leaves all five alone. Removing them there takes the socket away from a daemon that is still holding the user's shell: the session answers nothing, appears in no listing, and the id is free for a second daemon to bind over. The one benign reason for that state is the daemon's own bind-to-publish window (§6.2), so a *missing* pidfile is waited out for 2 s; a mode that hides it, or a body that is not a pid, is reported at once, since waiting cannot change either.
@@ -798,12 +861,9 @@ sequenceDiagram
   D->>C: AgentClose{chan}
 ```
 
-Why not refresh a symlink to sshd's socket on each attach: that requires reading the
-new connection's environment, which means running a process, which the warm resume
-path ([DESIGN.md § 6.1](DESIGN.md#61-warm-resume)) deliberately does not do. A socket the daemon owns is stable for the
-session's whole life, never dangles, and needs no environment at all.
-
-Mechanics:
+Why the daemon owns the socket rather than borrowing or refreshing sshd's, and why
+that is worth a sub-channel in a protocol that otherwise refuses to multiplex:
+[DESIGN.md § 5.4](DESIGN.md#54-agent-forwarding). Mechanics below.
 
 - Channel ids are `u32`, allocated by the daemon — the only opener — monotonically and never reused within a session, so a close/open pair crossing in flight cannot alias.
 - `AgentOpen` is optimistic: no ack. A client that cannot serve replies `AgentClose`.
@@ -815,12 +875,11 @@ Mechanics:
 - The socket is bound when the session is created, and only then. Turning forwarding on later would mean changing `SSH_AUTH_SOCK` in a running process, which is not possible; the client re-creating the session is the only path.
 - A socket that cannot be bound is not fatal. The session starts without forwarding and `HelloOk` says so, because a session without an agent is worth having and one that refuses to start is not.
 
-Security:
+Security — the two consequences that are this side of the boundary; the policy that
+follows from them is [DESIGN.md § 5.4](DESIGN.md#54-agent-forwarding)'s:
 
 - The socket is `0600` inside the `0700` run directory, so reachable only by the session's own user — the same exposure as sshd's forwarded socket.
-- **It works without `ForwardAgent`**, which means it bypasses a deliberate user decision. It must therefore be opt-in per host, defaulting off, and the client must never enable it silently.
 - If sshd forwarding is also active, `SSH_AUTH_SOCK` is set by sshd and then overwritten by the daemon (§6.1.1). Ours wins.
-- Better than `ssh -A` in one respect: because the client holds the keys and sees each request, it *can* prompt per signature or show which session is asking. Plain agent forwarding is unconditionally silent.
 
 ## 7. Attach relay
 
@@ -869,7 +928,9 @@ Targets:
 if any binary misses the budget. It also holds each size against the per-target
 baseline recorded in `scripts/size-baseline`, prints the signed delta beside the
 size, and fails a target that has grown more than 3% against it — the cap alone
-passed a commit that grew armv7 46% in one step, since 213 KiB still fits in 400.
+passed a commit that grew armv7 46% in one step, since the result still fitted it.
+Sizes are not repeated here: `scripts/size-baseline` is what a build writes and what
+the gate reads, and every prose copy of those numbers has gone stale at least once.
 `NOMUX_UPDATE_BASELINE=1` rewrites the baseline from that build and skips the growth
 gate, which puts an accepted size change in the diff a reviewer reads.
 
@@ -935,9 +996,11 @@ directory 56 times over. Release builds must pin a **dated** nightly
 | Layer | Approach | Where |
 | --- | --- | --- |
 | Codec | `proptest` round-trip; truncated, oversized and malformed frames must error, never panic. | `crates/nomux-proto/` |
+| Wire format | Hand-written byte vectors for all sixteen frames, taken from the §2.2 table rather than from the encoder, and checked in both directions. Every other codec test compares a frame to a frame, so it checks the codec against itself; these are the only thing that would notice a changed field order, width or endianness — which matters because the client is a separate codebase built from that table. Both handshake frames appear twice so that no flag bit or enumerator is exercised at only one value, and the five `Error` codes are pinned as a table, since a frame carries one at a time. | `crates/nomux-proto/tests/wire.rs` |
 | Ring buffer | Model-based against a reference `Vec`, asserting `base_offset` monotonicity and that served ranges are byte-exact, with chunks both under and over capacity. | `src/ring.rs` |
 | Exactly-once input | The §3 scenario, replayed from a randomly chosen earlier offset after every disconnect. | `tests/chaos.rs` |
-| Session | Spawn daemon → write → sever the socket mid-stream → reattach → assert the output resumes exactly where it left off. | `tests/session.rs` |
+| Session | Spawn daemon → write → sever the socket mid-stream → reattach → assert the output resumes exactly where it left off. Plus the handshake's two refusals of a client that has lost track of the streams: an `out_offset` above the end is clamped rather than believed (§4.2), and an `Input` above `in_applied` is `Error{INPUT_GAP}` and a closed connection (§3). | `tests/session.rs` |
+| Frames from the client | `Resize` reaches the child's `stty size`, and every attach restates its own geometry in both the greeting and the child; `Detach` ends the connection without ending the session, and `in_applied` survives it. Both are frames the daemon must honour and nothing else in the suite sends. | `tests/session.rs` |
 | Gap | Capacity forced small; assert `Gap` is emitted and `base_offset` is exact. | `tests/session.rs`, `tests/chaos.rs` |
 | Backpressure | A client blasting input at a child that reads none of it has its socket refuse long before the daemon has taken a fraction of it, the session still serves a new client afterwards, and repeated reconnects do not raise the ceiling by a byte — the cap is enforced where the queue grows, not where the socket is read. | `tests/session.rs` |
 | Chaos | Randomised disconnect injection, seeded and reproducible, under an escape-heavy full-screen stream and under `yes`. | `tests/chaos.rs` |

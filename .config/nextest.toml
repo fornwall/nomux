@@ -1,0 +1,19 @@
+# Nextest configuration.
+#
+# The one thing here is a bound on how long a test may take. Without it nextest's
+# default slow-timeout prints a warning and then waits for ever, so a session test
+# whose daemon never answers holds the runner until the job's own 20-minute timeout
+# fires — with no failing test to point at, because nothing failed.
+
+[profile.default]
+# `period` is only when nextest starts saying a test is slow, and `terminate-after`
+# is how many of those go by before it kills it and fails the run.
+#
+# Twenty seconds is roughly four times the slowest test in the suite (the daemon that
+# reaps itself, at about 5.4 s), so an ordinary run is silent. The termination at
+# four periods — eighty seconds — clears the one test that is legitimately slower:
+# `a_daemon_nobody_ever_attaches_to_reaps_itself` sits out a real 30-second
+# first-attach deadline and gives up on its own at 45, and CI runs it with
+# `--run-ignored all`. So the kill is a backstop for a test that has outlived its own
+# patience, never the thing that decides a result.
+slow-timeout = { period = "20s", terminate-after = 4 }

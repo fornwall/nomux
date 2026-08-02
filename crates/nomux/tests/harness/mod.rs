@@ -29,9 +29,9 @@
               modules, not integration test crates"
 )]
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::ops::{Deref, DerefMut};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -48,6 +48,81 @@ pub(crate) const WIN: WinSize = WinSize {
     xpixel: 0,
     ypixel: 0,
 };
+
+/// How long the harness waits for something it has asked a daemon for.
+///
+/// One value rather than one per call site: every wait here is on a daemon that is
+/// either about to answer or never going to, so the only thing a longer bound buys
+/// is patience with a slow machine — and that is the same question everywhere.
+const PATIENCE: Duration = Duration::from_secs(15);
+
+/// How long a socket read blocks before the caller's own deadline is looked at
+/// again.
+///
+/// Deliberately far below [`PATIENCE`]. The socket timeout used to equal it, so a
+/// daemon that went quiet tripped the socket first and the failure read `read from
+/// daemon: Resource temporarily unavailable` — the errno rather than the sentence
+/// naming what was being waited for. Keeping the socket impatient makes the logical
+/// deadline the one that always fires, and it is the only one that knows what the
+/// wait was about.
+const SOCKET_POLL: Duration = Duration::from_millis(100);
+
+/// How long [`poll_until`] waits between attempts.
+///
+/// The hand-written loops this replaces chose anything from 2 ms to 200 ms. Ten is
+/// short enough that a test measuring how long the daemon took is measuring the
+/// daemon rather than the sleep it overshot by — the tightest such bound in the
+/// suite is 400 ms against a 500 ms floor — and long enough that a condition which
+/// shells out to `nomux list` is not run back to back.
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Waits up to `within` for `condition` to hold, and reports whether it ever did.
+///
+/// Every wait in this suite is on something a daemon does on its own schedule, and
+/// each one used to be spelled out: a deadline, a loop, the condition, and a sleep
+/// picked afresh each time. Written once, "bounded" is structural rather than
+/// something the next test has to remember, and what is left at the call site is the
+/// only part that was ever its own — the sentence it fails with.
+pub(crate) fn poll_until(within: Duration, mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + within;
+    loop {
+        if condition() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Accepts one connection, or fails saying what never arrived.
+///
+/// A blocking `accept` on a listener nothing connects to parks the thread for ever,
+/// and a test parked there never returns — so its [`Spawned`] guards never run and
+/// the whole run hangs instead of failing. The listener is put in non-blocking mode
+/// here rather than at the call site so that no caller can forget; the connection it
+/// hands back is blocking, as `accept` does not pass the flag on.
+pub(crate) fn accept_within(
+    listener: &UnixListener,
+    within: Duration,
+    awaiting: &str,
+) -> UnixStream {
+    listener
+        .set_nonblocking(true)
+        .expect("a listener the test must not park on");
+    let mut accepted = None;
+    let arrived = poll_until(within, || match listener.accept() {
+        Ok((stream, _)) => {
+            accepted = Some(stream);
+            true
+        }
+        Err(err) if err.kind() == ErrorKind::WouldBlock => false,
+        Err(err) => panic!("accepting {awaiting} failed: {err}"),
+    });
+    assert!(arrived, "timed out waiting for {awaiting}");
+    accepted.expect("the connection the wait above returned for")
+}
 
 /// A daemon running in an isolated run directory, killed on drop.
 pub(crate) struct Session {
@@ -72,6 +147,15 @@ impl Session {
     }
 
     pub(crate) fn start_with_ring(name: &str, ring_bytes: usize) -> Self {
+        Self::start_with_raw_ring(name, &ring_bytes.to_string())
+    }
+
+    /// Starts a daemon with `NOMUX_RING_BYTES` set to exactly `value`.
+    ///
+    /// Takes the text rather than a number for the one test that is about a value
+    /// the daemon cannot parse (`IMPLEMENTATION.md` § 4), which is the thing
+    /// [`Session::start_with_ring`] cannot say.
+    pub(crate) fn start_with_raw_ring(name: &str, value: &str) -> Self {
         let root = run_root(name);
         let id = intern(name);
         let child = Command::new(env!("CARGO_BIN_EXE_nomux"))
@@ -83,7 +167,7 @@ impl Session {
             .env("PS1", "")
             // The child's working directory, so `pwd` is assertable.
             .env("HOME", &root)
-            .env("NOMUX_RING_BYTES", ring_bytes.to_string())
+            .env("NOMUX_RING_BYTES", value)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -103,7 +187,7 @@ impl Session {
     pub(crate) fn connect(&self) -> Client {
         let stream = UnixStream::connect(&self.socket).expect("connect to session");
         stream
-            .set_read_timeout(Some(Duration::from_secs(15)))
+            .set_read_timeout(Some(SOCKET_POLL))
             .expect("set read timeout");
         Client {
             stream,
@@ -168,9 +252,43 @@ impl Session {
     pub(crate) fn connect_agent(&self) -> UnixStream {
         let stream = UnixStream::connect(self.agent_socket()).expect("connect to agent socket");
         stream
-            .set_read_timeout(Some(Duration::from_secs(15)))
+            .set_read_timeout(Some(PATIENCE))
             .expect("set read timeout");
         stream
+    }
+}
+
+/// Reconnects until the daemon reports a gap, and hands back the greeting that did.
+///
+/// Whether the ring has overflowed *yet* is a question about when the daemon was
+/// last scheduled, not about the property any of these tests are pinning — so a test
+/// that sleeps and then asserts `gap` is really asserting that the machine got round
+/// to it, under nextest's full-core parallelism, while doing something else.
+/// Reconnecting until the daemon itself says so turns that into a wait on the thing
+/// being waited for, which either happens or fails with the numbers that explain why
+/// not.
+pub(crate) fn reconnect_until_gap(
+    session: &Session,
+    flags: u16,
+    out_offset: u64,
+    in_offset: u64,
+) -> (Client, nomux_proto::HelloOk) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let mut client = session.connect();
+        let resumed = client.hello_with(flags, out_offset, in_offset);
+        if resumed.gap {
+            return (client, resumed);
+        }
+        drop(client);
+        assert!(
+            Instant::now() < deadline,
+            "the ring never overflowed while detached: base={} in_applied={} \
+             (resuming from {out_offset})",
+            resumed.resume_from,
+            resumed.in_applied
+        );
+        thread::sleep(POLL_INTERVAL);
     }
 }
 
@@ -257,15 +375,17 @@ pub(crate) fn control(root: &Path, args: &[&str]) -> Output {
         .expect("run nomux")
 }
 
+/// Waits for a file the daemon publishes on its way up.
+///
+/// Named for the file rather than for binding a socket: two of the callers wait on a
+/// pidfile, and a failure that says the daemon "never bound" one sends the reader
+/// looking in the wrong place.
 pub(crate) fn wait_for(path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        if path.exists() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    panic!("daemon never bound {}", path.display());
+    assert!(
+        poll_until(Duration::from_secs(10), || path.exists()),
+        "the daemon never created {}",
+        path.display()
+    );
 }
 
 /// A protocol client: enough of one to assert on daemon behaviour.
@@ -356,30 +476,63 @@ impl Client {
     }
 
     pub(crate) fn next_frame(&mut self) -> (FrameType, Vec<u8>) {
+        let awaiting = "a frame from the daemon";
+        self.frame_before(Instant::now() + PATIENCE, awaiting)
+            .unwrap_or_else(|| panic!("timed out waiting for {awaiting}"))
+    }
+
+    /// The next frame, or `None` once `deadline` has passed without one.
+    ///
+    /// The deadline belongs to the caller rather than to this function, so that a
+    /// wait made of many frames — [`Client::read_until`] taking output until a needle
+    /// appears — is bounded as a whole rather than per frame. Returning rather than
+    /// panicking on the deadline leaves the failure to whoever knows what the wait
+    /// was for, which is the only place that can also say what it saw instead.
+    /// Everything that is *not* a timeout is fatal here and says `awaiting`, because
+    /// none of it leaves the caller anything to add.
+    fn frame_before(&mut self, deadline: Instant, awaiting: &str) -> Option<(FrameType, Vec<u8>)> {
         loop {
-            if self.pending.len() >= HEADER_LEN {
-                let head: [u8; HEADER_LEN] = self.pending[..HEADER_LEN].try_into().unwrap();
-                let header = decode_header(&head).expect("decode header");
-                let total = HEADER_LEN + header.len as usize;
-                if self.pending.len() >= total {
-                    let payload = self.pending[HEADER_LEN..total].to_vec();
-                    self.pending.drain(..total);
-                    return (header.ty, payload);
-                }
+            if let Some(frame) = self.take_pending_frame() {
+                return Some(frame);
+            }
+            if Instant::now() >= deadline {
+                return None;
             }
             let mut chunk = [0u8; 8192];
-            let n = self.stream.read(&mut chunk).expect("read from daemon");
-            assert!(n > 0, "daemon closed the connection unexpectedly");
-            self.pending.extend_from_slice(&chunk[..n]);
+            match self.stream.read(&mut chunk) {
+                Ok(0) => panic!("the daemon closed the connection while awaiting {awaiting}"),
+                Ok(n) => self.pending.extend_from_slice(&chunk[..n]),
+                // What a read timeout is reported as; the deadline above is the one
+                // that ends this loop.
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+                Err(err) => panic!("reading from the daemon while awaiting {awaiting}: {err}"),
+            }
         }
+    }
+
+    /// The next whole frame already in the receive buffer, if there is one.
+    fn take_pending_frame(&mut self) -> Option<(FrameType, Vec<u8>)> {
+        let head: [u8; HEADER_LEN] = self.pending.get(..HEADER_LEN)?.try_into().unwrap();
+        let header = decode_header(&head).expect("decode header");
+        let total = HEADER_LEN + header.len as usize;
+        if self.pending.len() < total {
+            return None;
+        }
+        let payload = self.pending[HEADER_LEN..total].to_vec();
+        self.pending.drain(..total);
+        Some((header.ty, payload))
     }
 
     /// Reads frames until one of type `want` arrives, returning its payload and
     /// ignoring the session's own chatter. Anything else is a bug in the daemon's
     /// frame ordering.
     pub(crate) fn next_of(&mut self, want: FrameType) -> Vec<u8> {
+        let awaiting = format!("a {want:?} frame");
+        let deadline = Instant::now() + PATIENCE;
         loop {
-            let (ty, payload) = self.next_frame();
+            let (ty, payload) = self
+                .frame_before(deadline, &awaiting)
+                .unwrap_or_else(|| panic!("timed out waiting for {awaiting}"));
             if ty == want {
                 return payload;
             }
@@ -391,6 +544,59 @@ impl Client {
                 "unexpected {ty:?} while waiting for {want:?}"
             );
         }
+    }
+
+    /// Waits for the daemon to close the connection after `after`, without
+    /// complaining on the way out.
+    ///
+    /// Whatever it still had queued is flushed and consumed here — that is a
+    /// departing daemon doing its job. An `Error` among it is not, and is checked for
+    /// because otherwise almost nothing distinguishes a frame that was *honoured*
+    /// from one that fell through to the daemon's "not valid from a client" arm:
+    /// both end with a closed connection, and only one of them is the behaviour a
+    /// caller is asking about.
+    pub(crate) fn expect_eof(&mut self, after: &str) {
+        let deadline = Instant::now() + PATIENCE;
+        let mut chunk = [0u8; 8192];
+        loop {
+            while let Some((ty, _)) = self.take_pending_frame() {
+                assert_ne!(
+                    ty,
+                    FrameType::Error,
+                    "the daemon refused {after} rather than acting on it"
+                );
+            }
+            match self.stream.read(&mut chunk) {
+                Ok(0) => return,
+                Ok(n) => self.pending.extend_from_slice(&chunk[..n]),
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+                Err(err) => panic!("reading after {after}: {err}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the daemon never closed the connection after {after}"
+            );
+        }
+    }
+
+    /// Leaves the daemon with something written that this client has not read.
+    ///
+    /// For the test that closes on purpose to provoke `ECONNRESET`: the kernel sends
+    /// RST rather than FIN only when data is still queued unread, so a close raced
+    /// against the daemon's next write exercises the orderly path instead of the one
+    /// the regression was about. The ping is what makes there be something to queue —
+    /// the session's own output arrives when the child gets round to it, and a client
+    /// that has just waited for an ack may already hold all of it. Peeked rather than
+    /// read, so the bytes stay where the kernel can still see them.
+    pub(crate) fn wait_for_unread_bytes(&mut self) {
+        self.send(&Frame::Ping { nonce: 0xDEAD });
+        let stream = &self.stream;
+        let queued = poll_until(PATIENCE, || has_unread_bytes(stream));
+        assert!(
+            queued,
+            "the daemon wrote nothing, so closing here would be an orderly FIN \
+             rather than the reset this is about"
+        );
     }
 
     /// The channel id carried by the next frame of type `want`.
@@ -409,10 +615,11 @@ impl Client {
     /// including bytes this client wrote and the daemon had not yet read. Draining
     /// first turns the close into an orderly FIN, so what happens to that input is
     /// the daemon's behaviour rather than the kernel's timing.
+    ///
+    /// A silent socket ends this after [`SOCKET_POLL`], which is the read timeout
+    /// every client here carries — there is nothing to shorten, because nothing waits
+    /// long in the first place.
     pub(crate) fn drain_available(&mut self) {
-        self.stream
-            .set_read_timeout(Some(Duration::from_millis(50)))
-            .expect("shorten read timeout");
         let mut chunk = [0u8; 8192];
         while let Ok(n) = self.stream.read(&mut chunk) {
             if n == 0 {
@@ -420,9 +627,6 @@ impl Client {
             }
             self.pending.extend_from_slice(&chunk[..n]);
         }
-        self.stream
-            .set_read_timeout(Some(Duration::from_secs(15)))
-            .expect("restore read timeout");
     }
 
     /// Reads until the daemon has acknowledged input through `through`, tolerating
@@ -432,8 +636,12 @@ impl Client {
     /// written but not yet read is lost when the socket closes with output still
     /// queued, so waiting for the ack is what makes "the daemon has this" true.
     pub(crate) fn wait_for_input_ack(&mut self, through: u64) {
+        let awaiting = format!("an InputAck through offset {through}");
+        let deadline = Instant::now() + PATIENCE;
         loop {
-            let (ty, payload) = self.next_frame();
+            let (ty, payload) = self
+                .frame_before(deadline, &awaiting)
+                .unwrap_or_else(|| panic!("timed out waiting for {awaiting}"));
             if ty == FrameType::InputAck
                 && let Frame::InputAck { applied_through } =
                     Frame::decode(ty, &payload).expect("decode ack")
@@ -449,9 +657,9 @@ impl Client {
     pub(crate) fn read_until(&mut self, needle: &str, from: u64) -> (String, u64) {
         let mut seen = Vec::new();
         let mut offset = from;
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while Instant::now() < deadline {
-            let (ty, payload) = self.next_frame();
+        let awaiting = format!("{needle:?} in the session's output");
+        let deadline = Instant::now() + PATIENCE;
+        while let Some((ty, payload)) = self.frame_before(deadline, &awaiting) {
             match Frame::decode(ty, &payload).expect("decode frame") {
                 Frame::Output { offset: at, data } => {
                     assert_eq!(at, offset, "output offsets must be contiguous");
@@ -470,6 +678,30 @@ impl Client {
             String::from_utf8_lossy(&seen)
         );
     }
+}
+
+/// Whether the kernel is holding bytes for `stream` that nothing has read yet.
+///
+/// `MSG_PEEK`, so asking does not consume them — which is the entire point at the
+/// one call site. `UnixStream::peek` says this safely but is unstable on the pinned
+/// toolchain, and adding rustix's `net` feature to reach `RecvFlags::PEEK` would be
+/// a dependency change for a single test.
+fn has_unread_bytes(stream: &UnixStream) -> bool {
+    use std::os::fd::AsRawFd;
+
+    let mut byte = 0u8;
+    // SAFETY: `recv` is given a valid one-byte buffer with the length that matches
+    // it, on a descriptor the borrow above keeps open for the call. `MSG_DONTWAIT`
+    // keeps it from blocking regardless of the socket's own timeout.
+    let peeked = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            std::ptr::from_mut(&mut byte).cast::<libc::c_void>(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    peeked > 0
 }
 
 /// The greeting the tests send: the current protocol, [`WIN`], and a terminal type
@@ -524,7 +756,7 @@ pub(crate) fn push_until_refused(
             // A fiftieth of the patience: short enough that what ends the loop is
             // the deadline rather than the sleep it overshot by, long enough not to
             // spin on a socket that is going to stay full.
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
                 thread::sleep(patience / 50);
             }
             Err(_) => break,
