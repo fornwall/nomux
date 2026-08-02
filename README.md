@@ -26,6 +26,7 @@ so the wire protocol is private and carries no stability guarantee.
 
 - [DESIGN.md](DESIGN.md) — problem, properties, architecture, security model, prior art.
 - [IMPLEMENTATION.md](IMPLEMENTATION.md) — wire protocol, ring buffer, PTY handling, bootstrap, build.
+- [PLAN.md](PLAN.md) — backlog: known gaps, unbuilt features, deferred decisions.
 
 ## Build
 
