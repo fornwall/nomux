@@ -34,14 +34,23 @@ and *then* closes no longer takes the five seconds with it. The attached client 
 the three fields that mean nothing without it are one `Option<Attached>`, so a
 takeover resets them together or not at all.
 
-92 tests, one of which waits out a real reaping timeout and is `#[ignore]`d (CI
+96 tests, one of which waits out a real reaping timeout and is `#[ignore]`d (CI
 runs it with `--run-ignored all`), plus 2 doctests: property tests over the codec
 including malformed and near-valid input, a model-checked ring, an integration
 suite driving the real binary over its socket, and a seeded chaos suite that severs
 the connection at generated points under an escape-heavy full-screen stream and
-under `yes`. The regression test guarding the event ordering of § 6.4.1 is itself
-verified, against a fault-injected build that restores the bug — and against one
-that forces only the interleaving, which must still pass.
+under `yes`. Two of them are verified against builds that restore the bug they
+guard: the event ordering of § 6.4.1, against a fault-injected binary and against
+one that forces only the interleaving, which must still pass; and the session
+reach of `Pty::terminate`, against a build with the `/proc` walk removed.
+
+The suite runs beside itself. Each test's run directory is named for a hash of the
+test and the pid of the process running it, so a second copy of a binary in a
+second terminal no longer deletes the first's sockets, and every process this
+suite starts is killed and collected by a `Drop` guard rather than by a line the
+author remembered to write. Both halves of the name are short on purpose: what the
+suite adds to `CARGO_TARGET_TMPDIR` is 38 bytes against `sockaddr_un`'s 108, which
+is what makes a worktree under `.claude/worktrees/` runnable.
 
 All four musl targets build reproducibly via `scripts/build-release.sh`, against
 the 400 KiB budget: x86_64 153.1 KiB, aarch64 144.2, armv7 213.0, riscv64gc 125.8.
@@ -90,23 +99,6 @@ missing line of code.
   `HELLO_FLAG_BITS`, both accessors and the proptest's `any_hello_flags`, at the cost
   of two adjacent booleans at six call sites where `HELLO_AGENT_FORWARD` currently
   reads better. Worth doing if a third flag ever lands.
-- **Test-harness duplication.** xorshift64 is implemented twice — as `Rng` in
-  `chaos.rs` and inline in `session.rs`'s `bulk_bytes` — and the `stty -echo`
-  readiness handshake has several copies across `session.rs` and `chaos.rs`. The
-  `Drop`-guard gap is now half closed: `spawn_lock.rs` has `LiveSession` and
-  `Reaped`, and `session.rs` has `Reaper` for the orphan it deliberately creates,
-  but four `attach`- and `daemon`-spawning tests in `session.rs` still build a bare
-  `Child`, so an assertion failure there leaks a relay whose daemon is in another
-  process group.
-- **The suite cannot be run twice concurrently, and cannot be run from a deep
-  path.** Each test owns a fixed run directory named after itself and wipes it on
-  entry, so two copies of one test binary delete each other's sockets — verified:
-  three concurrent runs produced 6 to 12 unrelated-looking failures, with the daemon
-  behaving correctly throughout. Safe under nextest, which never does this within a
-  run. The same fixed names put the socket path over `sockaddr_un`'s 108 bytes once
-  the checkout is deep enough — a git worktree under `.claude/worktrees/` is already
-  past it, which makes the pre-commit hook unrunnable there without a short
-  `CARGO_TARGET_DIR`. Interning the names shorter buys back both.
 - **A test can hold the spawn lock without meaning to.** `fork` duplicates every
   open descriptor, and a duplicate of an `flock`ed one keeps that lock alive until it
   is closed — for a child of the test binary, until its `exec`. So any test that
