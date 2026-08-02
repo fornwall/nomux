@@ -250,7 +250,11 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
         drop(events);
         drop(fds);
 
-        if stdin_events.intersects(PollFlags::IN | PollFlags::HUP)
+        // `ERR` alongside `HUP`, as the socket direction below and
+        // `daemon::poll_once` both have it: a source reporting only `ERR` would
+        // otherwise never be read and never be closed, and stdin stays in the poll
+        // set, so the relay would spin on it exactly as stdout used to.
+        if stdin_events.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
             && !to_socket.transfer(stdin_fd, sock_fd)?
         {
             stdin_open = false;
@@ -265,6 +269,19 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
         }
         if socket_events.contains(PollFlags::OUT) || to_socket.has_data() {
             to_socket.drain_to(sock_fd)?;
+        }
+        // Before the drain, and terminal. `POLLOUT` is the only thing that clears
+        // `Pump::dest_full`, and a destination whose reader has gone never reports
+        // it — a full pipe with no reader is not writable, it is broken. So the
+        // relay would poll a descriptor that answers `ERR` forever, match neither
+        // this condition nor the one below (the buffer is empty: `splice` moved
+        // those bytes inside the kernel), change nothing, and come straight back
+        // round — a busy loop at the speed of the scheduler, for as long as the
+        // socket stayed open. Leaving is the whole of the answer: there is nothing
+        // left to deliver output to, which is the same conclusion the socket
+        // direction already draws from its own `HUP | ERR` above.
+        if stdout_events.intersects(PollFlags::ERR | PollFlags::HUP) {
+            return Ok(());
         }
         if stdout_events.contains(PollFlags::OUT) || to_stdout.has_data() {
             to_stdout.drain_to(stdout_fd)?;

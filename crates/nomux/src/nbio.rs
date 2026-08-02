@@ -1,13 +1,17 @@
-//! The two non-blocking transfers every fd in this daemon is moved by.
+//! The two non-blocking transfers the PTY master and the agent channels are moved by.
 //!
-//! Four descriptors carry bytes here — the PTY master, the client socket, the
-//! agent listener's channels and the relay's stdio — and all of them are
-//! non-blocking, because a single-threaded `poll` loop cannot afford to be parked
-//! inside a `read` or a `write`. That makes `EINTR` and `EAGAIN` part of the
-//! ordinary flow rather than error handling, and both have a wrong answer that
-//! looks right: treating `EINTR` as failure loses bytes to any signal, and
-//! treating `EAGAIN` as end of file reports the session as over every time the
-//! kernel has nothing to hand over yet.
+//! Every descriptor in this daemon is non-blocking, because a single-threaded
+//! `poll` loop cannot afford to be parked inside a `read` or a `write`. That makes
+//! `EINTR` and `EAGAIN` part of the ordinary flow rather than error handling, and
+//! both have a wrong answer that looks right: treating `EINTR` as failure loses
+//! bytes to any signal, and treating `EAGAIN` as end of file reports the session as
+//! over every time the kernel has nothing to hand over yet.
+//!
+//! Two of them come through here — the PTY master and the agent listener's
+//! channels. The client socket (`conn`) and the relay's stdio (`attach`) keep loops
+//! of their own on purpose: both queue into a `Vec` with a cursor rather than a
+//! `VecDeque`, and both answer outcomes this module deliberately does not, such as
+//! `conn`'s short-write `WriteZero` and the relay's `EPIPE`.
 //!
 //! What is *not* here is what each outcome means. A closed peer ends the session
 //! for the PTY and ends one channel for the agent, and folding that decision in
@@ -42,16 +46,23 @@ pub(crate) fn read(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<usize, Errno> {
 /// that ends the session on the PTY master is one dead channel to the agent.
 ///
 /// The `as_slices` dance is load-bearing. A `VecDeque` that has wrapped hands back
-/// a front and a back, and the front is what may be empty — writing the back
-/// without the front ahead of it would deliver the queue out of order, which for a
-/// terminal is transposed keystrokes rather than an error anybody could see.
+/// a front and a back, and writing the back without the front ahead of it would
+/// deliver the queue out of order — which for a terminal is transposed keystrokes
+/// rather than an error anybody could see. Hence the front, always, and a second
+/// pass for whatever is behind it.
 pub(crate) fn drain_to(queue: &mut VecDeque<u8>, fd: BorrowedFd<'_>) -> Result<(), Errno> {
     while !queue.is_empty() {
         let (front, _) = queue.as_slices();
         if front.is_empty() {
-            // Only reachable once per drain: after this the whole queue is the
-            // front, so the branch cannot be taken again before something is
-            // written.
+            // Unreachable as `VecDeque` is written today: for a non-empty deque the
+            // head index is always inside the buffer, so the front slice always
+            // holds at least one byte and the `while` above has excluded the empty
+            // case. Kept as insurance rather than deleted, because the failure it
+            // would prevent is silent and permanent: `write` of an empty slice
+            // returns `Ok(0)`, which is the break below, so the queue would simply
+            // stop draining and every later `POLLOUT` would find it in the same
+            // state — a session that quietly stops accepting keystrokes. One branch
+            // against that is a good trade.
             queue.make_contiguous();
             continue;
         }

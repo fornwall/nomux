@@ -209,7 +209,7 @@ sequenceDiagram
   participant C as Client
   participant S as sshd
   participant D as daemon
-  C->>S: direct-streamlocal to ~/.local/state/nomux/run/$ID.sock
+  C->>S: direct-streamlocal to $XDG_RUNTIME_DIR/nomux/$ID.sock
   C->>D: Hello{out_offset, in_offset, cols, rows, TERM}
   D-->>C: HelloOk{resume_from, gap: false}
   D-->>C: Output[resume_from..end]
@@ -266,7 +266,7 @@ still clean it up — the fallback is never an orphaned shell. See
 [IMPLEMENTATION.md § 6.6](IMPLEMENTATION.md#66-frozen-control-surface).
 
 The daemon carries none of this. It only ever speaks its own version and rejects a
-mismatched `Hello.proto` outright. All skew handling is client-side, which is where
+mismatched `Hello.protocol` outright. All skew handling is client-side, which is where
 it belongs: the daemon is the size-constrained binary being uploaded over cellular.
 
 ## 7. Degradation
@@ -308,6 +308,6 @@ The combination — zero-install, no new ports, byte-exact — does not exist to
 
 ## 10. Open questions
 
-- Default ring capacity: 4 MiB covers a multi-hour idle disconnect but not `yes` for ten seconds. Fixed, or client-negotiated in `Hello`? Now multiplied by the §5.1 cap — eight sessions at 4 MiB is 32 MiB resident on a host whose administrator never agreed to any of this.
+- Default ring capacity: 4 MiB covers a multi-hour idle disconnect but not `yes` for ten seconds. `NOMUX_RING_BYTES` already makes it tunable per daemon, so the open question is only what the *default* should be — fixed, or client-negotiated in `Hello`? Now multiplied by the §5.1 cap — eight sessions at 4 MiB is 32 MiB resident on a host whose administrator never agreed to any of this.
 - Optional `libvterm` screen snapshot on overflow, to replace the SIGWINCH repaint heuristic with an exact redraw. Adds a C dependency and ~100 KiB; deferred until the heuristic proves insufficient.
 - Cross-device handover (start on desktop, resume on mobile). Deferred. It needs no new concurrency — takeover ([IMPLEMENTATION.md § 6.4](IMPLEMENTATION.md#64-multiple-clients)) is already the right primitive, since handover is serial — but it does need three things: a `u64::MAX` "tell me" sentinel for `Hello.in_offset` mirroring the output side, a rule that clients never auto-reconnect after `Error{TAKEOVER}` (otherwise two resilient clients evict each other forever), and geometry-conditional replay, because scrollback carries absolute cursor positioning computed for the old width.

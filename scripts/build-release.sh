@@ -8,7 +8,7 @@
 # regression in the one number users feel.
 #
 # The cap on its own is not enough, which is what the armv7 regression taught: one
-# commit grew that binary 48% and nothing said a word, because 213 KiB still fits in
+# commit grew that binary 46% and nothing said a word, because 213 KiB still fits in
 # 400 KiB comfortably. A number is only watched if something compares it to what it
 # was. So the script also keeps a per-target baseline in scripts/size-baseline, prints
 # the signed delta against it beside every size, and fails a build that grows a target
@@ -43,17 +43,20 @@
 # The panic machinery — formatting, backtrace symbolisation, gimli, addr2line — is
 # most of it, and it cannot be dropped from a precompiled std no matter how the
 # release profile is tuned. Rebuilding std from source with -Cpanic=immediate-abort
-# turns every panic into a bare trap and takes x86_64 from 493 KiB to 147 KiB. The
-# budget is missed on every target without it — 440 to 493 KiB against a 400 KiB cap,
-# armv7 included — and cleared by roughly 3x with it. So it is not an optimisation, it
-# is the only configuration that ships. The cost is a nightly compiler and panics that
-# abort with no message — acceptable only because the clippy wall in Cargo.toml
-# already denies unwrap, expect, panic and indexing. Point NOMUX_NIGHTLY at a dated
-# nightly for a real release: a floating one is a moving target, and the SHA-256 the
-# client pins would drift under it.
+# turns every panic into a bare trap and cuts each target to roughly a third: the
+# budget is missed on every one of them without it — 440 to 493 KiB against a 400 KiB
+# cap, armv7 included — and cleared with it. So it is not an optimisation, it is the
+# only configuration that ships. The cost is a nightly compiler and panics that abort
+# with no message — acceptable only because the clippy wall in Cargo.toml already
+# denies unwrap, expect, panic and indexing. Point NOMUX_NIGHTLY at a dated nightly
+# for a real release: a floating one is a moving target, and the SHA-256 the client
+# pins would drift under it.
 #
-# The figures above are what this script prints; see IMPLEMENTATION.md § 8 for the
-# per-target table. Re-measure with NOMUX_STABLE_STD=1 rather than trusting them.
+# No shipping figure is written down in this comment. scripts/size-baseline holds
+# them, written by a build rather than by hand, and the copy that used to live on
+# this line had gone stale — which is the whole argument for keeping one of them.
+# The stable-std figures above are the ones NOMUX_STABLE_STD=1 reproduces; see
+# IMPLEMENTATION.md § 8.
 #
 # Set NOMUX_STABLE_STD=1 to build against the pinned stable toolchain's released std
 # instead. Expect it to fail the size gate; it is kept to make that cost visible and
@@ -69,7 +72,7 @@ max_bytes=409600 # 400 KiB
 # ordinary drift and well below a regression, and there is a wide gap between the two:
 # a compiler bump or a handful of new match arms moves these binaries by hundreds of
 # bytes, a few tenths of a percent of the smallest of them, while the armv7 jump this
-# gate exists to catch was 48%. Three percent is around 4 KiB on x86_64 — loose enough
+# gate exists to catch was 46%. Three percent is around 4 KiB on x86_64 — loose enough
 # that no honest commit trips it and nobody learns to rerun with the escape hatch out
 # of habit, tight enough that nothing on the scale of a real regression gets through.
 max_growth_pct=3
@@ -102,6 +105,16 @@ fi
 # that is not a target and a byte count is an error rather than a silently ignored line
 # — a baseline that quietly holds no entry for a target is a gate that passes everything.
 baselines=''
+if [ ! -e "$baseline_file" ] && [ "$update_baseline" != 1 ]; then
+    # Refused rather than treated as "no baseline yet". A missing file used to leave
+    # every target `new`, print a note to stderr and exit 0 — so the one gate standing
+    # between the tree and another armv7-shaped regression turned itself off if the
+    # file was renamed, moved, or lost in a bad merge, and the build stayed green while
+    # it did. Creating a baseline is a deliberate act, and it already has a flag.
+    echo "missing ${baseline_file#"$repo"/}, which is the growth gate's only reference." >&2
+    echo "      rerun with NOMUX_UPDATE_BASELINE=1 to record one from this build." >&2
+    exit 1
+fi
 if [ -e "$baseline_file" ]; then
     if ! baselines=$(awk '
         { orig = $0; sub(/#.*/, "") }
@@ -293,9 +306,12 @@ if [ "$update_baseline" = 1 ]; then
 # accepting a size change is a commit someone signs rather than a number nobody
 # looked at.
 #
-# Measured by $toolchain on $(date -u '+%Y-%m-%d'). These are toolchain-dependent —
-# a compiler bump moves them all — so a refresh belongs in the commit that moved the
-# bytes, and nowhere else.
+# Measured on $(date -u '+%Y-%m-%d') by:
+#   $(rustc --version)
+# The resolved compiler rather than the toolchain name it was asked for, because
+# \`nightly\` floats: two builds a day apart can both call themselves that and disagree
+# about every figure below. These are toolchain-dependent — a compiler bump moves them
+# all — so a refresh belongs in the commit that moved the bytes, and nowhere else.
 EOF
             printf '%s' "$measured"
         } > "$baseline_file"

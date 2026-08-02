@@ -5,6 +5,11 @@
 # Hooks are ordered cheapest-first so an obvious failure reports fast.
 # They trigger on Rust sources and on manifests, since the lint configuration
 # itself lives in Cargo.toml.
+#
+# `--locked` on every cargo hook, matching .github/workflows/ci.yml: without it a
+# hook may quietly update Cargo.lock to make itself pass, and the first thing to
+# notice is CI failing on the dependency set the commit did not actually build
+# against. `cargo fmt` takes no such flag and reads no lockfile.
 repos:
   - repo: local
     hooks:
@@ -27,14 +32,14 @@ repos:
 
       - id: cargo-clippy
         name: cargo clippy
-        entry: cargo clippy --workspace --all-targets
+        entry: cargo clippy --locked --workspace --all-targets
         language: system
         files: '(\.rs|\.toml)$|^Cargo\.lock$'
         pass_filenames: false
 
       - id: cargo-nextest
         name: cargo nextest run
-        entry: cargo nextest run --workspace
+        entry: cargo nextest run --locked --workspace
         language: system
         files: '(\.rs|\.toml)$|^Cargo\.lock$'
         pass_filenames: false
@@ -43,7 +48,7 @@ repos:
       # examples silently go unexercised.
       - id: cargo-doctest
         name: cargo test --doc
-        entry: cargo test --doc --workspace
+        entry: cargo test --locked --doc --workspace
         language: system
         files: '(\.rs|\.toml)$|^Cargo\.lock$'
         pass_filenames: false

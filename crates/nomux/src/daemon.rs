@@ -909,18 +909,35 @@ impl Daemon {
                 return Ok(());
             }
             Err(_) => {
-                self.reject_pending("unparseable frame header");
+                self.reject_pending(ErrorCode::Protocol, "unparseable frame header");
                 return Ok(());
             }
         };
         if ty != FrameType::Hello {
-            self.reject_pending("first frame from a client must be Hello");
+            self.reject_pending(
+                ErrorCode::Protocol,
+                "first frame from a client must be Hello",
+            );
             return Ok(());
         }
         let Ok(Frame::Hello(hello)) = Frame::decode(ty, &buf) else {
-            self.reject_pending("unparseable Hello");
+            self.reject_pending(ErrorCode::Protocol, "unparseable Hello");
             return Ok(());
         };
+        // Before the eviction below, not after. A `Hello` this daemon cannot answer
+        // is refused on its own terms and the session keeps the client it has
+        // (§ 6.4) — checking it inside `on_hello`, which runs once the takeover has
+        // already happened, meant a newer client's *failed* handshake threw the
+        // working one off with `Error{TAKEOVER}` and then dropped the newcomer too,
+        // leaving nobody attached. Worse than losing the handshake: § 6.4 tells a
+        // client never to auto-reconnect after a takeover, so the session the user
+        // was in went quiet until they went looking for it by hand. `on_hello` keeps
+        // its own copy of this check for the other caller, where a `Hello` arrives on
+        // a connection that is already the client.
+        if hello.protocol != PROTOCOL_VERSION {
+            self.reject_pending(ErrorCode::Version, "protocol version mismatch");
+            return Ok(());
+        }
 
         // Final drain of the outgoing connection: it may have written between the
         // poll and this moment, and input it already delivered must not be lost to
@@ -937,13 +954,15 @@ impl Daemon {
         self.read_client(scratch)
     }
 
-    /// Turns away a connection that spoke out of turn, leaving the session alone.
-    fn reject_pending(&mut self, message: &'static str) {
+    /// Turns away a connection that cannot have the session, leaving the session
+    /// alone.
+    ///
+    /// The `code` is a parameter because not every refusal here is a protocol
+    /// error: a version mismatch is the peer being from another release rather than
+    /// misbehaving, and the client acts on the two differently (`DESIGN.md` § 6.4).
+    fn reject_pending(&mut self, code: ErrorCode, message: &'static str) {
         if let Some(mut pending) = self.pending.take() {
-            pending.send_last(&Frame::Error {
-                code: ErrorCode::Protocol,
-                message,
-            });
+            pending.send_last(&Frame::Error { code, message });
         }
     }
 

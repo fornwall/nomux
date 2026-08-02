@@ -22,7 +22,7 @@ codec; keeping it I/O-free makes it portable and property-testable in isolation.
 Spoken end-to-end between client and daemon (§7 relay is transparent).
 
 Private protocol: client and daemon ship as one unit ([DESIGN.md § 2](DESIGN.md#2-scope)).
-There is no negotiation and no reserved space for extensions. `Hello.proto` exists
+There is no negotiation and no reserved space for extensions. `Hello.protocol` exists
 solely to reject a mismatched peer immediately, which happens only in the bounded
 skew case of [DESIGN.md § 6.4](DESIGN.md#64-version-skew).
 
@@ -46,8 +46,8 @@ it appears.
 
 | Type | Dir | Name | Payload |
 | --- | --- | --- | --- |
-| `0x01` | C→D | `Hello` | `u16` proto, `u16` flags, `u64` out_offset, `u64` in_offset, winsize, `u16` term_len, term bytes |
-| `0x02` | D→C | `HelloOk` | `u16` proto, `u64` resume_from, `u64` in_applied, winsize, `u8` flags |
+| `0x01` | C→D | `Hello` | `u16` protocol, `u16` flags, `u64` out_offset, `u64` in_offset, winsize, `u16` term_len, term bytes |
+| `0x02` | D→C | `HelloOk` | `u16` protocol, `u64` resume_from, `u64` in_applied, winsize, `u8` flags |
 | `0x03` | C→D | `Input` | `u64` offset, bytes |
 | `0x04` | D→C | `InputAck` | `u64` applied_through |
 | `0x05` | D→C | `Output` | `u64` offset, bytes |
@@ -58,7 +58,7 @@ it appears.
 | `0x0a` | C→D | `Detach` | — |
 | `0x0b` | C→D | `Ping` | `u64` nonce |
 | `0x0c` | D→C | `Pong` | `u64` nonce |
-| `0x0d` | D→C | `Error` | `u16` code, UTF-8 message |
+| `0x0d` | D→C | `Error` | `u16` code (1 protocol, 2 takeover, 3 version, 4 input_gap, 5 internal), UTF-8 message |
 | `0x0e` | D→C | `AgentOpen` | `u32` chan |
 | `0x0f` | ↔ | `AgentData` | `u32` chan, opaque `ssh-agent` bytes |
 | `0x10` | ↔ | `AgentClose` | `u32` chan |
@@ -235,7 +235,7 @@ flowchart TD
   A["Hello{out_offset}"] --> B{"out_offset == u64::MAX?"}
   B -- yes --> C["resume_from = base_offset"]
   B -- no --> D{"out_offset < base_offset?"}
-  D -- no --> E["resume_from = out_offset<br/>gap = false"]
+  D -- no --> E["resume_from = min(out_offset, end_offset)<br/>gap = false"]
   D -- yes --> F["resume_from = base_offset<br/>gap = true"]
   C --> G["HelloOk{resume_from, gap}"]
   E --> G
@@ -245,6 +245,13 @@ flowchart TD
 
 At attach time the gap is reported by `HelloOk`'s flag alone; the standalone `Gap`
 frame is for overflow that happens *mid-stream*, while a client is attached.
+
+`resume_from` is clamped at *both* ends, which is why the no-gap branch carries a
+`min`. An `out_offset` above `end_offset` is a client claiming output the session
+never produced; taken at face value it would set the daemon's `sent_through` past
+the end of the stream, and the session would then look dead until the child happened
+to write enough to catch up. It is not reported as a gap, because nothing was
+dropped — there was never anything there.
 
 ### 4.3 Gap handling
 
@@ -862,7 +869,7 @@ Targets:
 if any binary misses the budget. It also holds each size against the per-target
 baseline recorded in `scripts/size-baseline`, prints the signed delta beside the
 size, and fails a target that has grown more than 3% against it — the cap alone
-passed a commit that grew armv7 48% in one step, since 213 KiB still fits in 400.
+passed a commit that grew armv7 46% in one step, since 213 KiB still fits in 400.
 `NOMUX_UPDATE_BASELINE=1` rewrites the baseline from that build and skips the growth
 gate, which puts an accepted size change in the diff a reviewer reads.
 
@@ -885,21 +892,23 @@ Size matters because the cold upload happens over cellular. Release profile:
 
 **The released standard library does not fit.** Measured, same source:
 
-| Target | stable 1.97.1 | + `build-std` + `panic=immediate-abort` |
-| --- | --- | --- |
-| `x86_64-unknown-linux-musl` | 493 KiB | 153.1 KiB |
-| `aarch64-unknown-linux-musl` | 440 KiB | 144.4 KiB |
-| `armv7-unknown-linux-musleabihf` | 472 KiB | 213.0 KiB |
-| `riscv64gc-unknown-linux-musl` | 442 KiB | 125.7 KiB |
+| Target | stable 1.97.1 |
+| --- | --- |
+| `x86_64-unknown-linux-musl` | 493 KiB |
+| `aarch64-unknown-linux-musl` | 440 KiB |
+| `armv7-unknown-linux-musleabihf` | 472 KiB |
+| `riscv64gc-unknown-linux-musl` | 442 KiB |
 
 Every stable figure is over the 400 KiB budget, armv7 included. Re-measure with
 `NOMUX_STABLE_STD=1 sh scripts/build-release.sh` rather than trusting the table.
 
-The shipping column is the same measurement `scripts/size-baseline` holds in bytes,
-and that file is the one to trust: it is rewritten by a build, where this table is
-rewritten by hand and was three releases stale — armv7 read 141 KiB here while the
-artifact was 213. armv7 carries a live regression against the other three; see
-[PLAN.md](PLAN.md).
+**The shipping sizes are deliberately not repeated here.** They live in
+`scripts/size-baseline`, which is written by a build; this table is written by hand.
+When it carried them too they went stale twice — armv7 once read 141 KiB here while
+the artifact was 213, and the other three sat two percent low for a release after
+that. One number in two places is one number that will disagree with itself, and the
+copy a reader trusts should be the copy a machine maintains. armv7 carries a live
+regression against the other three; see [PLAN.md](PLAN.md).
 
 The panic machinery — formatting, backtrace symbolisation, `gimli`, `addr2line` —
 is most of that, and it cannot be dropped from a precompiled `std` however the

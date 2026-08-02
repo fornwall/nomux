@@ -34,15 +34,41 @@ and *then* closes no longer takes the five seconds with it. The attached client 
 the three fields that mean nothing without it are one `Option<Attached>`, so a
 takeover resets them together or not at all.
 
-96 tests, one of which waits out a real reaping timeout and is `#[ignore]`d (CI
+Four defects found by review since then, each now with a test that fails without
+its fix. The relay spun at the speed of the scheduler when its stdout died with a
+`splice` latched on a full destination — reachable whenever the network drops with
+output backed up, which is the shape this project exists for. `Pty::terminate` paid
+its whole 500 ms grace on *every* shutdown, because an unreaped zombie still
+answers for its own process group and the group probe short-circuits the `/proc`
+walk that would have disagreed. A `Hello` carrying the wrong protocol version was
+refused only after the takeover had already evicted the working client, so a newer
+client's failed handshake left the session running with nobody attached and a
+client § 6.4 forbids from reconnecting. And `kill` refused a healthy session whose
+pidfile it caught between creation and first write.
+
+Two smaller ones went with them, both about answering the right way rather than
+about behaviour anybody would notice twice: the relay now acts on a bare `POLLERR`
+from stdin, as the socket direction and the daemon's own poll loop already did, and
+`attach` reports a malformed session id as § 10's `EX_USAGE` rather than as a
+session that resisted attaching — the client caches the latter per host, and would
+have cached it off its own typo.
+
+103 tests, one of which waits out a real reaping timeout and is `#[ignore]`d (CI
 runs it with `--run-ignored all`), plus 2 doctests: property tests over the codec
-including malformed and near-valid input, a model-checked ring, an integration
-suite driving the real binary over its socket, and a seeded chaos suite that severs
-the connection at generated points under an escape-heavy full-screen stream and
-under `yes`. Two of them are verified against builds that restore the bug they
-guard: the event ordering of § 6.4.1, against a fault-injected binary and against
-one that forces only the interleaving, which must still pass; and the session
-reach of `Pty::terminate`, against a build with the `/proc` walk removed.
+including malformed and near-valid input, hand-written wire vectors that pin the
+§ 2.2 byte layout, a model-checked ring, an integration suite driving the real
+binary over its socket, and a seeded chaos suite that severs the connection at
+generated points under an escape-heavy full-screen stream and under `yes`. Two of
+them are verified against builds that restore the bug they guard: the event
+ordering of § 6.4.1, against a fault-injected binary and against one that forces
+only the interleaving, which must still pass; and the session reach of
+`Pty::terminate`, against a build with the `/proc` walk removed.
+
+The wire vectors are the newest of those and close the widest hole the suite had.
+Every other codec test compared a frame to a frame, so the codec was only ever
+checked against itself: swapping `Hello.out_offset` with `Hello.in_offset` on both
+sides passed all 23 of them. The client is a separate codebase built from the § 2.2
+table, so "encode and decode agree" was never the property that mattered.
 
 The suite runs beside itself. Each test's run directory is named for a hash of the
 test and the pid of the process running it, so a second copy of a binary in a
@@ -53,13 +79,19 @@ suite adds to `CARGO_TARGET_TMPDIR` is 38 bytes against `sockaddr_un`'s 108, whi
 is what makes a worktree under `.claude/worktrees/` runnable.
 
 All four musl targets build reproducibly via `scripts/build-release.sh`, against
-the 400 KiB budget: x86_64 153.1 KiB, aarch64 144.2, armv7 213.0, riscv64gc 125.8.
-Named rather than listed, because an unlabelled list of four numbers is one that
-gets read in the wrong order — the exact figures live in `scripts/size-baseline`,
-which is written by a build rather than by hand. The script now holds each target
-against that baseline and fails a growth past 3%, so the next size regression is
-reported in the commit that causes it. The armv7 figure is one that arrived before
-the gate did; see below.
+the 400 KiB budget, and the largest of them — armv7, a little over 215 KiB — has
+the least headroom by a wide margin. The other three are not repeated here: they
+live in
+`scripts/size-baseline`, which a build writes, and the two places that used to
+copy them had both gone stale, one of them twice. The script holds each target
+against
+that baseline and fails a growth past 3%, so the next size regression is reported
+in the commit that causes it — and the baseline now records the resolved `rustc
+--version` rather than the toolchain alias it was asked for, since `nightly` floats
+and two builds a day apart can both answer to it while disagreeing about every
+figure. A missing baseline is refused outright rather than treated as "none yet",
+which used to turn the gate off silently. The armv7 figure is one that arrived
+before the gate did; see below.
 
 Everything below is either a feature not started, a decision deliberately deferred,
 or client-side work recorded because its server-side contract is fixed here.
@@ -71,19 +103,26 @@ guessing, and the same is true of these — which is worth saying because the tw
 that remain are both cases where the honest answer is a known cost rather than a
 missing line of code.
 
-- **A hand-started daemon has a bind-to-publish window.** `attach` now holds the
-  spawn lock until `<id>.pid` exists, so a session it created is never visible
-  without its pidfile. `nomux daemon <id>` run directly answers `connect` from its
-  bind onward and publishes the pidfile a few syscalls later, so a `kill` landing in
-  between sees a live session it cannot identify. It refuses rather than unlinking,
-  and waits the window out, so the outcome is an honest non-zero exit rather than a
+- **A hand-started daemon has a bind-to-publish window.** `attach` holds the spawn
+  lock until `<id>.pid` exists, so a session it created is never visible without its
+  pidfile. `nomux daemon <id>` run directly answers `connect` from its bind onward
+  and publishes the pidfile a few syscalls later, so a `kill` landing in between
+  sees a live session it cannot identify. It refuses rather than unlinking, and
+  waits the window out, so the outcome is an honest non-zero exit rather than a
   destroyed session — but the window is still there.
-- **The run-directory check costs armv7 67.6 KiB.** Bisected to the commit, and the
+
+  One half of it turned out to be reachable from the ordinary spawn too, and is now
+  closed: `write_pidfile` creates the file and fills it a syscall later, and `attach`
+  releases the lock at the first of those, so a `kill` could read a zero-length
+  pidfile. That read as a *corrupt* pidfile and was refused at once, where a missing
+  one was patiently waited out. Both halves are waited out now, which leaves only
+  the hand-started case this item is about.
+- **The run-directory check costs armv7 66 KiB.** Bisected to the commit, and the
   jump is that architecture alone: 148,292 → 215,884 bytes, a 46% step against
   roughly 6 KiB for the whole branch on each of the other three. Ruled out by
   probe: the two dynamic error messages (168 bytes) and the `fchmod` repair (120
   bytes). Removing the check recovers all of it, so the cost is in the
-  `open`/`fstat`/`Mode` path as 32-bit ARM codegen renders it. Under budget at 213
+  `open`/`fstat`/`Mode` path as 32-bit ARM codegen renders it. Under budget at 215
   KiB, so this is a size regression rather than a broken release — but it is very
   nearly a third of the binary users upload over cellular, and armv7 is the target
   least likely to be on a fast link. It went unnoticed because the release script

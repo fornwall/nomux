@@ -214,6 +214,51 @@ fn an_unopenable_spawn_lock_does_not_take_the_control_surface_with_it() {
     );
 }
 
+/// Regression: `kill` waits out a pidfile that exists but is still empty.
+///
+/// The daemon publishes its pid in two steps — `File::create`, which leaves a
+/// zero-length file, and then the write that fills it — so there is a moment when
+/// the path exists and holds nothing. `attach` does not cover it: it releases the
+/// spawn lock as soon as the path *exists*, which the empty file already satisfies,
+/// so an ordinary spawn reaches this state and not only a hand-started daemon.
+///
+/// A missing pidfile was already waited out as the daemon's bind-to-publish window.
+/// An empty one is the same window one syscall later, but it read as a *corrupt*
+/// pidfile and was reported at once — so `kill` refused a session that was in
+/// perfect health and a few microseconds from finishing its startup, and the caller
+/// got a non-zero exit for no fault of anyone's.
+///
+/// The file is emptied and refilled by hand here because the real window is too
+/// narrow to lose a race into deliberately; what is under test is what `kill` does
+/// while it is open, not how it is arrived at.
+#[test]
+fn kill_waits_out_a_pidfile_that_has_been_created_but_not_yet_written() {
+    let session = LiveSession::create("lk9");
+    let body = fs::read_to_string(session.pid_path()).expect("read the pidfile");
+    fs::write(session.pid_path(), b"").expect("empty the pidfile");
+
+    // Refilled well inside the two-second publish grace, so a `kill` that waits
+    // finds the pid and a `kill` that does not has already failed by now.
+    let path = session.pid_path();
+    let restore = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(300));
+        fs::write(path, body.as_bytes()).expect("republish the pid");
+    });
+
+    let killed = session.run.run(&["kill", "lk9"]);
+    restore.join().expect("the republishing thread");
+
+    assert!(
+        killed.status.success(),
+        "kill refused a session whose pidfile was merely still being written: {:?}",
+        String::from_utf8_lossy(&killed.stderr)
+    );
+    assert!(
+        !session.is_alive(),
+        "kill reported success without stopping the daemon"
+    );
+}
+
 /// `kill` never unlinks a live session's files, whatever the pidfile says.
 ///
 /// The socket has just answered, so there is a daemon holding the user's shell.

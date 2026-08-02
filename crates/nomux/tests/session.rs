@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use nomux_proto::{
-    Frame, FrameType, HELLO_AGENT_FORWARD, HELLO_REPAINT_CTRL_L, MAX_AGENT_CHANNELS,
-    PROTOCOL_VERSION, RESUME_FROM_START,
+    ErrorCode, Frame, FrameType, HELLO_AGENT_FORWARD, HELLO_REPAINT_CTRL_L, Hello,
+    MAX_AGENT_CHANNELS, PROTOCOL_VERSION, RESUME_FROM_START,
 };
 
 use harness::{
@@ -184,7 +184,7 @@ fn a_second_client_takes_over_and_the_first_is_told_why() {
         matches!(
             frame,
             Frame::Error {
-                code: nomux_proto::ErrorCode::Takeover,
+                code: ErrorCode::Takeover,
                 ..
             }
         ),
@@ -259,7 +259,7 @@ fn a_connection_that_does_not_greet_first_is_refused_alone() {
         matches!(
             Frame::decode(ty, &payload).expect("decode"),
             Frame::Error {
-                code: nomux_proto::ErrorCode::Protocol,
+                code: ErrorCode::Protocol,
                 ..
             }
         ),
@@ -1226,8 +1226,11 @@ fn a_daemon_that_reaps_itself_removes_its_run_files() {
         "the daemon should have written its pidfile"
     );
 
-    // The child exits, and leaving takes the linger window with it — `on_detached`
-    // collapses it once there is nobody left to serve.
+    // The child exits and the client leaves. The linger window is deliberately *not*
+    // collapsed by the departure — `on_detached` leaves `linger_until` alone, because
+    // the client the window exists for is the one that has not arrived yet (§ 6.5) —
+    // so what ends the daemon here is the five-second `EXIT_LINGER` expiring, and
+    // `shutdown` then unlinks the run files. Hence the generous deadline below.
     client.send(&Frame::Input {
         offset: 0,
         data: b"exit 3\n",
@@ -1325,6 +1328,63 @@ fn a_signalled_daemon_collects_a_process_that_ignores_sighup() {
         thread::sleep(Duration::from_millis(25));
     }
     panic!("pid {orphan} outlived the session it was backgrounded in");
+}
+
+/// A session with nothing left running is torn down at once, rather than waiting
+/// out the grace period that only the stubborn case needs.
+///
+/// The grace period is 500 ms, and it used to be spent on *every* shutdown. The
+/// loop's exit condition asks the process group first and only then walks `/proc`,
+/// and an unreaped zombie is still a member of its own group — so the group probe
+/// answered "still alive" for the very child the daemon was about to collect, and
+/// the `&&` short-circuited before the `/proc` walk, which filters zombies, could
+/// disagree. On the path that matters the child *is* unreaped: `reap` runs only
+/// once the PTY has reported end of file, which on the `nomux kill` path it has
+/// not.
+///
+/// Hence the bound below sits under the grace period rather than under § 6.6's
+/// two-second budget: the regression this guards has a hard floor of 500 ms, so
+/// anything that reintroduces it lands strictly above the bound however lightly
+/// loaded the machine is. What is left is the honest work — two `/proc` walks and
+/// a poll interval or two — which measures in tens of milliseconds.
+#[test]
+fn a_signalled_daemon_with_a_quiet_child_does_not_wait_out_the_grace_period() {
+    let mut session = Session::start("fastkill");
+    let mut client = session.connect();
+    let ok = client.hello(RESUME_FROM_START, 0);
+    // So the measurement covers a session with a live shell in it, rather than the
+    // window before the child exists at all.
+    client.send(&Frame::Input {
+        offset: 0,
+        data: b"echo NOMUX-READY\n",
+    });
+    client.read_until("NOMUX-READY", ok.resume_from);
+
+    let daemon = rustix::process::Pid::from_raw(session.child.id().cast_signed())
+        .expect("the daemon's own pid");
+    let began = Instant::now();
+    rustix::process::kill_process(daemon, rustix::process::Signal::TERM)
+        .expect("signal the daemon");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if session
+            .child
+            .try_wait()
+            .expect("wait for the daemon")
+            .is_some()
+        {
+            let elapsed = began.elapsed();
+            assert!(
+                elapsed < Duration::from_millis(400),
+                "shutdown took {elapsed:?}, at or over the 500 ms grace period it \
+                 should only pay when something is still running"
+            );
+            return;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    panic!("the signalled daemon never exited");
 }
 
 /// Kills a pid when it goes out of scope.
@@ -1441,6 +1501,64 @@ fn a_takeover_never_discards_input_already_delivered() {
         );
         client = next;
     }
+}
+
+/// Regression: a `Hello` the daemon cannot answer must not cost the session the
+/// client it already has.
+///
+/// Version skew is the one compatibility case that exists (`DESIGN.md` § 6.4), and
+/// its shape is a *newer* client reaching a session an older daemon is still
+/// holding. The refusal used to happen after the takeover rather than before it, so
+/// the failed handshake evicted the working client with `Error{TAKEOVER}` and then
+/// dropped the newcomer too, leaving the session running with nobody attached. § 6.4
+/// tells a client never to auto-reconnect after a takeover — so the user's shell
+/// went quiet and stayed quiet, over a connection attempt that was refused.
+#[test]
+fn a_version_mismatch_refuses_the_newcomer_without_evicting_the_client() {
+    let session = Session::start("skew");
+    let mut client = session.connect();
+    let ok = client.hello(RESUME_FROM_START, 0);
+
+    // The incumbent is serving before the newcomer knocks, or the assertion below
+    // that it still is would be about nothing.
+    let first = b"echo NOMUX-FIRST\n";
+    client.send(&Frame::Input {
+        offset: 0,
+        data: first,
+    });
+    let (_, from) = client.read_until("NOMUX-FIRST", ok.resume_from);
+
+    let mut newcomer = session.connect();
+    newcomer.send(&Frame::Hello(Hello {
+        protocol: PROTOCOL_VERSION + 1,
+        flags: 0,
+        out_offset: RESUME_FROM_START,
+        in_offset: 0,
+        win: harness::WIN,
+        term: "xterm-256color",
+    }));
+    let payload = newcomer.next_of(FrameType::Error);
+    let refusal = Frame::decode(FrameType::Error, &payload).expect("decode the refusal");
+    assert!(
+        matches!(
+            refusal,
+            Frame::Error {
+                code: ErrorCode::Version,
+                ..
+            }
+        ),
+        "a mismatched Hello must be refused as a version error, got {refusal:?}"
+    );
+
+    // The incumbent kept the session: it never saw a takeover, and its input stream
+    // carries on from where it was rather than restarting.
+    let second = b"echo NOMUX-STILL-HERE\n";
+    client.send(&Frame::Input {
+        offset: first.len() as u64,
+        data: second,
+    });
+    let (seen, _) = client.read_until("NOMUX-STILL-HERE", from);
+    assert!(seen.contains("NOMUX-STILL-HERE"), "transcript: {seen:?}");
 }
 
 /// Regression: a client vanishing must never take the session with it.
@@ -1577,6 +1695,78 @@ fn the_relay_moves_bulk_traffic_both_ways_without_losing_a_byte() {
 
     assert_same(&upstream, &uplink, "stdin -> socket", &complaints);
     assert_same(&downstream, &downlink, "socket -> stdout", &complaints);
+}
+
+/// Regression: the relay must leave when its output has nowhere left to go.
+///
+/// `splice` into a full destination reports `EAGAIN`, which the relay records as
+/// `dest_full` and answers by polling that destination for `POLLOUT` and holding
+/// off on reading the source. If the destination's peer then dies, `poll` reports
+/// `POLLERR` — never `POLLOUT`, because a pipe nobody is reading never becomes
+/// writable — and the drain that would clear the latch was guarded on `POLLOUT`
+/// alone. Nothing in the iteration could act, nothing could change, and the loop
+/// went round at the speed of the scheduler: a `nomux attach` pinned at 100% CPU
+/// on somebody's server for as long as the socket stayed open.
+///
+/// The shape is the ordinary one for this project rather than a corner: output
+/// backed up in the pipe is exactly the state a connection is in when the network
+/// drops under load.
+///
+/// A bare socket for a peer, as in the bulk test above — the relay parses nothing,
+/// so a daemon here would only add a protocol conversation the bug does not need.
+#[test]
+fn the_relay_exits_when_its_stdout_dies_with_the_destination_latched_full() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+
+    let root = run_root("spin");
+    let dir = root.join("nomux");
+    fs::create_dir_all(&dir).expect("create run directory");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("tighten run dir");
+    let listener = UnixListener::bind(dir.join("relay_spin.sock")).expect("bind session socket");
+
+    let mut child = Spawned::spawn(
+        Command::new(env!("CARGO_BIN_EXE_nomux"))
+            .args(["attach", "relay_spin"])
+            .env("XDG_RUNTIME_DIR", &root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+    );
+
+    let mut peer = listener.accept().expect("attach never connected").0;
+    // Stdin stays open and idle throughout. It is in the poll set the whole time,
+    // which is the point: the wakeups being spun on come from stdout, so a relay
+    // that blocked on stdin instead would hide the bug.
+    let _stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+
+    // Push until the kernel stops taking it: that is the socket buffer *and* the
+    // stdout pipe both full, which is what leaves the relay's last `splice` sitting
+    // on `EAGAIN` with `dest_full` latched and its buffer empty.
+    peer.set_nonblocking(true).expect("nonblocking peer");
+    let chunk = vec![b'x'; 64 * 1024];
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        match peer.write(&chunk) {
+            Ok(0) => break,
+            Ok(_) => thread::sleep(Duration::from_millis(5)),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(err) => panic!("writing to the relay's socket failed: {err}"),
+        }
+    }
+    // Nothing has read a byte of stdout, so the pipe is full and the relay is
+    // waiting for it to become writable. Now take away the reader.
+    drop(stdout);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if !child.is_running() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("the relay was still running with its stdout gone and its buffer empty");
 }
 
 /// Compares by first difference rather than by value: a failure here is megabytes

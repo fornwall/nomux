@@ -64,7 +64,7 @@ Two things are deliberately left out of the pre-commit gate and run in CI instea
 because both cost far more than a commit should:
 
 ```sh
-cargo nextest run --workspace --run-ignored all   # includes the reaping timeouts
+cargo nextest run --workspace --run-ignored all   # includes the 30 s first-attach reap
 sh scripts/verify-takeover-guard.sh               # rebuilds under fault injection
 ```
 
@@ -83,7 +83,7 @@ sh scripts/build-release.sh     # → target/dist/ plus SHA256SUMS
 It builds every musl target, prints a size table with the change against the
 per-target baseline in `scripts/size-baseline`, and fails if any binary exceeds the
 400 KiB budget or has grown more than 3% since that baseline — the cap on its own
-let a 48% armv7 regression through unremarked. `NOMUX_UPDATE_BASELINE=1` rewrites
+let a 46% armv7 regression through unremarked. `NOMUX_UPDATE_BASELINE=1` rewrites
 the baseline from that build and skips the growth gate, so an intended size change
 lands in the diff. There is no cross toolchain to install — `rust-lld` links all
 four and each `rust-std` component carries its own musl objects — but the shipping

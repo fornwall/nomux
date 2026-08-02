@@ -23,7 +23,7 @@ use rustix::termios::{Winsize, tcsetwinsize};
 use crate::passwd;
 
 /// What the session's child needs to know at spawn.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub(crate) struct Spawn<'a> {
     /// Value for the child's `TERM`, taken from the creating `Hello`.
     pub term: &'a str,
@@ -230,21 +230,42 @@ impl Pty {
             // finds everything still running, so `SIGKILL` would follow at once and
             // no shell would ever run its exit trap or flush its history.
             //
-            // The wait is on the session emptying, not on the direct child. By the
-            // time this runs the child has usually been reaped already, and waiting
-            // on it would return immediately while the backgrounded grandchildren
-            // this exists to collect are still there.
+            // The condition is the session emptying, not the direct child exiting.
+            // Waiting on the child alone would be satisfied the moment it goes,
+            // while the backgrounded grandchildren this exists to collect are still
+            // running — they are the whole reason for the `/proc` walk.
             let deadline = std::time::Instant::now() + TERM_GRACE;
+            let mut settled = false;
             while std::time::Instant::now() < deadline {
+                // Reaped here, every pass, and not merely for tidiness: an unreaped
+                // zombie is still a member of its own process group, so
+                // `test_kill_process_group` answers `Ok` for it and the `&&` below
+                // short-circuits before `session_members` — which *does* filter
+                // zombies — is ever consulted. Without this the condition cannot go
+                // true on the path that matters: `shutdown` reaches `terminate` with
+                // the child unreaped, because `reap` only runs once the PTY has
+                // reported end of file, which on the `nomux kill` path it has not.
+                // Every teardown then spent the whole 500 ms waiting out a child that
+                // had already gone, inside the two seconds § 6.6 gives the daemon to
+                // shut down.
+                let _ = self.child.try_wait();
                 if rustix::process::test_kill_process_group(pid).is_err()
                     && session_members(raw).is_empty()
                 {
+                    settled = true;
                     break;
                 }
                 std::thread::sleep(TERM_POLL_INTERVAL);
             }
-            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-            signal_session(raw, rustix::process::Signal::KILL);
+            // Only if something is still standing. Breaking early means the group is
+            // gone *and* the session is empty, so there is nothing left for these to
+            // reach — and once the child has been reaped its pid is free for the
+            // kernel to reissue, which is the one case where signalling a group that
+            // no longer exists could land somewhere it was never meant to.
+            if !settled {
+                let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+                signal_session(raw, rustix::process::Signal::KILL);
+            }
         }
         drop(self.child.kill());
         drop(self.child.wait());

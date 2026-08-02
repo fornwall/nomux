@@ -47,7 +47,8 @@ options:
   --label <text>        Display name for `list`, recorded when the session is
                         created. Advisory: ids are opaque, so this is what makes
                         an orphaned session recognisable to a human.
-  --version             Print version and protocol revision
+  --version, -V         Print version and protocol revision
+  --help, -h            Print this usage
 ";
 
 fn main() -> ExitCode {
@@ -111,6 +112,12 @@ fn run_session_mode(mode: &str, args: impl Iterator<Item = OsString>) -> ExitCod
                 eprintln!("nomux: {err}");
                 ExitCode::from(match err.kind() {
                     std::io::ErrorKind::TimedOut | std::io::ErrorKind::NotFound => EXIT_NO_SESSION,
+                    // A rejected session id is a malformed command line, not a
+                    // session that resisted attaching: the id could never have named
+                    // one. § 10 gives that `EX_USAGE`, and the distinction is the
+                    // client's to act on — it caches "unattachable" per host and
+                    // would otherwise cache it off its own typo.
+                    std::io::ErrorKind::InvalidInput => EXIT_USAGE,
                     _ => EXIT_UNATTACHABLE,
                 })
             }

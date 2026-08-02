@@ -37,10 +37,13 @@ const SPAWN_LOCK_GRACE: Duration = Duration::from_secs(2);
 ///
 /// The daemon binds its socket — which is what makes it answer as alive — before
 /// it writes the pidfile (§ 6.2), so a `kill` that lands inside that window finds a
-/// session that is unmistakably there and no pid to signal. The window is a couple
-/// of syscalls wide, and an `attach` spawning the daemon holds the spawn lock
-/// across the whole of it, so this is only reachable for a daemon somebody started
-/// by hand. Waiting it out turns a spurious failure into the ordinary answer;
+/// session that is unmistakably there and no pid to signal. `attach` holds the spawn
+/// lock until the pidfile exists, which covers most of it — but only most: the file
+/// is created empty and filled a syscall later, and `attach` lets go at the first
+/// half. So the window is reachable from the ordinary spawn as well as from a daemon
+/// somebody started by hand, and both halves of it — no file, and a file with nothing
+/// in it — are waited out here. Waiting turns a spurious failure into the ordinary
+/// answer;
 /// bounded, because a socket that answers with no pidfile behind it may equally be
 /// a daemon that died mid-publish, and this is the escape hatch — it does not hang.
 const PUBLISH_GRACE: Duration = Duration::from_secs(2);
@@ -237,21 +240,29 @@ fn resolve(paths: &SessionPaths) -> io::Result<Target> {
         if liveness(paths) == Liveness::Stale {
             return Ok(Target::Gone);
         }
-        match fs::read_to_string(paths.pid()) {
-            Ok(body) => {
+        let waiting_on = match fs::read_to_string(paths.pid()) {
+            Ok(body) if !body.trim().is_empty() => {
                 return parse_pid(&body)
                     .and_then(rustix::process::Pid::from_raw)
                     .map(Target::Daemon)
                     .ok_or_else(|| unreadable(paths, &format!("it holds {body:?}")));
             }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                if Instant::now() >= deadline {
-                    return Err(unreadable(paths, "it never appeared"));
-                }
-                thread::sleep(POLL_INTERVAL);
-            }
+            // Present but empty is the same window one syscall later, and is
+            // therefore waited out rather than reported. `write_pidfile` publishes in
+            // two steps — `File::create`, which leaves a zero-length file, then the
+            // `writeln!` that fills it — so a reader can land between them. Nor is
+            // this only the hand-started case: `attach` releases the spawn lock as
+            // soon as the path *exists*, which the empty file already satisfies, so
+            // the ordinary spawn reaches it too. Reported as an error it refused to
+            // kill a session that was in perfect health and about to finish starting.
+            Ok(_) => "it was created but never written",
+            Err(err) if err.kind() == io::ErrorKind::NotFound => "it never appeared",
             Err(err) => return Err(unreadable(paths, &err.to_string())),
+        };
+        if Instant::now() >= deadline {
+            return Err(unreadable(paths, waiting_on));
         }
+        thread::sleep(POLL_INTERVAL);
     }
 }
 

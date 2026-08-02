@@ -287,7 +287,7 @@ fn refuse_errno(dir: &Path, err: rustix::io::Errno, problem: &str) -> io::Error 
 }
 
 /// The five paths belonging to one session.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct SessionPaths {
     dir: PathBuf,
     id: String,

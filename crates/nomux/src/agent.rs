@@ -17,8 +17,11 @@ use nomux_proto::MAX_AGENT_CHANNELS;
 
 /// Most a single channel may hold for a local peer that has stopped reading.
 ///
-/// Generous by two orders of magnitude for real `ssh-agent` traffic, and small
-/// enough that eight channels at the limit are still nothing next to the ring.
+/// Generous by two orders of magnitude for real `ssh-agent` traffic, where an
+/// exchange is a few hundred bytes. The ceiling that matters is the product: eight
+/// channels all at the limit is 2 MiB, which is half the default ring rather than a
+/// rounding error against it — so this is sized to bound a runaway child, not to
+/// disappear beside the session's other memory.
 const MAX_CHANNEL_QUEUE: usize = 256 * 1024;
 
 /// Outcome of one attempt to drain a channel's queue.
