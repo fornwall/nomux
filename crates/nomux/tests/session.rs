@@ -18,11 +18,14 @@ use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use nomux_proto::{
-    Frame, FrameType, HELLO_AGENT_FORWARD, HELLO_REPAINT_CTRL_L, Hello, MAX_AGENT_CHANNELS,
+    Frame, FrameType, HELLO_AGENT_FORWARD, HELLO_REPAINT_CTRL_L, MAX_AGENT_CHANNELS,
     PROTOCOL_VERSION, RESUME_FROM_START,
 };
 
-use harness::{Session, WIN, wait_for};
+use harness::{
+    Rng, Session, Spawned, control, hello_frame, push_until_refused, run_root, wait_for,
+    write_frame,
+};
 
 #[test]
 fn runs_a_shell_and_streams_its_output() {
@@ -195,27 +198,17 @@ fn list_and_kill_operate_without_the_protocol() {
     let mut client = session.connect();
     client.hello(RESUME_FROM_START, 0);
 
-    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("run-control");
-    let listed = Command::new(env!("CARGO_BIN_EXE_nomux"))
-        .arg("list")
-        .env("XDG_RUNTIME_DIR", &root)
-        .output()
-        .expect("run list");
+    let listed = control(&session.root, &["list"]);
     let listed = String::from_utf8_lossy(&listed.stdout);
     assert!(
         listed.contains(&session.id),
         "list should report the live session, got {listed:?}"
     );
 
-    let status = Command::new(env!("CARGO_BIN_EXE_nomux"))
-        .args(["kill", &session.id])
-        .env("XDG_RUNTIME_DIR", &root)
-        .status()
-        .expect("run kill");
-    assert!(status.success());
+    let killed = control(&session.root, &["kill", &session.id]);
+    assert!(killed.status.success());
 
-    let socket = root.join("nomux").join(format!("{}.sock", session.id));
-    assert!(!socket.exists(), "kill must unlink the run files");
+    assert!(!session.socket.exists(), "kill must unlink the run files");
 }
 
 /// Connecting is not attaching.
@@ -235,11 +228,7 @@ fn a_liveness_probe_does_not_evict_the_attached_client() {
     for _ in 0..3 {
         drop(UnixStream::connect(&session.socket).expect("probe connect"));
     }
-    let listed = Command::new(env!("CARGO_BIN_EXE_nomux"))
-        .arg("list")
-        .env("XDG_RUNTIME_DIR", &session.root)
-        .output()
-        .expect("run list");
+    let listed = control(&session.root, &["list"]);
     assert!(String::from_utf8_lossy(&listed.stdout).contains(&session.id));
 
     // `read_until` refuses anything that is not output, so an `Error{TAKEOVER}`
@@ -399,36 +388,25 @@ fn child_of(parent: u32) -> Option<u32> {
 /// session recognisable to a human after the client loses its state.
 #[test]
 fn a_label_survives_into_list() {
-    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("run-label");
-    drop(fs::remove_dir_all(&root));
-    fs::create_dir_all(&root).expect("create run root");
-
-    let mut attach = Command::new(env!("CARGO_BIN_EXE_nomux"))
-        .args(["attach", "labelled", "--label", "  release build\tx  "])
-        .env("XDG_RUNTIME_DIR", &root)
-        .env("SHELL", "/bin/sh")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn attach");
+    let root = run_root("label");
+    let attach = Spawned::spawn(
+        Command::new(env!("CARGO_BIN_EXE_nomux"))
+            .args(["attach", "labelled", "--label", "  release build\tx  "])
+            .env("XDG_RUNTIME_DIR", &root)
+            .env("SHELL", "/bin/sh")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
     wait_for(&root.join("nomux").join("labelled.sock"));
 
-    let listed = Command::new(env!("CARGO_BIN_EXE_nomux"))
-        .arg("list")
-        .env("XDG_RUNTIME_DIR", &root)
-        .output()
-        .expect("run list");
+    let listed = control(&root, &["list"]);
     let listed = String::from_utf8_lossy(&listed.stdout).into_owned();
 
-    drop(attach.kill());
-    drop(attach.wait());
-    drop(
-        Command::new(env!("CARGO_BIN_EXE_nomux"))
-            .args(["kill", "labelled"])
-            .env("XDG_RUNTIME_DIR", &root)
-            .status(),
-    );
+    // Both collected before the assertions below, so a failure about the label does
+    // not also leave a session behind.
+    drop(attach);
+    drop(control(&root, &["kill", "labelled"]));
 
     let line = listed
         .lines()
@@ -443,12 +421,12 @@ fn a_label_survives_into_list() {
 
 #[test]
 fn invalid_session_ids_are_refused() {
+    // A run directory of its own even though nothing should ever be created in it:
+    // the refusal is what is under test, and a regression that got as far as the
+    // filesystem would otherwise leave its mess where every other test lives.
+    let root = run_root("bad_ids");
     for id in ["../escape", "with/slash", "with space"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_nomux"))
-            .args(["attach", id])
-            .env("XDG_RUNTIME_DIR", env!("CARGO_TARGET_TMPDIR"))
-            .output()
-            .expect("run attach");
+        let output = control(&root, &["attach", id]);
         assert!(!output.status.success(), "id {id:?} should be rejected");
         assert!(
             String::from_utf8_lossy(&output.stderr).contains("invalid session id"),
@@ -470,8 +448,7 @@ fn invalid_session_ids_are_refused() {
 fn a_symlinked_run_directory_is_refused_by_attach_and_daemon() {
     use std::os::unix::fs::PermissionsExt;
 
-    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("run-symdir");
-    drop(fs::remove_dir_all(&root));
+    let root = run_root("symdir");
     let target = root.join("elsewhere");
     fs::create_dir_all(&target).expect("create the directory the link points at");
     fs::set_permissions(&target, fs::Permissions::from_mode(0o777)).expect("loosen the target");
@@ -496,12 +473,7 @@ fn a_symlinked_run_directory_is_refused_by_attach_and_daemon() {
     // started — and a failure here means one *was*, in nobody's process group, with a
     // seven-day idle limit rather than the thirty seconds of a session no client ever
     // reached. Nothing else in this test would collect it.
-    drop(
-        Command::new(env!("CARGO_BIN_EXE_nomux"))
-            .args(["kill", "symdir"])
-            .env("XDG_RUNTIME_DIR", &root)
-            .output(),
-    );
+    drop(control(&root, &["kill", "symdir"]));
 
     for (mode, started, stderr) in &refusals {
         assert!(
@@ -538,20 +510,17 @@ fn a_symlinked_run_directory_is_refused_by_attach_and_daemon() {
 fn attach_spawns_the_daemon_and_relays_transparently() {
     use std::sync::mpsc;
 
-    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("run-relay");
-    drop(fs::remove_dir_all(&root));
-    fs::create_dir_all(&root).expect("create run root");
-
-    let mut child = Command::new(env!("CARGO_BIN_EXE_nomux"))
-        .args(["attach", "relay_probe"])
-        .env("XDG_RUNTIME_DIR", &root)
-        .env("SHELL", "/bin/sh")
-        .env("NOMUX_RING_BYTES", "65536")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn attach");
+    let root = run_root("relay");
+    let mut child = Spawned::spawn(
+        Command::new(env!("CARGO_BIN_EXE_nomux"))
+            .args(["attach", "relay_probe"])
+            .env("XDG_RUNTIME_DIR", &root)
+            .env("SHELL", "/bin/sh")
+            .env("NOMUX_RING_BYTES", "65536")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
 
     let mut stdin = child.stdin.take().expect("stdin");
     let mut stdout = child.stdout.take().expect("stdout");
@@ -568,27 +537,14 @@ fn attach_spawns_the_daemon_and_relays_transparently() {
         }
     });
 
-    let mut frame = Vec::new();
-    Frame::Hello(Hello {
-        protocol: PROTOCOL_VERSION,
-        flags: 0,
-        out_offset: RESUME_FROM_START,
-        in_offset: 0,
-        win: WIN,
-        term: "xterm-256color",
-    })
-    .encode(&mut frame)
-    .expect("encode hello");
-    stdin.write_all(&frame).expect("write hello");
-
-    frame.clear();
-    Frame::Input {
-        offset: 0,
-        data: b"echo NOMUX-RELAY\n",
-    }
-    .encode(&mut frame)
-    .expect("encode input");
-    stdin.write_all(&frame).expect("write input");
+    write_frame(&mut stdin, &hello_frame(0, RESUME_FROM_START, 0));
+    write_frame(
+        &mut stdin,
+        &Frame::Input {
+            offset: 0,
+            data: b"echo NOMUX-RELAY\n",
+        },
+    );
     stdin.flush().expect("flush");
 
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -609,16 +565,10 @@ fn attach_spawns_the_daemon_and_relays_transparently() {
     };
 
     drop(stdin);
-    drop(child.kill());
-    drop(child.wait());
+    drop(child);
     drop(pump.join());
 
-    drop(
-        Command::new(env!("CARGO_BIN_EXE_nomux"))
-            .args(["kill", "relay_probe"])
-            .env("XDG_RUNTIME_DIR", &root)
-            .status(),
-    );
+    drop(control(&root, &["kill", "relay_probe"]));
 
     assert!(
         found,
@@ -644,21 +594,10 @@ fn a_child_that_stops_reading_input_does_not_wedge_the_daemon() {
     // quietly dropping the overflow: in canonical mode a line longer than the
     // buffer is discarded, and the master write never blocks at all. `sleep` then
     // holds the terminal without reading it, so everything below piles up.
-    //
-    // The marker follows the `stty` and uses arithmetic for the same reason as in
-    // `input_the_child_never_reads_…`: emitted before it, and without something the
-    // echo of the command line cannot also contain, the wait is satisfied by the line
-    // discipline echoing the command back — and the pile-up below would then be
-    // discarded rather than blocking, which is a test that passes without testing.
-    let start = b"stty raw -echo; echo \"NOMUX-$((6*7))-RAW\"; sleep 30\n";
-    client.send(&Frame::Input {
-        offset: 0,
-        data: start,
-    });
-    let (_, _) = client.read_until("NOMUX-42-RAW", ok.resume_from);
+    let ready = client.make_ready("raw -echo", Some("sleep 30"), ok.resume_from);
 
     let chunk = vec![b'x'; 16 * 1024];
-    let mut offset = start.len() as u64;
+    let mut offset = ready.in_offset;
     for _ in 0..16 {
         client.send(&Frame::Input {
             offset,
@@ -716,46 +655,24 @@ fn input_the_child_never_reads_is_back_pressured_rather_than_buffered() {
     // Raw mode is what makes the line discipline apply back pressure instead of
     // quietly dropping the overflow: in canonical mode a line longer than the buffer
     // is discarded and the master never stops accepting. `sleep` then holds the
-    // terminal without reading a byte of it.
-    let setup = b"stty raw -echo; echo \"NOMUX-$((6*7))-RAW\"; sleep 30\n";
-    client.send(&Frame::Input {
-        offset: 0,
-        data: setup,
-    });
-    // The marker is emitted *after* the `stty`, so seeing it is what proves raw mode
-    // is already in effect — emitted before, it proves only that the shell reached
-    // the line, and a blast that started while the terminal was still canonical would
-    // be silently discarded by the line discipline and the test would accuse the
-    // daemon of a bug it does not have. The arithmetic distinguishes the shell's
-    // output from the line discipline's echo of the command itself, which arrives
-    // first and carries `$((6*7))` unexpanded. Seeing it also settles `in_applied` at
-    // `setup.len()`, which is where the blast has to continue from. No settling sleep
-    // is needed after it: the whole line is parsed before any of it runs, so the
-    // shell reads nothing more until `sleep 30` returns.
-    client.read_until("NOMUX-42-RAW", ok.resume_from);
+    // terminal without reading a byte of it. No settling sleep is needed once the
+    // marker is back: the whole line is parsed before any of it runs, so the shell
+    // reads nothing more until `sleep 30` returns.
+    let ready = client.make_ready("raw -echo", Some("sleep 30"), ok.resume_from);
     drop(client);
 
     // A raw socket rather than the harness client, because the question is how much
-    // the daemon will take before it stops taking, and a blocking `write_all` has no
-    // way to say.
+    // the daemon will take before it stops taking.
     let mut blaster = UnixStream::connect(&session.socket).expect("connect");
-    let mut hello = Vec::new();
-    Frame::Hello(Hello {
-        protocol: PROTOCOL_VERSION,
-        flags: 0,
-        out_offset: RESUME_FROM_START,
-        in_offset: setup.len() as u64,
-        win: WIN,
-        term: "xterm-256color",
-    })
-    .encode(&mut hello)
-    .expect("encode hello");
-    blaster.write_all(&hello).expect("write hello");
+    write_frame(
+        &mut blaster,
+        &hello_frame(0, RESUME_FROM_START, ready.in_offset),
+    );
     blaster.set_nonblocking(true).expect("stop blocking");
 
     let chunk = vec![b'x'; 60 * 1024];
     let mut frames = Vec::with_capacity(BLAST + chunk.len());
-    let mut offset = setup.len() as u64;
+    let mut offset = ready.in_offset;
     while frames.len() < BLAST {
         Frame::Input {
             offset,
@@ -766,23 +683,9 @@ fn input_the_child_never_reads_is_back_pressured_rather_than_buffered() {
         offset += chunk.len() as u64;
     }
 
-    // Stops once the socket has refused everything for a while, which is the daemon
-    // having stopped reading — the behaviour under test rather than a timeout.
-    let mut sent = 0;
-    let mut progressed = Instant::now();
-    while sent < frames.len() && progressed.elapsed() < Duration::from_secs(3) {
-        match blaster.write(&frames[sent..]) {
-            Ok(0) => break,
-            Ok(n) => {
-                sent += n;
-                progressed = Instant::now();
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(20));
-            }
-            Err(_) => break,
-        }
-    }
+    // Three seconds of refusal, which is long enough that a daemon merely busy with
+    // the megabytes it already took would have come back for more.
+    let sent = push_until_refused(&mut blaster, &frames, Duration::from_secs(3));
     assert!(
         sent < TOLERATED,
         "the daemon took {sent} bytes of input for a child that read none of them"
@@ -794,7 +697,7 @@ fn input_the_child_never_reads_is_back_pressured_rather_than_buffered() {
     // daemon really did accept.
     let mut client = session.connect();
     let resumed = client.hello(RESUME_FROM_START, offset);
-    let applied = resumed.in_applied.saturating_sub(setup.len() as u64);
+    let applied = resumed.in_applied.saturating_sub(ready.in_offset);
     assert!(applied > 0, "the daemon applied none of the input it took");
     assert!(
         applied <= sent as u64,
@@ -831,21 +734,15 @@ fn reconnecting_does_not_raise_the_input_ceiling() {
     let mut client = session.connect();
     let ok = client.hello(RESUME_FROM_START, 0);
 
-    // As in the test above: the marker after the `stty`, so seeing it proves raw mode
-    // is in effect. `sleep` then holds the terminal without reading a byte, for far
-    // longer than this test runs — a child that woke up and drained the queue would
-    // make the ceiling look like it moved.
-    let setup = b"stty raw -echo; echo \"NOMUX-$((6*7))-RAW\"; sleep 120\n";
-    client.send(&Frame::Input {
-        offset: 0,
-        data: setup,
-    });
-    client.read_until("NOMUX-42-RAW", ok.resume_from);
+    // The `sleep` holds the terminal without reading a byte for far longer than this
+    // test runs — a child that woke up and drained the queue would make the ceiling
+    // look like it moved.
+    let ready = client.make_ready("raw -echo", Some("sleep 120"), ok.resume_from);
     drop(client);
 
     let chunk = vec![b'x'; 60 * 1024];
     let mut ceiling = None;
-    let mut resume = setup.len() as u64;
+    let mut resume = ready.in_offset;
 
     for round in 0..ROUNDS {
         // Every round starts where the daemon says it has got to, which is what makes
@@ -864,43 +761,18 @@ fn reconnecting_does_not_raise_the_input_ceiling() {
             offset += chunk.len() as u64;
         }
 
-        // A fresh connection each time, which is the takeover this is about. Raw
-        // rather than the harness client, because the whole point is to stop pushing
-        // when the daemon stops taking and a blocking `write_all` has no way to say.
+        // A fresh connection each time, which is the takeover this is about.
         let mut blaster = UnixStream::connect(&session.socket).expect("connect");
-        let mut hello = Vec::new();
-        Frame::Hello(Hello {
-            protocol: PROTOCOL_VERSION,
-            flags: 0,
-            out_offset: RESUME_FROM_START,
-            in_offset: resume,
-            win: WIN,
-            term: "xterm-256color",
-        })
-        .encode(&mut hello)
-        .expect("encode hello");
-        blaster.write_all(&hello).expect("write hello");
+        write_frame(&mut blaster, &hello_frame(0, RESUME_FROM_START, resume));
         blaster.set_nonblocking(true).expect("stop blocking");
-
-        let mut sent = 0;
-        let mut progressed = Instant::now();
-        while sent < frames.len() && progressed.elapsed() < Duration::from_millis(250) {
-            match blaster.write(&frames[sent..]) {
-                Ok(0) => break,
-                Ok(n) => {
-                    sent += n;
-                    progressed = Instant::now();
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(5));
-                }
-                Err(_) => break,
-            }
-        }
 
         // The socket having refused everything for a quarter of a second is the daemon
         // having stopped taking input, so the ceiling is reached rather than merely
-        // approached — which is what makes the first round a fair baseline.
+        // approached — which is what makes the first round a fair baseline. Eight
+        // rounds of the three seconds the test above spends would be a minute of
+        // waiting for a queue that is already full.
+        let _pushed = push_until_refused(&mut blaster, &frames, Duration::from_millis(250));
+
         let mut probe = session.connect();
         let applied = probe.hello(RESUME_FROM_START, 0).in_applied;
         drop(probe);
@@ -966,19 +838,16 @@ fn the_daemon_releases_its_working_directory_but_the_shell_does_not() {
 /// survived rather than the one that started.
 #[test]
 fn the_daemon_mode_detaches_itself() {
-    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("run-detach");
-    drop(fs::remove_dir_all(&root));
-    fs::create_dir_all(&root).expect("create run root");
-
-    let mut child = Command::new(env!("CARGO_BIN_EXE_nomux"))
-        .args(["daemon", "detached"])
-        .env("XDG_RUNTIME_DIR", &root)
-        .env("SHELL", "/bin/sh")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn daemon");
+    let root = run_root("detach");
+    let child = Spawned::spawn(
+        Command::new(env!("CARGO_BIN_EXE_nomux"))
+            .args(["daemon", "detached"])
+            .env("XDG_RUNTIME_DIR", &root)
+            .env("SHELL", "/bin/sh")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
     let pid = child.id();
     wait_for(&root.join("nomux").join("detached.sock"));
 
@@ -987,7 +856,8 @@ fn the_daemon_mode_detaches_itself() {
     // waiting for it is not barrier enough.
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline
-        && (stat_field(pid, StatField::Session) != Some(pid) || !stdio_is_silenced(pid))
+        && (stat_field(pid, StatField::Session) != Some(pid)
+            || !stdio_is_silenced(&stdio_targets(pid)))
     {
         thread::sleep(Duration::from_millis(10));
     }
@@ -999,8 +869,7 @@ fn the_daemon_mode_detaches_itself() {
     let recorded = fs::read_to_string(root.join("nomux").join("detached.pid"))
         .ok()
         .and_then(|text| text.trim().parse::<u32>().ok());
-    drop(child.kill());
-    drop(child.wait());
+    drop(child);
 
     assert_eq!(
         leads_session,
@@ -1008,7 +877,7 @@ fn the_daemon_mode_detaches_itself() {
         "the daemon stayed in the session it was started in, so a hangup reaches it"
     );
     assert!(
-        stdio.iter().all(|path| path == Path::new("/dev/null")),
+        stdio_is_silenced(&stdio),
         "the daemon still holds the descriptors it was handed: {stdio:?}"
     );
     assert_eq!(
@@ -1033,10 +902,7 @@ fn the_daemon_mode_detaches_itself() {
 /// through `nomux kill`, before the assertions rather than after them.
 #[test]
 fn a_daemon_that_leads_a_process_group_detaches_by_forking() {
-    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("run-fork");
-    drop(fs::remove_dir_all(&root));
-    fs::create_dir_all(&root).expect("create run root");
-
+    let root = run_root("fork");
     let mut command = Command::new(env!("CARGO_BIN_EXE_nomux"));
     command
         .args(["daemon", "grouped"])
@@ -1056,7 +922,7 @@ fn a_daemon_that_leads_a_process_group_detaches_by_forking() {
             }
         });
     }
-    let mut starter = command.spawn().expect("spawn daemon");
+    let mut starter = Spawned::spawn(&mut command);
     let original_pid = starter.id();
 
     let pid_file = root.join("nomux").join("grouped.pid");
@@ -1069,7 +935,7 @@ fn a_daemon_that_leads_a_process_group_detaches_by_forking() {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut starter_exited = false;
     while Instant::now() < deadline {
-        if matches!(starter.try_wait(), Ok(Some(_))) {
+        if !starter.is_running() {
             starter_exited = true;
             break;
         }
@@ -1083,7 +949,8 @@ fn a_daemon_that_leads_a_process_group_detaches_by_forking() {
             .ok()
             .and_then(|text| text.trim().parse::<u32>().ok());
         if recorded.is_some_and(|pid| {
-            stat_field(pid, StatField::Session) == Some(pid) && stdio_is_silenced(pid)
+            stat_field(pid, StatField::Session) == Some(pid)
+                && stdio_is_silenced(&stdio_targets(pid))
         }) {
             break;
         }
@@ -1095,16 +962,8 @@ fn a_daemon_that_leads_a_process_group_detaches_by_forking() {
     let leads_session = recorded.and_then(|pid| stat_field(pid, StatField::Session));
     let stdio = recorded.map(stdio_targets).unwrap_or_default();
     let alive = recorded.is_some_and(process_alive);
-    drop(
-        Command::new(env!("CARGO_BIN_EXE_nomux"))
-            .args(["kill", "grouped"])
-            .env("XDG_RUNTIME_DIR", &root)
-            .output(),
-    );
-    if !starter_exited {
-        drop(starter.kill());
-    }
-    drop(starter.wait());
+    drop(control(&root, &["kill", "grouped"]));
+    drop(starter);
 
     assert!(
         starter_exited,
@@ -1125,7 +984,7 @@ fn a_daemon_that_leads_a_process_group_detaches_by_forking() {
         "the forked child must lead a session of its own"
     );
     assert!(
-        stdio.iter().all(|path| path == Path::new("/dev/null")),
+        stdio_is_silenced(&stdio),
         "the forked child still holds the descriptors it was handed: {stdio:?}"
     );
 }
@@ -1137,11 +996,13 @@ fn stdio_targets(pid: u32) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Whether all three point at `/dev/null`.
-fn stdio_is_silenced(pid: u32) -> bool {
-    stdio_targets(pid)
-        .iter()
-        .all(|path| path == Path::new("/dev/null"))
+/// Whether all three point at `/dev/null`, which is where detaching puts them.
+///
+/// Takes what was read rather than a pid, so an assertion can report the targets it
+/// judged: they have to be collected before the daemon is, and `/proc` has nothing
+/// to say about it afterwards.
+fn stdio_is_silenced(targets: &[PathBuf]) -> bool {
+    targets.iter().all(|path| path == Path::new("/dev/null"))
 }
 
 /// Agent forwarding, end to end: the child gets a socket, a connection to it
@@ -1268,19 +1129,15 @@ fn repaint_transcript(name: &str, flags: u16) -> String {
     let mut client = session.connect();
     let ok = client.hello_with(flags, RESUME_FROM_START, 0);
 
-    let setup = b"stty -echo -onlcr; echo \"$((6*7))-READY\"; cat\n";
-    client.send(&Frame::Input {
-        offset: 0,
-        data: setup,
-    });
-    let (_, offset) = client.read_until("42-READY", ok.resume_from);
+    let ready = client.make_ready("-echo -onlcr", Some("cat"), ok.resume_from);
+    let offset = ready.offset;
 
     // Echoed back by `cat` with nobody reading, which is what overflows the ring.
     // In lines, because the line discipline is still canonical: `cat` would see
     // nothing at all until a newline arrived, and the overflow would never happen.
     let filler = format!("{}\n", "x".repeat(63)).repeat(512);
     let filler = filler.as_bytes();
-    let mut in_offset = setup.len() as u64;
+    let mut in_offset = ready.in_offset;
     client.send(&Frame::Input {
         offset: in_offset,
         data: filler,
@@ -1337,15 +1194,11 @@ fn a_gap_repaints_with_ctrl_l_only_when_the_client_asks() {
 #[ignore = "waits out the 30-second first-attach timeout; run in CI, not on every commit"]
 fn a_daemon_nobody_ever_attaches_to_reaps_itself() {
     let session = Session::start("unattached");
-    let socket = session
-        .root
-        .join("nomux")
-        .join(format!("{}.sock", session.id));
-    assert!(socket.exists());
+    assert!(session.socket.exists());
 
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(45) {
-        if !socket.exists() {
+        if !session.socket.exists() {
             return;
         }
         thread::sleep(Duration::from_millis(200));
@@ -1367,10 +1220,7 @@ fn a_daemon_that_reaps_itself_removes_its_run_files() {
     let mut client = session.connect();
     client.hello(RESUME_FROM_START, 0);
 
-    let pid_file = session
-        .root
-        .join("nomux")
-        .join(format!("{}.pid", session.id));
+    let pid_file = session.pid_file();
     assert!(
         pid_file.exists(),
         "the daemon should have written its pidfile"
@@ -1448,10 +1298,7 @@ fn a_signalled_daemon_collects_a_process_that_ignores_sighup() {
 
     let daemon = rustix::process::Pid::from_raw(session.child.id().cast_signed())
         .expect("the daemon's own pid");
-    let pid_file = session
-        .root
-        .join("nomux")
-        .join(format!("{}.pid", session.id));
+    let pid_file = session.pid_file();
     // Signalled directly rather than through `nomux kill`, which unlinks the run
     // files itself and would answer the question for the daemon.
     rustix::process::kill_process(daemon, rustix::process::Signal::TERM)
@@ -1658,29 +1505,28 @@ fn the_relay_moves_bulk_traffic_both_ways_without_losing_a_byte() {
 
     const BULK: usize = 2 * 1024 * 1024;
 
-    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("run-relay-bulk");
-    drop(fs::remove_dir_all(&root));
+    let root = run_root("bulk");
     let dir = root.join("nomux");
-    fs::create_dir_all(&dir).expect("create run root");
+    fs::create_dir_all(&dir).expect("create run directory");
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("tighten run dir");
     let listener = UnixListener::bind(dir.join("relay_bulk.sock")).expect("bind session socket");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_nomux"))
-        .args(["attach", "relay_bulk"])
-        .env("XDG_RUNTIME_DIR", &root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn attach");
+    let mut child = Spawned::spawn(
+        Command::new(env!("CARGO_BIN_EXE_nomux"))
+            .args(["attach", "relay_bulk"])
+            .env("XDG_RUNTIME_DIR", &root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
 
     let peer = Arc::new(listener.accept().expect("attach never connected").0);
     let mut stdin = child.stdin.take().expect("stdin");
     let mut stdout = child.stdout.take().expect("stdout");
     let mut stderr = child.stderr.take().expect("stderr");
 
-    let upstream = bulk_bytes(0x5eed_1234, BULK);
-    let downstream = bulk_bytes(0xfeed_9876, BULK);
+    let upstream = Rng::new(0x5eed_1234).bytes(BULK);
+    let downstream = Rng::new(0xfeed_9876).bytes(BULK);
 
     // Four threads because all four flows must run at once: with any one of them
     // parked the relay's back pressure would deadlock the other three.
@@ -1727,25 +1573,10 @@ fn the_relay_moves_bulk_traffic_both_ways_without_losing_a_byte() {
 
     let mut complaints = String::new();
     drop(stderr.read_to_string(&mut complaints));
-    drop(child.wait());
+    drop(child);
 
     assert_same(&upstream, &uplink, "stdin -> socket", &complaints);
     assert_same(&downstream, &downlink, "socket -> stdout", &complaints);
-}
-
-/// A deterministic pseudo-random stream, since a repeating pattern would let a
-/// duplicated or dropped chunk slip through byte-for-byte comparison.
-fn bulk_bytes(seed: u64, len: usize) -> Vec<u8> {
-    let mut state = seed | 1;
-    let mut out = Vec::with_capacity(len + 8);
-    while out.len() < len {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        out.extend_from_slice(&state.to_le_bytes());
-    }
-    out.truncate(len);
-    out
 }
 
 /// Compares by first difference rather than by value: a failure here is megabytes

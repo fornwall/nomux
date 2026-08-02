@@ -7,8 +7,9 @@
 //! live in. These tests drive the real binary, because most of that is only wrong
 //! across process boundaries.
 //!
-//! Run directory names are kept short on purpose: they carry unix sockets, and
-//! `sockaddr_un` truncates the path at 108 bytes.
+//! Session ids are kept short on purpose: they carry unix sockets, and
+//! `sockaddr_un` truncates the path at 108 bytes. The directory they sit in is
+//! [`run_root`]'s business.
 
 #![allow(
     clippy::expect_used,
@@ -24,11 +25,11 @@ use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use harness::wait_for;
+use harness::{Spawned, control, run_root, wait_for};
 
 /// A `list` that finds the spawn lock held leaves the whole entry alone, and
 /// collects it on the next pass once the lock is free.
@@ -148,7 +149,7 @@ fn an_attach_re_takes_a_spawn_lock_that_was_collected() {
     // allocation policy of whichever filesystem the target directory sits on.
     let pinned = File::open(session.lock_path()).expect("pin the orphan inode");
 
-    let _relay = Reaped::spawn(
+    let _relay = Spawned::spawn(
         Command::new(env!("CARGO_BIN_EXE_nomux"))
             .args(["attach", &session.id])
             .env("XDG_RUNTIME_DIR", &session.root)
@@ -345,8 +346,7 @@ struct StaleSession {
 impl StaleSession {
     /// A directory with no session in it at all.
     fn empty(id: &str) -> Self {
-        let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("run-{id}"));
-        drop(fs::remove_dir_all(&root));
+        let root = run_root(id);
         let dir = root.join("nomux");
         fs::create_dir_all(&dir).expect("create run directory");
         Self {
@@ -396,11 +396,7 @@ impl StaleSession {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_nomux"))
-            .args(args)
-            .env("XDG_RUNTIME_DIR", &self.root)
-            .output()
-            .expect("run nomux")
+        control(&self.root, args)
     }
 }
 
@@ -476,8 +472,7 @@ struct PlantedRunDir {
 
 impl PlantedRunDir {
     fn create(name: &str) -> Self {
-        let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("run-{name}"));
-        drop(fs::remove_dir_all(&root));
+        let root = run_root(name);
         let theirs = root.join("theirs");
         fs::create_dir_all(&theirs).expect("create the planted directory");
         fs::set_permissions(&theirs, fs::Permissions::from_mode(0o777))
@@ -502,7 +497,7 @@ impl PlantedRunDir {
     /// turns the defect this test is about into a failed assertion rather than a
     /// test run that never ends.
     fn run(&self, args: &[&str]) -> Output {
-        let mut child = Reaped::spawn(
+        let mut child = Spawned::spawn(
             Command::new(env!("CARGO_BIN_EXE_nomux"))
                 .args(args)
                 .env("XDG_RUNTIME_DIR", self.root.join("xdg"))
@@ -531,39 +526,6 @@ impl PlantedRunDir {
     /// the listener's backlog.
     fn nothing_connected(&self) -> bool {
         matches!(self.listener.accept(), Err(err) if err.kind() == std::io::ErrorKind::WouldBlock)
-    }
-}
-
-/// A child killed when it goes out of scope, however it goes out of scope.
-///
-/// The relay puts its daemon in a session of its own, so an assertion firing before
-/// a hand-written cleanup would leak both past the end of the run — and the daemon
-/// would go on owning a run directory the next run wipes and reuses.
-struct Reaped(Option<Child>);
-
-impl Reaped {
-    fn spawn(command: &mut Command) -> Self {
-        Self(Some(command.spawn().expect("spawn a child")))
-    }
-
-    fn is_running(&mut self) -> bool {
-        self.0
-            .as_mut()
-            .is_some_and(|child| child.try_wait().expect("wait for a child").is_none())
-    }
-
-    /// Hands back a child that has already exited, so its output can be collected.
-    fn into_exited(mut self) -> Child {
-        self.0.take().expect("the child is still held")
-    }
-}
-
-impl Drop for Reaped {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
-            drop(child.kill());
-            drop(child.wait());
-        }
     }
 }
 

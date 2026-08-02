@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use nomux_proto::{Frame, RESUME_FROM_START};
 
-use harness::Session;
+use harness::{Rng, Session};
 
 /// Iterations of the escape-sequence emitter. Enough output to arrive as many
 /// separate reads, so disconnects land mid-stream rather than between commands.
@@ -26,30 +26,6 @@ const EMIT_ROUNDS: u32 = 20_000;
 
 /// Seed used when `NOMUX_CHAOS_SEED` is unset.
 const DEFAULT_SEED: u64 = 0x6e6f_6d75_785f_3031;
-
-/// xorshift64; a dependency-free generator whose only requirement here is that it
-/// is reproducible from its seed.
-struct Rng(u64);
-
-impl Rng {
-    const fn new(seed: u64) -> Self {
-        Self(if seed == 0 { DEFAULT_SEED } else { seed })
-    }
-
-    const fn next_u64(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
-    }
-
-    /// A value in `0..n`.
-    const fn below(&mut self, n: u64) -> u64 {
-        if n == 0 { 0 } else { self.next_u64() % n }
-    }
-}
 
 fn chaos_seed() -> u64 {
     std::env::var("NOMUX_CHAOS_SEED")
@@ -112,19 +88,12 @@ fn an_escape_heavy_stream_is_byte_exact_across_random_disconnects() {
     let session = Session::start_with_ring("chaos_exact", 8 << 20);
     let mut client = session.connect();
     let ok = client.hello(RESUME_FROM_START, 0);
-    let mut offset = ok.resume_from;
-    let mut in_offset = 0u64;
 
-    // Silence the echo and the newline translation, so what arrives is exactly
-    // what the child wrote and the comparison below can be literal.
-    let setup = b"stty -echo -onlcr; echo \"$((6*7))-READY\"\n";
-    client.send(&Frame::Input {
-        offset: in_offset,
-        data: setup,
-    });
-    in_offset += setup.len() as u64;
-    let (_, after_sync) = client.read_until("42-READY", offset);
-    offset = after_sync;
+    // Echo and newline translation silenced, so what arrives is exactly what the
+    // child wrote and the comparison below can be literal.
+    let ready = client.make_ready("-echo -onlcr", None, ok.resume_from);
+    let mut offset = ready.offset;
+    let mut in_offset = ready.in_offset;
 
     let command = emitter_command(EMIT_ROUNDS);
     client.send(&Frame::Input {
@@ -222,17 +191,10 @@ fn overflow_during_disconnects_is_always_reported() {
     let session = Session::start_with_ring("chaos_firehose", 32 * 1024);
     let mut client = session.connect();
     let ok = client.hello(RESUME_FROM_START, 0);
-    let mut offset = ok.resume_from;
-    let mut in_offset = 0u64;
 
-    let setup = b"stty -echo -onlcr; echo \"$((6*7))-READY\"\n";
-    client.send(&Frame::Input {
-        offset: in_offset,
-        data: setup,
-    });
-    in_offset += setup.len() as u64;
-    let (_, after_sync) = client.read_until("42-READY", offset);
-    offset = after_sync;
+    let ready = client.make_ready("-echo -onlcr", None, ok.resume_from);
+    let mut offset = ready.offset;
+    let mut in_offset = ready.in_offset;
 
     // `yes` outruns anything the client can do about it, which is the point.
     let command = b"yes\n";
@@ -334,17 +296,13 @@ fn replayed_input_across_random_disconnects_is_applied_once() {
     let session = Session::start_with_ring("chaos_input", 4 << 20);
     let mut client = session.connect();
     let ok = client.hello(RESUME_FROM_START, 0);
-    let mut offset = ok.resume_from;
 
-    // Everything the client has ever wanted the child to receive. A real client
-    // keeps exactly this, because it is what a resend is drawn from.
-    let mut intended: Vec<u8> = b"stty -echo -onlcr; echo \"$((6*7))-READY\"\n".to_vec();
-    client.send(&Frame::Input {
-        offset: 0,
-        data: &intended,
-    });
-    let (_, after_sync) = client.read_until("42-READY", offset);
-    offset = after_sync;
+    let ready = client.make_ready("-echo -onlcr", None, ok.resume_from);
+    let mut offset = ready.offset;
+    // Everything the client has ever wanted the child to receive, the setup line
+    // included. A real client keeps exactly this, because it is what a resend is
+    // drawn from.
+    let mut intended: Vec<u8> = ready.line.into_bytes();
 
     let mut rng = Rng::new(chaos_seed);
     let line = b"printf M\n";
