@@ -4,62 +4,48 @@ Backlog. Rationale: [DESIGN.md](DESIGN.md). Mechanics: [IMPLEMENTATION.md](IMPLE
 
 ## Status
 
-The daemon, attach relay and control surface work on Linux. Sessions survive a
-severed connection, resume by absolute byte offset, trim replayed input, and report
-overflow as an explicit gap. 32 tests, including an integration suite that drives
-the real binary over its socket.
+The daemon, attach relay, control surface and agent forwarding work on Linux.
+Sessions survive a severed connection, resume by absolute byte offset, trim
+replayed input, and report overflow as an explicit gap. The PTY master is
+non-blocking, so a child that stops reading cannot wedge the event loop; the daemon
+holds no working directory, ignores `SIGHUP`, keeps its PTY out of the child's
+descriptor table, and reports through `HelloOk` whether `logind` will let the
+session outlive the user's logout. Protocol revision 2, which gave both flag fields
+meaning. The relay moves bytes with `splice(2)` where the host allows it.
 
-Everything below is either a known gap in what ships, a feature not started, or a
-decision deliberately deferred.
+All four musl targets build reproducibly at 121–147 KiB against the 400 KiB budget,
+via `scripts/build-release.sh`.
 
-## P0 — correctness gaps in shipped code
+65 tests: property tests over the codec including malformed and near-valid input, a
+model-checked ring, an integration suite driving the real binary over its socket,
+and a seeded chaos suite that severs the connection at generated points under an
+escape-heavy full-screen stream and under `yes`. The regression test guarding the
+event ordering of § 6.4.1 is itself verified, against a fault-injected build that
+restores the bug — and against one that forces only the interleaving, which must
+still pass.
 
-| Gap | Symptom | Where |
-| --- | --- | --- |
-| PTY master is **blocking** | A full PTY input buffer blocks the whole event loop: one wedged child stalls output for the session. `write_pty`'s `EAGAIN` arm is currently dead code. | `pty.rs` — set `O_NONBLOCK` on the master |
-| `<id>.label` is never written | `list` reads it and `kill` unlinks it, but nothing creates it. The frozen layout has a hole, so per-tab ids stay anonymous after client state loss — the exact case §5.1 added it for. | Needs a writer: a CLI flag, or a `Hello` field |
-| No `chdir("/")` | The daemon inherits `attach`'s working directory and can pin a mount busy indefinitely. | `daemon.rs` startup |
-| `SIGHUP` not ignored | Documented in §6.2. Harmless today because `setsid` leaves no controlling terminal, but it is one refactor away from mattering. | `daemon.rs` startup |
-| No linger detection | §6.2 says detect `loginctl show-user -p Linger` and report it, so the client can warn that the session will die at logout. Not implemented, and `HelloOk` has no flag for it. | Needs a `HelloOk` flag bit |
+A review of the above turned up four defects in code that predates it, all fixed
+and each now covered: `Exit` reaching a reattaching client ahead of the output it
+belonged to, an unbounded blocking write letting a half-dead client hang the whole
+daemon, `nomux list` evicting the attached client of every session it probed, and
+the PTY master leaking into every process the user ran.
 
-## P1 — agent forwarding
+Everything below is either a feature not started, a decision deliberately deferred,
+or client-side work recorded because its server-side contract is fixed here.
 
-The largest unbuilt piece, and the one that decides whether §5.3's transparency
-claim holds. Frame types (`AgentOpen`/`AgentData`/`AgentClose`) and
-`MAX_AGENT_CHANNELS` exist in the codec; nothing serves the socket.
+## P1 — release process
 
-1. Daemon listens on `$RUNDIR/<id>.agent`, `0600`.
-2. Child env gets `SSH_AUTH_SOCK` pointing at it — gated on an opt-in flag, never by default (§6.7: this bypasses a deliberate `ForwardAgent` decision).
-3. Channel table with monotonic, never-reused ids; cap at 8; refuse beyond.
-4. Accept-and-close while detached, so `git push` fails fast instead of hanging.
-5. Poll set grows from a fixed 3 fds to 3 + N. The current fixed-index revents mapping in `poll_once` will not survive this and needs restructuring first.
+The four musl targets build, land between 121 and 147 KiB against the 400 KiB
+budget, and are byte-reproducible; `scripts/build-release.sh` enforces all three.
+What is left is process rather than code:
 
-Step 5 is the real work; the rest is plumbing.
-
-## P1 — build and release
-
-None of this is verified, because the pinned `1.97.1` toolchain has no musl std
-installed (see README).
-
-- Build all four musl targets; confirm the ≤400 KiB budget per arch.
-- `zig cc` as cross linker, one host toolchain.
-- Reproducible builds, so the client can pin a SHA-256 per arch and verify after upload.
-- Decide whether `-Z build-std` with `panic_immediate_abort` earns its nightly dependency.
+- Pick and pin the release nightly. The shipping build needs one ([IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)), CI names a dated one, and nothing yet decides when it moves. A floating nightly silently invalidates the SHA-256 the client pinned.
+- Publish the checksums somewhere the client reads, and decide what it does when a host already holds a binary whose hash it no longer recognises.
 
 ## P2 — test depth
 
-- `proptest` on the codec. §9 specifies it; current coverage is hand-written cases.
-- Fuzz `decode_header` + `Frame::decode`. It parses attacker-adjacent bytes and must never panic — `indexing_slicing` is denied, but that is not proof.
-- Chaos: randomised disconnect injection under `yes`, `vim`, and a sixel emitter. The suite currently proves byte-exactness for a shell, not for a full-screen program.
-- Verify the takeover regression test against the pre-fix ordering. It is a probabilistic guard today; reverting the ordering does not compile, so it was never shown to fail on the bug it describes.
-- CI. There is none.
-
-## P2 — smaller items
-
-- `getpwuid` fallback for shell selection; currently `$SHELL` then `/bin/sh`.
-- `splice(2)` in the relay. Documented as intended, currently a userspace copy.
-- Repaint policy is `winch`-only; §4.3 specifies a per-session `ctrl_l` alternative.
-- Exit-code propagation. The §10 table promises the child's status through 1–125, but the relay is deliberately dumb and cannot parse `Exit` to learn it. Either the client owns this and the table is wrong, or the relay stops being dumb. Resolve the doc, do not quietly widen the relay.
+- A `cargo-fuzz` target for `decode_header` and `Frame::decode`. The parser's fuzzing lives in `proptest` today: arbitrary bytes for every frame type, plus single-byte mutations of real encodings, which is what actually reaches past length prefixes and enum discriminants. It runs on stable in the normal suite. A nightly `cargo-fuzz` target would explore longer, and has not yet earned the nightly dependency.
+- Chaos against a real full-screen program. The suite emits sixel and CSI sequences from `sh`, which keeps it deterministic and dependency-free; driving an actual `vim` would test `vim`. Worth revisiting only if a bug turns up that this shape misses.
 
 ## Deferred by decision
 
@@ -81,3 +67,7 @@ server-side contract already fixed here.
 - Bootstrap orchestration: probe, arch selection, upload, negative caching per host.
 - N-1 codec retention and the "never auto-reconnect after `TAKEOVER`" rule.
 - Emulator reset on `gap`, and the 8-sessions-per-host cap.
+- The child's exit status. It arrives in the `Exit` frame; the relay cannot read it without parsing frames, which is exactly what keeps the relay version-independent ([IMPLEMENTATION.md § 10](IMPLEMENTATION.md#10-exit-codes)).
+- Answering agent channels from the key store, and the per-host opt-in that sets `HELLO_AGENT_FORWARD`. The daemon never enables forwarding on its own.
+- Choosing the repaint policy per attach via `HELLO_REPAINT_CTRL_L`; only the client knows whether an editor or a prompt is on screen.
+- Minting `--label` when a session is created, so an orphan is recognisable in `nomux list` after the client loses its state.

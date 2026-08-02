@@ -12,10 +12,16 @@
 
 mod frame;
 
-pub use frame::{ErrorCode, ExitKind, Frame, Hello, HelloOk, RESUME_FROM_START, WinSize};
+pub use frame::{
+    ErrorCode, ExitKind, Frame, HELLO_AGENT_FORWARD, HELLO_REPAINT_CTRL_L, Hello, HelloOk, Linger,
+    RESUME_FROM_START, WinSize,
+};
 
 /// Protocol revision. Bumped on any wire change, including compatible ones.
-pub const PROTOCOL_VERSION: u16 = 1;
+///
+/// Revision 2 gave both flag fields meaning: agent forwarding and repaint policy
+/// in `Hello`, linger state and agent status in `HelloOk`.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Fixed frame header size, so reads are a two-stage `read_exact`.
 pub const HEADER_LEN: usize = 4;
@@ -36,7 +42,7 @@ pub enum FrameType {
     HelloOk = 0x02,
     /// Client keystrokes, at an absolute offset in the input stream.
     Input = 0x03,
-    /// Daemon confirms input durably written to the PTY master.
+    /// Daemon confirms input it has taken ownership of, and will never re-apply.
     InputAck = 0x04,
     /// PTY output, at an absolute offset in the output stream.
     Output = 0x05,

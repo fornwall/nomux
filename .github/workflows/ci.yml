@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A pushed fixup makes the run it superseded worthless; don't pay for it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # A failure in the PTY suite is awkward to reproduce off the runner, so keep the
+  # backtrace in the log.
+  RUST_BACKTRACE: 1
+
+jobs:
+  # The prek gate, run in the same cheapest-first order. One job, so the workspace
+  # and its dependencies are compiled against a single cache.
+  check:
+    name: fmt, clippy, tests
+    runs-on: ubuntu-latest
+    # The session tests spawn a real PTY, shells and unix sockets; a wedged child
+    # would otherwise hold the runner for the six-hour default.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      # Bare `toolchain install` reads rust-toolchain.toml, so the 1.97.1 pin and
+      # its components stay stated in exactly one place.
+      - name: Install the pinned toolchain
+        run: rustup toolchain install --profile minimal --no-self-update
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Prebuilt binary; `cargo install` would build nextest from source on every
+      # cache miss.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - run: cargo fmt --all --check
+
+      # No `-D warnings`: the deny lives in [workspace.lints], so cargo, clippy and
+      # rust-analyzer agree without RUSTFLAGS-induced cache thrash. See README § Build.
+      - run: cargo clippy --workspace --all-targets
+
+      # `--run-ignored all`: the ignored tests are the ones that sit out a real
+      # reaping timeout. Too slow for a pre-commit hook, exactly what CI is for.
+      - run: cargo nextest run --workspace --run-ignored all
+
+      # nextest cannot run doctests.
+      - run: cargo test --doc --workspace
+
+  # Its own job: the script rebuilds the whole workspace under
+  # `--cfg nomux_fault_injection`, which shares no artifacts with the job above, and
+  # keeping it parallel leaves it off the critical path.
+  takeover-guard:
+    name: takeover guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install the pinned toolchain
+        run: rustup toolchain install --profile minimal --no-self-update
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Separate target directory, separate fingerprints, separate cache.
+          key: fault-injection
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      # Asserts the regression test still fails on the pre-fix ordering; a guard that
+      # passes on the bug guards nothing.
+      - run: sh scripts/verify-takeover-guard.sh
+
+  # The 400 KiB budget is correctness-adjacent — the cold upload happens over
+  # cellular — and is the one thing the local hooks cannot check.
+  release:
+    name: musl release builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Dated, never floating. The client pins a SHA-256 per architecture, and a
+      # compiler that moves moves those bytes underneath it.
+      NOMUX_NIGHTLY: nightly-2026-07-31
+    steps:
+      - uses: actions/checkout@v5
+
+      # The shipping build rebuilds std with panics compiled out, which is the only
+      # configuration that meets the size budget (IMPLEMENTATION.md § 8) and needs a
+      # nightly compiler plus its sources. No cross linker to install: rust-lld and
+      # the musl objects that ship with each rust-std component are the whole
+      # toolchain.
+      - name: Install the release nightly with the musl targets
+        run: >
+          rustup toolchain install "$NOMUX_NIGHTLY" --profile minimal --no-self-update
+          --component rust-src
+          --target x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,armv7-unknown-linux-musleabihf,riscv64gc-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: musl
+
+      # Owns the target list and the size budget; exits non-zero if a binary is over.
+      - run: sh scripts/build-release.sh

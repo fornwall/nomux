@@ -11,6 +11,10 @@ reporting and scrollback all work unchanged.
 nomux daemon <session-id>   Own a PTY session
 nomux attach <session-id>   Relay stdio to a session, spawning it if absent
 nomux probe                 Report OS, architecture and install path
+nomux list                  List sessions in the run directory
+nomux kill <session-id>     Terminate a session and unlink its run files
+
+  --label <text>            Display name for `list`, recorded at session creation
 ```
 
 Four properties drive the design:
@@ -53,32 +57,58 @@ prek run --all-files    # run the gate manually
 The hooks trigger on `*.rs`, `*.toml` and `Cargo.lock` — manifests included, because
 the lint configuration lives in `Cargo.toml`.
 
-The pin selects the `1.97.1` toolchain, which is a distinct rustup installation from
-`stable` even when both resolve to the same version. Targets added to `stable` are
-not visible here, so add them explicitly:
+Two things are deliberately left out of the pre-commit gate and run in CI instead,
+because both cost far more than a commit should:
 
 ```sh
-rustup target add --toolchain 1.97.1 \
+cargo nextest run --workspace --run-ignored all   # includes the reaping timeouts
+sh scripts/verify-takeover-guard.sh               # rebuilds under fault injection
+```
+
+The chaos suite picks its disconnect points from a fixed seed, so a failure
+reproduces; `NOMUX_CHAOS_SEED=<n>` explores other interleavings, and every failure
+message carries the seed that produced it.
+
+## Release builds
+
+The four shipping binaries come from one script:
+
+```sh
+sh scripts/build-release.sh     # → target/dist/ plus SHA256SUMS
+```
+
+It builds every musl target, prints a size table, and fails if any binary exceeds
+the 400 KiB budget. There is no cross toolchain to install — `rust-lld` links all
+four and each `rust-std` component carries its own musl objects — but the shipping
+configuration rebuilds the standard library with panics compiled out, which needs
+nightly and its sources:
+
+```sh
+rustup toolchain install nightly --component rust-src
+rustup target add --toolchain nightly \
   x86_64-unknown-linux-musl \
   aarch64-unknown-linux-musl \
   armv7-unknown-linux-musleabihf \
   riscv64gc-unknown-linux-musl
-
-cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-Cross-linking uses `zig cc`; see [IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build).
+That is not an optimisation: with the released standard library, every target
+misses the size budget. `NOMUX_STABLE_STD=1` builds against the pinned stable
+toolchain and is expected to fail the gate. `NOMUX_NIGHTLY=nightly-YYYY-MM-DD` pins
+the compiler, which a release must do — the client pins a SHA-256 per architecture,
+and a floating nightly moves it. See
+[IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build) for the measurements.
 
 ## Status
 
 Working end to end on Linux: the daemon owns a PTY and ring buffer, clients resume
-by byte offset across a severed connection, `attach` spawns a daemon on demand and
-relays, and `list`/`kill` operate on the run directory alone.
+by byte offset across a severed connection, agent forwarding proxies `ssh-agent`
+over the same channel, `attach` spawns a daemon on demand and relays, and
+`list`/`kill` operate on the run directory alone.
 
-Not yet implemented: agent forwarding (`DESIGN.md` § 5.4 — the frame types exist,
-the daemon does not serve the socket), `getpwuid` fallback for shell selection, and
-`direct-streamlocal` is a client-side concern that has no server counterpart to
-build.
+Everything left is either client-side — `direct-streamlocal`, bootstrap
+orchestration, emulator reset on gap — or a decision deliberately deferred. See
+[PLAN.md](PLAN.md).
 
 Tunables: `NOMUX_RING_BYTES` overrides the 4 MiB output ring per daemon.
 

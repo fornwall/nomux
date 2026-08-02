@@ -11,5 +11,14 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+# The default `fork` and `timeout` features run every case in a subprocess so a
+# hang or an abort can be attributed. This codec allocates nothing it does not
+# bound and loops over nothing, so a case that neither returns nor panics is not a
+# failure mode worth paying `rusty-fork`, `tempfile` and `wait-timeout` for. Same
+# for `bit-set`, which only accelerates shrinking of bitset strategies this suite
+# does not use.
+[dev-dependencies]
+proptest = { version = "1.11.0", default-features = false, features = ["std"] }
+
 [lints]
 workspace = true

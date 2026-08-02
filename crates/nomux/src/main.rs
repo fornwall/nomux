@@ -7,10 +7,13 @@
 //! - `probe` reports the information the client needs to bootstrap this host.
 //! - `list` and `kill` are the frozen, version-independent control surface.
 
+mod agent;
 mod attach;
 mod conn;
 mod control;
 mod daemon;
+mod linger;
+mod passwd;
 mod pty;
 mod ring;
 mod rundir;
@@ -28,7 +31,7 @@ const EXIT_UNATTACHABLE: u8 = 126;
 const EXIT_NO_SESSION: u8 = 127;
 
 const USAGE: &str = "\
-usage: nomux <mode> [session-id]
+usage: nomux <mode> [session-id] [--label <text>]
 
 modes:
   daemon <session-id>   Own a PTY session (normally spawned by `attach`)
@@ -39,6 +42,10 @@ control surface (frozen across versions, see IMPLEMENTATION.md 6.6):
   list                  List sessions in the run directory
   kill <session-id>     Terminate a session and unlink its run files
 
+options:
+  --label <text>        Display name for `list`, recorded when the session is
+                        created. Advisory: ids are opaque, so this is what makes
+                        an orphaned session recognisable to a human.
   --version             Print version and protocol revision
 ";
 
@@ -67,7 +74,7 @@ fn main() -> ExitCode {
             print!("{USAGE}");
             ExitCode::SUCCESS
         }
-        Some(mode @ ("daemon" | "attach" | "kill")) => run_session_mode(mode, args.next()),
+        Some(mode @ ("daemon" | "attach" | "kill")) => run_session_mode(mode, args),
         _ => {
             eprint!("{USAGE}");
             ExitCode::from(EXIT_USAGE)
@@ -76,20 +83,28 @@ fn main() -> ExitCode {
 }
 
 /// Dispatches the modes that take a session id.
-fn run_session_mode(mode: &str, session: Option<OsString>) -> ExitCode {
+fn run_session_mode(mode: &str, args: impl Iterator<Item = OsString>) -> ExitCode {
+    let (session, label) = match parse_session_args(args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("nomux: {message}\n");
+            eprint!("{USAGE}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
     let Some(session) = session else {
         eprintln!("nomux: `{mode}` requires a session id\n");
         eprint!("{USAGE}");
         return ExitCode::from(EXIT_USAGE);
     };
-    let Some(session) = session.to_str() else {
-        eprintln!("nomux: session id must be valid UTF-8");
-        return ExitCode::from(EXIT_USAGE);
-    };
 
     match mode {
-        "daemon" => report(daemon::run(session, daemon::ring_capacity())),
-        "attach" => match attach::run(session) {
+        "daemon" => report(daemon::run(
+            &session,
+            daemon::ring_capacity(),
+            label.as_deref(),
+        )),
+        "attach" => match attach::run(&session, label.as_deref()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("nomux: {err}");
@@ -99,8 +114,42 @@ fn run_session_mode(mode: &str, session: Option<OsString>) -> ExitCode {
                 })
             }
         },
-        _ => report(control::kill(session)),
+        _ => report(control::kill(&session)),
     }
+}
+
+/// Splits a session-mode command line into its id and optional label.
+///
+/// Deliberately minimal — no argument parser, no abbreviations, no `--` handling.
+/// The only caller is the client, which builds this command line itself.
+fn parse_session_args(
+    args: impl Iterator<Item = OsString>,
+) -> Result<(Option<String>, Option<String>), String> {
+    let mut session = None;
+    let mut label = None;
+    let mut args = args;
+
+    while let Some(arg) = args.next() {
+        let text = arg
+            .to_str()
+            .ok_or_else(|| format!("argument `{}` must be valid UTF-8", arg.display()))?;
+        match text.split_once('=') {
+            Some(("--label", value)) => label = Some(value.to_owned()),
+            _ if text == "--label" => {
+                label = Some(
+                    args.next()
+                        .ok_or_else(|| "`--label` requires a value".to_owned())?
+                        .to_str()
+                        .ok_or_else(|| "label must be valid UTF-8".to_owned())?
+                        .to_owned(),
+                );
+            }
+            _ if text.starts_with('-') => return Err(format!("unknown option `{text}`")),
+            _ if session.is_none() => session = Some(text.to_owned()),
+            _ => return Err(format!("unexpected argument `{text}`")),
+        }
+    }
+    Ok((session, label))
 }
 
 /// Maps a fallible operation onto an exit code, reporting failure on stderr.

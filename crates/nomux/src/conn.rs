@@ -17,8 +17,16 @@ use nomux_proto::{Frame, FrameType, HEADER_LEN, Header, MAX_PAYLOAD, decode_head
 /// a gap, never a blocked child.
 pub(crate) const MAX_PENDING_WRITE: usize = 1 << 20;
 
+/// Queue size at which a client is treated as gone rather than slow. Well clear of
+/// [`MAX_PENDING_WRITE`] plus one output chunk, so only unanswered control frames
+/// can reach it.
+const ABANDON_PENDING_WRITE: usize = 8 << 20;
+
 /// Compact the receive buffer once this many consumed bytes have accumulated.
 const COMPACT_THRESHOLD: usize = 64 * 1024;
+
+/// Longest to spend delivering a connection's last frames before abandoning them.
+const FINAL_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// A client connection carrying partially read and partially written frames.
 #[derive(Debug)]
@@ -73,6 +81,19 @@ impl Conn {
         self.tx.len() - self.tx_pos >= MAX_PENDING_WRITE
     }
 
+    /// Whether this peer has stopped reading altogether.
+    ///
+    /// [`Conn::is_write_saturated`] holds back output, but the control frames that
+    /// answer a client — an `InputAck` per `Input`, a `Pong` per `Ping` — are not
+    /// optional and are queued regardless. A peer that writes without ever reading
+    /// therefore grows this queue without bound, and past this point it is not slow,
+    /// it is gone: dropping it costs a working client nothing, since reattaching
+    /// replays from the ring.
+    #[must_use]
+    pub(crate) const fn is_write_hopeless(&self) -> bool {
+        self.tx.len() - self.tx_pos >= ABANDON_PENDING_WRITE
+    }
+
     /// Queues a frame.
     ///
     /// # Errors
@@ -108,10 +129,35 @@ impl Conn {
         // Leave room for the 8-byte offset that shares the payload.
         let chunk = MAX_PAYLOAD as usize - 8;
         for part in data.chunks(chunk) {
+            // Re-checked per chunk, not just before the call: the ring can be far
+            // larger than the queue budget, and a single pump would otherwise
+            // queue the whole of it for a client that has stopped reading. The
+            // caller resumes from the returned offset.
+            if self.is_write_saturated() {
+                break;
+            }
             self.send(&Frame::Output { offset, data: part })?;
             offset += part.len() as u64;
         }
         Ok(offset)
+    }
+
+    /// Queues agent bytes as one or more `AgentData` frames, splitting at
+    /// [`MAX_PAYLOAD`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates encoding failures, which cannot occur for correctly chunked input.
+    pub(crate) fn send_agent_data(
+        &mut self,
+        chan: u32,
+        data: &[u8],
+    ) -> Result<(), nomux_proto::ProtoError> {
+        // Leave room for the 4-byte channel id that shares the payload.
+        for part in data.chunks(MAX_PAYLOAD as usize - 4) {
+            self.send(&Frame::AgentData { chan, data: part })?;
+        }
+        Ok(())
     }
 
     /// Reads whatever the socket has available into the receive buffer.
@@ -161,18 +207,38 @@ impl Conn {
         Ok(())
     }
 
-    /// Blocks until the send buffer is drained, for the final frames before exit.
+    /// Pushes out whatever is queued, giving up after [`FINAL_FLUSH_TIMEOUT`].
     ///
     /// # Errors
     ///
-    /// Propagates write failures.
-    pub(crate) fn flush_blocking(&mut self) -> io::Result<()> {
+    /// Propagates write failures, including the timeout expiring.
+    pub(crate) fn flush_final(&mut self) -> io::Result<()> {
+        // Bounded, because the connection being flushed is frequently one that has
+        // stopped reading — that is what a takeover is usually recovering from. An
+        // unbounded blocking write here parks the entire daemon inside the kernel:
+        // no PTY drained, no client served, no reaping, until a peer that may never
+        // read again decides to.
         self.stream.set_nonblocking(false)?;
+        self.stream.set_write_timeout(Some(FINAL_FLUSH_TIMEOUT))?;
         let pending = self.tx.get(self.tx_pos..).unwrap_or(&[]);
         self.stream.write_all(pending)?;
         self.tx.clear();
         self.tx_pos = 0;
         self.stream.flush()
+    }
+
+    /// Sends `frame` as the last thing this connection will ever carry, discarding
+    /// anything still queued, then flushes.
+    ///
+    /// Queued output is worthless to a connection that is being closed — a
+    /// reattaching client replays it from the ring anyway — and dropping it keeps
+    /// the final write small enough to complete promptly even against a peer that
+    /// has stopped reading.
+    pub(crate) fn send_last(&mut self, frame: &Frame<'_>) {
+        self.tx.clear();
+        self.tx_pos = 0;
+        self.send_control(frame);
+        drop(self.flush_final());
     }
 
     /// Removes one complete frame from the receive buffer, copying its payload into

@@ -1,0 +1,19 @@
+version: 2
+
+updates:
+  # Action majors are tracked by a moving tag, minors are not; without this the
+  # workflow silently ages.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+
+  # The dependency tree is small and the binary ships to servers, so take patches.
+  # Grouped: separate PRs per crate is noise at this size.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      cargo:
+        patterns: ["*"]

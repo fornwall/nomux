@@ -26,6 +26,13 @@ panic = "abort"
 strip = "symbols"
 
 [workspace.lints.rust]
+# Fault injection for the test suite, never set in a shipped build. Declared so
+# `cfg!` on it is not itself a warning — which, under the blanket deny below,
+# would be an error.
+unexpected_cfgs = { level = "warn", check-cfg = [
+    "cfg(nomux_fault_injection)",
+    "cfg(nomux_fault_settle)",
+] }
 # Promotes every lint left at warn level — including rustc's own defaults, such as
 # unused_variables — to a hard error. `priority = 1` makes it the last flag passed
 # to the compiler, so it overrides the warn levels set below rather than being

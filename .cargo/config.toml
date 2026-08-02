@@ -1,0 +1,30 @@
+# Cross-linking for the four shipping targets (IMPLEMENTATION.md § 8).
+#
+# `rust-lld` is the whole cross toolchain. The tree is pure Rust — rustix runs on
+# its linux_raw backend, so nothing here compiles or links a C object — and every
+# rust-std component ships the musl CRT objects and libc.a beside it in
+# `lib/self-contained/`. So the four cross builds need no gcc, no zig, no sysroot:
+# `rustup target add` is the entire setup. rustc resolves the bare name `rust-lld`
+# out of its own sysroot, so it does not have to be on $PATH.
+#
+# x86_64 is listed too, though the host `cc` would link it. Reproducibility is the
+# reason: `cc` drags in whatever gcc and binutils the host happens to have, and
+# their version then shows up in the bytes we ask the client to pin a SHA-256 of.
+# rust-lld is pinned by rust-toolchain.toml like everything else.
+#
+# Only `linker` belongs in this file. A `rustflags` key here would be silently
+# discarded the moment anything sets $RUSTFLAGS — the environment variable
+# replaces these tables rather than appending to them — and scripts/build-release.sh
+# sets it. Link flags that must not go missing are passed from there instead.
+
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
+
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+
+[target.armv7-unknown-linux-musleabihf]
+linker = "rust-lld"
+
+[target.riscv64gc-unknown-linux-musl]
+linker = "rust-lld"

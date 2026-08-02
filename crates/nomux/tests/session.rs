@@ -7,179 +7,21 @@
 //! The two invariants that matter (`IMPLEMENTATION.md` § 9): input is never
 //! duplicated, and output is never lost unless a `Gap` was reported.
 
-#![expect(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    reason = "the allow-*-in-tests settings in clippy.toml only apply to #[cfg(test)] \
-              modules, not to integration test crates; a failed assertion here should \
-              panic, which is the whole point"
-)]
+mod harness;
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-use std::{env, fs, thread};
+use std::{fs, thread};
 
 use nomux_proto::{
-    Frame, FrameType, HEADER_LEN, Hello, PROTOCOL_VERSION, RESUME_FROM_START, WinSize,
-    decode_header,
+    Frame, FrameType, HELLO_AGENT_FORWARD, HELLO_REPAINT_CTRL_L, Hello, MAX_AGENT_CHANNELS,
+    PROTOCOL_VERSION, RESUME_FROM_START,
 };
 
-const WIN: WinSize = WinSize {
-    cols: 80,
-    rows: 24,
-    xpixel: 0,
-    ypixel: 0,
-};
-
-/// A daemon running in an isolated run directory, killed on drop.
-struct Session {
-    child: Child,
-    socket: PathBuf,
-    id: String,
-}
-
-impl Session {
-    fn start(name: &str) -> Self {
-        let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("run-{name}"));
-        drop(fs::remove_dir_all(&root));
-        fs::create_dir_all(&root).expect("create run root");
-
-        let id = format!("test_{name}");
-        let child = Command::new(env!("CARGO_BIN_EXE_nomux"))
-            .args(["daemon", &id])
-            .env("XDG_RUNTIME_DIR", &root)
-            // A predictable shell keeps assertions independent of the developer's
-            // login environment.
-            .env("SHELL", "/bin/sh")
-            .env("PS1", "")
-            // A small ring makes overflow reachable in milliseconds instead of
-            // requiring megabytes of output.
-            .env("NOMUX_RING_BYTES", "65536")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn daemon");
-
-        let socket = root.join("nomux").join(format!("{id}.sock"));
-        wait_for(&socket);
-        Self { child, socket, id }
-    }
-
-    fn connect(&self) -> Client {
-        let stream = UnixStream::connect(&self.socket).expect("connect to session");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(15)))
-            .expect("set read timeout");
-        Client {
-            stream,
-            pending: Vec::new(),
-        }
-    }
-}
-
-impl Drop for Session {
-    fn drop(&mut self) {
-        drop(self.child.kill());
-        drop(self.child.wait());
-    }
-}
-
-fn wait_for(path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        if path.exists() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    panic!("daemon never bound {}", path.display());
-}
-
-/// A protocol client: enough of one to assert on daemon behaviour.
-struct Client {
-    stream: UnixStream,
-    pending: Vec<u8>,
-}
-
-impl Client {
-    fn send(&mut self, frame: &Frame<'_>) {
-        let mut buf = Vec::new();
-        frame.encode(&mut buf).expect("encode");
-        self.stream.write_all(&buf).expect("write frame");
-    }
-
-    fn hello(&mut self, out_offset: u64, in_offset: u64) -> nomux_proto::HelloOk {
-        self.send(&Frame::Hello(Hello {
-            protocol: PROTOCOL_VERSION,
-            flags: 0,
-            out_offset,
-            in_offset,
-            win: WIN,
-            term: "xterm-256color",
-        }));
-        match self.next_frame() {
-            (FrameType::HelloOk, payload) => {
-                match Frame::decode(FrameType::HelloOk, &payload).expect("decode HelloOk") {
-                    Frame::HelloOk(ok) => ok,
-                    other => panic!("expected HelloOk, got {other:?}"),
-                }
-            }
-            (ty, _) => panic!("expected HelloOk, got {ty:?}"),
-        }
-    }
-
-    fn next_frame(&mut self) -> (FrameType, Vec<u8>) {
-        loop {
-            if self.pending.len() >= HEADER_LEN {
-                let head: [u8; HEADER_LEN] = self.pending[..HEADER_LEN].try_into().unwrap();
-                let header = decode_header(&head).expect("decode header");
-                let total = HEADER_LEN + header.len as usize;
-                if self.pending.len() >= total {
-                    let payload = self.pending[HEADER_LEN..total].to_vec();
-                    self.pending.drain(..total);
-                    return (header.ty, payload);
-                }
-            }
-            let mut chunk = [0u8; 8192];
-            let n = self.stream.read(&mut chunk).expect("read from daemon");
-            assert!(n > 0, "daemon closed the connection unexpectedly");
-            self.pending.extend_from_slice(&chunk[..n]);
-        }
-    }
-
-    /// Collects output until `needle` appears, returning everything consumed and
-    /// the offset one past the last output byte.
-    fn read_until(&mut self, needle: &str, from: u64) -> (String, u64) {
-        let mut seen = Vec::new();
-        let mut offset = from;
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while Instant::now() < deadline {
-            let (ty, payload) = self.next_frame();
-            match Frame::decode(ty, &payload).expect("decode frame") {
-                Frame::Output { offset: at, data } => {
-                    assert_eq!(at, offset, "output offsets must be contiguous");
-                    offset += data.len() as u64;
-                    seen.extend_from_slice(data);
-                    if String::from_utf8_lossy(&seen).contains(needle) {
-                        return (String::from_utf8_lossy(&seen).into_owned(), offset);
-                    }
-                }
-                Frame::InputAck { .. } | Frame::Pong { .. } => {}
-                other => panic!("unexpected frame while awaiting {needle:?}: {other:?}"),
-            }
-        }
-        panic!(
-            "timed out waiting for {needle:?}; saw: {:?}",
-            String::from_utf8_lossy(&seen)
-        );
-    }
-}
+use harness::{Session, WIN, wait_for};
 
 #[test]
 fn runs_a_shell_and_streams_its_output() {
@@ -375,6 +217,229 @@ fn list_and_kill_operate_without_the_protocol() {
     assert!(!socket.exists(), "kill must unlink the run files");
 }
 
+/// Connecting is not attaching.
+///
+/// The frozen control surface decides whether a daemon is alive by connecting to
+/// its socket (§ 6.6), and so does the spawn race in § 6.3. If the daemon counted
+/// that as a takeover, `nomux list` would evict the user from every session on the
+/// host — and the client is told never to auto-reconnect after `TAKEOVER`, so the
+/// damage would be permanent.
+#[test]
+fn a_liveness_probe_does_not_evict_the_attached_client() {
+    let session = Session::start("probe");
+    let mut client = session.connect();
+    let ok = client.hello(RESUME_FROM_START, 0);
+
+    // The bare probe, then the real thing.
+    for _ in 0..3 {
+        drop(UnixStream::connect(&session.socket).expect("probe connect"));
+    }
+    let listed = Command::new(env!("CARGO_BIN_EXE_nomux"))
+        .arg("list")
+        .env("XDG_RUNTIME_DIR", &session.root)
+        .output()
+        .expect("run list");
+    assert!(String::from_utf8_lossy(&listed.stdout).contains(&session.id));
+
+    // `read_until` refuses anything that is not output, so an `Error{TAKEOVER}`
+    // fails this rather than being skipped over.
+    client.send(&Frame::Input {
+        offset: 0,
+        data: b"echo NOMUX-STILL-ATTACHED\n",
+    });
+    let (seen, _) = client.read_until("NOMUX-STILL-ATTACHED", ok.resume_from);
+    assert!(
+        seen.contains("NOMUX-STILL-ATTACHED"),
+        "transcript: {seen:?}"
+    );
+}
+
+/// A connection that speaks out of turn is refused on its own terms, without
+/// costing the session its client.
+#[test]
+fn a_connection_that_does_not_greet_first_is_refused_alone() {
+    let session = Session::start("no_greeting");
+    let mut client = session.connect();
+    let ok = client.hello(RESUME_FROM_START, 0);
+
+    let mut rude = session.connect();
+    rude.send(&Frame::Ping { nonce: 1 });
+    let (ty, payload) = rude.next_frame();
+    assert!(
+        matches!(
+            Frame::decode(ty, &payload).expect("decode"),
+            Frame::Error {
+                code: nomux_proto::ErrorCode::Protocol,
+                ..
+            }
+        ),
+        "expected a protocol error, got {ty:?}"
+    );
+    drop(rude);
+
+    client.send(&Frame::Input {
+        offset: 0,
+        data: b"echo NOMUX-UNDISTURBED\n",
+    });
+    let (seen, _) = client.read_until("NOMUX-UNDISTURBED", ok.resume_from);
+    assert!(seen.contains("NOMUX-UNDISTURBED"), "transcript: {seen:?}");
+}
+
+/// The child's last words come before its status.
+///
+/// The linger window (§ 6.5) exists so a client reconnecting into the race still
+/// collects both — in that order. A client that closes the tab on `Exit` and is
+/// handed it first loses the entire transcript.
+#[test]
+fn the_exit_status_arrives_after_the_final_output() {
+    let session = Session::start("exit_order");
+    let mut client = session.connect();
+    client.hello(RESUME_FROM_START, 0);
+
+    let command = b"printf NOMUX-LAST-WORD; exit 3\n";
+    client.send(&Frame::Input {
+        offset: 0,
+        data: command,
+    });
+    // The daemon must own the command before the connection goes away, or RST
+    // takes it with them.
+    client.wait_for_input_ack(command.len() as u64);
+    drop(client);
+    thread::sleep(Duration::from_millis(500));
+
+    // Reattach inside the linger window, exactly the race the window is for.
+    let mut client = session.connect();
+    let resumed = client.hello(RESUME_FROM_START, command.len() as u64);
+    let mut seen = Vec::new();
+    loop {
+        let (ty, payload) = client.next_frame();
+        match Frame::decode(ty, &payload).expect("decode") {
+            Frame::Output { data, .. } => seen.extend_from_slice(data),
+            Frame::Exit { status, kind } => {
+                assert_eq!(status, 3, "the child's own status must survive");
+                assert_eq!(kind, nomux_proto::ExitKind::Exited);
+                break;
+            }
+            Frame::InputAck { .. } | Frame::Gap { .. } => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    let seen = String::from_utf8_lossy(&seen);
+    assert!(
+        seen.contains("NOMUX-LAST-WORD"),
+        "output arrived after the exit status, or not at all: {seen:?} \
+         (resumed from {})",
+        resumed.resume_from
+    );
+}
+
+/// The child must not inherit a handle to its own PTY master.
+///
+/// Everything the user runs in the session would otherwise hold a writable
+/// descriptor onto the master: anything that walks `/proc/self/fd`, or writes to a
+/// descriptor it did not open, could inject output into the stream or read the
+/// user's keystrokes.
+#[test]
+fn the_child_inherits_only_its_stdio() {
+    let session = Session::start("fds");
+    let mut client = session.connect();
+    let ok = client.hello(RESUME_FROM_START, 0);
+    // Wait for the shell to be up before looking for it.
+    client.send(&Frame::Input {
+        offset: 0,
+        data: b"echo NOMUX-SPAWNED\n",
+    });
+    client.read_until("NOMUX-SPAWNED", ok.resume_from);
+
+    let shell = child_of(session.child.id()).expect("find the session shell");
+    let mut terminals = Vec::new();
+    for entry in fs::read_dir(format!("/proc/{shell}/fd")).expect("read the shell's fds") {
+        let entry = entry.expect("fd entry");
+        let target = fs::read_link(entry.path()).unwrap_or_default();
+        let target = target.to_string_lossy().into_owned();
+        assert!(
+            !target.contains("ptmx"),
+            "the child inherited the PTY master as fd {:?}",
+            entry.file_name()
+        );
+        if target.starts_with("/dev/pts/") {
+            terminals.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    terminals.sort();
+    assert_eq!(
+        terminals,
+        ["0", "1", "2"],
+        "the child should hold the slave exactly three times, as its stdio"
+    );
+}
+
+/// The pid of `parent`'s first child, from `/proc`.
+fn child_of(parent: u32) -> Option<u32> {
+    let entries = fs::read_dir("/proc").ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|name| name.parse::<u32>().ok()) else {
+            continue;
+        };
+        let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+        let parent_of_pid = status
+            .lines()
+            .find_map(|line| line.strip_prefix("PPid:"))
+            .and_then(|value| value.trim().parse::<u32>().ok());
+        if parent_of_pid == Some(parent) {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+/// Ids are opaque per-tab identifiers, so the label is the only thing that makes a
+/// session recognisable to a human after the client loses its state.
+#[test]
+fn a_label_survives_into_list() {
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("run-label");
+    drop(fs::remove_dir_all(&root));
+    fs::create_dir_all(&root).expect("create run root");
+
+    let mut attach = Command::new(env!("CARGO_BIN_EXE_nomux"))
+        .args(["attach", "labelled", "--label", "  release build\tx  "])
+        .env("XDG_RUNTIME_DIR", &root)
+        .env("SHELL", "/bin/sh")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn attach");
+    wait_for(&root.join("nomux").join("labelled.sock"));
+
+    let listed = Command::new(env!("CARGO_BIN_EXE_nomux"))
+        .arg("list")
+        .env("XDG_RUNTIME_DIR", &root)
+        .output()
+        .expect("run list");
+    let listed = String::from_utf8_lossy(&listed.stdout).into_owned();
+
+    drop(attach.kill());
+    drop(attach.wait());
+    drop(
+        Command::new(env!("CARGO_BIN_EXE_nomux"))
+            .args(["kill", "labelled"])
+            .env("XDG_RUNTIME_DIR", &root)
+            .status(),
+    );
+
+    let line = listed
+        .lines()
+        .find(|line| line.starts_with("labelled\t"))
+        .unwrap_or_else(|| panic!("session missing from list: {listed:?}"));
+    let label = line.split('\t').nth(2).expect("label column");
+    assert_eq!(
+        label, "release buildx",
+        "label should be trimmed and stripped of control characters"
+    );
+}
+
 #[test]
 fn invalid_session_ids_are_refused() {
     for id in ["../escape", "with/slash", "with space"] {
@@ -486,13 +551,328 @@ fn attach_spawns_the_daemon_and_relays_transparently() {
     );
 }
 
+/// The PTY master is non-blocking, so a child that has stopped reading cannot
+/// wedge the daemon.
+///
+/// A PTY's input buffer is a few kilobytes. With a blocking master, pushing more
+/// than that at a child which is not reading parked the whole event loop inside
+/// `write(2)` — one session's stuck child froze that session's output entirely,
+/// including frames that had nothing to do with the PTY.
+#[test]
+fn a_child_that_stops_reading_input_does_not_wedge_the_daemon() {
+    let session = Session::start("wedge");
+    let mut client = session.connect();
+    let ok = client.hello(RESUME_FROM_START, 0);
+
+    // Raw mode is what makes the line discipline apply back pressure instead of
+    // quietly dropping the overflow: in canonical mode a line longer than the
+    // buffer is discarded, and the master write never blocks at all. `sleep` then
+    // holds the terminal without reading it, so everything below piles up.
+    let start = b"echo NOMUX-RAW; stty raw -echo; sleep 30\n";
+    client.send(&Frame::Input {
+        offset: 0,
+        data: start,
+    });
+    let (_, _) = client.read_until("NOMUX-RAW", ok.resume_from);
+    thread::sleep(Duration::from_millis(200));
+
+    let chunk = vec![b'x'; 16 * 1024];
+    let mut offset = start.len() as u64;
+    for _ in 0..16 {
+        client.send(&Frame::Input {
+            offset,
+            data: &chunk,
+        });
+        offset += chunk.len() as u64;
+    }
+
+    // Long enough for the daemon to have tried the write and, with a blocking
+    // master, to still be parked inside it. Sending the ping in the same batch as
+    // the input would prove nothing: it would be answered from the same read,
+    // before the write was ever attempted.
+    thread::sleep(Duration::from_millis(500));
+
+    // The daemon must still be answering: with a blocking master this does not
+    // return until the sleep does.
+    let began = Instant::now();
+    client.send(&Frame::Ping { nonce: 0xF00D });
+    let payload = client.next_of(FrameType::Pong);
+    assert_eq!(
+        Frame::decode(FrameType::Pong, &payload).expect("decode pong"),
+        Frame::Pong { nonce: 0xF00D }
+    );
+    assert!(
+        began.elapsed() < Duration::from_secs(10),
+        "daemon took {:?} to answer a ping behind a full PTY buffer",
+        began.elapsed()
+    );
+}
+
+/// The daemon must not hold the directory it was started in — that pins a mount
+/// for the life of the session — while the shell must still start where sshd
+/// would have started it.
+#[test]
+fn the_daemon_releases_its_working_directory_but_the_shell_does_not() {
+    let session = Session::start("cwd");
+    let mut client = session.connect();
+    let ok = client.hello(RESUME_FROM_START, 0);
+
+    let cwd = fs::read_link(format!("/proc/{}/cwd", session.child.id())).expect("read daemon cwd");
+    assert_eq!(
+        cwd,
+        Path::new("/"),
+        "daemon still holds a working directory"
+    );
+
+    client.send(&Frame::Input {
+        offset: 0,
+        data: b"pwd\n",
+    });
+    let home = session.root.to_str().expect("utf-8 root");
+    let (seen, _) = client.read_until(home, ok.resume_from);
+    assert!(
+        seen.contains(home),
+        "shell did not start in $HOME: {seen:?}"
+    );
+}
+
+/// Agent forwarding, end to end: the child gets a socket, a connection to it
+/// becomes a channel, and bytes cross in both directions untouched.
+#[test]
+fn agent_forwarding_proxies_a_connection_in_both_directions() {
+    let session = Session::start("agent");
+    let mut client = session.connect();
+    let ok = client.hello_with(HELLO_AGENT_FORWARD, RESUME_FROM_START, 0);
+    assert!(ok.agent, "daemon should report the agent socket as served");
+
+    // The child must be able to find it, which is the whole point.
+    client.send(&Frame::Input {
+        offset: 0,
+        data: b"echo \"sock=$SSH_AUTH_SOCK\"\n",
+    });
+    let (seen, _) = client.read_until(".agent", ok.resume_from);
+    let expected = format!("sock={}", session.agent_socket().display());
+    assert!(seen.contains(&expected), "child environment: {seen:?}");
+
+    let mut agent = session.connect_agent();
+    let chan = client.next_chan(FrameType::AgentOpen);
+
+    // Child to client.
+    agent.write_all(b"\0\0\0\x01\x0b").expect("write request");
+    let payload = client.next_of(FrameType::AgentData);
+    assert_eq!(
+        Frame::decode(FrameType::AgentData, &payload).expect("decode"),
+        Frame::AgentData {
+            chan,
+            data: b"\0\0\0\x01\x0b",
+        },
+        "agent bytes must arrive verbatim"
+    );
+
+    // Client to child.
+    client.send(&Frame::AgentData {
+        chan,
+        data: b"\0\0\0\x05\x0c-reply",
+    });
+    let mut reply = [0u8; 11];
+    agent.read_exact(&mut reply).expect("read response");
+    assert_eq!(&reply, b"\0\0\0\x05\x0c-reply");
+
+    // And the close travels too.
+    drop(agent);
+    assert_eq!(client.next_chan(FrameType::AgentClose), chan);
+}
+
+/// With no client attached there is nothing to answer a signature request, so a
+/// connection is accepted and closed at once: `git push` fails with the same error
+/// as a missing agent instead of hanging until the user reattaches.
+#[test]
+fn agent_connections_fail_fast_while_detached() {
+    let session = Session::start("agent_detached");
+    let mut client = session.connect();
+    client.hello_with(HELLO_AGENT_FORWARD, RESUME_FROM_START, 0);
+    drop(client);
+
+    let mut agent = session.connect_agent();
+    let mut buf = [0u8; 1];
+    assert_eq!(
+        agent.read(&mut buf).expect("read from agent socket"),
+        0,
+        "a detached session must close agent connections immediately"
+    );
+}
+
+/// The channel table is capped, and beyond the cap the daemon closes rather than
+/// queueing — a child that leaks agent connections must not be able to make the
+/// daemon track them.
+#[test]
+fn agent_channels_are_capped() {
+    let session = Session::start("agent_cap");
+    let mut client = session.connect();
+    client.hello_with(HELLO_AGENT_FORWARD, RESUME_FROM_START, 0);
+
+    let cap = MAX_AGENT_CHANNELS as usize;
+    let held: Vec<UnixStream> = (0..cap).map(|_| session.connect_agent()).collect();
+    let mut ids: Vec<u32> = (0..cap)
+        .map(|_| client.next_chan(FrameType::AgentOpen))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), cap, "channel ids must never repeat");
+
+    let mut extra = session.connect_agent();
+    let mut buf = [0u8; 1];
+    assert_eq!(
+        extra.read(&mut buf).expect("read from agent socket"),
+        0,
+        "the connection past the cap must be closed, not queued"
+    );
+    drop(held);
+}
+
+/// Ids come from a counter that never rewinds, so a channel closing and another
+/// opening cannot be confused for one another.
+#[test]
+fn agent_channel_ids_are_never_reused() {
+    let session = Session::start("agent_ids");
+    let mut client = session.connect();
+    client.hello_with(HELLO_AGENT_FORWARD, RESUME_FROM_START, 0);
+
+    let mut previous = 0;
+    for round in 0..4 {
+        let agent = session.connect_agent();
+        let chan = client.next_chan(FrameType::AgentOpen);
+        assert!(chan > previous, "round {round}: id {chan} did not advance");
+        previous = chan;
+        drop(agent);
+        assert_eq!(client.next_chan(FrameType::AgentClose), chan);
+    }
+}
+
+/// Drives a session to an overflow gap and returns what the child saw afterwards.
+///
+/// `cat` is the child because it hands back whatever reaches the PTY's input side,
+/// which is the only way to observe a repaint that is delivered as a keystroke.
+/// The ring is tiny so a few kilobytes echoed while detached is enough to overflow
+/// it.
+fn repaint_transcript(name: &str, flags: u16) -> String {
+    let session = Session::start_with_ring(name, 1024);
+    let mut client = session.connect();
+    let ok = client.hello_with(flags, RESUME_FROM_START, 0);
+
+    let setup = b"stty -echo -onlcr; echo \"$((6*7))-READY\"; cat\n";
+    client.send(&Frame::Input {
+        offset: 0,
+        data: setup,
+    });
+    let (_, offset) = client.read_until("42-READY", ok.resume_from);
+
+    // Echoed back by `cat` with nobody reading, which is what overflows the ring.
+    // In lines, because the line discipline is still canonical: `cat` would see
+    // nothing at all until a newline arrived, and the overflow would never happen.
+    let filler = format!("{}\n", "x".repeat(63)).repeat(512);
+    let filler = filler.as_bytes();
+    let mut in_offset = setup.len() as u64;
+    client.send(&Frame::Input {
+        offset: in_offset,
+        data: filler,
+    });
+    in_offset += filler.len() as u64;
+    client.wait_for_input_ack(in_offset);
+    drop(client);
+    thread::sleep(Duration::from_millis(300));
+
+    let mut client = session.connect();
+    let resumed = client.hello_with(flags, offset, in_offset);
+    assert!(
+        resumed.gap,
+        "the ring should have overflowed while detached"
+    );
+
+    // A fence bounds the wait: whatever the repaint was going to be has been
+    // echoed by the time this comes back.
+    client.send(&Frame::Input {
+        offset: in_offset,
+        data: b"FENCE\n",
+    });
+    let (seen, _) = client.read_until("FENCE", resumed.resume_from);
+    seen
+}
+
+/// The post-gap repaint is the client's choice, and `ctrl_l` reaches the child as
+/// an actual keystroke — the one thing a bare shell prompt responds to, since it
+/// ignores `SIGWINCH` entirely.
+#[test]
+fn a_gap_repaints_with_ctrl_l_only_when_the_client_asks() {
+    let asked = repaint_transcript("repaint_ctrl_l", HELLO_REPAINT_CTRL_L);
+    assert!(
+        asked.contains('\u{c}'),
+        "no Ctrl-L reached the child: {asked:?}"
+    );
+
+    let default = repaint_transcript("repaint_winch", 0);
+    assert!(
+        !default.contains('\u{c}'),
+        "the default policy must not write to the PTY: {default:?}"
+    );
+}
+
+/// A daemon spawned by a connection that died mid-handshake must reap itself.
+///
+/// Every reaping rule is only checked when `poll` returns, so this is really a test
+/// that a wakeup is armed for the 30-second first-attach deadline rather than only
+/// for the hour-long backstop. Waiting out that deadline is the only way to observe
+/// it from outside, which is why this is `#[ignore]`d: 30 seconds is unreasonable
+/// in a suite that otherwise finishes in two, and CI runs it with
+/// `--run-ignored all`.
+#[test]
+#[ignore = "waits out the 30-second first-attach timeout; run in CI, not on every commit"]
+fn a_daemon_nobody_ever_attaches_to_reaps_itself() {
+    let session = Session::start("unattached");
+    let socket = session
+        .root
+        .join("nomux")
+        .join(format!("{}.sock", session.id));
+    assert!(socket.exists());
+
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(45) {
+        if !socket.exists() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    panic!("daemon outlived its first-attach timeout");
+}
+
+/// A session created without the flag serves no socket at all: forwarding bypasses
+/// the user's `ForwardAgent` decision, so it must never be on by default.
+#[test]
+fn agent_forwarding_is_off_unless_asked_for() {
+    let session = Session::start("agent_off");
+    let mut client = session.connect();
+    let ok = client.hello(RESUME_FROM_START, 0);
+    assert!(!ok.agent);
+    assert!(
+        !session.agent_socket().exists(),
+        "no agent socket should exist for a session that did not ask for one"
+    );
+}
+
 /// Regression: a reconnect racing with in-flight input must not discard it.
 ///
-/// One `poll` can report a readable client and a pending connection together. The
-/// daemon originally accepted first, dropping the outgoing connection — and with
-/// it any frame still unread in its socket buffer — so keystrokes vanished
-/// whenever a reconnect landed in the same iteration as input the user had
-/// already sent. Repeated here because the interleaving is timing-dependent.
+/// One `poll` can report a readable client and a `Hello` from its replacement
+/// together. The daemon originally took over on the *connect* and dropped the
+/// outgoing connection there and then — and with it any frame still unread in its
+/// socket buffer — so keystrokes vanished whenever a reconnect landed in the same
+/// iteration as input the user had already sent.
+///
+/// Each round sets that interleaving up on purpose rather than hoping for it: the
+/// replacement connects and is left un-greeted until the daemon has certainly
+/// accepted it, and only then does the outgoing client send input, immediately
+/// followed by the `Hello` that evicts it. Both land in one wakeup, and the
+/// outgoing connection is not closed until after the assertion — so nothing here
+/// depends on how the kernel treats a socket closed with data still queued.
 #[test]
 fn a_takeover_never_discards_input_already_delivered() {
     let session = Session::start("takeover_input");
@@ -502,22 +882,21 @@ fn a_takeover_never_discards_input_already_delivered() {
     let command = b"true NOMUX-KEEP\n";
     let mut expected = 0u64;
 
-    for round in 0..25 {
+    for round in 0..15 {
+        let mut next = session.connect();
+        thread::sleep(Duration::from_millis(60));
+
         client.send(&Frame::Input {
             offset: expected,
             data: command,
         });
         expected += command.len() as u64;
-
-        // Reconnect immediately, giving the daemon no chance to drain the input in
-        // a poll iteration of its own.
-        drop(client);
-        client = session.connect();
-        let ok = client.hello(RESUME_FROM_START, expected);
+        let ok = next.hello(RESUME_FROM_START, expected);
         assert_eq!(
             ok.in_applied, expected,
             "round {round}: input delivered before the takeover was lost"
         );
+        client = next;
     }
 }
 
@@ -559,4 +938,132 @@ fn an_abrupt_client_disconnect_does_not_kill_the_session() {
     });
     let (seen, _) = client.read_until("NOMUX-STILL-HERE", ok.resume_from);
     assert!(seen.contains("NOMUX-STILL-HERE"), "transcript: {seen:?}");
+}
+
+/// Bulk traffic through the attach relay, both ways at once.
+///
+/// The relay moves bytes with `splice(2)` where the kernel allows it and by
+/// copying where it does not, decided per direction at runtime — two paths through
+/// the one component that must never break. Megabytes are what makes that
+/// interesting: enough to fill and refill the pipe and the socket, so both paths
+/// hit short transfers and full destinations. A chunk dropped, replayed or
+/// reordered at a path boundary then shows up as a first-difference index instead
+/// of as output that still looks plausible.
+///
+/// No daemon here on purpose. The relay never parses a frame, so a bare socket is
+/// a complete peer, and the assertions can be about bytes rather than about the
+/// protocol.
+#[test]
+fn the_relay_moves_bulk_traffic_both_ways_without_losing_a_byte() {
+    use std::net::Shutdown;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+    use std::sync::Arc;
+
+    const BULK: usize = 2 * 1024 * 1024;
+
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("run-relay-bulk");
+    drop(fs::remove_dir_all(&root));
+    let dir = root.join("nomux");
+    fs::create_dir_all(&dir).expect("create run root");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("tighten run dir");
+    let listener = UnixListener::bind(dir.join("relay_bulk.sock")).expect("bind session socket");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_nomux"))
+        .args(["attach", "relay_bulk"])
+        .env("XDG_RUNTIME_DIR", &root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn attach");
+
+    let peer = Arc::new(listener.accept().expect("attach never connected").0);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+
+    let upstream = bulk_bytes(0x5eed_1234, BULK);
+    let downstream = bulk_bytes(0xfeed_9876, BULK);
+
+    // Four threads because all four flows must run at once: with any one of them
+    // parked the relay's back pressure would deadlock the other three.
+    let feed = {
+        let data = upstream.clone();
+        thread::spawn(move || {
+            stdin.write_all(&data).expect("write to relay stdin");
+            // Half-close, which the relay must turn into shutdown(SHUT_WR) on the
+            // socket while still draining the other direction.
+            drop(stdin);
+        })
+    };
+    let push = {
+        let data = downstream.clone();
+        let peer = Arc::clone(&peer);
+        thread::spawn(move || {
+            let mut peer = &*peer;
+            peer.write_all(&data).expect("write to relay socket");
+        })
+    };
+    let uplink = {
+        let peer = Arc::clone(&peer);
+        thread::spawn(move || {
+            let mut peer = &*peer;
+            let mut got = Vec::new();
+            peer.read_to_end(&mut got).expect("read from relay socket");
+            got
+        })
+    };
+    let downlink = thread::spawn(move || {
+        let mut got = Vec::new();
+        stdout.read_to_end(&mut got).expect("read relay stdout");
+        got
+    });
+
+    feed.join().expect("feeder thread");
+    let uplink = uplink.join().expect("socket reader thread");
+    push.join().expect("pusher thread");
+    // Only now: the relay ends the moment the socket reports EOF, so closing this
+    // any earlier would truncate the direction under test rather than test it.
+    peer.shutdown(Shutdown::Write)
+        .expect("half-close the socket");
+    let downlink = downlink.join().expect("stdout reader thread");
+
+    let mut complaints = String::new();
+    drop(stderr.read_to_string(&mut complaints));
+    drop(child.wait());
+
+    assert_same(&upstream, &uplink, "stdin -> socket", &complaints);
+    assert_same(&downstream, &downlink, "socket -> stdout", &complaints);
+}
+
+/// A deterministic pseudo-random stream, since a repeating pattern would let a
+/// duplicated or dropped chunk slip through byte-for-byte comparison.
+fn bulk_bytes(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed | 1;
+    let mut out = Vec::with_capacity(len + 8);
+    while out.len() < len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        out.extend_from_slice(&state.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+/// Compares by first difference rather than by value: a failure here is megabytes
+/// wide, and the only useful part of it is where the two streams parted company.
+fn assert_same(want: &[u8], got: &[u8], direction: &str, stderr: &str) {
+    let at = want.iter().zip(got).position(|(a, b)| a != b);
+    assert!(
+        at.is_none(),
+        "{direction} diverged at byte {at:?} of {}; relay stderr: {stderr:?}",
+        want.len()
+    );
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "{direction} moved the wrong number of bytes; relay stderr: {stderr:?}"
+    );
 }

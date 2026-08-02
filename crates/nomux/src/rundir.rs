@@ -18,6 +18,9 @@ pub(crate) const DIR_MODE: u32 = 0o700;
 /// Permissions for every socket inside it.
 pub(crate) const SOCKET_MODE: u32 = 0o600;
 
+/// Longest label written to `<id>.label`, in bytes, per the frozen layout.
+pub(crate) const MAX_LABEL_LEN: usize = 256;
+
 /// Resolves the run directory, preferring `XDG_RUNTIME_DIR`.
 ///
 /// `XDG_RUNTIME_DIR` is tmpfs and cleared on last logout unless lingering is
@@ -119,6 +122,23 @@ impl SessionPaths {
         self.with_extension("label")
     }
 
+    /// Writes the display label, if `label` has anything left after sanitising.
+    ///
+    /// Advisory throughout: a failure here costs `list` a column and nothing else,
+    /// so the caller is expected to ignore the error rather than refuse a session
+    /// over it.
+    ///
+    /// # Errors
+    ///
+    /// Propagates failures to create or write the file.
+    pub(crate) fn write_label(&self, label: &str) -> io::Result<()> {
+        let label = sanitize_label(label);
+        if label.is_empty() {
+            return Ok(());
+        }
+        fs::write(self.label(), label.as_bytes())
+    }
+
     /// `ssh-agent` socket, once agent forwarding is implemented.
     #[must_use]
     pub(crate) fn agent(&self) -> PathBuf {
@@ -137,6 +157,25 @@ impl SessionPaths {
             drop(fs::remove_file(path));
         }
     }
+}
+
+/// Trims a client-supplied label to what the frozen layout permits: one line of
+/// printable UTF-8, at most [`MAX_LABEL_LEN`] bytes.
+///
+/// The label is a tab title chosen by a human, so it arrives with whatever they
+/// typed in it. Control characters are dropped rather than escaped — `list` writes
+/// this straight to a terminal, and a label carrying `ESC ]0;` would retitle the
+/// window of whoever ran it. Truncation is at a character boundary, so the result
+/// is always valid UTF-8.
+fn sanitize_label(label: &str) -> String {
+    let mut out = String::new();
+    for ch in label.chars().filter(|ch| !ch.is_control()) {
+        if out.len() + ch.len_utf8() > MAX_LABEL_LEN {
+            break;
+        }
+        out.push(ch);
+    }
+    out.trim().to_owned()
 }
 
 #[cfg(test)]
@@ -173,5 +212,26 @@ mod tests {
             assert_eq!(path.file_stem().unwrap(), "tab_7");
             assert_eq!(path.extension().unwrap(), extension);
         }
+    }
+
+    #[test]
+    fn labels_lose_control_characters_and_surrounding_space() {
+        assert_eq!(sanitize_label("  build  "), "build");
+        assert_eq!(sanitize_label("two\nlines"), "twolines");
+        assert_eq!(sanitize_label("\u{1b}]0;pwned\u{7}"), "]0;pwned");
+        assert_eq!(sanitize_label("\t\n"), "");
+    }
+
+    /// Truncation must not split a character, or `list` would print a replacement
+    /// glyph for a label the user typed correctly.
+    #[test]
+    fn labels_are_truncated_on_a_character_boundary() {
+        let long = "é".repeat(MAX_LABEL_LEN);
+        let cut = sanitize_label(&long);
+        assert_eq!(cut.len(), MAX_LABEL_LEN, "should fill the budget exactly");
+        assert_eq!(cut.chars().count(), MAX_LABEL_LEN / 2);
+
+        let odd = format!("{}€", "x".repeat(MAX_LABEL_LEN - 1));
+        assert_eq!(sanitize_label(&odd).len(), MAX_LABEL_LEN - 1);
     }
 }
