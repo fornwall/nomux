@@ -402,6 +402,16 @@ loser blocks there, then finds the socket the winner bound and connects to it. O
 a process that spawns its own daemon polls, and only for its own. A stale socket is one where `connect`
 returns `ECONNREFUSED` — unlink and respawn. `EACCES` is not staleness.
 
+`<id>.lock` is also one of the files garbage collection removes (§6.6), and that
+makes the lock and the file two different things: `flock` attaches to the inode,
+so a lock held on a file that has since been unlinked is a lock nobody else can
+see, and whoever asks next creates a fresh file at the same path and locks that
+instead. Two processes, a mutex each, two daemons for one session. Both sides
+therefore obey one protocol. Collection takes the lock before it removes anything
+and skips what it cannot get. Every acquirer, having got the lock, confirms that
+what it locked is still the file at that path — `fstat` against `stat`, comparing
+device and inode — and goes back for the real one if it is not.
+
 ### 6.4 Multiple clients
 
 Exactly one attached client. A second `Hello` on a live session takes over; the
@@ -450,6 +460,13 @@ Child exit → `waitpid` → flush the ring to any attached client → `Exit` fr
 unlink run files → exit. Linger briefly (5 s) so a client reconnecting into the
 race still collects the final output and status.
 
+The unlink is a collection like any other and takes `<id>.lock` first (§6.3),
+leaving the whole set in place if it cannot: an attach may be blocked on that lock
+at this moment, waiting to learn what this exit is about to tell it. Leftover files
+are something that attach recovers from by itself — a socket whose `connect` is
+refused is one it replaces — and the next `list` clears them. A mutex removed from
+under it is not.
+
 `waitpid` is not instantaneous here and the order above hides a trap. Linux closes
 the child's descriptors in `do_exit` *before* the task becomes reapable, so the PTY
 master reports end of file while `waitpid` still answers "not yet" — often, not
@@ -493,7 +510,8 @@ $RUNDIR/<id>.agent   ssh-agent socket, 0600 (§6.7)
 ```
 
 - `list` reads the directory and probes each socket with `connect`; `ECONNREFUSED` means stale, and stale entries are unlinked. The probe is safe because connecting is not attaching (§6.4) — it costs a live session nothing.
-- `kill` reads the pidfile, sends `SIGTERM`, waits up to 2 s, then `SIGKILL`, then unlinks all five files.
+- Unlinking happens under `<id>.lock`, and the probe is repeated once it is held, since that is the only point at which the answer cannot change between being read and being acted on. An entry whose lock somebody else holds is skipped: it is a session being started rather than garbage, and it stays collectable for as long as it stays dead.
+- `kill` takes `<id>.lock` first and holds it to the end, so nothing can spawn into the id it is removing; then reads the pidfile, sends `SIGTERM`, waits up to 2 s, then `SIGKILL`, then unlinks all five files. It waits up to 2 s for that lock — which is long enough to win the race against an attach creating the session, rather than merely lose it — and exits non-zero rather than reporting a "no such session" it did not establish.
 
 `<id>.label` exists because ids are opaque per-tab identifiers
 ([DESIGN.md § 5.1](DESIGN.md#51-identity)). Without it, a client that has lost its
@@ -675,6 +693,7 @@ a floating one moves the bytes the client pinned.
 | Agent forwarding | Bidirectional proxying, the channel cap, ids never reused, fail-fast while detached, and off unless asked for. | `tests/session.rs` |
 | Relay | Bulk traffic both ways through `nomux attach`, byte-exact, over both the `splice` and copying paths of §7. | `tests/session.rs` |
 | Shutdown | A daemon that reaps itself runs `terminate` to completion and unlinks its run files. | `tests/session.rs` |
+| Spawn lock | Collection against a lock somebody else holds: `list` leaves the entry alone, `kill` exits non-zero rather than claiming it, and an attach whose lock file is collected while it waits goes back for the file that replaced it. | `tests/spawn_lock.rs` |
 
 The two invariants that matter: **no duplicated input, ever**, and **no lost output
 unless a `Gap` was reported**.
