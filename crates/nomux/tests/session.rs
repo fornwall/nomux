@@ -477,17 +477,35 @@ fn a_symlinked_run_directory_is_refused_by_attach_and_daemon() {
     fs::set_permissions(&target, fs::Permissions::from_mode(0o777)).expect("loosen the target");
     std::os::unix::fs::symlink(&target, root.join("nomux")).expect("plant the symlink");
 
-    for mode in ["attach", "daemon"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_nomux"))
-            .args([mode, "symdir"])
+    let refusals: Vec<(&str, bool, String)> = ["attach", "daemon"]
+        .into_iter()
+        .map(|mode| {
+            let output = Command::new(env!("CARGO_BIN_EXE_nomux"))
+                .args([mode, "symdir"])
+                .env("XDG_RUNTIME_DIR", &root)
+                .env("SHELL", "/bin/sh")
+                .stdin(Stdio::null())
+                .output()
+                .expect("run nomux");
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            (mode, output.status.success(), stderr)
+        })
+        .collect();
+
+    // Before the assertions, because the thing being asserted is that no session was
+    // started — and a failure here means one *was*, in nobody's process group, with a
+    // seven-day idle limit rather than the thirty seconds of a session no client ever
+    // reached. Nothing else in this test would collect it.
+    drop(
+        Command::new(env!("CARGO_BIN_EXE_nomux"))
+            .args(["kill", "symdir"])
             .env("XDG_RUNTIME_DIR", &root)
-            .env("SHELL", "/bin/sh")
-            .stdin(Stdio::null())
-            .output()
-            .expect("run nomux");
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            .output(),
+    );
+
+    for (mode, started, stderr) in &refusals {
         assert!(
-            !output.status.success(),
+            !started,
             "{mode} started a session in a symlinked run directory"
         );
         assert!(
@@ -626,13 +644,18 @@ fn a_child_that_stops_reading_input_does_not_wedge_the_daemon() {
     // quietly dropping the overflow: in canonical mode a line longer than the
     // buffer is discarded, and the master write never blocks at all. `sleep` then
     // holds the terminal without reading it, so everything below piles up.
-    let start = b"echo NOMUX-RAW; stty raw -echo; sleep 30\n";
+    //
+    // The marker follows the `stty` and uses arithmetic for the same reason as in
+    // `input_the_child_never_reads_…`: emitted before it, and without something the
+    // echo of the command line cannot also contain, the wait is satisfied by the line
+    // discipline echoing the command back — and the pile-up below would then be
+    // discarded rather than blocking, which is a test that passes without testing.
+    let start = b"stty raw -echo; echo \"NOMUX-$((6*7))-RAW\"; sleep 30\n";
     client.send(&Frame::Input {
         offset: 0,
         data: start,
     });
-    let (_, _) = client.read_until("NOMUX-RAW", ok.resume_from);
-    thread::sleep(Duration::from_millis(200));
+    let (_, _) = client.read_until("NOMUX-42-RAW", ok.resume_from);
 
     let chunk = vec![b'x'; 16 * 1024];
     let mut offset = start.len() as u64;
@@ -694,17 +717,22 @@ fn input_the_child_never_reads_is_back_pressured_rather_than_buffered() {
     // quietly dropping the overflow: in canonical mode a line longer than the buffer
     // is discarded and the master never stops accepting. `sleep` then holds the
     // terminal without reading a byte of it.
-    let setup = b"echo \"NOMUX-$((6*7))-RAW\"; stty raw -echo; sleep 30\n";
+    let setup = b"stty raw -echo; echo \"NOMUX-$((6*7))-RAW\"; sleep 30\n";
     client.send(&Frame::Input {
         offset: 0,
         data: setup,
     });
-    // The arithmetic distinguishes the shell's output from the line discipline's
-    // echo of the command, which arrives first — waiting for the wrong one would
-    // start the blast while the terminal was still canonical. Seeing it also settles
-    // `in_applied` at `setup.len()`, which is where the blast has to continue from.
+    // The marker is emitted *after* the `stty`, so seeing it is what proves raw mode
+    // is already in effect — emitted before, it proves only that the shell reached
+    // the line, and a blast that started while the terminal was still canonical would
+    // be silently discarded by the line discipline and the test would accuse the
+    // daemon of a bug it does not have. The arithmetic distinguishes the shell's
+    // output from the line discipline's echo of the command itself, which arrives
+    // first and carries `$((6*7))` unexpanded. Seeing it also settles `in_applied` at
+    // `setup.len()`, which is where the blast has to continue from. No settling sleep
+    // is needed after it: the whole line is parsed before any of it runs, so the
+    // shell reads nothing more until `sleep 30` returns.
     client.read_until("NOMUX-42-RAW", ok.resume_from);
-    thread::sleep(Duration::from_millis(200));
     drop(client);
 
     // A raw socket rather than the harness client, because the question is how much
@@ -1404,6 +1432,9 @@ fn a_signalled_daemon_collects_a_process_that_ignores_sighup() {
     let (seen, _) = client.read_until("-NOMUX-ORPHAN-42", ok.resume_from);
     let orphan = trailing_pid(&seen, "-NOMUX-ORPHAN-42")
         .unwrap_or_else(|| panic!("no background pid in the transcript: {seen:?}"));
+    // Everything below is an assertion about a process that is deliberately in
+    // nobody's reach: if one of them fires, `sleep 300` outlives the whole suite.
+    let _collected = Reaper(orphan);
     assert!(
         process_alive(orphan),
         "the backgrounded process was gone before the session ended"
@@ -1447,6 +1478,24 @@ fn a_signalled_daemon_collects_a_process_that_ignores_sighup() {
         thread::sleep(Duration::from_millis(25));
     }
     panic!("pid {orphan} outlived the session it was backgrounded in");
+}
+
+/// Kills a pid when it goes out of scope.
+///
+/// The processes these tests background are backgrounded *on purpose*, so nothing
+/// else reaps them: a `sleep 300` left behind by a failing assertion is still there
+/// when the next run starts, and the failure it caused is now accompanied by one it
+/// did not. Read-then-kill-then-assert says the same thing where the ordering is
+/// simple enough to arrange; this covers the case where it is not, and it fires on a
+/// panic from anywhere in between.
+struct Reaper(u32);
+
+impl Drop for Reaper {
+    fn drop(&mut self) {
+        if let Some(pid) = rustix::process::Pid::from_raw(self.0.cast_signed()) {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        }
+    }
 }
 
 /// The run of digits immediately before `marker`, as a pid.
