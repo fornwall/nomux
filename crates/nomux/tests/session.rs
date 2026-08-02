@@ -608,6 +608,114 @@ fn a_child_that_stops_reading_input_does_not_wedge_the_daemon() {
     );
 }
 
+/// A client writing faster than the child reads is back-pressured, not buffered
+/// without limit.
+///
+/// `Conn::rx` and `pending_input` had no cap, so a client could grow the daemon by
+/// however much it cared to send — and the two cheaper answers are both closed off,
+/// since `in_applied` is authoritative and exactly-once (§ 3): a byte cannot be
+/// dropped once acknowledged, and refusing one with an `InputGap` would accuse a
+/// client that had done nothing wrong. So the daemon stops reading the socket
+/// instead, exactly as the output direction always has.
+///
+/// Measured as bytes the daemon would take, which bounds what it can be holding:
+/// everything it has is a subset of what crossed the socket.
+#[test]
+fn input_the_child_never_reads_is_back_pressured_rather_than_buffered() {
+    /// Comfortably more than every buffer between the two processes put together.
+    const BLAST: usize = 32 << 20;
+    /// Room for a megabyte of queued input, a megabyte of undecoded receive buffer
+    /// and the kernel's socket buffers, and nothing like room for [`BLAST`].
+    const TOLERATED: usize = 8 << 20;
+
+    let session = Session::start("input_cap");
+    let mut client = session.connect();
+    let ok = client.hello(RESUME_FROM_START, 0);
+
+    // Raw mode is what makes the line discipline apply back pressure instead of
+    // quietly dropping the overflow: in canonical mode a line longer than the buffer
+    // is discarded and the master never stops accepting. `sleep` then holds the
+    // terminal without reading a byte of it.
+    let setup = b"echo \"NOMUX-$((6*7))-RAW\"; stty raw -echo; sleep 30\n";
+    client.send(&Frame::Input {
+        offset: 0,
+        data: setup,
+    });
+    // The arithmetic distinguishes the shell's output from the line discipline's
+    // echo of the command, which arrives first — waiting for the wrong one would
+    // start the blast while the terminal was still canonical. Seeing it also settles
+    // `in_applied` at `setup.len()`, which is where the blast has to continue from.
+    client.read_until("NOMUX-42-RAW", ok.resume_from);
+    thread::sleep(Duration::from_millis(200));
+    drop(client);
+
+    // A raw socket rather than the harness client, because the question is how much
+    // the daemon will take before it stops taking, and a blocking `write_all` has no
+    // way to say.
+    let mut blaster = UnixStream::connect(&session.socket).expect("connect");
+    let mut hello = Vec::new();
+    Frame::Hello(Hello {
+        protocol: PROTOCOL_VERSION,
+        flags: 0,
+        out_offset: RESUME_FROM_START,
+        in_offset: setup.len() as u64,
+        win: WIN,
+        term: "xterm-256color",
+    })
+    .encode(&mut hello)
+    .expect("encode hello");
+    blaster.write_all(&hello).expect("write hello");
+    blaster.set_nonblocking(true).expect("stop blocking");
+
+    let chunk = vec![b'x'; 60 * 1024];
+    let mut frames = Vec::with_capacity(BLAST + chunk.len());
+    let mut offset = setup.len() as u64;
+    while frames.len() < BLAST {
+        Frame::Input {
+            offset,
+            data: &chunk,
+        }
+        .encode(&mut frames)
+        .expect("encode input");
+        offset += chunk.len() as u64;
+    }
+
+    // Stops once the socket has refused everything for a while, which is the daemon
+    // having stopped reading — the behaviour under test rather than a timeout.
+    let mut sent = 0;
+    let mut progressed = Instant::now();
+    while sent < frames.len() && progressed.elapsed() < Duration::from_secs(3) {
+        match blaster.write(&frames[sent..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                sent += n;
+                progressed = Instant::now();
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => break,
+        }
+    }
+    assert!(
+        sent < TOLERATED,
+        "the daemon took {sent} bytes of input for a child that read none of them"
+    );
+
+    // And it is still serving. A fresh connection is never held back — that is what
+    // keeps `list` and the spawn race working (§ 6.6) — so the handshake it gets
+    // back is both proof the loop is alive and a statement about the input the
+    // daemon really did accept.
+    let mut client = session.connect();
+    let resumed = client.hello(RESUME_FROM_START, offset);
+    let applied = resumed.in_applied.saturating_sub(setup.len() as u64);
+    assert!(applied > 0, "the daemon applied none of the input it took");
+    assert!(
+        applied <= sent as u64,
+        "the daemon applied {applied} bytes of input from {sent} bytes of frames"
+    );
+}
+
 /// The daemon must not hold the directory it was started in — that pins a mount
 /// for the life of the session — while the shell must still start where sshd
 /// would have started it.

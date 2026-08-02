@@ -131,7 +131,8 @@ Ownership, not durability: the master is non-blocking (§6.1), so a child that h
 stopped reading leaves input queued for as long as it likes, and waiting for the
 write would stall the ack behind it. The queue is in the daemon's own memory and is
 never re-applied, so the client's invariant holds; and losing it means losing the
-daemon, which ends the session anyway.
+daemon, which ends the session anyway. Bounded, though — §4.1 says by what, and what
+the daemon does instead once it is full.
 
 The other half of the invariant is the client's. An `Input` frame that was written
 but not yet read is **not** safe: a client that closes with output still queued
@@ -168,6 +169,28 @@ cost someone their session.
 The PTY drain must never block on a slow or absent client. Precedence: keep reading
 the PTY, drop from the ring's head. A stalled client causes a gap, never a frozen
 shell.
+
+The input direction cannot be answered that way. `in_applied` is authoritative and
+exactly-once (§3), so a byte the daemon has acknowledged has to reach the PTY:
+dropping it is not available, and refusing it with `Error{INPUT_GAP}` would accuse a
+client that had done nothing wrong. So the daemon stops **reading the client socket**
+once a megabyte is queued for a child that is not taking it. The bytes wait in the
+kernel's buffer, where the peer blocks on them — the same argument §6.7 makes for a
+saturated agent channel. The receive buffer is capped for the same reason: filling it
+loops until `EAGAIN`, and against a peer that keeps writing that loop has no end,
+since every chunk taken frees exactly that much room to refill.
+
+While it holds, the client is left out of the poll set rather than registered wanting
+nothing: `POLLHUP` is reported whatever the mask says, and the only answer to that
+wakeup is a read. Nothing can wedge, because a non-empty queue is exactly what puts
+the master in the set asking for `POLLOUT`, and draining it re-arms the client on the
+pass after.
+
+The cost is that a client's own control frames — `Ping`, `Resize`, `Detach` — queue
+behind its own stalled input. That is accepted; it is being held back on input, and
+nothing that has to work regardless goes through this path. A *new* connection is
+never held back, since it is polled as pending rather than as the client, so `list`
+and the spawn race of §6.3 are unaffected — and `nomux kill` is a signal (§6.5).
 
 ### 4.2 Attach with `from < base_offset`
 
@@ -298,7 +321,8 @@ input buffer, and in raw mode the line discipline throttles rather than discardi
 — so a blocking `write` parks the whole event loop inside the kernel until the
 child reads again, freezing output for a session whose only fault was a `sleep`.
 Unwritten input waits in the daemon's queue instead, and the poll set asks for
-`POLLOUT` only while there is something to write.
+`POLLOUT` only while there is something to write — and stops asking the client for
+`POLLIN` once that queue is full (§4.1).
 
 The poll set is variable-length and each entry is tagged with what it belongs to,
 rather than being read back by position. Agent forwarding makes the size depend on
@@ -721,6 +745,7 @@ a floating one moves the bytes the client pinned.
 | Exactly-once input | The §3 scenario, replayed from a randomly chosen earlier offset after every disconnect. | `tests/chaos.rs` |
 | Session | Spawn daemon → write → sever the socket mid-stream → reattach → assert the output resumes exactly where it left off. | `tests/session.rs` |
 | Gap | Capacity forced small; assert `Gap` is emitted and `base_offset` is exact. | `tests/session.rs`, `tests/chaos.rs` |
+| Backpressure | A client blasting input at a child that reads none of it has its socket refuse long before the daemon has taken a fraction of it, and the session still serves a new client afterwards. | `tests/session.rs` |
 | Chaos | Randomised disconnect injection, seeded and reproducible, under an escape-heavy full-screen stream and under `yes`. | `tests/chaos.rs` |
 | Agent forwarding | Bidirectional proxying, the channel cap, ids never reused, fail-fast while detached, and off unless asked for. | `tests/session.rs` |
 | Relay | Bulk traffic both ways through `nomux attach`, byte-exact, over both the `splice` and copying paths of §7. | `tests/session.rs` |

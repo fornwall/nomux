@@ -110,6 +110,21 @@ const SETTLE_BEFORE_POLL: bool = cfg!(nomux_fault_injection) || cfg!(nomux_fault
 /// How long that pause is.
 const FAULT_SETTLE: Duration = Duration::from_millis(20);
 
+/// Stop reading the client once this much input is already queued for a PTY that is
+/// not taking it.
+///
+/// The mirror of the output direction's budget, and for the same reason: the socket
+/// stops being drained, the bytes wait in the kernel's buffer, and the peer blocks
+/// on them. Neither of the cheaper answers is available here — `in_applied` is
+/// authoritative and exactly-once (`IMPLEMENTATION.md` § 3), so a byte cannot be
+/// dropped once acknowledged, and refusing one with an `InputGap` would tell a
+/// well-behaved client it had skipped ahead when it had not.
+///
+/// A ceiling rather than a limit: `Conn::fill` decodes everything it buffered, so
+/// one pass can carry the queue up to a receive buffer past this. What matters is
+/// that both are bounded, where neither was.
+const MAX_PENDING_INPUT: usize = 1 << 20;
+
 /// Signals that mean "stop", handled so that leaving runs the shutdown path
 /// (`IMPLEMENTATION.md` § 6.5) instead of the default disposition.
 ///
@@ -473,6 +488,11 @@ impl Daemon {
         }
     }
 
+    /// Whether the PTY queue has grown past [`MAX_PENDING_INPUT`].
+    fn input_is_saturated(&self) -> bool {
+        self.pending_input.len() >= MAX_PENDING_INPUT
+    }
+
     fn should_stop(&self) -> bool {
         if self.stopping {
             return true;
@@ -514,7 +534,18 @@ impl Daemon {
         }
 
         if let Some(client) = self.client.as_ref() {
-            let mut flags = PollFlags::IN;
+            // Input already queued for a PTY that is not taking it is the only back
+            // pressure signal there is: stop reading the client until it drains, and
+            // the bytes wait in the kernel's socket buffer where the peer blocks on
+            // them. The same argument the agent channels make below. Nothing can
+            // wedge here — a non-empty queue is exactly what puts the master in the
+            // set asking for `POLLOUT`, and draining it re-arms this on the pass
+            // after.
+            let mut flags = if self.input_is_saturated() {
+                PollFlags::empty()
+            } else {
+                PollFlags::IN
+            };
             // Ring bytes still owed count as wanting to write, not just bytes
             // already encoded. `pump_output` stops at `MAX_PENDING_WRITE`, so a
             // large replay routinely ends an iteration with the queue drained and
@@ -525,7 +556,14 @@ impl Daemon {
             if client.wants_write() || (self.greeted && self.sent_through < self.ring.end()) {
                 flags |= PollFlags::OUT;
             }
-            watches.push((Source::Client, client.stream().as_fd(), flags));
+            // Left out of the set entirely rather than registered wanting nothing.
+            // `HUP` is reported whatever the mask says, so a client that has closed
+            // its sending half would wake the loop on every pass for as long as the
+            // queue stayed full — and the only answer to that wakeup is a read,
+            // which is the thing being held back.
+            if !flags.is_empty() {
+                watches.push((Source::Client, client.stream().as_fd(), flags));
+            }
         }
         if let Some(pending) = self.pending.as_ref() {
             watches.push((Source::Pending, pending.stream().as_fd(), PollFlags::IN));

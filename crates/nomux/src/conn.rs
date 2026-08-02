@@ -22,6 +22,19 @@ const MAX_PENDING_WRITE: usize = 1 << 20;
 /// can reach it.
 const ABANDON_PENDING_WRITE: usize = 8 << 20;
 
+/// Stop reading from the socket once this much undecoded input is already buffered.
+///
+/// [`Conn::fill`] loops until `EAGAIN`, and against a peer that keeps writing that
+/// loop has no natural end: every chunk it takes frees exactly that much room in the
+/// kernel's buffer for the peer to refill. The cap turns it back into back pressure,
+/// leaving the bytes where the peer blocks on them.
+///
+/// It has to stay clear of `HEADER_LEN + MAX_PAYLOAD`, which is the one thing it may
+/// not be: a frame that cannot be buffered whole is a frame [`Conn::take_frame`]
+/// never completes, and the connection would then refuse to read the rest of the
+/// frame it is waiting for.
+const MAX_PENDING_READ: usize = 1 << 20;
+
 /// Compact the receive buffer once this many consumed bytes have accumulated.
 const COMPACT_THRESHOLD: usize = 64 * 1024;
 
@@ -140,14 +153,20 @@ impl Conn {
         }
     }
 
-    /// Reads whatever the socket has available into the receive buffer.
+    /// Whether enough undecoded input is buffered that no more should be read.
+    const fn is_read_saturated(&self) -> bool {
+        self.rx.len() - self.rx_pos >= MAX_PENDING_READ
+    }
+
+    /// Reads whatever the socket has available into the receive buffer, up to
+    /// [`MAX_PENDING_READ`] still undecoded.
     ///
     /// # Errors
     ///
     /// Propagates read failures other than `EWOULDBLOCK` and `EINTR`.
     pub(crate) fn fill(&mut self) -> io::Result<()> {
         let mut chunk = [0u8; 16 * 1024];
-        loop {
+        while !self.is_read_saturated() {
             match self.stream.read(&mut chunk) {
                 Ok(0) => {
                     self.eof = true;
@@ -159,6 +178,7 @@ impl Conn {
                 Err(err) => return Err(err),
             }
         }
+        Ok(())
     }
 
     /// Writes as much of the send buffer as the socket accepts.
