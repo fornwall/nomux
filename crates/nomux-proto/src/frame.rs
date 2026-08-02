@@ -241,7 +241,12 @@ pub enum Frame<'a> {
         /// Raw bytes for the PTY master.
         data: &'a [u8],
     },
-    /// Input durably written to the PTY.
+    /// Input the daemon has taken ownership of and will never re-apply.
+    ///
+    /// Sent once the bytes are queued for the PTY master, not once `write(2)` for
+    /// them returns — see `IMPLEMENTATION.md` § 3. Ownership is what the client
+    /// needs to stop replaying them; the write cannot be lost afterwards, because
+    /// the queue outlives the connection.
     InputAck {
         /// Exclusive upper bound of applied input.
         applied_through: u64,
@@ -339,22 +344,31 @@ impl Frame<'_> {
     /// # Errors
     ///
     /// [`ProtoError::PayloadTooLarge`] if the encoded payload exceeds
-    /// [`crate::MAX_PAYLOAD`]. `out` is left unchanged in that case.
+    /// [`crate::MAX_PAYLOAD`], or [`ProtoError::Malformed`] for a field too long
+    /// for its own length prefix. `out` is left unchanged in either case.
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), ProtoError> {
+        // Checked before anything is appended, so the caller's buffer is untouched
+        // on the error path. Refused rather than truncated: this returns a
+        // `Result`, so reporting success while putting something other than what
+        // the caller passed on the wire is never the right trade. A `TERM` this
+        // long is a broken caller, and silently shortening it would open the
+        // session under a terminal type nobody chose.
+        if let Self::Hello(hello) = *self
+            && u16::try_from(hello.term.len()).is_err()
+        {
+            return Err(ProtoError::Malformed("TERM exceeds 65535 bytes"));
+        }
+
         let start = out.len();
         out.extend_from_slice(&[0; HEADER_LEN]);
         self.encode_payload(out);
 
-        let len = out.len() - start - HEADER_LEN;
-        let len = u32::try_from(len).map_err(|_| ProtoError::PayloadTooLarge(u32::MAX))?;
-        let header = encode_header(self.frame_type(), len).inspect_err(|_| out.truncate(start))?;
-        for (slot, byte) in out
-            .iter_mut()
-            .skip(start)
-            .take(HEADER_LEN)
-            .zip(header.iter())
-        {
-            *slot = *byte;
+        let header = u32::try_from(out.len() - start - HEADER_LEN)
+            .map_err(|_| ProtoError::PayloadTooLarge(u32::MAX))
+            .and_then(|len| encode_header(self.frame_type(), len))
+            .inspect_err(|_| out.truncate(start))?;
+        if let Some(slot) = out.get_mut(start..start + HEADER_LEN) {
+            slot.copy_from_slice(&header);
         }
         Ok(())
     }
@@ -367,22 +381,10 @@ impl Frame<'_> {
                 out.extend_from_slice(&hello.out_offset.to_be_bytes());
                 out.extend_from_slice(&hello.in_offset.to_be_bytes());
                 put_win(out, hello.win);
-                // A `TERM` past 64 KiB is nonsense from a broken caller, but the
-                // cut must still land on a character boundary: a frame carrying
-                // half a code point is one the peer refuses outright, which turns
-                // a silly `TERM` into a session that will not open.
-                let term = if u16::try_from(hello.term.len()).is_ok() {
-                    hello.term
-                } else {
-                    let mut end = usize::from(u16::MAX);
-                    while end > 0 && !hello.term.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    hello.term.get(..end).unwrap_or("")
-                };
-                let term_len = u16::try_from(term.len()).unwrap_or(u16::MAX);
+                // `encode` refused anything longer, so this never truncates.
+                let term_len = u16::try_from(hello.term.len()).unwrap_or(u16::MAX);
                 out.extend_from_slice(&term_len.to_be_bytes());
-                out.extend_from_slice(term.as_bytes());
+                out.extend_from_slice(hello.term.as_bytes());
             }
             Self::HelloOk(ok) => {
                 out.extend_from_slice(&ok.protocol.to_be_bytes());
@@ -433,9 +435,21 @@ impl<'a> Frame<'a> {
     /// # Errors
     ///
     /// [`ProtoError::Truncated`] if the payload ends early,
-    /// [`ProtoError::TrailingBytes`] if it is longer than the frame requires, and
-    /// [`ProtoError::Malformed`] for invalid enum discriminants or non-UTF-8 text.
+    /// [`ProtoError::TrailingBytes`] if it is longer than the frame requires,
+    /// [`ProtoError::PayloadTooLarge`] if it is longer than [`crate::MAX_PAYLOAD`],
+    /// and [`ProtoError::Malformed`] for invalid enum discriminants or non-UTF-8
+    /// text.
     pub fn decode(ty: FrameType, payload: &'a [u8]) -> Result<Self, ProtoError> {
+        // The in-tree caller reaches this only through `decode_header`, which has
+        // already applied the bound. Restated here because `decode` is public and
+        // meant to be usable on its own (`IMPLEMENTATION.md` § 1): without it a
+        // frame could decode that this crate would then refuse to encode, and the
+        // two halves would not be inverses.
+        let len = u32::try_from(payload.len()).unwrap_or(u32::MAX);
+        if len > crate::MAX_PAYLOAD {
+            return Err(ProtoError::PayloadTooLarge(len));
+        }
+
         let mut r = Reader::new(payload);
         let frame = match ty {
             FrameType::Hello => {
@@ -519,15 +533,10 @@ impl<'a> Frame<'a> {
             },
         };
 
-        // Variants ending in `rest()` have already consumed the remainder.
-        if matches!(
-            ty,
-            FrameType::Input | FrameType::Output | FrameType::Error | FrameType::AgentData
-        ) {
-            Ok(frame)
-        } else {
-            r.finish().map(|()| frame)
-        }
+        // Every fixed-size frame must have consumed its payload exactly; the
+        // variable-length ones end in `rest()`, which empties the reader, so this
+        // is vacuously true for them rather than a case to exclude.
+        r.finish().map(|()| frame)
     }
 }
 
@@ -834,5 +843,53 @@ mod tests {
             before,
             "failed encode must not leave partial data"
         );
+    }
+
+    /// `term` is length-prefixed by a `u16`, so a longer one cannot be represented.
+    /// Refused rather than truncated: `encode` reporting success while sending a
+    /// different `TERM` than it was handed would open the session under a terminal
+    /// type nobody chose, and the caller has no way to notice.
+    #[test]
+    fn an_unrepresentable_term_is_refused_rather_than_truncated() {
+        let long = "x".repeat(usize::from(u16::MAX) + 1);
+        let mut buf = b"previous frame".to_vec();
+        let before = buf.len();
+        let err = Frame::Hello(Hello {
+            protocol: PROTOCOL_VERSION,
+            flags: 0,
+            out_offset: 0,
+            in_offset: 0,
+            win: WIN,
+            term: &long,
+        })
+        .encode(&mut buf);
+
+        assert!(matches!(err, Err(ProtoError::Malformed(_))), "got {err:?}");
+        assert_eq!(buf.len(), before, "the buffer must be left untouched");
+
+        // The longest that still fits is accepted, so the boundary is exact.
+        let exact = "x".repeat(usize::from(u16::MAX));
+        round_trip(Frame::Hello(Hello {
+            protocol: PROTOCOL_VERSION,
+            flags: 0,
+            out_offset: 0,
+            in_offset: 0,
+            win: WIN,
+            term: &exact,
+        }));
+    }
+
+    /// `decode` is public and usable without `decode_header`, so it applies the
+    /// same bound rather than trusting a caller to have done it.
+    #[test]
+    fn a_payload_over_the_maximum_is_refused_by_decode() {
+        let oversized = vec![0u8; MAX_PAYLOAD as usize + 1];
+        assert_eq!(
+            Frame::decode(FrameType::Output, &oversized),
+            Err(ProtoError::PayloadTooLarge(MAX_PAYLOAD + 1))
+        );
+        // One byte under the limit still decodes, so the bound is inclusive.
+        let largest = vec![0u8; MAX_PAYLOAD as usize];
+        assert!(Frame::decode(FrameType::Output, &largest).is_ok());
     }
 }
