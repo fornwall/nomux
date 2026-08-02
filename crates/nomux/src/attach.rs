@@ -25,6 +25,13 @@ const SPAWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Delay between connect retries while waiting for the daemon.
 const SPAWN_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// Delay between checks for the pidfile the daemon publishes just after its socket.
+///
+/// Shorter than [`SPAWN_POLL_INTERVAL`] because the window it covers is two
+/// syscalls wide and is usually already over, while the wait itself is on the path
+/// of every session creation.
+const PUBLISH_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
 /// Largest transfer asked of `splice` in one call.
 ///
 /// A pipe holds 64 KiB by default, so a larger request only comes back short while
@@ -53,13 +60,19 @@ pub(crate) fn run(session_id: &str, label: Option<&str>) -> io::Result<()> {
 /// garbage collection takes the same lock (`IMPLEMENTATION.md` § 6.6): while it
 /// is held, nothing can unlink the socket this is waiting for.
 fn connect_or_spawn(paths: &SessionPaths, label: Option<&str>) -> io::Result<UnixStream> {
+    // Before the first `connect`, not on the way to spawning a daemon. The socket
+    // this is about to hand the user's keystrokes to is a *name* in the run
+    // directory (§ 6.3), and where that directory is a symlink into somewhere
+    // another user can write, the name is theirs to make: checking only when
+    // nothing answers checks only the case where nothing was planted. It costs the
+    // warm path one `open` and one `fstat`.
+    paths.ensure_dir()?;
     match UnixStream::connect(paths.socket()) {
         Ok(stream) => return Ok(stream),
         Err(err) if is_absent(&err) => {}
         Err(err) => return Err(err),
     }
 
-    paths.ensure_dir()?;
     // `lock_spawn` is where the subtlety lives: a collector may have unlinked
     // `<id>.lock` while this call was blocked on it, and a lock on a file that no
     // longer has that name is not this mutex — the next attach would create a new
@@ -78,7 +91,10 @@ fn connect_or_spawn(paths: &SessionPaths, label: Option<&str>) -> io::Result<Uni
     let deadline = Instant::now() + SPAWN_TIMEOUT;
     loop {
         match UnixStream::connect(paths.socket()) {
-            Ok(stream) => return Ok(stream),
+            Ok(stream) => {
+                await_publication(paths, deadline);
+                return Ok(stream);
+            }
             Err(err) if is_absent(&err) => {
                 if Instant::now() >= deadline {
                     return Err(io::Error::new(
@@ -90,6 +106,28 @@ fn connect_or_spawn(paths: &SessionPaths, label: Option<&str>) -> io::Result<Uni
             }
             Err(err) => return Err(err),
         }
+    }
+}
+
+/// Keeps the spawn lock until the daemon this attach started has published
+/// `<id>.pid`.
+///
+/// This is what makes the lock mean what the rest of the layout assumes it means.
+/// The daemon binds its socket before it writes the pidfile (§ 6.2), so a `connect`
+/// that succeeds says the id is claimed — not that anything on disk says so yet.
+/// Returning here the instant it succeeded would drop the lock inside that window,
+/// and "the lock is free" would not imply "the id is unclaimed": a `kill` taking it
+/// there finds a live daemon and no pid, and the version of `kill` that answered
+/// that by unlinking all five files left a daemon holding the user's shell with no
+/// socket to reach it by, and the id free for a second daemon to bind.
+///
+/// Bounded by the caller's own deadline and never fatal. The pidfile belongs to
+/// `kill`, not to the relay, so a daemon that never writes one still gets its
+/// client — `kill` has its own answer for that (`control::resolve`), and it is not
+/// this connection's business.
+fn await_publication(paths: &SessionPaths, deadline: Instant) {
+    while !paths.pid().exists() && Instant::now() < deadline {
+        std::thread::sleep(PUBLISH_POLL_INTERVAL);
     }
 }
 
