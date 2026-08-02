@@ -442,21 +442,41 @@ Path precedence:
 1. `$XDG_RUNTIME_DIR/nomux/<id>.sock` — tmpfs, but removed on last logout unless linger is on.
 2. `$XDG_STATE_HOME/nomux/run/<id>.sock`, default `~/.local/state/nomux/run/`.
 
-Directory `0700`, socket `0600`. Filesystem sockets only — never abstract sockets,
-which are namespace- rather than permission-scoped and would be reachable by any
-local user.
+Directory `0700`, socket `0600`, and the three plain files — pidfile, lock, label —
+`0600` as well. Every one of those is exact rather than an upper bound: the umask is
+suppressed around each creating call, since `mkdir`, `bind` and `open` all subtract
+it, and a `<id>.lock` created `0400` under `umask 0200` is one no later process can
+open at all, which loses the mutex the control surface rests on. Filesystem sockets
+only — never abstract sockets, which are namespace- rather than permission-scoped
+and would be reachable by any local user.
 
 The directory is *checked* rather than merely created, because on every run but the
 first it already exists, and that it exists says nothing about what it is. It is
 opened `O_DIRECTORY | O_NOFOLLOW` and `fstat`ed: a symlink or a non-directory is
 refused, so is one belonging to another uid, and so is one that group or other can
 write to — whoever had that could have left a socket of their own at a session id
-about to be connected to, and no later `chmod` un-plants it. A merely readable mode
-is tightened instead, through the descriptor rather than the path, since that is
-what an earlier version or an odd umask leaves behind and it discloses the ids and
-the labels rather than granting anything. Refusal here is hard, where everything
-else in the daemon degrades: a run directory that is not what it claims to be is
-not somewhere to start a session.
+about to be connected to, and no later `chmod` un-plants it. Refusal here is hard,
+where everything else in the daemon degrades: a run directory that is not what it
+claims to be is not somewhere to start a session.
+
+Every other mode is *repaired* to exactly `0700`, through the descriptor already
+checked rather than through the path. That covers a group- or other-readable mode,
+which discloses the ids and the labels and grants nothing else; an owner bit that is
+missing rather than spare, which an odd umask under an older version leaves behind;
+and `setgid` or `sticky`, harmless in themselves but not the stated mode. The one
+mode that cannot be repaired is one the owner cannot *open* — there is no descriptor
+to `fchmod` through, and a `chmod` by name would resolve the path the `O_NOFOLLOW`
+exists to stop resolving twice — so that is refused, and reported as a judgement on
+the mode rather than as an `EACCES` from a syscall.
+
+The check belongs to every mode that touches the directory, before the first name in
+it is resolved: `attach` before its *first* `connect`, not only on the way to
+spawning a daemon; `list` before it reads the directory; `kill` before it reads a pid
+and signals it; the daemon before it binds. Checking after connecting checks only the
+case where nothing was planted — with a socket already at the path, the relay hands
+the user's keystrokes to whoever bound it. `list` and `kill` check without creating:
+being asked what sessions exist must not be what brings the run directory into
+existence, so a host that has never run one lists nothing and exits 0.
 
 The run files are then opened by name rather than relative to that descriptor.
 There is no `bindat(2)`, so the socket and the agent socket — the two that decide
@@ -474,6 +494,14 @@ loser blocks there, then finds the socket the winner bound and connects to it. O
 a process that spawns its own daemon polls, and only for its own. A stale socket is one where `connect`
 returns `ECONNREFUSED` — unlink and respawn. `EACCES` is not staleness.
 
+The lock is held past the `connect` that succeeds, until `<id>.pid` exists. The
+daemon binds its socket before it writes that file (§6.2), so a `connect` that
+succeeds says the id is claimed and not that anything on disk says so yet; releasing
+there would make "the lock is free" mean something weaker than "the id is
+unclaimed", and `kill` taking it inside that window finds a live daemon and no pid
+to signal. The wait is bounded by the same spawn timeout and is never fatal — the
+pidfile belongs to `kill`, not to the relay.
+
 `<id>.lock` is also one of the files garbage collection removes (§6.6), and that
 makes the lock and the file two different things: `flock` attaches to the inode,
 so a lock held on a file that has since been unlinked is a lock nobody else can
@@ -482,7 +510,23 @@ instead. Two processes, a mutex each, two daemons for one session. Both sides
 therefore obey one protocol. Collection takes the lock before it removes anything
 and skips what it cannot get. Every acquirer, having got the lock, confirms that
 what it locked is still the file at that path — `fstat` against `stat`, comparing
-device and inode — and goes back for the real one if it is not.
+device and inode — and goes back for the real one if it is not. And the lock is
+removed **last** of the five: from the moment its name is gone the caller's lock
+guards nothing, so an unlink still to come lands on a session the next acquirer has
+legitimately brought up in the meantime — silently, in the case of `<id>.label` and
+of the `<id>.agent` socket the child's `SSH_AUTH_SOCK` points at.
+
+A lock that cannot be had *at all* — `<id>.lock` will not open, the filesystem does
+not implement `flock`, the run directory is read-only or over quota — is answered by
+proceeding without one, deliberately. The reason to take a mutex is that somebody
+else might hold it, and a lock this process cannot obtain by any means is one no
+other process here can be holding either: every one of them reaches it through the
+same call, on the same file, under the same uid. Refusing would buy nothing and
+would cost the escape hatch of §6.6, which must be able to collect a dead session on
+any host. What is given up is serialisation against a concurrent attach, which is
+what this layout had before the lock existed and which the daemon's own `bind` still
+backstops by refusing an id whose socket already answers. Only `EWOULDBLOCK` — a
+lock somebody is genuinely holding — makes a caller wait, skip or refuse.
 
 ### 6.4 Multiple clients
 
@@ -600,15 +644,18 @@ The contract is therefore the **on-disk layout**, not a protocol subset:
 
 ```
 $RUNDIR/<id>.sock    unix socket   0600
-$RUNDIR/<id>.pid     daemon pid, ASCII, newline-terminated
-$RUNDIR/<id>.lock    flock target for spawn races
-$RUNDIR/<id>.label   UTF-8 display label, no newline, <= 256 bytes
+$RUNDIR/<id>.pid     daemon pid, ASCII, newline-terminated, 0600
+$RUNDIR/<id>.lock    flock target for spawn races, 0600
+$RUNDIR/<id>.label   UTF-8 display label, no newline, <= 256 bytes, 0600
 $RUNDIR/<id>.agent   ssh-agent socket, 0600 (§6.7)
 ```
 
+- Both establish first that the run directory is this user's alone (§6.3), before any name in it is read, connected to or signalled. Neither creates it: on a host that has never run a session, `list` prints nothing and exits 0, and `kill` reports the "no such session" that already holds.
 - `list` reads the directory and probes each socket with `connect`; `ECONNREFUSED` means stale, and stale entries are unlinked. The probe is safe because connecting is not attaching (§6.4) — it costs a live session nothing.
-- Unlinking happens under `<id>.lock`, and the probe is repeated once it is held, since that is the only point at which the answer cannot change between being read and being acted on. An entry whose lock somebody else holds is skipped: it is a session being started rather than garbage, and it stays collectable for as long as it stays dead.
-- `kill` takes `<id>.lock` first and holds it to the end, so nothing can spawn into the id it is removing; then reads the pidfile, sends `SIGTERM`, waits up to 2 s, then `SIGKILL`, then unlinks all five files. It waits up to 2 s for that lock — which is long enough to win the race against an attach creating the session, rather than merely lose it — and exits non-zero rather than reporting a "no such session" it did not establish.
+- Unlinking happens under `<id>.lock`, and the probe is repeated once it is held, since that is the only point at which the answer cannot change between being read and being acted on. An entry whose lock somebody else holds is skipped: it is a session being started rather than garbage, and it stays collectable for as long as it stays dead. An entry whose lock is not *obtainable at all* is collected anyway, per §6.3 — a collector that stops collecting because of the mutex protecting it leaks under exactly the conditions it exists for.
+- `kill` takes `<id>.lock` first and holds it to the end, so nothing can spawn into the id it is removing; then probes the socket, reads the pidfile, sends `SIGTERM`, waits up to 2 s, then `SIGKILL`, then unlinks all five files. It waits up to 2 s for that lock — which is long enough to win the race against an attach creating the session, rather than merely lose it.
+- **A live session's files are never unlinked.** Where the socket answers and the pidfile cannot be read, `kill` exits non-zero and leaves all five alone. Removing them there takes the socket away from a daemon that is still holding the user's shell: the session answers nothing, appears in no listing, and the id is free for a second daemon to bind over. The one benign reason for that state is the daemon's own bind-to-publish window (§6.2), so a *missing* pidfile is waited out for 2 s; a mode that hides it, or a body that is not a pid, is reported at once, since waiting cannot change either.
+- `kill` exits non-zero rather than reporting a "no such session" it did not establish. Two states do that, and both are honest rather than ideal: the live-but-unreadable case above, and a lock still held at the 2 s deadline. That deadline is shorter than the five seconds an attach spends waiting for a daemon that never starts, so an attach parked on that timeout makes `kill` report a session that by then does not exist. The attach is about to fail, and its own failure is the better account of what happened.
 
 `<id>.label` exists because ids are opaque per-tab identifiers
 ([DESIGN.md § 5.1](DESIGN.md#51-identity)). Without it, a client that has lost its
