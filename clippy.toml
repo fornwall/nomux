@@ -1,4 +1,5 @@
-msrv = "1.97.1"
+# No `msrv` key: clippy reads `rust-version` from Cargo.toml, and stating it twice
+# is one more place for the pin to drift.
 
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true

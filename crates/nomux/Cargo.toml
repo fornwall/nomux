@@ -13,7 +13,7 @@ categories.workspace = true
 
 [dependencies]
 nomux-proto.workspace = true
-rustix = { version = "1.1.4", features = ["pty", "termios", "process", "event", "fs", "stdio", "pipe"] }
+rustix = { version = "1.1.4", features = ["pty", "termios", "process", "event", "fs", "pipe"] }
 # Only for `signal`: rustix's equivalent lives in its `runtime` module, which is
 # documented as unusable in a process that has a libc — which this one does, via
 # std. Declarations only, so it costs nothing in the binary, and it is already in

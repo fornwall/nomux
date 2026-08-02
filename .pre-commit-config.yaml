@@ -8,6 +8,16 @@
 repos:
   - repo: local
     hooks:
+      # The release build and the takeover guard are shell, and both had defects
+      # that no Rust hook could ever have looked at — an unquoted exit status
+      # compared as a boolean, in a script whose whole job is asserting a specific
+      # failure. Cheapest hook here, and it runs first for that reason.
+      - id: shellcheck
+        name: shellcheck
+        entry: shellcheck --shell=sh
+        language: system
+        files: '\.sh$'
+
       - id: cargo-fmt
         name: cargo fmt --check
         entry: cargo fmt --all --check

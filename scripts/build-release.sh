@@ -33,14 +33,17 @@
 # The panic machinery — formatting, backtrace symbolisation, gimli, addr2line — is
 # most of it, and it cannot be dropped from a precompiled std no matter how the
 # release profile is tuned. Rebuilding std from source with -Cpanic=immediate-abort
-# turns every panic into a bare trap and takes x86_64 from 476 KiB to 133 KiB. Without
-# it the budget is missed on every target — armv7 has squeaked under, by a margin too
-# thin to plan around — and with it all four clear it by ~3x. So it is not an
-# optimisation, it is the only configuration that ships. The cost is a
-# nightly compiler and panics that abort with no message — acceptable only because the
-# clippy wall in Cargo.toml already denies unwrap, expect, panic and indexing. Point
-# NOMUX_NIGHTLY at a dated nightly for a real release: a floating one is a moving
-# target, and the SHA-256 the client pins would drift under it.
+# turns every panic into a bare trap and takes x86_64 from 493 KiB to 147 KiB. The
+# budget is missed on every target without it — 440 to 493 KiB against a 400 KiB cap,
+# armv7 included — and cleared by roughly 3x with it. So it is not an optimisation, it
+# is the only configuration that ships. The cost is a nightly compiler and panics that
+# abort with no message — acceptable only because the clippy wall in Cargo.toml
+# already denies unwrap, expect, panic and indexing. Point NOMUX_NIGHTLY at a dated
+# nightly for a real release: a floating one is a moving target, and the SHA-256 the
+# client pins would drift under it.
+#
+# The figures above are what this script prints; see IMPLEMENTATION.md § 8 for the
+# per-target table. Re-measure with NOMUX_STABLE_STD=1 rather than trusting them.
 #
 # Set NOMUX_STABLE_STD=1 to build against the pinned stable toolchain's released std
 # instead. Expect it to fail the size gate; it is kept to make that cost visible and
@@ -119,8 +122,25 @@ mkdir -p "$dist"
 
 for target in $targets; do
     echo "building $target ($toolchain)..." >&2
-    RUSTFLAGS="$rustflags" cargo build --release --target "$target" --bin nomux "$@" >&2
+    RUSTFLAGS="$rustflags" cargo build --locked --release --target "$target" --bin nomux "$@" >&2
     cp "${CARGO_TARGET_DIR:-$repo/target}/$target/release/nomux" "$dist/nomux-$target"
+
+    # The remap check, actually run. Two clean builds on one machine are
+    # byte-identical with or without --remap-path-prefix, so comparing them proves
+    # nothing about the next machine; what does is that no builder-specific path
+    # survives in the artifact. Without this the flags above could stop matching —
+    # a moved $CARGO_HOME, a new sysroot layout — and nothing would say so until a
+    # client somewhere failed a checksum it could not diagnose.
+    # `-a` is load-bearing: without it grep classifies the artifact as binary and
+    # reports no match even where one exists, so the check would silently pass on
+    # every input and prove nothing.
+    for leak in "${CARGO_HOME:-$HOME/.cargo}" "$sysroot" "$repo"; do
+        if LC_ALL=C grep -qaF -- "$leak" "$dist/nomux-$target"; then
+            echo "FAIL: $target embeds the build path $leak" >&2
+            echo "      the artifact is reproducible only on this machine." >&2
+            exit 1
+        fi
+    done
 done
 
 # Emitted in `sha256sum -c` format so a verifier needs no bespoke tooling.

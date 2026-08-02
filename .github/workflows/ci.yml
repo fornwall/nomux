@@ -48,14 +48,16 @@ jobs:
 
       # No `-D warnings`: the deny lives in [workspace.lints], so cargo, clippy and
       # rust-analyzer agree without RUSTFLAGS-induced cache thrash. See README § Build.
-      - run: cargo clippy --workspace --all-targets
+      - run: cargo clippy --locked --workspace --all-targets
 
       # `--run-ignored all`: the ignored tests are the ones that sit out a real
       # reaping timeout. Too slow for a pre-commit hook, exactly what CI is for.
-      - run: cargo nextest run --workspace --run-ignored all
+      # `--no-fail-fast`: one failure should not hide the state of everything
+      # else, which is most of the value of a CI run over a local one.
+      - run: cargo nextest run --locked --workspace --run-ignored all --no-fail-fast
 
       # nextest cannot run doctests.
-      - run: cargo test --doc --workspace
+      - run: cargo test --locked --doc --workspace
 
   # Its own job: the script rebuilds the whole workspace under
   # `--cfg nomux_fault_injection`, which shares no artifacts with the job above, and
@@ -109,7 +111,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: musl
+          key: musl-${{ env.NOMUX_NIGHTLY }}
 
       # Owns the target list and the size budget; exits non-zero if a binary is over.
       - run: sh scripts/build-release.sh
+
+      # The checksums are the point of this job — the client pins one per
+      # architecture — so they have to outlive the log they were printed to.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: musl-binaries
+          path: target/dist/
+          if-no-files-found: error
+
