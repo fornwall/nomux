@@ -111,6 +111,16 @@ fn an_attach_re_takes_a_spawn_lock_that_was_collected() {
     let session = StaleSession::empty("lk3");
     let lock = session.hold_lock();
     let orphan = lock.metadata().expect("stat the held lock").ino();
+    // A second descriptor on the same file, carrying no lock of its own: an inode
+    // number is reusable the moment its last reference goes, and the attach closes
+    // the orphan before reopening the path. ext4 then hands the same number
+    // straight back to the file created there, and the assertion below compares a
+    // genuinely fresh file against a number it inherited — which is why this test
+    // passes on tmpfs, where numbers are allocated monotonically, and fails on
+    // ext4. Holding the inode open keeps its number out of circulation, so what
+    // the assertion reports is the identity of the file rather than the
+    // allocation policy of whichever filesystem the target directory sits on.
+    let pinned = File::open(session.lock_path()).expect("pin the orphan inode");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_nomux"))
         .args(["attach", &session.id])
@@ -140,6 +150,7 @@ fn an_attach_re_takes_a_spawn_lock_that_was_collected() {
         orphan,
         "the file at the path must be a new one, not the inode that was unlinked"
     );
+    drop(pinned);
 
     drop(child.kill());
     drop(child.wait());
