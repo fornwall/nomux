@@ -149,8 +149,9 @@ both, at the cost of the session-list UI this project exists to avoid).
 
 ### 5.2 Reaping
 
-A detached session exits on its own after a long idle period, default 7 days,
-measured as **time since last detach**.
+A detached session exits on its own after a long idle period — 7 days, not
+currently tunable — measured as **time since last detach**. A session that never
+saw its first client is reaped after 30 s instead.
 
 Output volume is not usable as the signal: it cannot distinguish a multi-hour build
 that must survive from a `tail -f` that could run forever, and a shell sitting at a
@@ -308,4 +309,4 @@ The combination — zero-install, no new ports, byte-exact — does not exist to
 
 - Default ring capacity: 4 MiB covers a multi-hour idle disconnect but not `yes` for ten seconds. Fixed, or client-negotiated in `Hello`? Now multiplied by the §5.1 cap — eight sessions at 4 MiB is 32 MiB resident on a host whose administrator never agreed to any of this.
 - Optional `libvterm` screen snapshot on overflow, to replace the SIGWINCH repaint heuristic with an exact redraw. Adds a C dependency and ~100 KiB; deferred until the heuristic proves insufficient.
-- Cross-device handover (start on desktop, resume on mobile). Deferred. It needs no new concurrency — takeover (§6.4) is already the right primitive, since handover is serial — but it does need three things: a `u64::MAX` "tell me" sentinel for `Hello.in_offset` mirroring the output side, a rule that clients never auto-reconnect after `Error{TAKEOVER}` (otherwise two resilient clients evict each other forever), and geometry-conditional replay, because scrollback carries absolute cursor positioning computed for the old width.
+- Cross-device handover (start on desktop, resume on mobile). Deferred. It needs no new concurrency — takeover ([IMPLEMENTATION.md § 6.4](IMPLEMENTATION.md#64-multiple-clients)) is already the right primitive, since handover is serial — but it does need three things: a `u64::MAX` "tell me" sentinel for `Hello.in_offset` mirroring the output side, a rule that clients never auto-reconnect after `Error{TAKEOVER}` (otherwise two resilient clients evict each other forever), and geometry-conditional replay, because scrollback carries absolute cursor positioning computed for the old width.

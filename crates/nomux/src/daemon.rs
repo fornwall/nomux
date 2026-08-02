@@ -1,9 +1,10 @@
 //! The session daemon: owns the PTY, the ring buffer and the listening socket.
 //!
-//! Single-threaded around `poll`. There is at most one client (`DESIGN.md` § 6.4),
-//! so the poll set is small: the listener, the PTY master, the client if one is
-//! attached, and — when agent forwarding is on — the agent socket plus one entry
-//! per live channel.
+//! Single-threaded around `poll`. There is at most one client
+//! (`IMPLEMENTATION.md` § 6.4), so the poll set is small: the listener, the PTY
+//! master, the client if one is attached, the connection that has not greeted yet,
+//! and — when agent forwarding is on — the agent socket plus one entry per live
+//! channel.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -488,7 +489,7 @@ impl Daemon {
     /// spawn race in § 6.3 — if that counted as a takeover, listing sessions would
     /// evict the user from all of them, and the client is told never to
     /// auto-reconnect after `TAKEOVER`. So the takeover is triggered by the
-    /// `Hello`, exactly as `DESIGN.md` § 6.4 words it, and a connection that never
+    /// `Hello`, exactly as `IMPLEMENTATION.md` § 6.4 words it, and a connection that never
     /// greets costs the session nothing.
     /// Never fails. `EMFILE`, `ECONNABORTED` and friends belong to one connection
     /// and are transient; propagating them would destroy a live session over a
@@ -577,7 +578,7 @@ impl Daemon {
     }
 
     /// Hands the session over: the previous connection is usually one the daemon
-    /// has not yet noticed is dead (`DESIGN.md` § 6.4).
+    /// has not yet noticed is dead (`IMPLEMENTATION.md` § 6.4).
     fn evict_client(&mut self) {
         if let Some(mut old) = self.client.take() {
             old.send_last(&Frame::Error {

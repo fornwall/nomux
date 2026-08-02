@@ -15,6 +15,8 @@ nomux list                  List sessions in the run directory
 nomux kill <session-id>     Terminate a session and unlink its run files
 
   --label <text>            Display name for `list`, recorded at session creation
+  --version, -V             Print version and protocol revision
+  --help, -h                Print this usage
 ```
 
 Four properties drive the design:
@@ -106,9 +108,10 @@ by byte offset across a severed connection, agent forwarding proxies `ssh-agent`
 over the same channel, `attach` spawns a daemon on demand and relays, and
 `list`/`kill` operate on the run directory alone.
 
-Everything left is either client-side — `direct-streamlocal`, bootstrap
-orchestration, emulator reset on gap — or a decision deliberately deferred. See
-[PLAN.md](PLAN.md).
+What is left is the release process — pinning the shipping nightly and publishing
+the checksums the client verifies against — plus client-side work
+(`direct-streamlocal`, bootstrap orchestration, emulator reset on gap) and a
+handful of decisions deliberately deferred. See [PLAN.md](PLAN.md).
 
 Tunables: `NOMUX_RING_BYTES` overrides the 4 MiB output ring per daemon.
 

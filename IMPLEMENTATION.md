@@ -56,8 +56,8 @@ it appears.
 | `0x08` | D→C | `Gap` | `u64` new_base_offset |
 | `0x09` | D→C | `Exit` | `i32` status, `u8` kind (0 = exited, 1 = signalled) |
 | `0x0a` | C→D | `Detach` | — |
-| `0x0b` | ↔ | `Ping` | `u64` nonce |
-| `0x0c` | ↔ | `Pong` | `u64` nonce |
+| `0x0b` | C→D | `Ping` | `u64` nonce |
+| `0x0c` | D→C | `Pong` | `u64` nonce |
 | `0x0d` | D→C | `Error` | `u16` code, UTF-8 message |
 | `0x0e` | D→C | `AgentOpen` | `u32` chan |
 | `0x0f` | ↔ | `AgentData` | `u32` chan, opaque `ssh-agent` bytes |
@@ -72,7 +72,10 @@ The session id is **not** in `Hello` — it is already fixed by the socket path
 ### 2.3 Flags
 
 Both flag fields are exhaustive: an undefined bit is a protocol error, not a
-forward-compatibility case ([DESIGN.md § 2](DESIGN.md#2-scope)).
+forward-compatibility case ([DESIGN.md § 2](DESIGN.md#2-scope)). The same rule
+covers every other closed set on the wire — `Error.code`, `Exit.kind` and the
+linger field below — so an unrecognised value is refused rather than passed
+through. A peer that emits one was built from a different tree than this.
 
 `Hello.flags`:
 
@@ -99,14 +102,14 @@ Output is at-least-once and idempotent: the client discards anything below its
 
 Input must be **exactly-once** — replaying a partially applied keystroke buffer into
 a shell is how a truncated `rm -rf` gets executed. The daemon's `in_applied` is
-authoritative, advanced only after `write(2)` to the PTY master returns:
+authoritative, and it advances the moment the daemon takes ownership of the bytes:
 
 ```mermaid
 sequenceDiagram
   participant C as Client
   participant D as Daemon
   C->>D: Input{offset: 100, "ls -l" CR}
-  D->>D: write() to PTY → in_applied = 106
+  D->>D: queue for the PTY → in_applied = 106
   D--xC: InputAck{106} lost with the connection
   Note over C: still believes in_applied = 100
   C->>D: Hello{in_offset: 100}
@@ -124,12 +127,11 @@ Rules:
 - `Input` above `in_applied` is a gap in the input stream → `Error` + close. The client must not skip.
 - `OutputAck` is advisory. It never trims the ring (§4); it exists so a reconnecting client that lost its own state can be told where it was.
 
-`in_applied` advances when the daemon takes ownership of the bytes — when they are
-queued for the PTY master — not when `write(2)` for them returns. The master is
-non-blocking (§6.1), so those are different moments: a child that has stopped
-reading leaves input queued for as long as it likes. The queue is in the daemon's
-own memory and is never re-applied, so the client's invariant holds; and losing it
-means losing the daemon, which ends the session anyway.
+Ownership, not durability: the master is non-blocking (§6.1), so a child that has
+stopped reading leaves input queued for as long as it likes, and waiting for the
+write would stall the ack behind it. The queue is in the daemon's own memory and is
+never re-applied, so the client's invariant holds; and losing it means losing the
+daemon, which ends the session anyway.
 
 The other half of the invariant is the client's. An `Input` frame that was written
 but not yet read is **not** safe: a client that closes with output still queued
@@ -143,7 +145,7 @@ Fixed capacity, allocated once. `VecDeque<u8>`, drained via `as_slices` to write
 without copying.
 
 Capacity defaults to 4 MiB and is overridable per daemon with `NOMUX_RING_BYTES`.
-The right value is host-dependent — a machine running the §5.1 cap of eight sessions
+The right value is host-dependent — a machine running the DESIGN.md §5.1 cap of eight sessions
 pays it eight times over — and an unparseable or zero value falls back to the
 default rather than refusing to start, since a mistyped tuning variable should never
 cost someone their session.
@@ -156,8 +158,9 @@ cost someone their session.
    dropped                  capacity
 ```
 
-- Writer (PTY reader task) always drains the PTY, attached or not. If full, it advances `base_offset`, discarding oldest bytes, and sets `gap_pending`.
-- Reader (client writer task) serves `[max(from, base_offset) .. end_offset]`.
+- The daemon always drains the PTY, attached or not. If the ring is full it advances `base_offset`, discarding the oldest bytes. A write larger than the whole ring discards everything retained as well as its own head, so `base_offset` accounts for both.
+- A client is served `[max(from, base_offset) .. end_offset]`.
+- Overflow is not a stored flag. Whether a *reader* lost anything depends on where that reader had reached, so it is derived per client by comparing its position against `base_offset` — which stays correct across any number of overflows, including ones that happened while it was away.
 - Never trimmed on ack. A full rolling window is the scrollback a fresh client gets.
 
 ### 4.1 Backpressure
@@ -214,6 +217,22 @@ echo "NOMUX-BOOTSTRAP $(uname -s) $(uname -m) $p"
 `exec` replaces the shell on success, so the `echo` is unreachable unless the binary
 is missing or unrunnable. Warm cost: zero extra round trips.
 
+There is a **second** probe with the same prefix and a different vocabulary, and the
+client must not confuse them. The line above is emitted by `sh` before any binary
+exists, so its fields are `uname`'s: `Linux`, `x86_64`, `armv7l`. The `nomux probe`
+subcommand is emitted by an already-installed binary, and reports Rust's
+compile-time constants instead — lowercase `linux`, and `arm` where `uname -m` says
+`armv7l`:
+
+```
+NOMUX-BOOTSTRAP linux aarch64 /home/u/.local/share/nomux
+```
+
+That difference is deliberate. The shell probe answers "what should I upload?", so
+it has to describe the *host*; `nomux probe` answers "what is actually installed
+here?", so it describes the *artifact*, which is the only question worth asking
+after an upload. A client that parses both needs the mapping in both directions.
+
 ### 5.2 Upload and attach in one round trip
 
 ```sh
@@ -259,15 +278,20 @@ on every reconnect.
 Via `rustix` rather than raw `libc`, so almost none of this needs `unsafe`.
 
 1. `openpt(O_RDWR | O_NOCTTY | O_CLOEXEC)`, `grantpt`, `unlockpt`, `ptsname`.
-2. `fork`. In the child: `setsid()`, open the slave `O_NOCTTY | O_CLOEXEC` (acquiring it as controlling terminal via `ioctl_tiocsctty`), `dup2` slave → 0/1/2, restore `SIGHUP` to `SIG_DFL` (§6.2 leaves it ignored in the daemon, and an ignored disposition survives `exec`), `execv`.
+2. Parent opens the slave `O_RDWR | O_NOCTTY | O_CLOEXEC` and hands it to the child as all three stdio descriptors.
+3. `fork`. In the child, before `exec`: `setsid()`, acquire the slave as controlling terminal via `ioctl_tiocsctty`, restore `SIGHUP` to `SIG_DFL` (§6.2 leaves it ignored in the daemon, and an ignored disposition survives `exec`). Only async-signal-safe calls, which is why the open is not among them.
 
 `O_CLOEXEC` on both ends is what keeps them out of the child. Without it every
 process the user runs holds a writable descriptor onto its own PTY master, and
 anything that walks `/proc/self/fd` — or writes to a descriptor it did not open —
 can inject output into the stream or read the user's keystrokes. The child keeps
 its stdio regardless, because `dup2` onto 0/1/2 clears the flag on the copies.
-3. Parent sets the initial `TIOCSWINSZ` from `Hello` before the first read.
-4. Master is set non-blocking; the event loop is `poll` over {master, listener, client fd, agent socket, one fd per agent channel}.
+4. Parent sets the initial `TIOCSWINSZ` from `Hello` before the first read.
+5. Master is set non-blocking; the event loop is `poll` over {master, listener, attached client, pending connection, agent socket, one fd per agent channel}.
+
+The *pending* entry is a connection accepted but not yet greeted, and it is
+load-bearing rather than incidental: it is what makes "connecting is not attaching"
+(§6.4) work, since a liveness probe from `list` must not evict anyone.
 
 The master **must** be non-blocking. A child that stops reading fills the PTY's
 input buffer, and in raw mode the line discipline throttles rather than discarding
@@ -312,8 +336,8 @@ only available fix, and only for variables that name a path.
 fork → parent _exit
   setsid
     chdir "/"
-    close inherited fds; 0/1/2 → /dev/null
-    ignore SIGHUP, SIGPIPE
+    0/1/2 → /dev/null
+    ignore SIGHUP
 ```
 
 The classic second fork is deliberately absent. Its only purpose is to leave the
@@ -346,7 +370,8 @@ or broken bus and turn "linger is off" into "the session would not start". Absen
 of the marker is a definite *disabled*; only a lookup that fails for some other
 reason is *unknown*, and the client must not warn on unknown.
 
-Most distributions ship `KillUserProcesses=no`, where the double-fork alone suffices.
+Most distributions ship `KillUserProcesses=no`, where nothing reaps the session at
+logout and `setsid` alone suffices.
 
 ### 6.3 Socket
 
@@ -372,8 +397,9 @@ Directory `0700`, socket `0600`. Filesystem sockets only — never abstract sock
 which are namespace- rather than permission-scoped and would be reachable by any
 local user.
 
-Spawn race (two clients attaching at once): `flock(LOCK_EX | LOCK_NB)` on
-`<id>.lock`; the loser polls for the socket. A stale socket is one where `connect`
+Spawn race (two clients attaching at once): `flock(LOCK_EX)` on `<id>.lock`; the
+loser blocks there, then finds the socket the winner bound and connects to it. Only
+a process that spawns its own daemon polls, and only for its own. A stale socket is one where `connect`
 returns `ECONNREFUSED` — unlink and respawn. `EACCES` is not staleness.
 
 ### 6.4 Multiple clients
@@ -408,8 +434,9 @@ wakeup can report both a readable client and a pending connection; accepting fir
 would replace `self.client`, dropping the outgoing `Conn` while a frame it had
 already delivered was still unread in the socket buffer. Input vanished whenever a
 reconnect landed in the same iteration as a keystroke — reliably, under load.
-`accept` additionally drains the outgoing connection once more, covering the
-narrower window between the poll returning and the accept running.
+The `Hello` handler additionally drains the outgoing connection once more, just
+before the eviction, covering the narrower window between the poll returning and
+the greeting being parsed.
 
 A failing client socket is **never** propagated out of the event loop. A client that
 closes with output still queued makes the kernel send RST, so the next read yields
@@ -420,8 +447,17 @@ detach the client and nothing more.
 ### 6.5 Shutdown
 
 Child exit → `waitpid` → flush the ring to any attached client → `Exit` frame →
-unlink run files → exit. Linger briefly (default 5 s) so a client reconnecting into
-the race still collects the final output and status.
+unlink run files → exit. Linger briefly (5 s) so a client reconnecting into the
+race still collects the final output and status.
+
+`waitpid` is not instantaneous here and the order above hides a trap. Linux closes
+the child's descriptors in `do_exit` *before* the task becomes reapable, so the PTY
+master reports end of file while `waitpid` still answers "not yet" — often, not
+rarely. Resolving the status at end of file therefore invents one, and reports
+`exit 3` as `exit 0`. The status stays unknown until `waitpid` yields it, retried
+each pass for up to 2 s; only a child that closed its terminal without exiting —
+a program that daemonises itself — reaches that deadline, and it has no status to
+report by then.
 
 The order is load-bearing and the code enforces it in one place: `Exit` is queued
 by the output pump, only once everything the child wrote has been queued ahead of
@@ -431,9 +467,14 @@ the child said on its way out.
 
 Idle reaping ([DESIGN.md § 5.2](DESIGN.md#52-reaping)) is self-inflicted, not
 external: the daemon stamps `last_detach` on losing a client and arms a `poll`
-timeout against it. On expiry it sends `SIGHUP` then `SIGKILL` to the child's process
-*group* — not just the child, or backgrounded grandchildren survive — and exits
-through the same path. No cron, no supervisor, nothing to install.
+timeout against it. On expiry it sends `SIGHUP` then, after a grace period,
+`SIGKILL` to the child's process *group* — not just the child, or backgrounded
+grandchildren survive — and exits through the same path. No cron, no supervisor,
+nothing to install.
+
+A session nobody ever attaches to is reaped after 30 s rather than the idle
+timeout: a daemon spawned by a connection that died mid-handshake has no client
+coming and would otherwise sit there for a week.
 
 ### 6.6 Frozen control surface
 
@@ -591,15 +632,18 @@ Size matters because the cold upload happens over cellular. Release profile:
 
 | Target | stable 1.97.1 | + `build-std` + `panic=immediate-abort` |
 | --- | --- | --- |
-| `x86_64-unknown-linux-musl` | 492 KiB | 147 KiB |
-| `aarch64-unknown-linux-musl` | 439 KiB | 138 KiB |
-| `armv7-unknown-linux-musleabihf` | 471 KiB | 141 KiB |
+| `x86_64-unknown-linux-musl` | 493 KiB | 147 KiB |
+| `aarch64-unknown-linux-musl` | 440 KiB | 139 KiB |
+| `armv7-unknown-linux-musleabihf` | 472 KiB | 141 KiB |
 | `riscv64gc-unknown-linux-musl` | 442 KiB | 121 KiB |
+
+Every stable figure is over the 400 KiB budget, armv7 included. Re-measure with
+`NOMUX_STABLE_STD=1 sh scripts/build-release.sh` rather than trusting the table.
 
 The panic machinery — formatting, backtrace symbolisation, `gimli`, `addr2line` —
 is most of that, and it cannot be dropped from a precompiled `std` however the
-release profile is tuned. `-Z build-std` **alone earns nothing** (476 KiB → 447 KiB,
-still over); `-Cpanic=immediate-abort` is the entire win. So it is not an opt-in
+release profile is tuned. `-Z build-std` **alone earns little** — still comfortably
+over the budget; `-Cpanic=immediate-abort` is the entire win. So it is not an opt-in
 profile, it is the only configuration that ships, and the cost is a nightly
 compiler and panics that abort without a message. That is acceptable only because
 the lint wall in `Cargo.toml` already denies `unwrap`, `expect`, `panic` and
@@ -607,7 +651,10 @@ the lint wall in `Cargo.toml` already denies `unwrap`, `expect`, `panic` and
 instead, and is expected to fail the size gate; it exists to keep that cost visible.
 
 Builds are reproducible: the client pins a SHA-256 per arch and verifies after
-upload. Three `--remap-path-prefix` flags are what make that true — for
+upload. `scripts/build-release.sh` checks this the only way that means anything —
+by grepping each artifact for the builder's `$CARGO_HOME`, sysroot and checkout
+path, since two clean builds on one machine are byte-identical whether or not the
+paths were remapped. Three `--remap-path-prefix` flags are what make it true — for
 `$CARGO_HOME`, the sysroot and the checkout — because rustc bakes absolute paths
 into panic location strings, and an unremapped binary contains the builder's home
 directory 56 times over. Note that the obvious test lies: two builds on one machine
@@ -620,11 +667,14 @@ a floating one moves the bytes the client pinned.
 | Layer | Approach | Where |
 | --- | --- | --- |
 | Codec | `proptest` round-trip; truncated, oversized and malformed frames must error, never panic. | `crates/nomux-proto/` |
-| Ring buffer | Model-based against a reference `VecDeque`, asserting `base_offset` monotonicity and that served ranges are byte-exact. | `src/ring.rs` |
+| Ring buffer | Model-based against a reference `Vec`, asserting `base_offset` monotonicity and that served ranges are byte-exact, with chunks both under and over capacity. | `src/ring.rs` |
 | Exactly-once input | The §3 scenario, replayed from a randomly chosen earlier offset after every disconnect. | `tests/chaos.rs` |
 | Session | Spawn daemon → write → sever the socket mid-stream → reattach → assert the output resumes exactly where it left off. | `tests/session.rs` |
 | Gap | Capacity forced small; assert `Gap` is emitted and `base_offset` is exact. | `tests/session.rs`, `tests/chaos.rs` |
 | Chaos | Randomised disconnect injection, seeded and reproducible, under an escape-heavy full-screen stream and under `yes`. | `tests/chaos.rs` |
+| Agent forwarding | Bidirectional proxying, the channel cap, ids never reused, fail-fast while detached, and off unless asked for. | `tests/session.rs` |
+| Relay | Bulk traffic both ways through `nomux attach`, byte-exact, over both the `splice` and copying paths of §7. | `tests/session.rs` |
+| Shutdown | A daemon that reaps itself runs `terminate` to completion and unlinks its run files. | `tests/session.rs` |
 
 The two invariants that matter: **no duplicated input, ever**, and **no lost output
 unless a `Gap` was reported**.
@@ -669,7 +719,3 @@ The child's own status is **not** propagated through this exit code, and the
 forbids, because protocol logic must exist in exactly one place. The client is also
 the side that can do something useful with it; a relay exit code is invisible to
 the user behind an SSH exec channel.
-
-This was previously specified the other way round, as "1–125: child's own status,
-propagated". Nothing implemented it, and implementing it would have meant teaching
-the relay the protocol. The specification was wrong, not the code.

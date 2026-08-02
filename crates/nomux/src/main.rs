@@ -167,6 +167,11 @@ fn report(result: std::io::Result<()>) -> ExitCode {
 ///
 /// The architecture reported is this binary's own compile-time target, which is
 /// what the client actually needs to confirm: that the uploaded artifact runs here.
+///
+/// So the vocabulary is Rust's and *not* `uname`'s — lowercase `linux`, and `arm`
+/// where `uname -m` says `armv7l`. The shell probe in § 5.1 runs before any binary
+/// exists and necessarily uses `uname`; this one describes the artifact rather than
+/// the host. Same prefix, two vocabularies, on purpose.
 fn print_probe() {
     println!(
         "NOMUX-BOOTSTRAP {} {} {}",
