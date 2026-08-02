@@ -11,6 +11,7 @@ mod harness;
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -476,17 +477,35 @@ fn a_symlinked_run_directory_is_refused_by_attach_and_daemon() {
     fs::set_permissions(&target, fs::Permissions::from_mode(0o777)).expect("loosen the target");
     std::os::unix::fs::symlink(&target, root.join("nomux")).expect("plant the symlink");
 
-    for mode in ["attach", "daemon"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_nomux"))
-            .args([mode, "symdir"])
+    let refusals: Vec<(&str, bool, String)> = ["attach", "daemon"]
+        .into_iter()
+        .map(|mode| {
+            let output = Command::new(env!("CARGO_BIN_EXE_nomux"))
+                .args([mode, "symdir"])
+                .env("XDG_RUNTIME_DIR", &root)
+                .env("SHELL", "/bin/sh")
+                .stdin(Stdio::null())
+                .output()
+                .expect("run nomux");
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            (mode, output.status.success(), stderr)
+        })
+        .collect();
+
+    // Before the assertions, because the thing being asserted is that no session was
+    // started — and a failure here means one *was*, in nobody's process group, with a
+    // seven-day idle limit rather than the thirty seconds of a session no client ever
+    // reached. Nothing else in this test would collect it.
+    drop(
+        Command::new(env!("CARGO_BIN_EXE_nomux"))
+            .args(["kill", "symdir"])
             .env("XDG_RUNTIME_DIR", &root)
-            .env("SHELL", "/bin/sh")
-            .stdin(Stdio::null())
-            .output()
-            .expect("run nomux");
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            .output(),
+    );
+
+    for (mode, started, stderr) in &refusals {
         assert!(
-            !output.status.success(),
+            !started,
             "{mode} started a session in a symlinked run directory"
         );
         assert!(
@@ -625,13 +644,18 @@ fn a_child_that_stops_reading_input_does_not_wedge_the_daemon() {
     // quietly dropping the overflow: in canonical mode a line longer than the
     // buffer is discarded, and the master write never blocks at all. `sleep` then
     // holds the terminal without reading it, so everything below piles up.
-    let start = b"echo NOMUX-RAW; stty raw -echo; sleep 30\n";
+    //
+    // The marker follows the `stty` and uses arithmetic for the same reason as in
+    // `input_the_child_never_reads_…`: emitted before it, and without something the
+    // echo of the command line cannot also contain, the wait is satisfied by the line
+    // discipline echoing the command back — and the pile-up below would then be
+    // discarded rather than blocking, which is a test that passes without testing.
+    let start = b"stty raw -echo; echo \"NOMUX-$((6*7))-RAW\"; sleep 30\n";
     client.send(&Frame::Input {
         offset: 0,
         data: start,
     });
-    let (_, _) = client.read_until("NOMUX-RAW", ok.resume_from);
-    thread::sleep(Duration::from_millis(200));
+    let (_, _) = client.read_until("NOMUX-42-RAW", ok.resume_from);
 
     let chunk = vec![b'x'; 16 * 1024];
     let mut offset = start.len() as u64;
@@ -693,17 +717,22 @@ fn input_the_child_never_reads_is_back_pressured_rather_than_buffered() {
     // quietly dropping the overflow: in canonical mode a line longer than the buffer
     // is discarded and the master never stops accepting. `sleep` then holds the
     // terminal without reading a byte of it.
-    let setup = b"echo \"NOMUX-$((6*7))-RAW\"; stty raw -echo; sleep 30\n";
+    let setup = b"stty raw -echo; echo \"NOMUX-$((6*7))-RAW\"; sleep 30\n";
     client.send(&Frame::Input {
         offset: 0,
         data: setup,
     });
-    // The arithmetic distinguishes the shell's output from the line discipline's
-    // echo of the command, which arrives first — waiting for the wrong one would
-    // start the blast while the terminal was still canonical. Seeing it also settles
-    // `in_applied` at `setup.len()`, which is where the blast has to continue from.
+    // The marker is emitted *after* the `stty`, so seeing it is what proves raw mode
+    // is already in effect — emitted before, it proves only that the shell reached
+    // the line, and a blast that started while the terminal was still canonical would
+    // be silently discarded by the line discipline and the test would accuse the
+    // daemon of a bug it does not have. The arithmetic distinguishes the shell's
+    // output from the line discipline's echo of the command itself, which arrives
+    // first and carries `$((6*7))` unexpanded. Seeing it also settles `in_applied` at
+    // `setup.len()`, which is where the blast has to continue from. No settling sleep
+    // is needed after it: the whole line is parsed before any of it runs, so the
+    // shell reads nothing more until `sleep 30` returns.
     client.read_until("NOMUX-42-RAW", ok.resume_from);
-    thread::sleep(Duration::from_millis(200));
     drop(client);
 
     // A raw socket rather than the harness client, because the question is how much
@@ -770,6 +799,129 @@ fn input_the_child_never_reads_is_back_pressured_rather_than_buffered() {
     assert!(
         applied <= sent as u64,
         "the daemon applied {applied} bytes of input from {sent} bytes of frames"
+    );
+}
+
+/// Reconnecting must not raise the ceiling.
+///
+/// Holding the client out of the poll set throttles only the reads the poll set
+/// drives, and that is not where the queue grows. The takeover path of § 6.4.1 reaches
+/// the decode loop twice without passing through the poll set at all — once to drain
+/// the outgoing connection, once for the input pipelined behind the arriving `Hello` —
+/// and a connection promoted with a megabyte already buffered decoded every byte of
+/// it. Each reconnect injected another queue's worth and nothing bounds reconnects:
+/// measured, 60 takeovers carried `in_applied` from 1.3 MB to 20.8 MB and the daemon's
+/// resident set from 4.6 MB to 23.8 MB, linearly. So the cap is enforced between
+/// frames in the decode loop, and this is the test that says so.
+///
+/// `in_applied` is what is asserted on because it is exactly what the daemon has taken
+/// ownership of (§ 3): every byte queued for the PTY is below it, so a ceiling on it is
+/// a ceiling on the queue. The test above measures one connection and would keep
+/// passing with the cap in either place.
+#[test]
+fn reconnecting_does_not_raise_the_input_ceiling() {
+    /// Enough per round that the old growth — a third of a megabyte a takeover —
+    /// would be plain in the total, and enough to refill whatever the queue took.
+    const BLAST: usize = 4 << 20;
+    /// Linear growth over this many would be several megabytes; a ceiling is a
+    /// ceiling after the first.
+    const ROUNDS: usize = 8;
+
+    let session = Session::start("input_ceiling");
+    let mut client = session.connect();
+    let ok = client.hello(RESUME_FROM_START, 0);
+
+    // As in the test above: the marker after the `stty`, so seeing it proves raw mode
+    // is in effect. `sleep` then holds the terminal without reading a byte, for far
+    // longer than this test runs — a child that woke up and drained the queue would
+    // make the ceiling look like it moved.
+    let setup = b"stty raw -echo; echo \"NOMUX-$((6*7))-RAW\"; sleep 120\n";
+    client.send(&Frame::Input {
+        offset: 0,
+        data: setup,
+    });
+    client.read_until("NOMUX-42-RAW", ok.resume_from);
+    drop(client);
+
+    let chunk = vec![b'x'; 60 * 1024];
+    let mut ceiling = None;
+    let mut resume = setup.len() as u64;
+
+    for round in 0..ROUNDS {
+        // Every round starts where the daemon says it has got to, which is what makes
+        // the measurement mean anything: input below `in_applied` is trimmed rather
+        // than queued (§ 3), so a round replaying from a fixed offset would be
+        // discarded on arrival and would look like a ceiling holding.
+        let mut frames = Vec::with_capacity(BLAST + chunk.len());
+        let mut offset = resume;
+        while frames.len() < BLAST {
+            Frame::Input {
+                offset,
+                data: &chunk,
+            }
+            .encode(&mut frames)
+            .expect("encode input");
+            offset += chunk.len() as u64;
+        }
+
+        // A fresh connection each time, which is the takeover this is about. Raw
+        // rather than the harness client, because the whole point is to stop pushing
+        // when the daemon stops taking and a blocking `write_all` has no way to say.
+        let mut blaster = UnixStream::connect(&session.socket).expect("connect");
+        let mut hello = Vec::new();
+        Frame::Hello(Hello {
+            protocol: PROTOCOL_VERSION,
+            flags: 0,
+            out_offset: RESUME_FROM_START,
+            in_offset: resume,
+            win: WIN,
+            term: "xterm-256color",
+        })
+        .encode(&mut hello)
+        .expect("encode hello");
+        blaster.write_all(&hello).expect("write hello");
+        blaster.set_nonblocking(true).expect("stop blocking");
+
+        let mut sent = 0;
+        let mut progressed = Instant::now();
+        while sent < frames.len() && progressed.elapsed() < Duration::from_millis(250) {
+            match blaster.write(&frames[sent..]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    sent += n;
+                    progressed = Instant::now();
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+
+        // The socket having refused everything for a quarter of a second is the daemon
+        // having stopped taking input, so the ceiling is reached rather than merely
+        // approached — which is what makes the first round a fair baseline.
+        let mut probe = session.connect();
+        let applied = probe.hello(RESUME_FROM_START, 0).in_applied;
+        drop(probe);
+        drop(blaster);
+        resume = applied;
+
+        let first = *ceiling.get_or_insert(applied);
+        assert_eq!(
+            applied, first,
+            "round {round} took the input queue past the ceiling the first round \
+             established: {applied} against {first}"
+        );
+    }
+
+    // And the ceiling is the cap rather than an accident of how much fitted in a
+    // socket buffer: one frame of overshoot is allowed, since the cap is tested
+    // between frames.
+    let ceiling = ceiling.expect("at least one round");
+    assert!(
+        ceiling >= (1 << 20),
+        "the daemon stopped far short of the megabyte it is allowed to queue: {ceiling}"
     );
 }
 
@@ -863,6 +1015,118 @@ fn the_daemon_mode_detaches_itself() {
         recorded,
         Some(pid),
         "the pidfile must name the process that is actually serving"
+    );
+}
+
+/// The other half of § 6.2, which the test above never reaches.
+///
+/// `Command` never calls `setpgid`, so a daemon it starts is not a process-group
+/// leader, `setsid` succeeds outright, and the fork is unreachable from there — which
+/// makes `recorded == pid` true by construction rather than by the pidfile being
+/// written in the right order. Moving `detach_from_login_session` to after
+/// `write_pidfile` leaves that test passing, so it guards nothing. Making the child a
+/// group leader first is what forces the `EPERM` only a fork can answer, and it is
+/// the shape a shell with job control produces.
+///
+/// The daemon that survives is in nobody's process group and is nobody's child, so
+/// `wait` collects the process that started and nothing else — it has to be reaped
+/// through `nomux kill`, before the assertions rather than after them.
+#[test]
+fn a_daemon_that_leads_a_process_group_detaches_by_forking() {
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("run-fork");
+    drop(fs::remove_dir_all(&root));
+    fs::create_dir_all(&root).expect("create run root");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_nomux"));
+    command
+        .args(["daemon", "grouped"])
+        .env("XDG_RUNTIME_DIR", &root)
+        .env("SHELL", "/bin/sh")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: the closure runs in the forked child before exec, so it must be
+    // async-signal-safe. `setpgid` is, and nothing here allocates or takes a lock.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    let mut starter = command.spawn().expect("spawn daemon");
+    let original_pid = starter.id();
+
+    let pid_file = root.join("nomux").join("grouped.pid");
+    wait_for(&root.join("nomux").join("grouped.sock"));
+    wait_for(&pid_file);
+
+    // Bounded rather than a bare `wait`: if the fork never happened then the process
+    // started here *is* the daemon, and waiting on it would hang the suite instead of
+    // failing an assertion.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut starter_exited = false;
+    while Instant::now() < deadline {
+        if matches!(starter.try_wait(), Ok(Some(_))) {
+            starter_exited = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut recorded = None;
+    while Instant::now() < deadline {
+        recorded = fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok());
+        if recorded.is_some_and(|pid| {
+            stat_field(pid, StatField::Session) == Some(pid) && stdio_is_silenced(pid)
+        }) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Everything read before anything is collected, so a failing assertion cannot
+    // leave a session behind.
+    let leads_session = recorded.and_then(|pid| stat_field(pid, StatField::Session));
+    let stdio = recorded.map(stdio_targets).unwrap_or_default();
+    let alive = recorded.is_some_and(process_alive);
+    drop(
+        Command::new(env!("CARGO_BIN_EXE_nomux"))
+            .args(["kill", "grouped"])
+            .env("XDG_RUNTIME_DIR", &root)
+            .output(),
+    );
+    if !starter_exited {
+        drop(starter.kill());
+    }
+    drop(starter.wait());
+
+    assert!(
+        starter_exited,
+        "the process that started never left, so nothing forked"
+    );
+    assert_ne!(
+        recorded,
+        Some(original_pid),
+        "the pidfile names the process that started, which has since exited — \
+         `nomux kill` would signal nobody"
+    );
+    assert!(
+        alive,
+        "no live daemon behind the pidfile: it names {recorded:?}"
+    );
+    assert_eq!(
+        leads_session, recorded,
+        "the forked child must lead a session of its own"
+    );
+    assert!(
+        stdio.iter().all(|path| path == Path::new("/dev/null")),
+        "the forked child still holds the descriptors it was handed: {stdio:?}"
     );
 }
 
@@ -1168,6 +1432,9 @@ fn a_signalled_daemon_collects_a_process_that_ignores_sighup() {
     let (seen, _) = client.read_until("-NOMUX-ORPHAN-42", ok.resume_from);
     let orphan = trailing_pid(&seen, "-NOMUX-ORPHAN-42")
         .unwrap_or_else(|| panic!("no background pid in the transcript: {seen:?}"));
+    // Everything below is an assertion about a process that is deliberately in
+    // nobody's reach: if one of them fires, `sleep 300` outlives the whole suite.
+    let _collected = Reaper(orphan);
     assert!(
         process_alive(orphan),
         "the backgrounded process was gone before the session ended"
@@ -1211,6 +1478,24 @@ fn a_signalled_daemon_collects_a_process_that_ignores_sighup() {
         thread::sleep(Duration::from_millis(25));
     }
     panic!("pid {orphan} outlived the session it was backgrounded in");
+}
+
+/// Kills a pid when it goes out of scope.
+///
+/// The processes these tests background are backgrounded *on purpose*, so nothing
+/// else reaps them: a `sleep 300` left behind by a failing assertion is still there
+/// when the next run starts, and the failure it caused is now accompanied by one it
+/// did not. Read-then-kill-then-assert says the same thing where the ordering is
+/// simple enough to arrange; this covers the case where it is not, and it fires on a
+/// panic from anywhere in between.
+struct Reaper(u32);
+
+impl Drop for Reaper {
+    fn drop(&mut self) {
+        if let Some(pid) = rustix::process::Pid::from_raw(self.0.cast_signed()) {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        }
+    }
 }
 
 /// The run of digits immediately before `marker`, as a pid.
