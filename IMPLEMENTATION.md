@@ -173,24 +173,60 @@ shell.
 The input direction cannot be answered that way. `in_applied` is authoritative and
 exactly-once (§3), so a byte the daemon has acknowledged has to reach the PTY:
 dropping it is not available, and refusing it with `Error{INPUT_GAP}` would accuse a
-client that had done nothing wrong. So the daemon stops **reading the client socket**
-once a megabyte is queued for a child that is not taking it. The bytes wait in the
-kernel's buffer, where the peer blocks on them — the same argument §6.7 makes for a
-saturated agent channel. The receive buffer is capped for the same reason: filling it
-loops until `EAGAIN`, and against a peer that keeps writing that loop has no end,
-since every chunk taken frees exactly that much room to refill.
+client that had done nothing wrong. So the daemon stops **accepting** input once a
+megabyte is queued for a child that is not taking it: it stops decoding `Input` frames,
+and it stops asking the socket for more. The bytes wait in the kernel's buffer, where
+the peer blocks on them — the same argument §6.7 makes for a saturated agent channel.
 
-While it holds, the client is left out of the poll set rather than registered wanting
-nothing: `POLLHUP` is reported whatever the mask says, and the only answer to that
-wakeup is a read. Nothing can wedge, because a non-empty queue is exactly what puts
-the master in the set asking for `POLLOUT`, and draining it re-arms the client on the
-pass after.
+Those two are not one bound, and only the first is the bound. Holding the client out of
+`POLLIN` throttles the reads the poll set drives and nothing else: the takeover path of
+§6.4.1 reaches the same decode loop twice without passing through the poll set at all —
+once to drain the outgoing connection, once for the input the arriving one pipelined
+behind its `Hello` — and a connection promoted with a megabyte already buffered would
+decode every byte of it. Each reconnect could inject another queue's worth, and nothing
+bounds reconnects. **The cap is enforced where the queue grows**, between frames in the
+decode loop; the poll set only keeps the socket from being drained to no purpose while
+it holds.
+
+What that leaves is bounded on both sides. The queue overshoots by at most the one
+frame that crossed the cap, so `MAX_PAYLOAD`. The frames the decode loop declined stay
+in that connection's receive buffer, which has a megabyte cap of its own, and there are
+at most two connections — the client and one pending. No complete frame is stranded
+there: a decode that stops mid-buffer is not announced by a second `POLLIN`, the socket
+having reported those bytes once already, so "buffered and no longer saturated" is
+itself an event the loop acts on — and the `POLLOUT` that drained the queue is what has
+just made it true.
+
+The client stays in the poll set with an *empty* mask rather than being left out of it.
+`POLLHUP` and `POLLERR` are reported whatever the mask says, and that is the point:
+they are the only way to learn that a held-back peer has died. A read is not always an
+answer to them — a receive buffer at its cap makes filling a no-op, so it never reaches
+the zero-length read that would notice, and the descriptor then reports `POLLHUP` on
+every pass for as long as the child declines to read. So the loop lets the client go on
+the spot, which cannot spin: that descriptor is out of the set on the very next pass.
+It is also what stamps the idle-reaping deadline and fails the agent's waiting callers
+(§6.7) when the peer dies, rather than whenever the child next happens to read. Nothing
+can wedge either, because a non-empty queue is exactly what puts the master in the set
+asking for `POLLOUT`, and draining it re-arms the client on the pass after.
+
+The receive-buffer cap does less than it looks like, and is worth stating exactly. Its
+job is to make the ceiling on one connection's buffered input the daemon's own number
+rather than the peer's: filling loops until `EAGAIN`, so without it the ceiling is
+whatever the peer set `SO_SNDBUF` to. On a stock Linux the kernel's own 212 KiB unix
+send buffer is the tighter of the two and the cap never binds at all. Against a peer
+that raises `SO_SNDBUF` past a megabyte it does, measurably — removing it doubled the
+daemon's resident set under a blast, 5.2 MB to 12.3 MB — but it converts a peer-chosen
+bound into a fixed one, not an unbounded one into a bound.
 
 The cost is that a client's own control frames — `Ping`, `Resize`, `Detach` — queue
 behind its own stalled input. That is accepted; it is being held back on input, and
-nothing that has to work regardless goes through this path. A *new* connection is
-never held back, since it is polled as pending rather than as the client, so `list`
-and the spawn race of §6.3 are unaffected — and `nomux kill` is a signal (§6.5).
+nothing that has to work regardless goes through this path. The same applies to the
+final drain a takeover performs: with the queue full, the outgoing connection's last
+frames go with it. They were never acknowledged, so §3 already has the client resending
+them from `in_applied` — the invariant is exactly-once, not never-retransmitted. A
+*new* connection is never held back, since it is polled as pending rather than as the
+client, so `list` and the spawn race of §6.3 are unaffected — and `nomux kill` is a
+signal (§6.5).
 
 ### 4.2 Attach with `from < base_offset`
 

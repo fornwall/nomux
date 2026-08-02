@@ -29,11 +29,25 @@ const ABANDON_PENDING_WRITE: usize = 8 << 20;
 /// kernel's buffer for the peer to refill. The cap turns it back into back pressure,
 /// leaving the bytes where the peer blocks on them.
 ///
+/// Load-bearing rather than defensive, because the daemon stops *decoding* once the
+/// PTY queue is full (`IMPLEMENTATION.md` § 4.1). Nothing empties this buffer while
+/// that holds, so without a ceiling on what goes into it the queue would simply have
+/// moved from one `Vec` to another.
+///
 /// It has to stay clear of `HEADER_LEN + MAX_PAYLOAD`, which is the one thing it may
 /// not be: a frame that cannot be buffered whole is a frame [`Conn::take_frame`]
 /// never completes, and the connection would then refuse to read the rest of the
 /// frame it is waiting for.
 const MAX_PENDING_READ: usize = 1 << 20;
+
+// That last relationship, as a compile error rather than a paragraph. The two sides
+// live in different crates, so raising `MAX_PAYLOAD` is a change nobody editing it
+// would think to check here — and the failure it buys is a connection that wedges on
+// the one frame it can never finish reading.
+const _: () = assert!(
+    MAX_PENDING_READ > HEADER_LEN + MAX_PAYLOAD as usize,
+    "MAX_PENDING_READ must have room for a whole frame, or take_frame never completes one"
+);
 
 /// Compact the receive buffer once this many consumed bytes have accumulated.
 const COMPACT_THRESHOLD: usize = 64 * 1024;
@@ -156,6 +170,18 @@ impl Conn {
     /// Whether enough undecoded input is buffered that no more should be read.
     const fn is_read_saturated(&self) -> bool {
         self.rx.len() - self.rx_pos >= MAX_PENDING_READ
+    }
+
+    /// Whether undecoded bytes are still sitting in the receive buffer.
+    ///
+    /// The daemon stops decoding while the PTY queue is full (`IMPLEMENTATION.md`
+    /// § 4.1), which can leave whole frames here that no second `POLLIN` will ever
+    /// announce — the socket reported them once and has nothing new to say. This is
+    /// what tells the event loop to come back for them once the queue has room,
+    /// instead of waiting for a wakeup that is not coming.
+    #[must_use]
+    pub(crate) const fn has_buffered_input(&self) -> bool {
+        self.rx_pos < self.rx.len()
     }
 
     /// Reads whatever the socket has available into the receive buffer, up to

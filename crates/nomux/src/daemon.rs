@@ -110,7 +110,7 @@ const SETTLE_BEFORE_POLL: bool = cfg!(nomux_fault_injection) || cfg!(nomux_fault
 /// How long that pause is.
 const FAULT_SETTLE: Duration = Duration::from_millis(20);
 
-/// Stop reading the client once this much input is already queued for a PTY that is
+/// Stop accepting client input once this much is already queued for a PTY that is
 /// not taking it.
 ///
 /// The mirror of the output direction's budget, and for the same reason: the socket
@@ -120,9 +120,8 @@ const FAULT_SETTLE: Duration = Duration::from_millis(20);
 /// dropped once acknowledged, and refusing one with an `InputGap` would tell a
 /// well-behaved client it had skipped ahead when it had not.
 ///
-/// A ceiling rather than a limit: `Conn::fill` decodes everything it buffered, so
-/// one pass can carry the queue up to a receive buffer past this. What matters is
-/// that both are bounded, where neither was.
+/// A ceiling rather than a limit, by one frame: the cap is tested between frames, so
+/// the last one decoded can carry the queue up to `MAX_PAYLOAD` past it.
 const MAX_PENDING_INPUT: usize = 1 << 20;
 
 /// Signals that mean "stop", handled so that leaving runs the shutdown path
@@ -535,12 +534,14 @@ impl Daemon {
 
         if let Some(client) = self.client.as_ref() {
             // Input already queued for a PTY that is not taking it is the only back
-            // pressure signal there is: stop reading the client until it drains, and
-            // the bytes wait in the kernel's socket buffer where the peer blocks on
-            // them. The same argument the agent channels make below. Nothing can
-            // wedge here — a non-empty queue is exactly what puts the master in the
-            // set asking for `POLLOUT`, and draining it re-arms this on the pass
-            // after.
+            // pressure signal there is: stop asking the client for more until it
+            // drains, and the bytes wait in the kernel's socket buffer where the peer
+            // blocks on them. The same argument the agent channels make below.
+            // Nothing can wedge here — a non-empty queue is exactly what puts the
+            // master in the set asking for `POLLOUT`, and draining it re-arms this on
+            // the pass after. This holds back the *socket*; what bounds the queue is
+            // `read_client` declining to decode past the cap, since the takeover path
+            // reaches that loop without passing through here at all.
             let mut flags = if self.input_is_saturated() {
                 PollFlags::empty()
             } else {
@@ -556,14 +557,14 @@ impl Daemon {
             if client.wants_write() || (self.greeted && self.sent_through < self.ring.end()) {
                 flags |= PollFlags::OUT;
             }
-            // Left out of the set entirely rather than registered wanting nothing.
-            // `HUP` is reported whatever the mask says, so a client that has closed
-            // its sending half would wake the loop on every pass for as long as the
-            // queue stayed full — and the only answer to that wakeup is a read,
-            // which is the thing being held back.
-            if !flags.is_empty() {
-                watches.push((Source::Client, client.stream().as_fd(), flags));
-            }
+            // Registered even when the mask is empty, which is the only way to hear
+            // that a held-back peer has died: `HUP` and `ERR` are reported whatever
+            // the mask says. `poll_once` answers that wakeup by letting the client
+            // go, so it cannot repeat — the descriptor is out of the set on the next
+            // pass — and until then the daemon would otherwise sit on a dead peer's
+            // socket with the idle deadline unarmed and the agent's callers still
+            // waiting (§ 6.7).
+            watches.push((Source::Client, client.stream().as_fd(), flags));
         }
         if let Some(pending) = self.pending.as_ref() {
             watches.push((Source::Pending, pending.stream().as_fd(), PollFlags::IN));
@@ -648,11 +649,25 @@ impl Daemon {
         if pty_events.intersects(readable) {
             self.read_pty(read_buf)?;
         }
+        // Frames the input cap left undecoded are not announced a second time — the
+        // socket reported them once and has nothing new to say — so draining the
+        // queue just above is itself the event that lets them through.
+        let client_ready = client_events.intersects(readable)
+            || (!self.input_is_saturated()
+                && self.client.as_ref().is_some_and(Conn::has_buffered_input));
         // Before the greeting, always: one poll can report both a readable client
         // and a `Hello` from its replacement, and handling the takeover first would
         // drop the outgoing `Conn` with input still unread in its socket buffer.
-        if !ACCEPT_BEFORE_READ && client_events.intersects(readable) {
+        if !ACCEPT_BEFORE_READ && client_ready {
             self.read_client(scratch)?;
+        }
+        // `HUP` is the peer gone for good, and reading is not an answer to it while
+        // input is being held back: nothing will consume what is left in the socket,
+        // so `fill` never reaches the zero-length read that would notice. Letting the
+        // client go here is what stamps `detached_since` and fails the agent's
+        // waiting callers now rather than at reattach (§ 6.7).
+        if client_events.intersects(PollFlags::HUP | PollFlags::ERR) && self.client.is_some() {
+            self.drop_client();
         }
         if revents(Source::Pending).intersects(readable) {
             self.read_pending(scratch)?;
@@ -660,7 +675,7 @@ impl Daemon {
         if revents(Source::Listener).contains(PollFlags::IN) {
             self.accept();
         }
-        if ACCEPT_BEFORE_READ && client_events.intersects(readable) {
+        if ACCEPT_BEFORE_READ && client_ready {
             self.read_client(scratch)?;
         }
 
@@ -918,6 +933,16 @@ impl Daemon {
         }
 
         loop {
+            // The cap that actually bounds the queue (§ 4.1). Holding the client out
+            // of the poll set only throttles the one caller that arrives through it;
+            // the takeover path reaches this loop twice without passing through the
+            // poll set at all, and a connection promoted with a megabyte already
+            // buffered would otherwise decode all of it. What is left stays in the
+            // receive buffer, which is capped in its own right, and is picked up on a
+            // later pass once the PTY has taken some of the queue.
+            if self.input_is_saturated() {
+                break;
+            }
             let Some(client) = self.client.as_mut() else {
                 return Ok(());
             };
