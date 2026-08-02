@@ -29,9 +29,7 @@ use harness::{
 
 #[test]
 fn runs_a_shell_and_streams_its_output() {
-    let session = Session::start("basic");
-    let mut client = session.connect();
-    let ok = client.hello(RESUME_FROM_START, 0);
+    let (_session, mut client, ok) = Session::attached("basic");
     assert_eq!(ok.protocol, PROTOCOL_VERSION);
     assert!(!ok.gap);
 
@@ -46,9 +44,7 @@ fn runs_a_shell_and_streams_its_output() {
 
 #[test]
 fn output_resumes_contiguously_after_a_reconnect() {
-    let session = Session::start("resume");
-    let mut client = session.connect();
-    let ok = client.hello(RESUME_FROM_START, 0);
+    let (session, mut client, ok) = Session::attached("resume");
 
     let first = b"echo NOMUX-BEFORE\n";
     client.send(&Frame::Input {
@@ -84,9 +80,7 @@ fn output_resumes_contiguously_after_a_reconnect() {
 /// because the `InputAck` was lost with the connection — must not run it twice.
 #[test]
 fn replayed_input_is_applied_exactly_once() {
-    let session = Session::start("dedup");
-    let mut client = session.connect();
-    let ok = client.hello(RESUME_FROM_START, 0);
+    let (session, mut client, ok) = Session::attached("dedup");
 
     // `printf` with a counter would need shell state; instead emit a unique marker
     // and assert it appears exactly once in the transcript.
@@ -128,9 +122,7 @@ fn replayed_input_is_applied_exactly_once() {
 
 #[test]
 fn overflow_is_reported_as_a_gap_rather_than_silently_truncated() {
-    let session = Session::start("gap");
-    let mut client = session.connect();
-    let ok = client.hello(RESUME_FROM_START, 0);
+    let (session, mut client, ok) = Session::attached("gap");
 
     // Detach, then generate far more output than the ring can hold.
     // Comfortably more than the 64 KiB ring configured for these tests.
@@ -171,9 +163,7 @@ fn overflow_is_reported_as_a_gap_rather_than_silently_truncated() {
 
 #[test]
 fn a_second_client_takes_over_and_the_first_is_told_why() {
-    let session = Session::start("takeover");
-    let mut first = session.connect();
-    first.hello(RESUME_FROM_START, 0);
+    let (session, mut first, _) = Session::attached("takeover");
 
     let mut second = session.connect();
     second.hello(RESUME_FROM_START, 0);
@@ -194,9 +184,7 @@ fn a_second_client_takes_over_and_the_first_is_told_why() {
 
 #[test]
 fn list_and_kill_operate_without_the_protocol() {
-    let session = Session::start("control");
-    let mut client = session.connect();
-    client.hello(RESUME_FROM_START, 0);
+    let (session, _client, _) = Session::attached("control");
 
     let listed = control(&session.root, &["list"]);
     let listed = String::from_utf8_lossy(&listed.stdout);
@@ -220,9 +208,7 @@ fn list_and_kill_operate_without_the_protocol() {
 /// damage would be permanent.
 #[test]
 fn a_liveness_probe_does_not_evict_the_attached_client() {
-    let session = Session::start("probe");
-    let mut client = session.connect();
-    let ok = client.hello(RESUME_FROM_START, 0);
+    let (session, mut client, ok) = Session::attached("probe");
 
     // The bare probe, then the real thing.
     for _ in 0..3 {
@@ -248,9 +234,7 @@ fn a_liveness_probe_does_not_evict_the_attached_client() {
 /// costing the session its client.
 #[test]
 fn a_connection_that_does_not_greet_first_is_refused_alone() {
-    let session = Session::start("no_greeting");
-    let mut client = session.connect();
-    let ok = client.hello(RESUME_FROM_START, 0);
+    let (session, mut client, ok) = Session::attached("no_greeting");
 
     let mut rude = session.connect();
     rude.send(&Frame::Ping { nonce: 1 });
@@ -282,9 +266,7 @@ fn a_connection_that_does_not_greet_first_is_refused_alone() {
 /// handed it first loses the entire transcript.
 #[test]
 fn the_exit_status_arrives_after_the_final_output() {
-    let session = Session::start("exit_order");
-    let mut client = session.connect();
-    client.hello(RESUME_FROM_START, 0);
+    let (session, mut client, _) = Session::attached("exit_order");
 
     let command = b"printf NOMUX-LAST-WORD; exit 3\n";
     client.send(&Frame::Input {
@@ -331,9 +313,7 @@ fn the_exit_status_arrives_after_the_final_output() {
 /// user's keystrokes.
 #[test]
 fn the_child_inherits_only_its_stdio() {
-    let session = Session::start("fds");
-    let mut client = session.connect();
-    let ok = client.hello(RESUME_FROM_START, 0);
+    let (session, mut client, ok) = Session::attached("fds");
     // Wait for the shell to be up before looking for it.
     client.send(&Frame::Input {
         offset: 0,
@@ -586,9 +566,7 @@ fn attach_spawns_the_daemon_and_relays_transparently() {
 /// including frames that had nothing to do with the PTY.
 #[test]
 fn a_child_that_stops_reading_input_does_not_wedge_the_daemon() {
-    let session = Session::start("wedge");
-    let mut client = session.connect();
-    let ok = client.hello(RESUME_FROM_START, 0);
+    let (_session, mut client, ok) = Session::attached("wedge");
 
     // Raw mode is what makes the line discipline apply back pressure instead of
     // quietly dropping the overflow: in canonical mode a line longer than the
@@ -648,9 +626,7 @@ fn input_the_child_never_reads_is_back_pressured_rather_than_buffered() {
     /// and the kernel's socket buffers, and nothing like room for [`BLAST`].
     const TOLERATED: usize = 8 << 20;
 
-    let session = Session::start("input_cap");
-    let mut client = session.connect();
-    let ok = client.hello(RESUME_FROM_START, 0);
+    let (session, mut client, ok) = Session::attached("input_cap");
 
     // Raw mode is what makes the line discipline apply back pressure instead of
     // quietly dropping the overflow: in canonical mode a line longer than the buffer
@@ -730,9 +706,7 @@ fn reconnecting_does_not_raise_the_input_ceiling() {
     /// ceiling after the first.
     const ROUNDS: usize = 8;
 
-    let session = Session::start("input_ceiling");
-    let mut client = session.connect();
-    let ok = client.hello(RESUME_FROM_START, 0);
+    let (session, mut client, ok) = Session::attached("input_ceiling");
 
     // The `sleep` holds the terminal without reading a byte for far longer than this
     // test runs — a child that woke up and drained the queue would make the ceiling
@@ -802,9 +776,7 @@ fn reconnecting_does_not_raise_the_input_ceiling() {
 /// would have started it.
 #[test]
 fn the_daemon_releases_its_working_directory_but_the_shell_does_not() {
-    let session = Session::start("cwd");
-    let mut client = session.connect();
-    let ok = client.hello(RESUME_FROM_START, 0);
+    let (session, mut client, ok) = Session::attached("cwd");
 
     let cwd = fs::read_link(format!("/proc/{}/cwd", session.child.id())).expect("read daemon cwd");
     assert_eq!(
@@ -1009,9 +981,7 @@ fn stdio_is_silenced(targets: &[PathBuf]) -> bool {
 /// becomes a channel, and bytes cross in both directions untouched.
 #[test]
 fn agent_forwarding_proxies_a_connection_in_both_directions() {
-    let session = Session::start("agent");
-    let mut client = session.connect();
-    let ok = client.hello_with(HELLO_AGENT_FORWARD, RESUME_FROM_START, 0);
+    let (session, mut client, ok) = Session::attached_with("agent", HELLO_AGENT_FORWARD);
     assert!(ok.agent, "daemon should report the agent socket as served");
 
     // The child must be able to find it, which is the whole point.
@@ -1057,9 +1027,7 @@ fn agent_forwarding_proxies_a_connection_in_both_directions() {
 /// as a missing agent instead of hanging until the user reattaches.
 #[test]
 fn agent_connections_fail_fast_while_detached() {
-    let session = Session::start("agent_detached");
-    let mut client = session.connect();
-    client.hello_with(HELLO_AGENT_FORWARD, RESUME_FROM_START, 0);
+    let (session, client, _) = Session::attached_with("agent_detached", HELLO_AGENT_FORWARD);
     drop(client);
 
     let mut agent = session.connect_agent();
@@ -1076,9 +1044,7 @@ fn agent_connections_fail_fast_while_detached() {
 /// daemon track them.
 #[test]
 fn agent_channels_are_capped() {
-    let session = Session::start("agent_cap");
-    let mut client = session.connect();
-    client.hello_with(HELLO_AGENT_FORWARD, RESUME_FROM_START, 0);
+    let (session, mut client, _) = Session::attached_with("agent_cap", HELLO_AGENT_FORWARD);
 
     let cap = MAX_AGENT_CHANNELS as usize;
     let held: Vec<UnixStream> = (0..cap).map(|_| session.connect_agent()).collect();
@@ -1103,9 +1069,7 @@ fn agent_channels_are_capped() {
 /// opening cannot be confused for one another.
 #[test]
 fn agent_channel_ids_are_never_reused() {
-    let session = Session::start("agent_ids");
-    let mut client = session.connect();
-    client.hello_with(HELLO_AGENT_FORWARD, RESUME_FROM_START, 0);
+    let (session, mut client, _) = Session::attached_with("agent_ids", HELLO_AGENT_FORWARD);
 
     let mut previous = 0;
     for round in 0..4 {
@@ -1216,9 +1180,7 @@ fn a_daemon_nobody_ever_attaches_to_reaps_itself() {
 /// a session nobody can attach to until something else garbage-collects it.
 #[test]
 fn a_daemon_that_reaps_itself_removes_its_run_files() {
-    let session = Session::start("shutdown_cleanup");
-    let mut client = session.connect();
-    client.hello(RESUME_FROM_START, 0);
+    let (session, mut client, _) = Session::attached("shutdown_cleanup");
 
     let pid_file = session.pid_file();
     assert!(
@@ -1270,9 +1232,7 @@ fn a_daemon_that_reaps_itself_removes_its_run_files() {
 /// do anyway.
 #[test]
 fn a_signalled_daemon_collects_a_process_that_ignores_sighup() {
-    let session = Session::start("sigterm");
-    let mut client = session.connect();
-    let ok = client.hello(RESUME_FROM_START, 0);
+    let (session, mut client, ok) = Session::attached("sigterm");
 
     // The marker trails the pid so that seeing it proves the digits already
     // arrived, and the arithmetic keeps it out of the line discipline's echo of the
@@ -1349,9 +1309,7 @@ fn a_signalled_daemon_collects_a_process_that_ignores_sighup() {
 /// a poll interval or two — which measures in tens of milliseconds.
 #[test]
 fn a_signalled_daemon_with_a_quiet_child_does_not_wait_out_the_grace_period() {
-    let mut session = Session::start("fastkill");
-    let mut client = session.connect();
-    let ok = client.hello(RESUME_FROM_START, 0);
+    let (mut session, mut client, ok) = Session::attached("fastkill");
     // So the measurement covers a session with a live shell in it, rather than the
     // window before the child exists at all.
     client.send(&Frame::Input {
@@ -1452,9 +1410,7 @@ fn process_alive(pid: u32) -> bool {
 /// the user's `ForwardAgent` decision, so it must never be on by default.
 #[test]
 fn agent_forwarding_is_off_unless_asked_for() {
-    let session = Session::start("agent_off");
-    let mut client = session.connect();
-    let ok = client.hello(RESUME_FROM_START, 0);
+    let (session, _client, ok) = Session::attached("agent_off");
     assert!(!ok.agent);
     assert!(
         !session.agent_socket().exists(),
@@ -1478,9 +1434,7 @@ fn agent_forwarding_is_off_unless_asked_for() {
 /// depends on how the kernel treats a socket closed with data still queued.
 #[test]
 fn a_takeover_never_discards_input_already_delivered() {
-    let session = Session::start("takeover_input");
-    let mut client = session.connect();
-    client.hello(RESUME_FROM_START, 0);
+    let (session, mut client, _) = Session::attached("takeover_input");
 
     let command = b"true NOMUX-KEEP\n";
     let mut expected = 0u64;
@@ -1515,9 +1469,7 @@ fn a_takeover_never_discards_input_already_delivered() {
 /// went quiet and stayed quiet, over a connection attempt that was refused.
 #[test]
 fn a_version_mismatch_refuses_the_newcomer_without_evicting_the_client() {
-    let session = Session::start("skew");
-    let mut client = session.connect();
-    let ok = client.hello(RESUME_FROM_START, 0);
+    let (session, mut client, ok) = Session::attached("skew");
 
     // The incumbent is serving before the newcomer knocks, or the assertion below
     // that it still is would be about nothing.
@@ -1570,9 +1522,7 @@ fn a_version_mismatch_refuses_the_newcomer_without_evicting_the_client() {
 /// exists to survive.
 #[test]
 fn an_abrupt_client_disconnect_does_not_kill_the_session() {
-    let session = Session::start("reset");
-    let mut client = session.connect();
-    client.hello(RESUME_FROM_START, 0);
+    let (session, mut client, _) = Session::attached("reset");
 
     let command = b"echo NOMUX-SURVIVED\n";
     client.send(&Frame::Input {

@@ -37,7 +37,10 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
-use nomux_proto::{Frame, FrameType, HEADER_LEN, Hello, PROTOCOL_VERSION, WinSize, decode_header};
+use nomux_proto::{
+    Frame, FrameType, HEADER_LEN, Hello, PROTOCOL_VERSION, RESUME_FROM_START, WinSize,
+    decode_header,
+};
 
 pub(crate) const WIN: WinSize = WinSize {
     cols: 80,
@@ -106,6 +109,43 @@ impl Session {
             stream,
             pending: Vec::new(),
         }
+    }
+
+    /// A daemon with one client attached to it, greeted from the start of both
+    /// streams.
+    ///
+    /// Start, connect, greet is how most of the suite opens, and those three lines say
+    /// nothing about the test that follows them: a session nobody has touched before,
+    /// a single client, and a `HelloOk` whose `resume_from` is where the first
+    /// [`Client::read_until`] begins. Saying it once leaves each test starting at the
+    /// thing it is actually about.
+    ///
+    /// The [`Session`] comes back alongside the client because it owns the daemon and
+    /// kills it on drop, so the caller has to bind it for as long as the client is
+    /// used — `let (_session, ..)` where the test never names it again, never `let (_,
+    /// ..)`, which would end the session on the spot.
+    ///
+    /// Not for the connections that need the three steps apart: one that asserts on
+    /// the run directory before anything connects, one that resumes from an offset it
+    /// worked out for itself, one that wants a ring other than [`DEFAULT_TEST_RING`],
+    /// or one whose own handshake is the subject. Those spell it out, because there
+    /// the spelling is the test — and it is per *connection* rather than per test,
+    /// since the tests about a refused greeting still open with an ordinary attached
+    /// client and then bring on the connection they are really about.
+    pub(crate) fn attached(name: &str) -> (Self, Client, nomux_proto::HelloOk) {
+        Self::attached_with(name, 0)
+    }
+
+    /// [`Session::attached`], with `flags` in the greeting.
+    ///
+    /// Its own function rather than an argument on the common one so that the sessions
+    /// asking for nothing in particular do not all carry a `0` that reads like a
+    /// decision somebody made.
+    pub(crate) fn attached_with(name: &str, flags: u16) -> (Self, Client, nomux_proto::HelloOk) {
+        let session = Self::start(name);
+        let mut client = session.connect();
+        let ok = client.hello_with(flags, RESUME_FROM_START, 0);
+        (session, client, ok)
     }
 
     /// The directory the daemon publishes its five files in.
