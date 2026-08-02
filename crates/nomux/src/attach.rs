@@ -15,7 +15,6 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use rustix::event::PollFlags;
-use rustix::fs::{FlockOperation, Mode, OFlags};
 use rustix::pipe::SpliceFlags;
 
 use crate::rundir::SessionPaths;
@@ -25,6 +24,13 @@ const SPAWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Delay between connect retries while waiting for the daemon.
 const SPAWN_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Delay between checks for the pidfile the daemon publishes just after its socket.
+///
+/// Shorter than [`SPAWN_POLL_INTERVAL`] because the window it covers is two
+/// syscalls wide and is usually already over, while the wait itself is on the path
+/// of every session creation.
+const PUBLISH_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Largest transfer asked of `splice` in one call.
 ///
@@ -49,21 +55,29 @@ pub(crate) fn run(session_id: &str, label: Option<&str>) -> io::Result<()> {
 /// Connects, spawning the daemon under an exclusive lock if nothing is listening.
 ///
 /// The lock serialises concurrent attaches so two clients racing to create the
-/// same session produce one daemon, not two fighting over the socket path.
+/// same session produce one daemon, not two fighting over the socket path. It is
+/// held to the end of the function rather than released after the spawn, because
+/// garbage collection takes the same lock (`IMPLEMENTATION.md` § 6.6): while it
+/// is held, nothing can unlink the socket this is waiting for.
 fn connect_or_spawn(paths: &SessionPaths, label: Option<&str>) -> io::Result<UnixStream> {
+    // Before the first `connect`, not on the way to spawning a daemon. The socket
+    // this is about to hand the user's keystrokes to is a *name* in the run
+    // directory (§ 6.3), and where that directory is a symlink into somewhere
+    // another user can write, the name is theirs to make: checking only when
+    // nothing answers checks only the case where nothing was planted. It costs the
+    // warm path one `open` and one `fstat`.
+    paths.ensure_dir()?;
     match UnixStream::connect(paths.socket()) {
         Ok(stream) => return Ok(stream),
         Err(err) if is_absent(&err) => {}
         Err(err) => return Err(err),
     }
 
-    paths.ensure_dir()?;
-    let lock = rustix::fs::open(
-        paths.lock(),
-        OFlags::CREATE | OFlags::RDWR | OFlags::CLOEXEC,
-        Mode::RUSR | Mode::WUSR,
-    )?;
-    rustix::fs::flock(&lock, FlockOperation::LockExclusive)?;
+    // `lock_spawn` is where the subtlety lives: a collector may have unlinked
+    // `<id>.lock` while this call was blocked on it, and a lock on a file that no
+    // longer has that name is not this mutex — the next attach would create a new
+    // file there and lock that. It checks and goes back for the real one.
+    let _spawn_lock = paths.lock_spawn()?;
 
     // Another attach may have created the session while we waited for the lock.
     match UnixStream::connect(paths.socket()) {
@@ -77,7 +91,10 @@ fn connect_or_spawn(paths: &SessionPaths, label: Option<&str>) -> io::Result<Uni
     let deadline = Instant::now() + SPAWN_TIMEOUT;
     loop {
         match UnixStream::connect(paths.socket()) {
-            Ok(stream) => return Ok(stream),
+            Ok(stream) => {
+                await_publication(paths, deadline);
+                return Ok(stream);
+            }
             Err(err) if is_absent(&err) => {
                 if Instant::now() >= deadline {
                     return Err(io::Error::new(
@@ -92,6 +109,28 @@ fn connect_or_spawn(paths: &SessionPaths, label: Option<&str>) -> io::Result<Uni
     }
 }
 
+/// Keeps the spawn lock until the daemon this attach started has published
+/// `<id>.pid`.
+///
+/// This is what makes the lock mean what the rest of the layout assumes it means.
+/// The daemon binds its socket before it writes the pidfile (§ 6.2), so a `connect`
+/// that succeeds says the id is claimed — not that anything on disk says so yet.
+/// Returning here the instant it succeeded would drop the lock inside that window,
+/// and "the lock is free" would not imply "the id is unclaimed": a `kill` taking it
+/// there finds a live daemon and no pid, and the version of `kill` that answered
+/// that by unlinking all five files left a daemon holding the user's shell with no
+/// socket to reach it by, and the id free for a second daemon to bind.
+///
+/// Bounded by the caller's own deadline and never fatal. The pidfile belongs to
+/// `kill`, not to the relay, so a daemon that never writes one still gets its
+/// client — `kill` has its own answer for that (`control::resolve`), and it is not
+/// this connection's business.
+fn await_publication(paths: &SessionPaths, deadline: Instant) {
+    while !paths.pid().exists() && Instant::now() < deadline {
+        std::thread::sleep(PUBLISH_POLL_INTERVAL);
+    }
+}
+
 /// Whether the error means "no daemon is listening there", as opposed to a real
 /// failure. A refused connection is a stale socket; the daemon unlinks it on bind.
 fn is_absent(err: &io::Error) -> bool {
@@ -103,8 +142,14 @@ fn is_absent(err: &io::Error) -> bool {
 
 /// Starts the daemon detached from this process's session.
 ///
-/// `setsid` is what lets it outlive the SSH connection that spawned it; stdio goes
-/// to `/dev/null` so it does not hold the SSH channel open.
+/// Both halves of that are the daemon's own job as of `IMPLEMENTATION.md` § 6.2,
+/// and both are still done here, because the daemon cannot do either of them soon
+/// enough. Between this `exec` and its own `setsid` there is a window where a
+/// hangup would take the session with it; and until it redirects its own stdio it
+/// holds *this relay's* descriptors, so anything it writes — a session that already
+/// exists, a backtrace — lands in the middle of the client's frame stream. Both
+/// windows close before the daemon exists, and cost it nothing: it finds itself
+/// already a session leader and does nothing more.
 fn spawn_daemon(session_id: &str, label: Option<&str>) -> io::Result<()> {
     let exe = env::current_exe()?;
     let mut command = Command::new(exe);

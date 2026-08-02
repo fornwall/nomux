@@ -22,6 +22,33 @@ const MAX_PENDING_WRITE: usize = 1 << 20;
 /// can reach it.
 const ABANDON_PENDING_WRITE: usize = 8 << 20;
 
+/// Stop reading from the socket once this much undecoded input is already buffered.
+///
+/// [`Conn::fill`] loops until `EAGAIN`, and against a peer that keeps writing that
+/// loop has no natural end: every chunk it takes frees exactly that much room in the
+/// kernel's buffer for the peer to refill. The cap turns it back into back pressure,
+/// leaving the bytes where the peer blocks on them.
+///
+/// Load-bearing rather than defensive, because the daemon stops *decoding* once the
+/// PTY queue is full (`IMPLEMENTATION.md` § 4.1). Nothing empties this buffer while
+/// that holds, so without a ceiling on what goes into it the queue would simply have
+/// moved from one `Vec` to another.
+///
+/// It has to stay clear of `HEADER_LEN + MAX_PAYLOAD`, which is the one thing it may
+/// not be: a frame that cannot be buffered whole is a frame [`Conn::take_frame`]
+/// never completes, and the connection would then refuse to read the rest of the
+/// frame it is waiting for.
+const MAX_PENDING_READ: usize = 1 << 20;
+
+// That last relationship, as a compile error rather than a paragraph. The two sides
+// live in different crates, so raising `MAX_PAYLOAD` is a change nobody editing it
+// would think to check here — and the failure it buys is a connection that wedges on
+// the one frame it can never finish reading.
+const _: () = assert!(
+    MAX_PENDING_READ > HEADER_LEN + MAX_PAYLOAD as usize,
+    "MAX_PENDING_READ must have room for a whole frame, or take_frame never completes one"
+);
+
 /// Compact the receive buffer once this many consumed bytes have accumulated.
 const COMPACT_THRESHOLD: usize = 64 * 1024;
 
@@ -140,14 +167,32 @@ impl Conn {
         }
     }
 
-    /// Reads whatever the socket has available into the receive buffer.
+    /// Whether enough undecoded input is buffered that no more should be read.
+    const fn is_read_saturated(&self) -> bool {
+        self.rx.len() - self.rx_pos >= MAX_PENDING_READ
+    }
+
+    /// Whether undecoded bytes are still sitting in the receive buffer.
+    ///
+    /// The daemon stops decoding while the PTY queue is full (`IMPLEMENTATION.md`
+    /// § 4.1), which can leave whole frames here that no second `POLLIN` will ever
+    /// announce — the socket reported them once and has nothing new to say. This is
+    /// what tells the event loop to come back for them once the queue has room,
+    /// instead of waiting for a wakeup that is not coming.
+    #[must_use]
+    pub(crate) const fn has_buffered_input(&self) -> bool {
+        self.rx_pos < self.rx.len()
+    }
+
+    /// Reads whatever the socket has available into the receive buffer, up to
+    /// [`MAX_PENDING_READ`] still undecoded.
     ///
     /// # Errors
     ///
     /// Propagates read failures other than `EWOULDBLOCK` and `EINTR`.
     pub(crate) fn fill(&mut self) -> io::Result<()> {
         let mut chunk = [0u8; 16 * 1024];
-        loop {
+        while !self.is_read_saturated() {
             match self.stream.read(&mut chunk) {
                 Ok(0) => {
                     self.eof = true;
@@ -159,6 +204,7 @@ impl Conn {
                 Err(err) => return Err(err),
             }
         }
+        Ok(())
     }
 
     /// Writes as much of the send buffer as the socket accepts.
@@ -187,21 +233,41 @@ impl Conn {
         Ok(())
     }
 
-    /// Pushes out whatever is queued, giving up after [`FINAL_FLUSH_TIMEOUT`].
+    /// Pushes out whatever is queued, giving up [`FINAL_FLUSH_TIMEOUT`] after it
+    /// started.
     ///
     /// # Errors
     ///
-    /// Propagates write failures, including the timeout expiring.
+    /// Propagates write failures, including the deadline expiring.
     pub(crate) fn flush_final(&mut self) -> io::Result<()> {
         // Bounded, because the connection being flushed is frequently one that has
         // stopped reading — that is what a takeover is usually recovering from. An
         // unbounded blocking write here parks the entire daemon inside the kernel:
         // no PTY drained, no client served, no reaping, until a peer that may never
         // read again decides to.
+        //
+        // Against the whole call, not against each `write`. `SO_SNDTIMEO` restarts
+        // per syscall, so a peer reading a trickle keeps resetting it and eight
+        // megabytes — the queue this tolerates before giving up on a client — take
+        // as long as that peer likes. `nomux kill` allows the daemon two seconds to
+        // shut down before `SIGKILL`, and this runs inside them, so an overrun here
+        // is a process group left behind and run files that outlive the session.
         self.stream.set_nonblocking(false)?;
-        self.stream.set_write_timeout(Some(FINAL_FLUSH_TIMEOUT))?;
-        let pending = self.tx.get(self.tx_pos..).unwrap_or(&[]);
-        self.stream.write_all(pending)?;
+        let deadline = std::time::Instant::now() + FINAL_FLUSH_TIMEOUT;
+        while self.tx_pos < self.tx.len() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            self.stream.set_write_timeout(Some(remaining))?;
+            let pending = self.tx.get(self.tx_pos..).unwrap_or(&[]);
+            match self.stream.write(pending) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => self.tx_pos += n,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(err),
+            }
+        }
         self.tx.clear();
         self.tx_pos = 0;
         self.stream.flush()
