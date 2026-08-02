@@ -6,11 +6,13 @@
 //! never change.
 
 use std::io;
+use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 use nomux_proto::is_valid_session_id;
+use rustix::fs::{FlockOperation, Mode, OFlags};
 
 /// Permissions for the run directory: owner-only, since it holds the sockets that
 /// grant access to live sessions.
@@ -33,9 +35,7 @@ pub(crate) const SOCKET_MODE: u32 = 0o600;
 /// # Errors
 ///
 /// Propagates bind failures.
-pub(crate) fn bind_socket_private(path: &std::path::Path) -> io::Result<UnixListener> {
-    use rustix::fs::Mode;
-
+pub(crate) fn bind_socket_private(path: &Path) -> io::Result<UnixListener> {
     let previous = rustix::process::umask(Mode::from_bits_truncate(0o777 & !SOCKET_MODE));
     let listener = UnixListener::bind(path);
     rustix::process::umask(previous);
@@ -170,8 +170,69 @@ impl SessionPaths {
         self.with_extension("agent")
     }
 
+    /// Takes the spawn lock, waiting for whoever holds it.
+    ///
+    /// # Errors
+    ///
+    /// Propagates failures to create or lock `<id>.lock`, and reports
+    /// [`io::ErrorKind::ResourceBusy`] if the file at that path was replaced under
+    /// this one more often than [`LOCK_ATTEMPTS`] allows for.
+    pub(crate) fn lock_spawn(&self) -> io::Result<SpawnLock> {
+        self.acquire(FlockOperation::LockExclusive)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                format!("the spawn lock for session {} kept being removed", self.id),
+            )
+        })
+    }
+
+    /// Takes the spawn lock if it is free this instant, for callers with better
+    /// things to do than wait. `Ok(None)` means it was not granted.
+    ///
+    /// # Errors
+    ///
+    /// Propagates failures to create or open `<id>.lock`. A run directory that
+    /// does not exist arrives as [`io::ErrorKind::NotFound`], which is not a
+    /// failure so much as an answer: there is no session there to collect.
+    pub(crate) fn try_lock_spawn(&self) -> io::Result<Option<SpawnLock>> {
+        self.acquire(FlockOperation::NonBlockingLockExclusive)
+    }
+
+    /// Locks `<id>.lock` and confirms that what got locked is still that file.
+    fn acquire(&self, operation: FlockOperation) -> io::Result<Option<SpawnLock>> {
+        let path = self.lock();
+        for _ in 0..LOCK_ATTEMPTS {
+            let fd = rustix::fs::open(
+                &path,
+                OFlags::CREATE | OFlags::RDWR | OFlags::CLOEXEC,
+                Mode::RUSR | Mode::WUSR,
+            )?;
+            match rustix::fs::flock(&fd, operation) {
+                Ok(()) => {}
+                Err(rustix::io::Errno::WOULDBLOCK) => return Ok(None),
+                Err(err) => return Err(err.into()),
+            }
+            let lock = SpawnLock { fd };
+            if lock.is_file_at(&path) {
+                return Ok(Some(lock));
+            }
+            // Collection removed the file while this call was waiting for it, so
+            // what is held now is an inode nobody else can reach. Whoever asks
+            // next creates a fresh file at the path and locks that instead, and
+            // the two of them then hold one mutex each. Go back for the file that
+            // is actually there.
+        }
+        Ok(None)
+    }
+
     /// Removes every file belonging to this session, ignoring absences.
-    pub(crate) fn unlink_all(&self) {
+    ///
+    /// `lock` is never read: it is the proof that the caller holds `<id>.lock`,
+    /// which is what makes removing that file safe. Collection that skipped the
+    /// lock would pull the spawn mutex out from under an attach that is using it
+    /// (`IMPLEMENTATION.md` § 6.3), and could unlink the socket of a session that
+    /// came up while the decision to collect was being made.
+    pub(crate) fn unlink_all_locked(&self, _lock: &SpawnLock) {
         for path in [
             self.socket(),
             self.pid(),
@@ -181,6 +242,60 @@ impl SessionPaths {
         ] {
             drop(fs::remove_file(path));
         }
+    }
+
+    /// Removes every file belonging to this session, if the spawn lock is free.
+    ///
+    /// For the daemon's own shutdown, which holds nothing. An attach may be
+    /// waiting on `<id>.lock` at this very moment — this daemon's exit is what it
+    /// is about to discover — so the files are left alone rather than removed from
+    /// under it. That costs little: the attach finds a socket whose `connect` is
+    /// refused, which it already treats as stale and replaces, and the next `list`
+    /// collects whatever is left over. Waiting for the lock instead would park the
+    /// daemon's exit behind that attach's spawn timeout.
+    pub(crate) fn unlink_all(&self) {
+        if let Ok(Some(lock)) = self.try_lock_spawn() {
+            self.unlink_all_locked(&lock);
+        }
+    }
+}
+
+/// How many times an acquirer will re-take the lock on finding that the file it
+/// locked is no longer the file at the path.
+///
+/// Each retry costs some other process a whole collection, so more than one or
+/// two means a machine looping on `nomux list` rather than a race being lost; the
+/// cap is only here so that such a machine cannot spin an attach forever.
+const LOCK_ATTEMPTS: usize = 8;
+
+/// An exclusive hold on a session's `<id>.lock`, released when this is dropped.
+///
+/// It serialises two attaches racing to create the same session
+/// (`IMPLEMENTATION.md` § 6.3) and — less obviously — either of them against the
+/// garbage collection of § 6.6, which removes `<id>.lock` along with the rest of
+/// the session. Both must take it, because a file that is unlinked while it is
+/// locked stops being a mutex at all: the next process to ask creates a new file
+/// at the same path, locks that, and both are then certain they hold the only
+/// lock there is.
+#[derive(Debug)]
+pub(crate) struct SpawnLock {
+    /// Held only for the `flock` it carries; `close(2)` is what releases it.
+    fd: OwnedFd,
+}
+
+impl SpawnLock {
+    /// Whether the locked descriptor is still the file at `path`.
+    ///
+    /// `flock` attaches to the inode rather than to the name, so this is the only
+    /// way to tell a lock on the spawn mutex from a lock on what used to be it.
+    /// Either failure — an unreadable descriptor, a path that is gone — answers
+    /// "no", which is the safe direction: the caller goes round again instead of
+    /// acting on a lock it may not hold.
+    fn is_file_at(&self, path: &Path) -> bool {
+        let (Ok(held), Ok(named)) = (rustix::fs::fstat(&self.fd), rustix::fs::stat(path)) else {
+            return false;
+        };
+        held.st_dev == named.st_dev && held.st_ino == named.st_ino
     }
 }
 

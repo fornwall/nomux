@@ -15,7 +15,6 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use rustix::event::PollFlags;
-use rustix::fs::{FlockOperation, Mode, OFlags};
 use rustix::pipe::SpliceFlags;
 
 use crate::rundir::SessionPaths;
@@ -49,7 +48,10 @@ pub(crate) fn run(session_id: &str, label: Option<&str>) -> io::Result<()> {
 /// Connects, spawning the daemon under an exclusive lock if nothing is listening.
 ///
 /// The lock serialises concurrent attaches so two clients racing to create the
-/// same session produce one daemon, not two fighting over the socket path.
+/// same session produce one daemon, not two fighting over the socket path. It is
+/// held to the end of the function rather than released after the spawn, because
+/// garbage collection takes the same lock (`IMPLEMENTATION.md` § 6.6): while it
+/// is held, nothing can unlink the socket this is waiting for.
 fn connect_or_spawn(paths: &SessionPaths, label: Option<&str>) -> io::Result<UnixStream> {
     match UnixStream::connect(paths.socket()) {
         Ok(stream) => return Ok(stream),
@@ -58,12 +60,11 @@ fn connect_or_spawn(paths: &SessionPaths, label: Option<&str>) -> io::Result<Uni
     }
 
     paths.ensure_dir()?;
-    let lock = rustix::fs::open(
-        paths.lock(),
-        OFlags::CREATE | OFlags::RDWR | OFlags::CLOEXEC,
-        Mode::RUSR | Mode::WUSR,
-    )?;
-    rustix::fs::flock(&lock, FlockOperation::LockExclusive)?;
+    // `lock_spawn` is where the subtlety lives: a collector may have unlinked
+    // `<id>.lock` while this call was blocked on it, and a lock on a file that no
+    // longer has that name is not this mutex — the next attach would create a new
+    // file there and lock that. It checks and goes back for the real one.
+    let _spawn_lock = paths.lock_spawn()?;
 
     // Another attach may have created the session while we waited for the lock.
     match UnixStream::connect(paths.socket()) {

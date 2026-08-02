@@ -11,13 +11,22 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
-use crate::rundir::{SessionPaths, run_dir, sanitize_label};
+use crate::rundir::{SessionPaths, SpawnLock, run_dir, sanitize_label};
 
 /// How long a terminated daemon has to exit before it is killed outright.
 const TERM_GRACE: Duration = Duration::from_secs(2);
 
 /// Interval between liveness checks while waiting out `TERM_GRACE`.
 const REAP_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// How long `kill` waits for the spawn lock before giving up on the session.
+///
+/// Long enough for a healthy spawn — a `fork`, an `exec` and a `bind` — and for
+/// any collection, which is five `unlink`s, so the ordinary race is simply won
+/// rather than reported. Deliberately shorter than the five seconds an attach
+/// spends waiting for a daemon that never starts: past that point telling the
+/// caller is worth more than going on waiting.
+const SPAWN_LOCK_GRACE: Duration = Duration::from_secs(2);
 
 /// State of one session as seen from the run directory alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,7 +64,7 @@ pub(crate) fn list() -> io::Result<()> {
             continue;
         };
         match liveness(&paths) {
-            Liveness::Stale => paths.unlink_all(),
+            Liveness::Stale => collect(&paths),
             Liveness::Alive => {
                 let pid = read_pid(&paths).map_or_else(|| "?".to_owned(), |pid| pid.to_string());
                 // Sanitised on read as well as on write. The file is sanitised
@@ -75,25 +84,35 @@ pub(crate) fn list() -> io::Result<()> {
 ///
 /// # Errors
 ///
-/// Fails if the session id is invalid. A session that is already gone is not an
-/// error — the postcondition is "no such session", which already holds.
+/// Fails if the session id is invalid, or if the spawn lock could not be taken
+/// within [`SPAWN_LOCK_GRACE`] — see [`hold_spawn_lock`]. A session that is
+/// already gone is not an error — the postcondition is "no such session", which
+/// already holds.
 pub(crate) fn kill(session_id: &str) -> io::Result<()> {
     let paths = SessionPaths::new(session_id)?;
+    // Held from here to the end of the function. Nothing can spawn into this id
+    // while it is held (§ 6.3), which is what keeps the two halves of this
+    // operation talking about the same session: without it, an attach that starts
+    // a fresh daemon between the signal below and the unlink that follows loses
+    // its socket to a kill it was never the target of.
+    let Some(lock) = hold_spawn_lock(&paths)? else {
+        return Ok(());
+    };
     // Liveness first, and only then the pid. A daemon that died without unlinking —
     // `SIGKILL`, an OOM kill, a crash — leaves its pidfile behind, and the kernel
     // reuses pids, so signalling one read off disk without checking is how `nomux
     // kill` ends up terminating an unrelated process of the user's. The socket is
     // the authority on whether the daemon is still there.
     if liveness(&paths) == Liveness::Stale {
-        paths.unlink_all();
+        paths.unlink_all_locked(&lock);
         return Ok(());
     }
     let Some(pid) = read_pid(&paths) else {
-        paths.unlink_all();
+        paths.unlink_all_locked(&lock);
         return Ok(());
     };
     let Some(pid) = rustix::process::Pid::from_raw(pid) else {
-        paths.unlink_all();
+        paths.unlink_all_locked(&lock);
         return Ok(());
     };
 
@@ -102,15 +121,76 @@ pub(crate) fn kill(session_id: &str) -> io::Result<()> {
     let deadline = Instant::now() + TERM_GRACE;
     while Instant::now() < deadline {
         if liveness(&paths) == Liveness::Stale {
-            paths.unlink_all();
+            paths.unlink_all_locked(&lock);
             return Ok(());
         }
         thread::sleep(REAP_POLL_INTERVAL);
     }
 
     let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
-    paths.unlink_all();
+    paths.unlink_all_locked(&lock);
     Ok(())
+}
+
+/// Takes the spawn lock for the whole of a `kill`, waiting briefly for it.
+///
+/// `Ok(None)` means there is no run directory to lock in, and therefore no
+/// session: the postcondition holds without anything being done.
+///
+/// The wait is what makes `kill` *win* a race against the attach creating this
+/// session rather than merely lose one: the holder releases as soon as its daemon
+/// answers, and that daemon is then killed on the next line like any other. It is
+/// bounded rather than a blocking `flock` because this is the frozen control
+/// surface — a process that has stopped while holding the lock is not a reason
+/// for `kill` to hang forever.
+///
+/// # Errors
+///
+/// Reports [`io::ErrorKind::ResourceBusy`] when the lock is still held at the
+/// deadline. Returning success there would make `kill` claim a postcondition it
+/// did not establish — the session is still on disk and about to be listed again
+/// — and the exit status is all the caller has to go on.
+fn hold_spawn_lock(paths: &SessionPaths) -> io::Result<Option<SpawnLock>> {
+    let deadline = Instant::now() + SPAWN_LOCK_GRACE;
+    loop {
+        match paths.try_lock_spawn() {
+            Ok(Some(lock)) => return Ok(Some(lock)),
+            Ok(None) if Instant::now() >= deadline => {
+                return Err(io::Error::new(
+                    io::ErrorKind::ResourceBusy,
+                    format!(
+                        "session {} is being started or removed by another process",
+                        paths.id()
+                    ),
+                ));
+            }
+            Ok(None) => thread::sleep(REAP_POLL_INTERVAL),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Removes a dead session's files, or leaves them to whoever comes next.
+///
+/// The probe that got us here is a hint rather than a verdict. `<id>.lock` is the
+/// mutex an attach holds across creating a session (§ 6.3) and is itself one of
+/// the files removed below, so an entry that looked stale a moment ago may be one
+/// an attach is in the middle of bringing up — and taking that mutex out from
+/// under it is how two attaches end up each holding a lock of their own. So
+/// collection takes the same lock, and gives up rather than waits: a session
+/// somebody is starting is not garbage, `list` is a snapshot either way, and the
+/// entry is collectable for as long as it stays dead.
+///
+/// Liveness is then decided again under the lock, which is the only place the
+/// answer cannot change between being read and being acted on.
+fn collect(paths: &SessionPaths) {
+    let Ok(Some(lock)) = paths.try_lock_spawn() else {
+        return;
+    };
+    if liveness(paths) == Liveness::Stale {
+        paths.unlink_all_locked(&lock);
+    }
 }
 
 /// Extracts a session id from a `*.sock` path, ignoring anything else.
