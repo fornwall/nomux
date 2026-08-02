@@ -521,8 +521,17 @@ fn bind_socket(paths: &SessionPaths) -> io::Result<UnixListener> {
     Ok(listener)
 }
 
+/// Records the pid `nomux kill` will signal, at a mode its owner can read back.
+///
+/// `File::create` asks for `0666`, so the umask alone decides what this ends up
+/// as: `0644` under an ordinary one, and `0266` under `umask 0400` — a pidfile
+/// its own owner cannot read. `kill` refuses to unlink a live session whose pid
+/// it cannot read, correctly, so the session would be unkillable until somebody
+/// noticed and `chmod`ed it. The directory is `0700` either way; this is about
+/// the file staying legible to the process that has to act on it.
 fn write_pidfile(paths: &SessionPaths) -> io::Result<()> {
-    let mut file = fs::File::create(paths.pid())?;
+    let mut file =
+        crate::rundir::with_umask(crate::rundir::FILE_MODE, || fs::File::create(paths.pid()))?;
     writeln!(file, "{}", std::process::id())
 }
 
