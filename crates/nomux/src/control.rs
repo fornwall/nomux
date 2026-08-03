@@ -11,7 +11,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
-use crate::rundir::{SessionPaths, SpawnLock, check_run_dir, read_label, run_dir};
+use crate::rundir::{SessionPaths, SpawnLock, check_run_dir, read_label, read_prefix, run_dir};
 
 /// How long a terminated daemon has to exit before it is killed outright.
 const TERM_GRACE: Duration = Duration::from_secs(2);
@@ -59,11 +59,23 @@ const SPAWN_LOCK_GRACE: Duration = Duration::from_secs(2);
 /// does not hang.
 const PUBLISH_GRACE: Duration = Duration::from_secs(2);
 
+/// Longest `<id>.pid` body this reads.
+///
+/// The layout says a pid in ASCII and a newline (§ 6.6), which is eleven bytes at
+/// the widest a pid can be; the rest is room for whatever whitespace a file repaired
+/// by hand carries. Bounded at all for [`read_prefix`]'s reason: what somebody left
+/// at that path does not get to decide how much memory the escape hatch faults in.
+const MAX_PID_LEN: usize = 32;
+
 /// State of one session as seen from the run directory alone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 enum Liveness {
-    /// A daemon accepted a connection.
-    Alive,
+    /// A daemon accepted a connection, which is handed over with the answer: that
+    /// connection is what ties a pid to this socket (see [`daemon_of`]).
+    ///
+    /// `None` where liveness was concluded from something *other* than an accepted
+    /// connection — see [`liveness`] — and so with nothing to ask.
+    Alive(Option<UnixStream>),
     /// The socket exists but nothing is listening; the daemon died.
     Stale,
 }
@@ -83,6 +95,14 @@ fn present(checked: io::Result<()>) -> io::Result<bool> {
 }
 
 /// Prints one line per live session: id, pid and label.
+///
+/// A reader that closes stdout early — `nomux list | head` — ends the listing rather
+/// than failing it. The Rust runtime ignores `SIGPIPE` (§ 6.2 depends on that), so
+/// the write comes back `EPIPE` instead of ending the process, and § 10 already reads
+/// a closed stdout as a clean end for `attach`. What it does *not* end is the sweep:
+/// the ids are already in hand, so finishing it costs one `connect` and at most five
+/// `unlink`s per dead session and leaves nothing behind, where returning early would
+/// make `head` the reason a stale session survived.
 ///
 /// # Errors
 ///
@@ -121,13 +141,17 @@ pub(crate) fn list() -> io::Result<()> {
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
+    let mut listening = true;
     for id in ids {
         let Ok(paths) = SessionPaths::new(&id) else {
             continue;
         };
         match liveness(&paths) {
             Liveness::Stale => collect(&paths),
-            Liveness::Alive => {
+            // Nowhere left to print to, and the arm above is the whole reason the
+            // loop goes on anyway.
+            Liveness::Alive(_) if !listening => {}
+            Liveness::Alive(_) => {
                 let pid = read_pid(&paths).map_or_else(|| "?".to_owned(), |pid| pid.to_string());
                 // Sanitised on read as well as on write. The file is sanitised
                 // going in, but this is the frozen layout (§ 6.6): the daemon that
@@ -135,7 +159,10 @@ pub(crate) fn list() -> io::Result<()> {
                 // of whoever ran `list`. A label carrying `ESC ]0;` would retitle
                 // their window.
                 let label = read_label(&paths.label());
-                writeln!(out, "{id}\t{pid}\t{label}")?;
+                match writeln!(out, "{id}\t{pid}\t{label}") {
+                    Err(err) if err.kind() == io::ErrorKind::BrokenPipe => listening = false,
+                    outcome => outcome?,
+                }
             }
         }
     }
@@ -176,15 +203,16 @@ pub(crate) fn kill(session_id: &str) -> io::Result<()> {
         // moment it is reaped, and `SIGKILL` is the one signal nothing survives.
         let mut deadline = Instant::now() + TERM_GRACE;
         let mut killed = false;
-        while liveness(&paths) == Liveness::Alive {
+        while matches!(liveness(&paths), Liveness::Alive(_)) {
             if Instant::now() >= deadline {
                 // Still answering after `SIGKILL`, which nothing survives — so the
-                // pid that was signalled is not the process serving this socket.
-                // A stale pidfile whose number has been reissued is how that
-                // happens, and the two signals went to a stranger. The unlink below
-                // is unconditional, so without this it would take a live session's
-                // socket with it, which is the one thing § 6.6 promises never
-                // happens. Refused instead, the same way `resolve` refuses a
+                // pid that was signalled is not the process serving this socket, and
+                // the two signals went to a stranger. [`resolve`] takes that pid from
+                // the socket wherever the socket will name one, which leaves the
+                // pidfile fallback as the way this is still reachable. The unlink
+                // below is unconditional, so without this it would take a live
+                // session's socket with it, which is the one thing § 6.6 promises
+                // never happens. Refused instead, the same way `resolve` refuses a
                 // session it cannot identify.
                 if killed {
                     return Err(io::Error::new(
@@ -270,8 +298,15 @@ enum Target {
 /// kill` ends up terminating an unrelated process of the user's. The socket is the
 /// authority on whether the daemon is still there.
 ///
+/// It is the authority on *which* process it is, too, wherever it will say: the
+/// connection that just answered carries the pid in [`daemon_of`], and nothing at a
+/// filename can forge that. `<id>.pid` is what is left when it will not — the
+/// bind-to-publish window has no file yet, and § 6.2's fork leaves a socket whose
+/// creator is gone and an heir only the file names — so the file is read second and
+/// believed only there.
+///
 /// The other direction is § 6.6's rule that a live session's files are never
-/// unlinked: a socket that answers and a pid that cannot be read is an **error**,
+/// unlinked: a socket that answers and no pid to be had either way is an **error**,
 /// never a "no such session". There is exactly one benign reason for that state,
 /// which is the daemon's own bind-to-publish window, so a *missing* pidfile is
 /// waited out for [`PUBLISH_GRACE`] and anything else — a mode that hides it, a
@@ -279,25 +314,32 @@ enum Target {
 ///
 /// # Errors
 ///
-/// Reports the reason a live session's pid could not be read.
+/// Reports the reason a live session's pid could not be had.
 fn resolve(paths: &SessionPaths) -> io::Result<Target> {
     let deadline = Instant::now() + PUBLISH_GRACE;
     loop {
-        if liveness(paths) == Liveness::Stale {
+        let Liveness::Alive(answered) = liveness(paths) else {
             return Ok(Target::Gone);
+        };
+        if let Some(pid) = answered.as_ref().and_then(daemon_of) {
+            return Ok(Target::Daemon(pid));
         }
-        let waiting_on = match fs::read_to_string(paths.pid()) {
-            Ok(body) if !body.trim().is_empty() => {
-                return parse_pid(&body)
+        let mut buf = [0u8; MAX_PID_LEN];
+        let waiting_on = match read_prefix(&paths.pid(), &mut buf) {
+            Ok(body) if !body.trim_ascii().is_empty() => {
+                return parse_pid(body)
                     .and_then(rustix::process::Pid::from_raw)
                     .map(Target::Daemon)
-                    .ok_or_else(|| unreadable(paths, &format!("it holds {body:?}")));
+                    .ok_or_else(|| {
+                        let body = String::from_utf8_lossy(body);
+                        unreadable(paths, &format!("it holds {body:?}"))
+                    });
             }
             // Present but empty is the same window one syscall later, and is therefore
             // waited out rather than reported: `SessionPaths::write_pid` publishes in
-            // two steps — a `File::create` that leaves a zero-length file, then the
-            // `writeln!` that fills it — so a reader can land between them. Reported
-            // as an error it refused to kill a session in perfect health.
+            // two steps — a `File::create` that leaves a zero-length file, then the one
+            // `write` that fills it — so a reader can land between them. Reported as an
+            // error it refused to kill a session in perfect health.
             Ok(_) => "it was created but never written",
             Err(err) if err.kind() == io::ErrorKind::NotFound => "it never appeared",
             Err(err) => return Err(unreadable(paths, &err.to_string())),
@@ -307,6 +349,27 @@ fn resolve(paths: &SessionPaths) -> io::Result<Target> {
         }
         thread::sleep(POLL_INTERVAL);
     }
+}
+
+/// The daemon behind a connection that answered: the process that called `listen`.
+///
+/// `SO_PEERCRED` on the *client* side of a unix socket reports the credentials the
+/// kernel recorded for the listening socket, which it takes at `listen(2)` from the
+/// process performing it. So this is the one number on this surface that is tied to
+/// the socket rather than to a name in a directory — a stale `<id>.pid`, or one a
+/// user repaired by hand, cannot make it point anywhere.
+///
+/// `None` where that process no longer exists, which is not a formality: § 6.2's
+/// interactive path binds the socket and *then* forks, so a daemon that had to detach
+/// that way is an heir serving a socket its exited parent created, and the parent's
+/// number is exactly the reissuable one this exists to stop signalling. The pidfile,
+/// written after that fork by the process that survived it, is the only account of
+/// the heir — so an answer of `None` sends [`resolve`] there rather than at a stranger.
+fn daemon_of(answered: &UnixStream) -> Option<rustix::process::Pid> {
+    let creator = rustix::net::sockopt::socket_peercred(answered).ok()?.pid;
+    rustix::process::test_kill_process(creator)
+        .is_ok()
+        .then_some(creator)
 }
 
 /// The refusal to touch a live session whose pid is not knowable.
@@ -345,7 +408,7 @@ fn collect(paths: &SessionPaths) {
     let Some(lock) = paths.try_lock_spawn() else {
         return;
     };
-    if liveness(paths) == Liveness::Stale {
+    if matches!(liveness(paths), Liveness::Stale) {
         // Ignored, unlike `kill`: this is opportunistic tidying behind a `list`,
         // with no caller waiting on an answer and nothing lost by trying again.
         drop(paths.unlink_all_locked(&lock));
@@ -376,8 +439,12 @@ fn session_id_of(path: &Path) -> Option<String> {
 
 /// Probes the socket. A refused connection means the daemon is gone; the socket
 /// file outlives the process that bound it.
+///
+/// The connection is handed back rather than dropped, because it is evidence about
+/// more than liveness: [`daemon_of`] reads the daemon's own pid off it.
 fn liveness(paths: &SessionPaths) -> Liveness {
     match UnixStream::connect(paths.socket()) {
+        Ok(answered) => Liveness::Alive(Some(answered)),
         Err(err)
             if matches!(
                 err.kind(),
@@ -386,9 +453,9 @@ fn liveness(paths: &SessionPaths) -> Liveness {
         {
             Liveness::Stale
         }
-        // A successful connect obviously means alive; so does anything else, such
-        // as EACCES, which is not evidence of death. Never unlink on a guess.
-        _ => Liveness::Alive,
+        // Anything else — `EACCES`, a descriptor limit — is not evidence of death
+        // either, so it is alive with nothing to ask. Never unlink on a guess.
+        Err(_) => Liveness::Alive(None),
     }
 }
 
@@ -398,7 +465,8 @@ fn liveness(paths: &SessionPaths) -> Liveness {
 /// body instead, because a live session whose pid will not parse is the one case
 /// that must be reported rather than shrugged off.
 fn read_pid(paths: &SessionPaths) -> Option<i32> {
-    parse_pid(&fs::read_to_string(paths.pid()).ok()?)
+    let mut buf = [0u8; MAX_PID_LEN];
+    parse_pid(read_prefix(&paths.pid(), &mut buf).ok()?)
 }
 
 /// The pidfile's on-disk contract (§ 6.6), in the one place both readers share.
@@ -407,6 +475,11 @@ fn read_pid(paths: &SessionPaths) -> Option<i32> {
 /// a whole process group and as every process the caller may signal, so a pidfile
 /// holding one is a number that must never reach a signal — and a daemon whose
 /// pidfile says `0` is not a daemon this can identify.
-fn parse_pid(body: &str) -> Option<i32> {
-    body.trim().parse::<i32>().ok().filter(|pid| *pid > 0)
+fn parse_pid(body: &[u8]) -> Option<i32> {
+    str::from_utf8(body)
+        .ok()?
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .filter(|pid| *pid > 0)
 }

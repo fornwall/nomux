@@ -16,7 +16,10 @@ categories.workspace = true
 
 [dependencies]
 nomux-proto.workspace = true
-rustix = { version = "1.1.4", features = ["pty", "termios", "process", "event", "fs", "pipe", "stdio"] }
+# `net` is here for one getsockopt: `SO_PEERCRED` on the connection `nomux kill`
+# already makes is what ties a pid to the socket rather than to a file anybody
+# could have written (`control::daemon_of`). Sockets themselves are std's.
+rustix = { version = "1.1.4", features = ["pty", "termios", "process", "event", "fs", "pipe", "stdio", "net"] }
 # Only for `signal`, `fork` and `_exit`, all of which rustix puts in its `runtime`
 # module — documented as unusable in a process that has a libc, which this one does
 # via std. Declarations only, so it costs nothing in the binary, and it is already

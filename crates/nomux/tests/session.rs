@@ -1779,12 +1779,22 @@ fn a_daemon_that_leads_a_process_group_detaches_by_forking() {
     // leave a session behind.
     let detachment = recorded.map(detachment_of).unwrap_or_default();
     let alive = recorded.is_some_and(process_alive);
-    drop(control(&root, &["kill", "grouped"]));
+    let killed = control(&root, &["kill", "grouped"]);
     drop(starter);
 
     assert!(
         starter_exited,
         "the process that started never left, so nothing forked"
+    );
+    // The other half of what the pidfile is for, and the one case where it outranks
+    // the socket: `control::daemon_of` takes the pid off the connection, and the
+    // process that made this socket is the one that `_exit`ed above. A number the
+    // kernel has already reclaimed is not an identity, so `kill` falls back to the
+    // file the survivor wrote — without which this session could not be stopped at
+    // all, which is the fault the assertion below names from the other side.
+    succeeded(
+        &killed,
+        "kill could not stop a daemon that had to fork to detach",
     );
     assert_ne!(
         recorded,

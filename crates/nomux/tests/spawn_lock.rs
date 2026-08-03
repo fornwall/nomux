@@ -23,18 +23,19 @@ mod harness;
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
 use nomux_proto::PROTOCOL_VERSION;
 
 use harness::{
     Reaper, Spawned, collect, control, nomux, nomux_with_shell, poll_until, run_root, stderr,
-    stdout, succeeded, wait_for,
+    stdout, succeeded, wait_for, while_nothing_forks,
 };
 
 /// A `list` that finds the spawn lock held leaves the whole entry alone, and
@@ -295,22 +296,42 @@ fn kill_waits_out_a_pidfile_that_has_been_created_but_not_yet_written() {
     );
 }
 
-/// `kill` never unlinks a live session's files, whatever the pidfile says.
+/// `kill` never unlinks a live session's files when nothing will say which process
+/// is serving it.
 ///
-/// The socket has just answered, so there is a daemon holding the user's shell.
-/// Unlinking there — which is what an unreadable pidfile used to mean — takes that
-/// daemon's socket away without stopping it: the session answers nothing, appears
-/// in no listing, and the id is free for a second daemon to bind over. So this is
-/// an error, and the files stay exactly as they were until somebody can say which
-/// process to signal.
+/// The socket is unmistakably there, so there is a daemon holding the user's shell.
+/// Unlinking there takes that daemon's socket away without stopping it: the session
+/// answers nothing, appears in no listing, and the id is free for a second daemon to
+/// bind over. So this is an error, and the files stay exactly as they were until
+/// somebody can say which process to signal.
+///
+/// Both sources have to be shut for that, and the pidfile is now the lesser of them:
+/// the socket names the daemon wherever it will answer at all (`control::daemon_of`),
+/// so a hidden pidfile alone no longer leaves `kill` without an answer. A `connect`
+/// refused with `EACCES` is not evidence of death either (§ 6.6), which is what
+/// leaves this session both certainly alive and unidentifiable.
 #[test]
-fn kill_leaves_a_live_session_alone_when_its_pidfile_cannot_be_read() {
+fn kill_leaves_a_live_session_alone_when_nothing_will_say_which_process_it_is() {
+    if rustix::process::getuid().is_root() {
+        // A mode keeps nobody out of their own socket as root, so the daemon would
+        // name itself on the connection and `kill` would rightly stop it.
+        return;
+    }
     let session = LiveSession::create("lk6");
     let before = entries(&session.run.dir);
+    fs::set_permissions(session.run.socket(), fs::Permissions::from_mode(0o000))
+        .expect("shut the socket");
     fs::set_permissions(session.pid_path(), fs::Permissions::from_mode(0o000))
         .expect("hide the pidfile");
 
     let killed = session.run.run(&["kill", "lk6"]);
+    // Both repaired before the assertions, since `is_alive` below has to be able to
+    // reach the socket and the collection at the end has to be able to identify it.
+    fs::set_permissions(session.run.socket(), fs::Permissions::from_mode(0o600))
+        .expect("restore the socket");
+    fs::set_permissions(session.pid_path(), fs::Permissions::from_mode(0o600))
+        .expect("restore the pidfile");
+
     assert!(
         !killed.status.success(),
         "kill claimed to have removed a session it left running"
@@ -327,17 +348,230 @@ fn kill_leaves_a_live_session_alone_when_its_pidfile_cannot_be_read() {
         "not one of the five files was kill's to remove"
     );
 
-    // Repaired, the same command works: the refusal is about the pidfile, not
+    // Repaired, the same command works: the refusal is about what could be read, not
     // about the session.
-    fs::set_permissions(session.pid_path(), fs::Permissions::from_mode(0o600))
-        .expect("restore the pidfile");
     succeeded(
         &session.run.run(&["kill", "lk6"]),
-        "kill failed once the pidfile was readable again",
+        "kill failed once the session could be identified again",
     );
     assert!(
         entries(&session.run.dir).is_empty(),
         "kill must unlink all five files"
+    );
+}
+
+/// Regression: `kill` signals the process the socket names, not the number in the
+/// pidfile.
+///
+/// `<id>.pid` is a name in a directory. Nothing tied it to the socket, so a number
+/// that has been reissued since — a daemon killed before `clear_pid` existed, an
+/// older version, a file repaired by hand — sent `SIGTERM` and then `SIGKILL` to an
+/// unrelated process of the user's, and only the "still answering after `SIGKILL`"
+/// branch noticed, by which time that process was already dead. `SO_PEERCRED` on the
+/// connection `kill` already makes is the tie: the kernel takes it at `listen(2)`
+/// from the process performing it, and no file can forge it.
+///
+/// The first assertion is that claim about `SO_PEERCRED` itself, checked against a
+/// daemon in another process rather than assumed from the manual page.
+#[test]
+fn kill_signals_the_process_the_socket_names_rather_than_the_pidfile() {
+    let session = LiveSession::create("lk11");
+
+    let answered = UnixStream::connect(session.run.socket()).expect("connect to the session");
+    let named = rustix::net::sockopt::socket_peercred(&answered)
+        .expect("the credentials of whoever is listening")
+        .pid;
+    drop(answered);
+    assert_eq!(
+        named.as_raw_nonzero().get().cast_unsigned(),
+        session.pid,
+        "a connection must name the process that called `listen` on the socket"
+    );
+
+    // A process of the user's with nothing to do with the session, and a pidfile that
+    // names it.
+    let mut bystander = Spawned::spawn(
+        Command::new("sleep")
+            .arg("300")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    );
+    fs::write(session.pid_path(), format!("{}\n", bystander.id()))
+        .expect("plant a reissued pid in the pidfile");
+
+    let killed = session.run.run(&["kill", "lk11"]);
+    // Read before anything is asserted, so a failure cannot also leave the bystander
+    // behind — and `Spawned` collects it either way.
+    let survived = bystander.is_running();
+    drop(bystander);
+
+    assert!(
+        survived,
+        "kill signalled an unrelated process of the user's: {:?}",
+        stderr(&killed)
+    );
+    succeeded(&killed, "kill could not stop the session");
+    assert!(
+        poll_until(Duration::from_secs(10), || !process_alive(session.pid)),
+        "kill reported success with the daemon it was asked to stop still running \
+         as pid {}",
+        session.pid
+    );
+}
+
+/// Regression: `list` answers from a bounded prefix of `<id>.pid`.
+///
+/// The escape hatch has to keep working on any host, which it would not if a file
+/// somebody left in the run directory decided how much memory it faulted in — and
+/// under `-Cpanic=immediate-abort` (§ 8) an allocation that fails is an abort rather
+/// than an error. `rundir::read_prefix` makes the argument; `<id>.label` has always
+/// been read that way and `<id>.pid` was read whole.
+///
+/// The file here holds a usable pid in its first bytes and then runs on for sixty-four
+/// megabytes, so a reader that stops where the layout stops prints that pid and one
+/// that faults in the rest prints `?` — the difference lands in a column, rather than
+/// in a measurement of the memory the process touched. The magnitude is only what
+/// makes it obviously the wrong amount to read; the assertion is about the bound.
+#[test]
+fn list_reads_the_pidfile_as_far_as_the_layout_goes_and_no_further() {
+    let session = LiveSession::create("lk12");
+    let mut body = format!("{}\n", session.pid).into_bytes();
+    // Whitespace to the end of what any bounded reader would take, so the prefix is
+    // exactly a pidfile and everything past it is not.
+    body.resize(32, b' ');
+    let mut padded = File::create(session.pid_path()).expect("rewrite the pidfile");
+    padded.write_all(&body).expect("write the pid");
+    padded
+        .set_len(1 << 26)
+        .expect("run the file on past anything worth reading");
+    drop(padded);
+
+    let listed = session.run.run(&["list"]);
+    succeeded(&listed, "list failed");
+    let line = stdout(&listed);
+    let column = line.split('\t').nth(1).map(str::to_owned);
+    succeeded(&session.run.run(&["kill", "lk12"]), "kill failed");
+
+    assert_eq!(
+        column,
+        Some(session.pid.to_string()),
+        "list must answer from the prefix the layout describes: {line:?}"
+    );
+}
+
+/// Regression: neither run file `list` reads can park it in a syscall.
+///
+/// A FIFO opened `O_RDONLY` without `O_NONBLOCK` blocks in `open(2)` until somebody
+/// opens it for writing, which for a file nobody is writing is for ever — so a FIFO
+/// at `<id>.pid` or `<id>.label` stopped the escape hatch dead. The 0700 directory
+/// bounds that to the session's own user, so it is the robustness of `list` rather
+/// than a way in, but so was the bound on the label's length.
+///
+/// Both files at once, since one open is as far as the old reader ever got. `kill`
+/// reads the pidfile through the same call, so it is fixed by the same flag.
+#[test]
+fn list_does_not_park_on_a_run_file_that_is_a_fifo() {
+    let session = LiveSession::create("lk13");
+    for path in [session.pid_path(), session.run.dir.join("lk13.label")] {
+        drop(fs::remove_file(&path));
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &path,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_bits_truncate(0o600),
+            0,
+        )
+        .expect("plant a FIFO where a run file should be");
+    }
+
+    // Backgrounded with a deadline of its own: the defect is a wait with no end, and
+    // a test that waits for it is one that never fails.
+    let mut listing = Spawned::spawn(
+        nomux(&session.run.root, &["list"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
+    let returned = poll_until(Duration::from_secs(10), || !listing.is_running());
+    let listed = if returned {
+        Some(
+            listing
+                .into_exited()
+                .wait_with_output()
+                .expect("collect what list said"),
+        )
+    } else {
+        None
+    };
+
+    // The FIFOs go before the assertions, so a `kill` that has to fall back to the
+    // pidfile is not itself parked on one.
+    for path in [session.pid_path(), session.run.dir.join("lk13.label")] {
+        drop(fs::remove_file(path));
+    }
+    succeeded(&session.run.run(&["kill", "lk13"]), "kill failed");
+
+    assert!(
+        returned,
+        "`nomux list` parked on a FIFO in the run directory"
+    );
+    let listed = listed.expect("the output of a list that returned");
+    succeeded(&listed, "list failed");
+    assert_eq!(
+        stdout(&listed),
+        "lk13\t?\t\n",
+        "a FIFO holds no pid and no label, and says so in the columns"
+    );
+}
+
+/// Regression: `nomux list | head` is a listing that ended, not a failure.
+///
+/// The Rust runtime ignores `SIGPIPE` — § 6.2 depends on that — so the write to a
+/// stdout whose reader has gone comes back `EPIPE` rather than ending the process.
+/// Reported, that is `nomux: Broken pipe (os error 32)` and exit 1 for something the
+/// user did on purpose, and § 10 already reads a closed stdout as a clean end for
+/// `attach`. It also cut the sweep short, so the stale entries after the one being
+/// printed were left for a `list` nobody may run again.
+///
+/// The pipe here has no reader at all rather than one that walks away, so the first
+/// write fails and nothing depends on beating a reader to the buffer.
+#[test]
+fn a_listing_whose_reader_has_gone_ends_cleanly_and_still_collects() {
+    let session = LiveSession::create("lk14");
+    // Sorted after the live session, so the collection under test is the one that
+    // comes after the write that fails.
+    let stale = session.run.dir.join("lk14x.sock");
+    abandon_socket(&stale);
+    fs::write(session.run.dir.join("lk14x.pid"), "999999999\n").expect("write a stale pidfile");
+
+    // The read end is closed where no `fork` can be carrying a copy of it: a
+    // duplicate in another test's child would leave the pipe with a reader, and the
+    // write below would succeed rather than testing anything.
+    let broken = while_nothing_forks(|| {
+        let (read_end, write_end) = rustix::pipe::pipe().expect("a pipe to break");
+        drop(read_end);
+        write_end
+    });
+    let listed = collect(
+        nomux(&session.run.root, &["list"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(broken))
+            .stderr(Stdio::piped()),
+    );
+
+    let left = entries(&session.run.dir);
+    succeeded(&session.run.run(&["kill", "lk14"]), "kill failed");
+
+    succeeded(&listed, "a reader that closed early is not a failure");
+    assert!(
+        stderr(&listed).is_empty(),
+        "nothing is wrong, so nothing should be said: {:?}",
+        stderr(&listed)
+    );
+    assert!(
+        !left.iter().any(|name| name.starts_with("lk14x")),
+        "the stale session after the broken write was left behind: {left:?}"
     );
 }
 
@@ -499,6 +733,71 @@ fn probe_and_version_report_what_a_client_bootstraps_from() {
             stdout(&refused)
         );
     }
+}
+
+/// Regression: the install directory `probe` reports is absolute or there is none.
+///
+/// § 5.1 has the client read that path off one line of stdout, upload a binary to it
+/// and `exec` what it uploaded (§ 5.2), over an exec channel whose working directory
+/// is nobody's to predict — so a relative answer names a different place on every
+/// connection, and `./nomux` from an unset `HOME` names one under whatever the login
+/// shell happened to start in. `rundir::run_dir` has refused a non-absolute value
+/// since it was written, for its own version of the same reason; this is the other
+/// path out of the environment.
+///
+/// A missing answer is a failure and not a line, because a bootstrap line naming a
+/// path that cannot work is worse than none at all: the client parses stdout, and
+/// there is nothing in the format for "this is not usable".
+#[test]
+fn probe_refuses_an_install_directory_that_is_not_absolute() {
+    let root = run_root("lk15");
+    let home = root.join("home");
+    fs::create_dir_all(&home).expect("create the home the fallback resolves against");
+
+    // A relative `XDG_DATA_HOME` is not an install directory, and `HOME` is what § 5
+    // falls back to when the first source says nothing usable.
+    let fell_back = collect(
+        nomux(&root, &["probe"])
+            .env("XDG_DATA_HOME", "relative/share")
+            .env("HOME", &home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
+    succeeded(&fell_back, "probe failed with a usable HOME");
+    assert_eq!(
+        stdout(&fell_back),
+        format!(
+            "NOMUX-BOOTSTRAP linux {} {}\n",
+            env::consts::ARCH,
+            home.join(".local/share/nomux").display()
+        ),
+        "a relative XDG_DATA_HOME is no install directory, and HOME is the fallback"
+    );
+
+    let nowhere = collect(
+        nomux(&root, &["probe"])
+            .env("XDG_DATA_HOME", "relative/share")
+            .env_remove("HOME")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
+    assert!(
+        !nowhere.status.success(),
+        "probe reported an install directory it had no way to resolve: {:?}",
+        stdout(&nowhere)
+    );
+    assert!(
+        nowhere.stdout.is_empty(),
+        "a line the client cannot use must not be on the stream it parses: {:?}",
+        stdout(&nowhere)
+    );
+    assert!(
+        stderr(&nowhere).contains("absolute"),
+        "the failure must say what was wrong with the environment: {:?}",
+        stderr(&nowhere)
+    );
 }
 
 /// A run directory holding one session, with nothing listening on its socket.

@@ -717,34 +717,58 @@ pub(crate) fn sanitize_label(label: &str) -> String {
     out.trim().to_owned()
 }
 
+/// Reads a bounded prefix of `path`, and hands back what arrived.
+///
+/// Both files the frozen control surface reads by hand come through here —
+/// `<id>.label` and `<id>.pid` — and neither is read whole. The write side bounds
+/// both; the read side cannot assume it did, for the same reason [`read_label`]
+/// sanitizes what it finds: this is the frozen layout (§ 6.6), so the daemon that
+/// wrote the file may be any version, and a stray shell redirect into the run
+/// directory is not a daemon at all. `list` and `kill` are the escape hatch that has
+/// to keep working on any host, which they would not if a file somebody left there
+/// decided how much memory they faulted in — nor if it could park them in a syscall
+/// with no end. `O_NONBLOCK` is what turns a FIFO at either path into an `EAGAIN`
+/// rather than an `open` that waits for a writer that never comes, and `O_NOFOLLOW`
+/// keeps the name from resolving somewhere else entirely.
+///
+/// One read is enough — a regular file returns what was asked for or reaches the end
+/// — and [`crate::nbio::read`] covers the signal that would otherwise cut it short.
+/// `File` with `Take` and `read_to_end` measured 1.6 KiB of machinery this binary
+/// otherwise does not link, against the § 8 budget, for two files that cannot exceed
+/// a few hundred bytes worth reading.
+///
+/// # Errors
+///
+/// Propagates the `open`, so a caller can tell a file that is absent from one it may
+/// not read — which is the difference between a daemon that has not published yet
+/// and one `kill` must refuse to touch. A FIFO nobody is writing to is neither: it
+/// opens, reads nothing, and comes back empty, which is what any other file holding
+/// no session data comes back as.
+pub(crate) fn read_prefix<'a>(path: &Path, buf: &'a mut [u8]) -> io::Result<&'a [u8]> {
+    let fd = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let read = match crate::nbio::read(fd.as_fd(), buf) {
+        Err(rustix::io::Errno::AGAIN) => 0,
+        outcome => outcome?,
+    };
+    Ok(buf.get(..read).unwrap_or(&[]))
+}
+
 /// Reads a session's label, bounded by what the layout permits.
 ///
-/// The write side caps the label at [`MAX_LABEL_LEN`]; the read side cannot assume
-/// it did, for the same reason it sanitizes what it finds — this is the frozen
-/// layout (§ 6.6), so the daemon that wrote the file may be any version, and a
-/// stray shell redirect into the run directory is not a daemon at all. `list` is
-/// the escape hatch that has to keep working on any host, which it would not if a
-/// file somebody left there decided how much memory it faulted in. So a bounded
-/// prefix is read rather than the file.
-///
 /// Anything unreadable is an empty label. A listing that names the session and its
-/// pid is worth more than one that fails over a decoration.
+/// pid is worth more than one that fails over a decoration. Invalid UTF-8 is an
+/// empty label rather than a repaired one, which is what reading it as a `String`
+/// always did.
 pub(crate) fn read_label(path: &Path) -> String {
-    // A stack buffer one byte past the cap, filled by the same `open` and the same
-    // `read` the rest of the daemon uses: `File` with `Take` and `read_to_end`
-    // measured 1.6 KiB of machinery this binary otherwise does not link, against
-    // the § 8 budget, for a file that cannot exceed 257 bytes worth reading. One
-    // read is enough — a regular file returns what was asked for or reaches the end
-    // — and `nbio::read` covers the signal that would otherwise cut it short.
-    //
-    // Invalid UTF-8 is an empty label rather than a repaired one, which is what
-    // reading it as a `String` always did.
+    // One byte past the cap, so a label written at exactly [`MAX_LABEL_LEN`] still
+    // arrives whole and a longer one is visibly over.
     let mut buf = [0u8; MAX_LABEL_LEN + 1];
-    let Ok(fd) = rustix::fs::open(path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()) else {
-        return String::new();
-    };
-    let read = crate::nbio::read(fd.as_fd(), &mut buf).unwrap_or(0);
-    sanitize_label(str::from_utf8(buf.get(..read).unwrap_or(&[])).unwrap_or(""))
+    let body = read_prefix(path, &mut buf).unwrap_or(&[]);
+    sanitize_label(str::from_utf8(body).unwrap_or(""))
 }
 
 #[cfg(test)]
