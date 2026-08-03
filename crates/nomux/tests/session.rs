@@ -1489,6 +1489,71 @@ fn a_symlinked_run_directory_is_refused_by_attach_and_daemon() {
     );
 }
 
+/// A daemon that cannot publish `<id>.pid` refuses to start rather than serving a
+/// session nothing can find.
+///
+/// The pidfile is what `nomux kill` reads to know what to signal (§ 6.6), so a
+/// daemon that carried on without one would hold the user's shell behind a socket
+/// `list` reports as live and `kill` cannot stop — the worst of the states § 6.6
+/// exists to make impossible. Nothing exercised that `?`: every other way of
+/// refusing to start is on the *bind*, which happens first, so the whole window
+/// between binding a socket and publishing the pid was untested.
+///
+/// What it leaves behind is asserted too, because that is the half a refusal cannot
+/// tidy up itself: the socket is already bound when the failure happens, and it is
+/// the one file whose presence is how everything else decides a session exists. A
+/// `connect` to it is refused, which § 6.6 defines as stale, so the next `list` is
+/// what collects it — and does not report a session in the meantime.
+#[test]
+fn a_daemon_that_cannot_publish_its_pidfile_refuses_to_start() {
+    let root = run_root("nopid");
+    let run_dir = root.join("nomux");
+    fs::create_dir_all(run_dir.join("nopid.pid"))
+        .expect("plant a directory where the pidfile goes");
+
+    // Waited out rather than backgrounded, which is safe only because the refusal is
+    // what this asserts: a regression that got past it would hang here rather than
+    // fail, and `SHELL` is set so that what it started would at least be predictable.
+    let refused = collect(
+        nomux_with_shell(&root, &["daemon", "nopid"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
+    assert_eq!(
+        refused.status.code(),
+        Some(1),
+        "a daemon that cannot publish its pidfile must refuse to start (§ 10): {:?}",
+        stderr(&refused)
+    );
+    // Only that it said something, which is all it says. `write_pid` propagates the
+    // bare `io::Error` from `fs::write`, so the line the user gets is `nomux: Is a
+    // directory (os error 21)` with no path in it — every other refusal on this path
+    // names what it refused, and this one is worth an errno with a filename beside
+    // it. Left as a note rather than asserted, because tightening it is a change to
+    // the daemon rather than to its tests.
+    assert!(
+        !stderr(&refused).is_empty(),
+        "a daemon that refuses to start must say why"
+    );
+
+    let listed = control(&root, &["list"]);
+    succeeded(
+        &listed,
+        "list over the wreckage of a daemon that never started",
+    );
+    assert!(
+        !stdout(&listed).contains("nopid"),
+        "a session that never started must not be listed as one: {:?}",
+        stdout(&listed)
+    );
+    assert!(
+        !run_dir.join("nopid.sock").exists(),
+        "the socket the refusal left bound is stale by § 6.6's own test — a refused \
+         connect — so `list` must have collected it"
+    );
+}
+
 /// The other half of `attach`'s exit table: a session that is not there and could
 /// not be started is 127, the shell's "not found" (`IMPLEMENTATION.md` § 10).
 ///
