@@ -510,12 +510,12 @@ impl Daemon {
                 .as_ref()
                 .is_some_and(|client| client.conn.is_write_saturated());
             watches.push((Source::AgentListener, agent.listener(), PollFlags::IN));
-            for (id, fd, wants_write) in agent.watches() {
+            for (id, fd, wants_write, wants_read) in agent.watches() {
                 // A saturated client is the one back pressure signal available:
                 // stop draining agent sockets until the queue it feeds has room.
                 // The bytes wait in the kernel's socket buffer, where the peer
                 // blocks on them, which is exactly the right place for them.
-                let mut flags = if saturated {
+                let mut flags = if saturated || !wants_read {
                     PollFlags::empty()
                 } else {
                     PollFlags::IN
@@ -795,7 +795,7 @@ impl Daemon {
     /// error: a version mismatch is the peer being from another release rather than
     /// misbehaving, and the client acts on the two differently (`DESIGN.md` § 6.4).
     fn reject_pending(&mut self, code: ErrorCode, message: &'static str) {
-        if let Some(mut pending) = self.pending.take() {
+        if let Some(pending) = self.pending.take() {
             pending.send_last(&Frame::Error { code, message });
         }
     }
@@ -820,13 +820,26 @@ impl Daemon {
         };
         match crate::nbio::drain_to(&mut self.pending_input, pty.master()) {
             Ok(()) => Ok(()),
-            // The child is gone; report it rather than failing the daemon, so the
-            // attached client still receives `Exit`. The queue goes with it —
-            // there is no longer anything on the other side of the master to
-            // apply it to.
+            // Belt and braces for an error Linux does not appear to produce: a write
+            // to a master whose slave has gone *succeeds* here, and the departure is
+            // reported on the read side alone, as the `EIO` that `pty::read_pty`
+            // turns into end of file. Measured, not assumed — including against a
+            // session leader holding the slave as its controlling terminal, which is
+            // the shape this daemon makes. So this arm is kept for the kernel that
+            // answers differently rather than for one that does.
+            //
+            // If it ever does fire, the child is gone: not a failure of the daemon,
+            // so the attached client still receives `Exit`, and the queue goes with
+            // it because there is no longer anything to apply it to. What it must not
+            // do is record the exit. `child_gone` is what drops the master from the
+            // poll set, and the read side can still be holding everything the child
+            // wrote on its way out — the line discipline hands it over 4 KiB at a
+            // time — so stamping it here would end the session on output that was
+            // still readable, which is the one thing § 9 says never happens without
+            // a `Gap`. Left to `read_pty`, which reaches `Read::Eof` only once the
+            // master is dry.
             Err(rustix::io::Errno::IO) => {
                 self.pending_input.clear();
-                self.on_child_exit();
                 Ok(())
             }
             Err(err) => Err(err.into()),
@@ -887,6 +900,13 @@ impl Daemon {
             // client that closes with output still queued makes the kernel send
             // RST, and reading that yields ECONNRESET — propagating it would kill
             // the session, which is precisely what this daemon exists to prevent.
+            //
+            // Whatever that `fill` had already buffered goes with the connection,
+            // undecoded. On AF_UNIX the bytes did arrive — the error is reported
+            // after the last of them, not instead of them — so this is where the
+            // input § 3 calls unsafe is actually lost, rather than in the kernel.
+            // It stays this way deliberately: the peer is gone, so the frames are
+            // owed to nobody, and the client resends from `in_applied` anyway.
             self.drop_client();
             return Ok(());
         }
@@ -979,8 +999,13 @@ impl Daemon {
             match Agent::bind(&self.paths.agent()) {
                 Ok(agent) => self.agent = Some(agent),
                 // A session without an agent is worth having; one that refuses to
-                // start is not. `HelloOk` reports the outcome either way.
-                Err(_) => self.agent = None,
+                // start is not. `HelloOk` reports the outcome either way — but only
+                // as a bare `agent: false`, which tells the user who opted in per
+                // host nothing about why. This is the daemon's one remaining silent
+                // degradation, so it says so where everything else does.
+                Err(err) => {
+                    crate::syslog::error(self.paths.id(), &format!("agent socket: {err}"));
+                }
             }
         }
         let config = pty::Spawn {
@@ -1023,11 +1048,21 @@ impl Daemon {
             // session never produced; left alone it would set `sent_through` past
             // the stream and the session would look dead until the child happened
             // to catch up.
-            hello.out_offset.clamp(base, self.ring.end())
+            // `min` then `max` rather than `clamp`, which asserts its bounds are
+            // ordered. They are — `end` is `base + len` — but a shipping build
+            // compiles that assert down to a bare trap with no message and no
+            // symbol, so the cheapest form that cannot abort is the one to use.
+            hello.out_offset.min(self.ring.end()).max(base)
         };
         if let Some(client) = self.client.as_mut() {
             client.sent_through = resume_from;
             client.greeted = true;
+            // Re-armed with the other two, because a second `Hello` on an
+            // established connection rewinds the stream and asks for it again. A
+            // client that greets after the child has gone would otherwise have its
+            // output replayed and wait for ever for an `Exit` that was sent against
+            // the offsets it just abandoned.
+            client.exit_sent = false;
         }
         self.tell_client(&Frame::HelloOk(HelloOk {
             protocol: PROTOCOL_VERSION,
@@ -1212,7 +1247,7 @@ impl Daemon {
 
     /// Sends a final `Error` and closes the connection.
     fn reject(&mut self, code: ErrorCode, message: &'static str) {
-        if let Some(mut client) = self.client.take() {
+        if let Some(client) = self.client.take() {
             client.conn.send_last(&Frame::Error { code, message });
         }
         self.on_detached();

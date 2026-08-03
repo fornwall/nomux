@@ -285,9 +285,10 @@ fn overflow_during_disconnects_is_always_reported() {
 ///
 /// This is § 3 played out as a client actually experiences it. Every round writes
 /// a line and then severs the connection immediately, so each frame lands in one
-/// of three states: fully applied, partly applied, or lost entirely — a client
-/// that closes with output still queued makes the kernel send RST, which discards
-/// what it wrote but the daemon had not yet read. The client responds the way the
+/// of three states: fully applied, partly applied, or lost entirely — a client that
+/// closes with output still queued makes the kernel send RST, and the daemon answers
+/// the `ECONNRESET` that follows by letting the connection go without decoding what
+/// it had just read from it (§ 3). The client responds the way the
 /// protocol says: take the daemon's `in_applied` as authoritative and resend from
 /// there, deliberately overlapping into bytes already applied so the trimming path
 /// is exercised too.

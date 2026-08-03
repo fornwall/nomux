@@ -11,10 +11,22 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
-use crate::rundir::{SessionPaths, SpawnLock, check_run_dir, run_dir, sanitize_label};
+use crate::rundir::{SessionPaths, SpawnLock, check_run_dir, read_label, run_dir};
 
 /// How long a terminated daemon has to exit before it is killed outright.
 const TERM_GRACE: Duration = Duration::from_secs(2);
+
+/// How long a killed daemon has to actually go before `kill` concludes that the
+/// signal never reached whatever is serving the socket.
+///
+/// Nothing survives `SIGKILL`, so this is not a grace in the sense the one above
+/// is: an ordinary daemon is gone within microseconds of it and the wait is never
+/// observed. What it bounds is the case where the pid being signalled is *not* the
+/// process behind the socket — a stale pidfile whose number the kernel has since
+/// reissued — where the two signals landed on a stranger and the session is still
+/// running. Half a second is far beyond how long dying takes and far short of
+/// making the failure slow to report.
+const KILL_GRACE: Duration = Duration::from_millis(500);
 
 /// How often to look again while waiting any of the three graces out.
 ///
@@ -122,7 +134,7 @@ pub(crate) fn list() -> io::Result<()> {
                 // wrote it may be any version, and the bytes land on the terminal
                 // of whoever ran `list`. A label carrying `ESC ]0;` would retitle
                 // their window.
-                let label = sanitize_label(&fs::read_to_string(paths.label()).unwrap_or_default());
+                let label = read_label(&paths.label());
                 writeln!(out, "{id}\t{pid}\t{label}")?;
             }
         }
@@ -136,9 +148,11 @@ pub(crate) fn list() -> io::Result<()> {
 ///
 /// Fails if the session id is invalid, if the run directory is not this user's
 /// alone (§ 6.3), if the spawn lock could not be taken within [`SPAWN_LOCK_GRACE`]
-/// — see [`hold_spawn_lock`] — or if the session is alive but will not say which
-/// process it is (see [`resolve`]). A session that is already gone is not an error
-/// — the postcondition is "no such session", which already holds.
+/// — see [`hold_spawn_lock`] — if the session is alive but will not say which
+/// process it is (see [`resolve`]), or if it goes on answering after both signals,
+/// which means the pid it published is not the process serving it. A session that
+/// is already gone is not an error — the postcondition is "no such session", which
+/// already holds.
 pub(crate) fn kill(session_id: &str) -> io::Result<()> {
     let paths = SessionPaths::new(session_id)?;
     // The same check `list` makes, and this is where it bites hardest: the two
@@ -160,20 +174,42 @@ pub(crate) fn kill(session_id: &str) -> io::Result<()> {
         // Liveness first, deadline second, so a daemon that let go on the last
         // interval is not signalled again: the pid it published is reusable the
         // moment it is reaped, and `SIGKILL` is the one signal nothing survives.
-        let deadline = Instant::now() + TERM_GRACE;
+        let mut deadline = Instant::now() + TERM_GRACE;
+        let mut killed = false;
         while liveness(&paths) == Liveness::Alive {
             if Instant::now() >= deadline {
+                // Still answering after `SIGKILL`, which nothing survives — so the
+                // pid that was signalled is not the process serving this socket.
+                // A stale pidfile whose number has been reissued is how that
+                // happens, and the two signals went to a stranger. The unlink below
+                // is unconditional, so without this it would take a live session's
+                // socket with it, which is the one thing § 6.6 promises never
+                // happens. Refused instead, the same way `resolve` refuses a
+                // session it cannot identify.
+                if killed {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "session {id} is still answering after SIGTERM and SIGKILL to \
+                             pid {pid}, so that pid is not the process serving it; leaving \
+                             it alone rather than unlinking a live session's files",
+                            id = paths.id(),
+                            pid = pid.as_raw_nonzero(),
+                        ),
+                    ));
+                }
                 let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
-                break;
+                killed = true;
+                deadline = Instant::now() + KILL_GRACE;
             }
             thread::sleep(POLL_INTERVAL);
         }
     }
     // The one *successful* exit from the locked region, and so the one place the
     // files go: a session that was already gone, one that stopped on `SIGTERM` and
-    // one that had to be killed all leave the same nothing behind. The other exit is
-    // `resolve`'s `?` above, which deliberately unlinks nothing — § 6.6 keeps all
-    // five files when `kill` cannot establish that the session is dead.
+    // one that had to be killed all leave the same nothing behind. Every other exit
+    // is a `?` or a `return` above, and none of them unlinks anything — § 6.6 keeps
+    // all five files whenever `kill` cannot establish that the session is dead.
     paths.unlink_all_locked(&lock);
     Ok(())
 }
@@ -344,7 +380,15 @@ fn liveness(paths: &SessionPaths) -> Liveness {
         Err(err)
             if matches!(
                 err.kind(),
-                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+                io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::NotFound
+                    // Not a guess, and not the `EACCES` case below: `InvalidInput`
+                    // here is std refusing to build the address at all, because the
+                    // path does not fit `sun_path`. Nothing can be listening on an
+                    // address that cannot be formed, so reading it as alive would
+                    // make the wreckage of such a session permanent — `list` would
+                    // show it for ever and `kill` would decline to collect it.
+                    | io::ErrorKind::InvalidInput
             ) =>
         {
             Liveness::Stale

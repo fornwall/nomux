@@ -286,7 +286,13 @@ impl Conn {
     /// reattaching client replays it from the ring anyway — and dropping it keeps
     /// the final write small enough to complete promptly even against a peer that
     /// has stopped reading.
-    pub(crate) fn send_last(&mut self, frame: &Frame<'_>) {
+    ///
+    /// Consumes the connection, which is what makes "last" true rather than merely
+    /// intended: [`Conn::flush_final`] puts the socket back into blocking mode, and
+    /// on its timeout path it returns with the queue untouched and the socket still
+    /// blocking. Handing that back to a non-blocking event loop is the one mistake
+    /// available here, and taking `self` is what removes it.
+    pub(crate) fn send_last(mut self, frame: &Frame<'_>) {
         self.tx.clear();
         self.tx_pos = 0;
         self.send_control(frame);

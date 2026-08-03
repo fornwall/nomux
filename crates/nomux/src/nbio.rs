@@ -1,5 +1,4 @@
-//! The two non-blocking transfers the PTY master, the agent channels and the relay
-//! are moved by.
+//! The two transfers the PTY master, the agent channels and the relay are moved by.
 //!
 //! Every descriptor in this daemon is non-blocking, because a single-threaded
 //! `poll` loop cannot afford to be parked inside a `read` or a `write`. That makes
@@ -46,6 +45,15 @@ pub(crate) fn read(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<usize, Errno> {
 /// `POLLOUT` and come back. Errors are the caller's to interpret: the same `EIO`
 /// that ends the session on the PTY master is one dead channel to the agent.
 ///
+/// One write, not a loop until `EAGAIN`. A short write already means the descriptor
+/// is full — a pipe, a unix socket and the PTY line discipline all return partial
+/// only on hitting their limit — so the retry could answer nothing but `EAGAIN` on
+/// the non-blocking descriptors, and on the one *blocking* descriptor this is
+/// pointed at it is worse than useless: the relay's stdout may be a terminal it
+/// cannot set non-blocking (`attach.rs`), where `POLLOUT` promises only that some
+/// write will succeed, and a second one parks the whole relay inside the kernel with
+/// the other direction unserved. Stopping here is what makes it safe for both.
+///
 /// The `writev` is load-bearing rather than an optimisation. A `VecDeque` that has
 /// wrapped hands back a front and a back, and writing the back without the front
 /// ahead of it would deliver the queue out of order — which for a terminal is
@@ -66,7 +74,10 @@ pub(crate) fn drain_to(queue: &mut VecDeque<u8>, fd: BorrowedFd<'_>) -> Result<(
         };
         match written {
             Ok(0) | Err(Errno::AGAIN) => break,
-            Ok(n) => drop(queue.drain(..n)),
+            Ok(n) => {
+                drop(queue.drain(..n));
+                break;
+            }
             Err(Errno::INTR) => {}
             Err(err) => return Err(err),
         }

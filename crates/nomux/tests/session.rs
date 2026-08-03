@@ -16,7 +16,7 @@
 
 mod harness;
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -25,15 +25,15 @@ use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use nomux_proto::{
-    ErrorCode, Frame, FrameType, HELLO_AGENT_FORWARD, HELLO_REPAINT_CTRL_L, Hello,
-    MAX_AGENT_CHANNELS, PROTOCOL_VERSION, RESUME_FROM_START, WinSize,
+    ErrorCode, Frame, FrameType, HEADER_LEN, HELLO_AGENT_FORWARD, HELLO_REPAINT_CTRL_L, Hello,
+    MAX_AGENT_CHANNELS, PROTOCOL_VERSION, RESUME_FROM_START, WinSize, decode_header,
 };
 
 use harness::{
     Reaper, Rng, Session, Spawned, accept_within, collect, control, hello_frame, join_within,
     nomux, nomux_with_shell, poll_until, push_until_refused, read_uninterrupted,
-    reconnect_until_gap, run_root, stderr, stdout, succeeded, wait_for, while_nothing_forks,
-    write_frame,
+    reconnect_until_gap, run_root, shrink_send_buffer, stderr, stdout, succeeded, wait_for,
+    while_nothing_forks, write_frame,
 };
 
 #[test]
@@ -360,6 +360,69 @@ fn a_ring_capacity_the_daemon_cannot_use_falls_back_to_the_default() {
     }
 }
 
+/// An `OutputAck` is advisory: it says where a client had got to, and the ring keeps
+/// everything regardless (`IMPLEMENTATION.md` § 3 and § 4's "never trimmed on ack").
+///
+/// The daemon's arm for it is empty on purpose, which is exactly the kind of thing a
+/// later change fills in — `consumed_through` looks like a low-water mark asking to
+/// be applied, and applying it would even look like an improvement, since the bytes
+/// below it are ones somebody has already seen. Nothing else in the suite would
+/// notice: the codec tests prove the frame survives a round trip, and every other
+/// test here reads its output as it arrives, so a ring trimmed to what its reader
+/// already holds serves all of them identically. What breaks is the one thing the
+/// ring is for — § 4's "a full rolling window is the scrollback a fresh client gets"
+/// — and it breaks for the *next* client, which never sent the ack.
+///
+/// So the marker is written, acked past, and then asked for by somebody who has
+/// never seen it. The flag cannot be what fails here and is asserted anyway:
+/// `RESUME_FROM_START` resumes at `base_offset` whatever that is, so a daemon that
+/// trimmed would report no gap and simply hand back a shorter stream. The base is
+/// what says so directly — a session this quiet cannot move it any other way, the
+/// ring being 64 KiB against a few hundred bytes of shell — and the transcript is
+/// what says what was lost.
+///
+/// The fence is what bounds the second read: the replay is finite and the session
+/// silent after it, so looking for a marker that is gone would otherwise cost the
+/// whole timeout rather than failing with the transcript in hand.
+#[test]
+fn an_output_ack_never_trims_the_ring() {
+    let (session, mut client, ok) = Session::attached("ack_ring");
+
+    let command = b"echo NOMUX-BEFORE-ACK\n";
+    client.input(0, command);
+    let (_, end) = client.read_until("NOMUX-BEFORE-ACK", ok.resume_from);
+
+    // Everything this client has seen, which is everything the marker is in.
+    client.send(&Frame::OutputAck {
+        consumed_through: end,
+    });
+    // Frames are handled in the order they arrive, so a `Pong` for a ping sent behind
+    // the ack is the daemon having already done whatever it does with one. Without it
+    // the reconnect below could win the race and pass against a daemon that trims.
+    client.send(&Frame::Ping { nonce: 0xACED });
+    drop(client.next_of(FrameType::Pong));
+    drop(client);
+
+    let mut client = session.connect();
+    let resumed = client.hello(RESUME_FROM_START, command.len() as u64);
+    assert!(
+        !resumed.gap,
+        "nothing was dropped, so nothing may be reported as a gap"
+    );
+    assert_eq!(
+        resumed.resume_from, 0,
+        "the ack moved the ring's base off the start of the stream"
+    );
+
+    client.input(resumed.in_applied, b"echo NOMUX-FENCE\n");
+    let (replayed, _) = client.read_until("NOMUX-FENCE", resumed.resume_from);
+    assert!(
+        replayed.contains("NOMUX-BEFORE-ACK"),
+        "output the previous client acknowledged was trimmed from the ring, so a \
+         fresh client got a shorter scrollback than the session held: {replayed:?}"
+    );
+}
+
 #[test]
 fn a_second_client_takes_over_and_the_first_is_told_why() {
     let (session, mut first, _) = Session::attached("takeover");
@@ -561,6 +624,53 @@ fn the_exit_status_arrives_after_the_final_output() {
     );
 }
 
+/// A child that was killed is reported as `Signalled` carrying the signal, not as a
+/// process that returned one (`IMPLEMENTATION.md` § 10).
+///
+/// The whole of the `128+n` convention rests on telling those two apart, and it is
+/// the client that applies it: a shell killed by `SIGKILL` has to reach the user as
+/// 137 rather than as a program that chose to exit 9, and the only thing carrying
+/// that distinction across the wire is this one byte. `pty::exit_parts` produces it
+/// from `ExitStatus::code()` returning `None`, which nothing end to end had ever
+/// made happen — every other exit in the suite is an ordinary one, so the
+/// `Signalled` arm was reachable only from the codec tests, where it is a value in a
+/// round trip rather than a fate the daemon observed.
+///
+/// A test of its own rather than a second case on
+/// [`the_exit_status_arrives_after_the_final_output`], which is about *ordering* and
+/// buys that with a shape this does not want: it waits for the child to be gone and
+/// then reattaches inside the linger window, so what it asserts is the replay. A
+/// second case there would assert that a second time and the live path not at all;
+/// this one stays attached, so what it pins is the frame the daemon builds on the
+/// pass that collects the status.
+///
+/// `kill -9 $$` rather than a signal from outside, because `$$` is the shell the
+/// daemon is watching and `kill` is a builtin of it: no second process to find, and
+/// nothing to race. There is no final output to wait through, so the loop tolerates
+/// whatever the echo of the command line produces and stops at the fate.
+#[test]
+fn a_child_killed_by_a_signal_is_reported_as_signalled_rather_than_as_a_status() {
+    let (_session, mut client, _) = Session::attached("exit_signalled");
+
+    client.input(0, b"kill -9 $$\n");
+
+    let ended = loop {
+        let (ty, payload) = client.next_frame();
+        match Frame::decode(ty, &payload).expect("decode") {
+            Frame::Exit { status, kind } => break (status, kind),
+            Frame::Output { .. } | Frame::InputAck { .. } | Frame::Pong { .. } => {}
+            other => panic!("unexpected {other:?} while waiting for the exit"),
+        }
+    };
+
+    assert_eq!(
+        ended,
+        (9, nomux_proto::ExitKind::Signalled),
+        "a child killed by SIGKILL must arrive as the signal that killed it, not as \
+         a status a process chose"
+    );
+}
+
 /// Regression: the status is turned into a frame on the pass that collects it, not
 /// on whatever pass happens to wake up next.
 ///
@@ -718,7 +828,11 @@ fn a_label_survives_into_list() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped()),
     );
-    wait_for(&root.join("nomux").join("labelled.sock"));
+    // The label, not the socket. The daemon publishes in the order bind, pidfile,
+    // label (§ 6.2), and the assertion below reads the last two — so waiting on the
+    // first would let `list` run against a session that is answering and has not
+    // said what it is called, which prints `labelled\t?\t` and fails on the label.
+    wait_for(&root.join("nomux").join("labelled.label"));
 
     let listed = stdout(&control(&root, &["list"]));
 
@@ -857,9 +971,18 @@ fn attach_spawns_the_daemon_and_relays_transparently() {
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     let pump = thread::spawn(move || {
         let mut chunk = [0u8; 8192];
-        while let Ok(n) = stdout.read(&mut chunk) {
-            if n == 0 || tx.send(chunk[..n].to_vec()).is_err() {
-                break;
+        loop {
+            match stdout.read(&mut chunk) {
+                // The rule PLAN § P2 records, one layer out: a signal ending this
+                // read would close the channel and fail the test for something that
+                // happened to the process rather than to the relay.
+                Err(err) if err.kind() == ErrorKind::Interrupted => {}
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send(chunk[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -1081,6 +1204,317 @@ fn reconnecting_does_not_raise_the_input_ceiling() {
     );
 }
 
+/// A peer that writes without ever reading is let go of, rather than queued for
+/// without bound (`IMPLEMENTATION.md` § 4.1).
+///
+/// The output direction is bounded twice, at two different meanings of "not keeping
+/// up", and only the first has a test. Past a megabyte pending the daemon stops
+/// *queueing output*, which is what
+/// [`an_overflow_that_outruns_an_attached_client_is_reported_as_a_gap_mid_stream`]
+/// builds its gap out of. That bound does not cover everything, because the frames
+/// that *answer* a client — an `InputAck` per `Input`, a `Pong` per `Ping` — are not
+/// optional and are queued whatever the output policy says. So a peer that only ever
+/// writes grows the queue at exactly the rate it is fed, and `ABANDON_PENDING_WRITE`
+/// is the second bound: past eight megabytes it is not slow but gone. Nothing in the
+/// suite sent a daemon anything it had to answer without reading the answers, so both
+/// the bound and its consequence were untested — § 9's backpressure row is the input
+/// direction alone.
+///
+/// `Ping` is what this is written in because it is the smallest frame that must be
+/// answered and the answer is the same size, so the queue tracks what was pushed at
+/// it byte for byte, and the two-sided bound below can say which bound fired. That is
+/// the point of the *lower* one: every cheaper way for the daemon to end up with a
+/// closed connection — a write it could not make, a frame it would not accept, a peer
+/// it decided was a protocol violation — happens far below eight megabytes, so a
+/// figure at the bound is the bound. The transcript is checked for the same reason
+/// from the other side: it must carry the pongs that filled the queue and no `Error`,
+/// since a refusal reaches the same closed socket by a different route entirely.
+///
+/// What the daemon does about it is nothing: `drop_client`, no `Error`, no goodbye,
+/// which is the connection simply ending under a peer that was not listening anyway.
+/// This side sees it as the `EPIPE` that stops the push, and then as everything the
+/// daemon did send followed by an end — `ECONNRESET` rather than a clean zero, since
+/// it let go with bytes of ours still unread (§ 3).
+#[test]
+fn a_client_that_never_reads_its_answers_is_dropped_rather_than_queued_for() {
+    /// Comfortably past [`QUEUE`] and the socket buffers either side of it: a daemon
+    /// that lets go takes a fraction of this, and one that queues without bound takes
+    /// all of it.
+    const BLAST: usize = 24 << 20;
+    /// The queue § 4.1 lets a client reach before it counts as gone. Every byte of it
+    /// is a pong answering a ping, so it is also, near enough, how much of [`BLAST`]
+    /// the daemon has to have taken to get there.
+    const QUEUE: usize = 8 << 20;
+    /// [`QUEUE`] over again for the kernel's buffers, the undecoded megabyte § 4.1
+    /// caps the receive side at, and the pongs already on the wire — and nothing like
+    /// room for [`BLAST`].
+    const TOLERATED: usize = 16 << 20;
+
+    let session = Session::start("abandon");
+
+    // The `Hello` this sends is what starts the session, and past it this peer never
+    // reads another byte until the measurement is over.
+    let mut peer = blaster(&session, 0);
+    let mut ping = Vec::new();
+    Frame::Ping { nonce: 0x8B_ACED }
+        .encode(&mut ping)
+        .expect("encode a ping");
+    let pings = ping.repeat(BLAST.div_ceil(ping.len()));
+
+    // A second of a socket that will not take another byte, which is not what ends
+    // this: the daemon lets go, and the write after that is an `EPIPE`. The patience
+    // is for the daemon that never does — a full second without a byte accepted is one
+    // that has stopped rather than one that is busy — and it doubles as the pace of the
+    // push, since [`push_until_refused`] backs off by a fiftieth of it whenever the
+    // send buffer is full. That is most of this test's second: the buffer holds a
+    // fraction of what has to cross, so the eight megabytes are handed over in some
+    // forty rounds of filling it and waiting for the daemon to drain it.
+    let sent = push_until_refused(&mut peer, &pings, Duration::from_secs(1));
+
+    // Blocking with a timeout for the drain, so what the daemon managed to send is
+    // read at the speed it wrote it rather than at a poll interval per chunk — and so
+    // that a daemon which is merely slow is read from until the deadline rather than
+    // declared finished by an `EAGAIN` between two of its writes.
+    peer.set_nonblocking(false).expect("block for the drain");
+    peer.set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("bound each read");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut answered = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let released = loop {
+        match read_uninterrupted(&mut peer, &mut chunk) {
+            // Both are the daemon having let go, and which one arrives is the
+            // kernel's business rather than the daemon's: a close with nothing of
+            // ours left unread is a plain end of file, and one with pings still
+            // queued for it is the same close reported as a reset (§ 3). It is
+            // always the second here, since the push ends by being refused.
+            Ok(0) => break true,
+            Ok(n) => answered.extend_from_slice(&chunk[..n]),
+            Err(err) if err.kind() == ErrorKind::ConnectionReset => break true,
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+            Err(err) => panic!("reading what the daemon sent before it let go: {err}"),
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+    };
+
+    assert!(
+        released,
+        "the daemon never let go: it has written {} bytes to a peer that read none of \
+         them and is still queueing more",
+        answered.len()
+    );
+    assert!(
+        sent >= QUEUE,
+        "the daemon let go at {sent} bytes of pings, short of the {QUEUE} of pongs \
+         they queue — so it dropped this peer for something other than a queue it \
+         could not deliver"
+    );
+    assert!(
+        sent < TOLERATED,
+        "the daemon took {sent} bytes from a peer that read none of its answers"
+    );
+
+    let seen = frame_types(&answered);
+    assert!(
+        seen.contains(&FrameType::Pong),
+        "the daemon answered none of the pings, so what filled its queue was not the \
+         traffic § 4.1 says cannot be held back: {} bytes over {} frames",
+        answered.len(),
+        seen.len()
+    );
+    assert!(
+        !seen.contains(&FrameType::Error),
+        "the daemon refused this peer rather than letting go of it, which reaches the \
+         same closed connection for an entirely different reason"
+    );
+
+    // § 4.1: dropping such a client costs a working one nothing, since reattaching
+    // replays from the ring. Nothing was ever read off this session, so a fresh client
+    // driving one command through the shell is the whole of that claim.
+    let mut client = session.connect();
+    let ok = client.hello(RESUME_FROM_START, 0);
+    client.input(ok.in_applied, b"echo NOMUX-AFTER-ABANDON\n");
+    client.read_until("NOMUX-AFTER-ABANDON", ok.resume_from);
+}
+
+/// A child that exits while the daemon is still holding input it never read must not
+/// take its own last words with it.
+///
+/// Guards the consequence rather than one line of the cause. `write_pty` used to
+/// answer an `EIO` from the master by recording the exit, and recording the exit is
+/// what takes the master out of the poll set, since `Daemon::watches` keeps it only
+/// while `child_gone` is `None`. From that moment the master is never read again, so
+/// everything the child wrote on its way out past the one read of that same pass was
+/// dropped with no `Gap` to say so, which is the one thing § 9 forbids outright. The
+/// exit belongs to `read_pty`, which reaches `Read::Eof` only once the master is dry.
+///
+/// That `EIO` cannot be provoked on Linux, and this test does not pretend otherwise:
+/// writing to a master whose slave has closed *succeeds* here — measured directly,
+/// and measured again for a slave that was a session leader's controlling terminal,
+/// which is the shape this daemon makes. A master reports the departure on its read
+/// side only, as the `EIO` `pty::read_pty` turns into end of file, and its write side
+/// answers a slave that is gone exactly as it answers one that is merely full, with
+/// `EAGAIN`. So the arm that was changed is unreachable from outside the process, and
+/// no end-to-end test can fail on it; showing it fails needs the fault injection § 9
+/// already keeps for the takeover ordering, which is a change to the daemon rather
+/// than to this file.
+///
+/// What is left is worth having on its own account, because it is the invariant the
+/// removed line broke rather than the line: the state where an early exit would cost
+/// output, composed exactly rather than hoped for, and asserted byte for byte. It
+/// fails on a daemon that stamps the exit while the master still holds anything —
+/// confirmed by doing so at the very moment the old code would have, which lost 4 KiB
+/// of the 10 below.
+///
+/// Composing that state is what the rest of this is. The master has to be holding
+/// output nobody has read, and a daemon keeps up with a child effortlessly: writing
+/// megabytes at it builds no backlog at all, since the terminal ends up empty at the
+/// exit and `read_pty` reaches end of file with nothing outstanding. `pending_input`
+/// has to be non-empty, since the daemon asks for `POLLOUT` only while something is
+/// queued. And the master has to still be *writable*, which rules out the queue
+/// [`input_the_child_never_reads_is_back_pressured_rather_than_buffered`] builds:
+/// input that reached the cap got there by filling the terminal, and a full terminal
+/// never reports `POLLOUT` again.
+///
+/// So the daemon is stopped while all three are arranged around it. That is not a
+/// stand-in for a wait — it is the only way to hold a single-threaded event loop still
+/// long enough to compose a state it would otherwise pass through in microseconds, and
+/// every step is then a condition rather than a hope: the child has burst and exited
+/// (`/proc` says so), the whole burst is in the terminal's buffer (it fits, so the
+/// child never blocked on a daemon that was not running), and the keystroke is in the
+/// socket waiting to be read.
+#[test]
+fn a_child_that_exits_with_input_still_queued_delivers_its_last_output_in_full() {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    use rustix::fs::Mode;
+
+    /// Bounded on both sides by the line discipline rather than by this daemon, and
+    /// sitting between the two: a read of the master is handed 4095 bytes however
+    /// large a buffer it offers, and a single write into an empty terminal is taken up
+    /// to 11776 before the writer has to wait for a reader. So the burst is more than
+    /// the couple of reads a daemon gets in before it could notice the exit — without
+    /// which there would be nothing left to lose — and less than what the child can
+    /// hand over in one go without ever waiting on a daemon that is not running, which
+    /// it would otherwise do for ever, never reaching the exit this is about.
+    const BURST: usize = 10 * 1024;
+    /// Room for the burst several times over. A `Gap` here would be the ring being
+    /// tight rather than the master leaving the poll set, and the assertions below
+    /// have to be able to tell those apart.
+    const RING: usize = 4 << 20;
+
+    let session = Session::start_with_ring("last_words", RING);
+
+    // Written where the child can reach it — the shell starts in this directory — and
+    // compared byte for byte at the far end, so a burst that arrives short, doubled or
+    // out of order fails on the byte rather than on the total.
+    let burst = Rng::new(0x1a57_0207).bytes(BURST);
+    fs::write(session.root.join("burst"), &burst).expect("write what the child will emit");
+    let cue = session.root.join("cue");
+    rustix::fs::mkfifoat(rustix::fs::CWD, &cue, Mode::RUSR | Mode::WUSR)
+        .expect("create the FIFO the child waits on");
+
+    let mut client = session.connect();
+    let ok = client.hello(RESUME_FROM_START, 0);
+    // `-echo` so the keystroke below is not echoed into the stream being compared, and
+    // `raw` so the line discipline neither mangles it nor throws it away — which is
+    // what makes it reach `pending_input` rather than the floor. Past the marker the
+    // child never reads its terminal again: the whole line is parsed before any of it
+    // runs, the cue comes from the FIFO, and `cat` has a file.
+    let ready = client.make_ready(
+        "raw -echo",
+        Some("read cue < cue; cat burst; exit 9"),
+        ok.resume_from,
+    );
+    let shell = shell_of(&session);
+
+    let daemon = rustix::process::Pid::from_raw(session.child.id().cast_signed())
+        .expect("the daemon's own pid");
+    rustix::process::kill_process(daemon, rustix::process::Signal::STOP).expect("stop the daemon");
+    assert!(
+        poll_until(Duration::from_secs(10), || process_state(
+            session.child.id()
+        ) == Some('T')),
+        "the daemon never stopped, so what follows is a race rather than a setup"
+    );
+
+    // Opened without blocking, so a child that never reached its own `open` fails this
+    // rather than parking it: a FIFO answers `ENXIO` until a reader is there, and the
+    // child counts as one from the moment it enters the wait.
+    let mut go = None;
+    assert!(
+        poll_until(Duration::from_secs(10), || {
+            go = fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&cue)
+                .ok();
+            go.is_some()
+        }),
+        "the child never reached the cue it waits on"
+    );
+    go.expect("the FIFO the wait above opened")
+        .write_all(b"go\n")
+        .expect("cue the child");
+
+    // The whole burst is in the terminal's buffer by the time this comes back, and
+    // nothing but the master's read side can ever produce it again. A child that has
+    // exited but not been collected is a zombie, which is one of the two states this
+    // reads as gone — the daemon that would reap it is stopped.
+    assert!(
+        poll_until(Duration::from_secs(10), || !process_alive(shell)),
+        "the child never finished its burst and left"
+    );
+
+    // A keystroke the child is never going to read, waiting in the socket for a daemon
+    // that has not run since the terminal it belongs to lost its far end.
+    client.input(ready.in_offset, b"x");
+
+    rustix::process::kill_process(daemon, rustix::process::Signal::CONT)
+        .expect("let the daemon go");
+
+    let mut seen: Vec<u8> = Vec::new();
+    let mut offset = ready.offset;
+    let ended = loop {
+        let (ty, payload) = client.next_frame();
+        match Frame::decode(ty, &payload).expect("decode frame") {
+            Frame::Output { offset: at, data } => {
+                assert_eq!(
+                    at,
+                    offset,
+                    "the child's last output must arrive unbroken: this frame opens {} \
+                     bytes from where the stream stood",
+                    at.abs_diff(offset)
+                );
+                offset += data.len() as u64;
+                seen.extend_from_slice(data);
+            }
+            Frame::Exit { status, kind } => break (status, kind),
+            Frame::InputAck { .. } | Frame::Pong { .. } => {}
+            other => panic!("unexpected {other:?} while collecting the child's last output"),
+        }
+    };
+
+    assert_eq!(
+        ended,
+        (9, nomux_proto::ExitKind::Exited),
+        "the child's own status must survive the exit its queued input interrupted"
+    );
+    assert!(
+        seen.len() >= BURST,
+        "only {} bytes arrived before the Exit, out of the {BURST} the child wrote on \
+         its way out",
+        seen.len()
+    );
+    assert_eq!(
+        &seen[seen.len() - BURST..],
+        &burst[..],
+        "the child's last {BURST} bytes are not what it wrote"
+    );
+}
+
 /// At least `at_least` bytes of encoded `Input` frames starting at `from`, and one
 /// past the last input offset they carry.
 ///
@@ -1103,11 +1537,41 @@ fn input_frames(at_least: usize, from: u64) -> (Vec<u8>, u64) {
     (frames, offset)
 }
 
-/// A greeted socket that refuses rather than blocks once the daemon stops reading.
+/// The types of the frames in `bytes`, stopping at the first one that is not all
+/// there.
+///
+/// For the one test that reads a connection the daemon abandoned rather than closed
+/// in order: its last write is however much of the queue the socket took, so the tail
+/// is routinely half a frame, and a walk that decoded it would be reporting on the
+/// truncation rather than on what the daemon sent. Only the header is read, because
+/// the question is which frames arrived rather than what they carried.
+fn frame_types(bytes: &[u8]) -> Vec<FrameType> {
+    let mut types = Vec::new();
+    let mut at = 0;
+    while let Some(head) = bytes
+        .get(at..at + HEADER_LEN)
+        .and_then(|head| <[u8; HEADER_LEN]>::try_from(head).ok())
+    {
+        let header = decode_header(&head).expect("decode a header the daemon wrote");
+        at += HEADER_LEN + header.len as usize;
+        if at > bytes.len() {
+            break;
+        }
+        types.push(header.ty);
+    }
+    types
+}
+
+/// A greeted socket that refuses rather than blocks once the daemon stops taking what
+/// it is given.
 ///
 /// [`push_until_refused`] reads that refusal as the daemon having stopped, which is
-/// the behaviour both tests are about — so the non-blocking flag is not a detail of
-/// how the writing is done, it is what makes the measurement possible at all.
+/// the behaviour all three of its callers are about — so the non-blocking flag is not
+/// a detail of how the writing is done, it is what makes the measurement possible at
+/// all. Two of them have the daemon stop by declining to read, where the refusal is
+/// an `EAGAIN`; the third by letting go of the connection altogether, where it is an
+/// `EPIPE`. The measurement is the same one either way: how much this peer got rid of
+/// before the daemon stopped taking it.
 fn blaster(session: &Session, in_offset: u64) -> UnixStream {
     let mut socket = UnixStream::connect(&session.socket).expect("connect");
     write_frame(&mut socket, &hello_frame(0, RESUME_FROM_START, in_offset));
@@ -1439,6 +1903,139 @@ fn agent_channel_ids_are_never_reused() {
     }
 }
 
+/// Regression: a channel the client has closed against a peer that stopped reading
+/// leaves the daemon asleep rather than spinning at a full core.
+///
+/// `close_from_client` shuts the read half of the daemon's end of the channel down,
+/// and a unix socket in that state reports itself readable on every pass for ever.
+/// `Agent::read` is right to decline to act on a closing channel — taking that end of
+/// file at face value would drop the very queue the close exists to deliver — so
+/// nothing consumes the readiness and nothing can. The daemon armed `POLLIN` on every
+/// channel a saturated client was not already holding back, so `poll` returned
+/// instantly for ever; with the local peer's buffer full there was no `POLLOUT` to
+/// make progress against either, and the daemon burned a core until the peer read.
+/// `Agent::watches` now reports read interest of its own, and the daemon arms
+/// `POLLIN` only where it is set.
+///
+/// Measured as processor time, because that is the only thing the bug touches: every
+/// frame is still answered, every byte still arrives, and the sole symptom is the
+/// fan. The two answers are nowhere near each other — a spinning daemon burns a
+/// hundred ticks a second and a sleeping one burns none — so the threshold sits an
+/// order of magnitude below one core and cannot be reached by a loaded machine
+/// scheduling a daemon that has nothing to do.
+///
+/// The window is a wall-clock interval rather than a wait for a condition, since it
+/// *is* the measurement. Everything it needs to be true was established before it
+/// started: the queue is provably non-empty, the close has provably been acted on,
+/// and the drain afterwards proves the channel was still there to be spun on.
+#[test]
+fn a_closed_agent_channel_whose_peer_stopped_reading_leaves_the_daemon_asleep() {
+    /// One `AgentData` frame per round, and small beside `MAX_CHANNEL_QUEUE`: the
+    /// daemon closes a channel whose queue outgrows that, which would take away the
+    /// very state under test.
+    const CHUNK: usize = 32 * 1024;
+    /// How far past what the socket will hold the client sends. It is what is left
+    /// over that the daemon has to keep, and it has to be enough to be certain of —
+    /// but comfortably short of `MAX_CHANNEL_QUEUE`, which the daemon would answer by
+    /// closing the channel rather than holding it.
+    const OVERSHOOT: usize = 96 * 1024;
+    /// How long the daemon is watched for. Long enough that the bug would show up as
+    /// tens of ticks, short enough to keep the suite where it is.
+    const WINDOW: Duration = Duration::from_millis(300);
+    /// Five ticks is 50 ms of processor time against 300 ms of wall clock: a sixth of
+    /// one core, where the bug is a whole one and the fix is exactly zero.
+    const TOLERATED: u32 = 5;
+
+    let (session, mut client, ok) = Session::attached_with("agent_spin", HELLO_AGENT_FORWARD);
+    // `-echo` so that everything on the output stream is the child answering rather
+    // than the line discipline repeating the question, which is what lets the two
+    // markers below be read one after the other from a stream that joins up.
+    let ready = client.make_ready("-echo", None, ok.resume_from);
+
+    // How much a unix socket on this host takes from a peer that has stopped reading.
+    // Measured rather than assumed: the limit is the *sender's* send buffer, which is
+    // a sysctl away from any number written down here, and everything below turns on
+    // sending more than it. Asking a socketpair is asking the same kernel the same
+    // question — nothing about the pair the daemon accepts is different.
+    let capacity = {
+        let (mut probe, _other_end) = UnixStream::pair().expect("a socketpair to measure");
+        probe.set_nonblocking(true).expect("stop blocking");
+        push_until_refused(&mut probe, &vec![0u8; 8 << 20], Duration::from_millis(100))
+    };
+
+    let mut agent = session.connect_agent();
+    let chan = client.next_chan(FrameType::AgentOpen);
+
+    // Bytes the test's end of the channel is deliberately never going to read. Past
+    // `capacity` the kernel stops taking them and the rest stays in the daemon's own
+    // queue, which is what the close below has to find for the channel to outlive it.
+    //
+    // A frame at a time, each fenced by a round trip the daemon can only answer by
+    // having read it. The daemon queues everything it decodes in one pass and writes
+    // it out on the pass after, so handing it the lot at once would take the queue
+    // past `MAX_CHANNEL_QUEUE` and have the channel closed for that instead — which
+    // looks nothing like the state this is about and would still leave the daemon
+    // asleep.
+    let filler = vec![b'k'; CHUNK];
+    let mut sent = 0usize;
+    while sent < capacity + OVERSHOOT {
+        client.send(&Frame::AgentData {
+            chan,
+            data: &filler,
+        });
+        sent += filler.len();
+        client.send(&Frame::Ping { nonce: 0x5EED });
+        drop(client.next_of(FrameType::Pong));
+    }
+
+    // Nothing answers an `AgentClose` — the client closed the channel and has already
+    // forgotten it — so the round trip through the child behind it is what says the
+    // daemon has acted on it, frames being handled in the order they arrive. It is
+    // also the first half of the session still working.
+    client.send(&Frame::AgentClose { chan });
+    let before = b"echo NOMUX-CLOSE-ACTED-ON\n";
+    client.input(ready.in_offset, before);
+    let (_, offset) = client.read_until("NOMUX-CLOSE-ACTED-ON", ready.offset);
+
+    let daemon = session.child.id();
+    let began = cpu_ticks(daemon);
+    thread::sleep(WINDOW);
+    let burned = cpu_ticks(daemon).saturating_sub(began);
+    assert!(
+        burned <= TOLERATED,
+        "the daemon burned {burned} clock ticks in {WINDOW:?} holding one closed \
+         agent channel, with a shell that is doing nothing and a client that is \
+         asking for nothing"
+    );
+
+    // And the queue really was there to spin on. A channel the daemon had forgotten
+    // at the close would have taken what it was holding with it, so reading the lot
+    // back is what makes the measurement above a measurement of the right state —
+    // and it is § 6.7's promise that a reply the client already sent still reaches
+    // the process waiting on it.
+    let mut received = 0usize;
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        match read_uninterrupted(&mut agent, &mut chunk) {
+            Ok(0) => break,
+            Ok(read) => received += read,
+            Err(err) => panic!("reading what the closed channel still owed: {err}"),
+        }
+    }
+    assert_eq!(
+        received, sent,
+        "the daemon was not holding the queue this test measured it against: a \
+         channel it had let go of at the close takes the rest with it, and no more \
+         than the {capacity} bytes already in the kernel could have arrived"
+    );
+
+    client.input(
+        ready.in_offset + before.len() as u64,
+        b"echo NOMUX-STILL-SERVING\n",
+    );
+    client.read_until("NOMUX-STILL-SERVING", offset);
+}
+
 /// Drives a session to an overflow gap and returns what the child saw afterwards.
 ///
 /// `cat` is the child because it hands back whatever reaches the PTY's input side,
@@ -1686,6 +2283,10 @@ enum StatField {
     ProcessGroup = 2,
     /// The session it belongs to, which is its own pid exactly when it leads one.
     Session = 3,
+    /// Clock ticks spent in user mode.
+    UserTime = 11,
+    /// Clock ticks spent in the kernel on this process's own behalf.
+    SystemTime = 12,
 }
 
 /// Reads one field of `/proc/<pid>/stat`.
@@ -1699,16 +2300,37 @@ fn stat_field(pid: u32, field: StatField) -> Option<u32> {
     tail.split_whitespace().nth(field as usize)?.parse().ok()
 }
 
+/// How much processor time `pid` has been charged, in the clock ticks `/proc`
+/// counts in.
+///
+/// User and system together, because the two states this has to tell apart are
+/// "asleep in `poll`" and "going round the loop as fast as the scheduler allows",
+/// and the second spends its time on both sides of the syscall boundary. A process
+/// that has gone reports nothing, which reads here as zero — the same answer the
+/// caller's assertion wants, and one no daemon that is still there can produce
+/// falsely, since these counters never go down.
+fn cpu_ticks(pid: u32) -> u32 {
+    [StatField::UserTime, StatField::SystemTime]
+        .into_iter()
+        .filter_map(|field| stat_field(pid, field))
+        .sum()
+}
+
+/// The single-letter run state `/proc` reports for `pid`, or `None` once it is gone.
+///
+/// Read from after the parenthesised command name for the reason [`stat_field`]
+/// gives: the name can contain a space or a bracket, and counting from the front
+/// stops working the moment it does.
+fn process_state(pid: u32) -> Option<char> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, tail) = stat.rsplit_once(')')?;
+    tail.trim_start().chars().next()
+}
+
 /// Whether `pid` is still a process rather than gone or a zombie awaiting its
 /// parent. A collected process group reaches one of the latter two promptly.
 fn process_alive(pid: u32) -> bool {
-    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
-    };
-    let Some((_, tail)) = stat.rsplit_once(')') else {
-        return false;
-    };
-    !tail.trim_start().starts_with('Z')
+    process_state(pid).is_some_and(|state| state != 'Z')
 }
 
 /// Regression: a reconnect racing with in-flight input must not discard it.
@@ -2000,6 +2622,13 @@ fn assert_relay_moves_bulk(
         .expect("half-close the socket");
     let downlink = join_within(downlink, RELAY_PATIENCE, "stdout reader");
 
+    // Killed before its stderr is read to the end. Every wait above goes through
+    // `join_within` so that a stalled relay fails rather than hangs, and this read
+    // has no deadline of its own: a relay that had closed both data directions but
+    // not exited would park the run here until nextest's own kill, with nothing to
+    // point at. By this line the three joins have established that both directions
+    // reached EOF, so there is nothing left for it to say that this could cut off.
+    drop(child.kill());
     let mut complaints = String::new();
     drop(stderr.read_to_string(&mut complaints));
     drop(child);
@@ -2170,6 +2799,150 @@ fn the_relay_exits_when_a_stdout_it_can_only_copy_to_stops_reading() {
         poll_until(Duration::from_secs(10), || !child.is_running()),
         "the relay was still running with a stdout it could only copy to gone"
     );
+}
+
+/// Regression: a write to stdout that a signal cut short must not send the relay
+/// straight back into the kernel for the rest of it.
+///
+/// `nbio::drain_to` used to write until the descriptor refused. Every descriptor in
+/// the daemon is non-blocking, so there the retry could answer nothing but `EAGAIN` —
+/// but the relay points it at *stdout*, which is deliberately left blocking, because
+/// it may be a terminal whose open file description the user's shell shares and
+/// `O_NONBLOCK` is not this process's to set (`attach.rs`). There the second `writev`
+/// is a second block, and the relay sits inside it with the other direction unserved:
+/// keystrokes stop reaching the session because the session's output has nowhere to
+/// go. `POLLOUT` promises only that *some* write will succeed, which is exactly the
+/// promise the loop was reading as more than that.
+///
+/// What makes it observable is a *short* write, and on Linux a blocking descriptor
+/// short-writes only when a signal ends the call after it has already transferred
+/// something. So this provides one: `SIGSTOP` cannot be caught, blocked or ignored,
+/// so it always reaches a task parked in a write, and a write that has already moved
+/// bytes reports the short count rather than being restarted. `SIGCONT` then puts the
+/// relay back exactly where the fix has to matter — one `drain_to` call, mid-queue,
+/// against a destination that is still full.
+///
+/// The destination is a socketpair with a shrunken send buffer, which is what makes
+/// the rest exact rather than probable. A unix socket blocks only once its buffer is
+/// at the limit — the same condition `POLLOUT` answers — so the write the relay makes
+/// on `POLLOUT` always transfers at least one segment before it stops, and the write
+/// it would go back for afterwards has no `POLLOUT` to start from. Shrinking the
+/// buffer is what makes 16 KiB more than one segment; at the default 208 KiB the
+/// whole write is a single one, which either fits or is refused outright. A socket is
+/// also a destination the kernel will not splice into, which is what keeps the relay
+/// on the copying path `drain_to` belongs to — a pipe would be moved inside the
+/// kernel and never reach it (§ 7).
+#[test]
+fn a_write_to_stdout_a_signal_cut_short_does_not_park_the_relay_again() {
+    use std::os::fd::OwnedFd;
+
+    /// Small enough that one of the relay's 16 KiB writes is several segments, so it
+    /// can stop partway rather than only at a boundary of its own.
+    const STDOUT_BUFFER: libc::c_int = 4096;
+    /// More than the shrunken socket and the relay's own 16 KiB buffer hold between
+    /// them, so the write it parks in cannot end by running out of bytes.
+    const PUSH: usize = 64 * 1024;
+    /// Sent the other way, and nothing to do with the write above: this is the
+    /// traffic the parked relay is failing to serve.
+    const MARKER: &[u8] = b"NOMUX-OTHER-DIRECTION";
+    /// How long the marker is given to *not* arrive. Only has to outlast a relay that
+    /// is still going round its loop, which takes microseconds.
+    const PARKED: Duration = Duration::from_millis(250);
+
+    // Never read from, which is what keeps the relay's stdout full; held to the end
+    // of the test, since a closed one would be an `EPIPE` rather than a block.
+    let (_unread, relay_stdout) = UnixStream::pair().expect("a socketpair for the relay's stdout");
+    shrink_send_buffer(&relay_stdout, STDOUT_BUFFER);
+    let (mut child, mut peer, _listener) = relay_onto_a_socket_over(
+        "relay_short_write",
+        Stdio::piped(),
+        Stdio::from(OwnedFd::from(relay_stdout)),
+        Stdio::null(),
+    );
+    let mut stdin = child.stdin.take().expect("stdin");
+    let relay = child.id();
+
+    peer.write_all(&vec![b'x'; PUSH])
+        .expect("write to the relay's socket");
+    // Short, because every look for the marker below reads through this and a relay
+    // that is parked has nothing to say.
+    peer.set_read_timeout(Some(Duration::from_millis(20)))
+        .expect("a peer the polls below must not wait on");
+
+    assert!(
+        poll_until(Duration::from_secs(10), || parked_in_a_write(relay)),
+        "the relay never parked inside a write to its stdout, so there is no \
+         interrupted write below for either version of `drain_to` to answer"
+    );
+
+    // Written only now, so that it cannot have been served before the relay stopped.
+    stdin.write_all(MARKER).expect("write to the relay's stdin");
+    stdin.flush().expect("flush the relay's stdin");
+    let mut seen = Vec::new();
+    assert!(
+        !poll_until(PARKED, || marker_arrived(&mut peer, &mut seen, MARKER)),
+        "the relay served its stdin while it was supposed to be parked in a write, \
+         so the wait below would be satisfied by a marker that had already arrived"
+    );
+
+    // The stop is what ends the write; the continue is what makes what happens next
+    // the relay's own decision. Waited out rather than sent back to back: a `SIGCONT`
+    // generated before the stop has been taken discards it, and the write would then
+    // be restarted rather than cut short.
+    let pid = rustix::process::Pid::from_raw(relay.cast_signed()).expect("the relay's pid");
+    rustix::process::kill_process(pid, rustix::process::Signal::STOP).expect("stop the relay");
+    assert!(
+        poll_until(Duration::from_secs(10), || process_state(relay)
+            == Some('T')),
+        "the relay never took the stop, so the write it is in was never interrupted"
+    );
+    rustix::process::kill_process(pid, rustix::process::Signal::CONT).expect("continue the relay");
+
+    assert!(
+        poll_until(Duration::from_secs(10), || marker_arrived(
+            &mut peer, &mut seen, MARKER
+        )),
+        "the relay went back into the kernel for the rest of a write the signal had \
+         already ended, leaving the other direction unserved"
+    );
+}
+
+/// Whether `pid` is inside a `writev(2)` at this moment, as `/proc` reports it.
+///
+/// The relay makes exactly one kind of write — `nbio::drain_to`'s `writev` across the
+/// two halves of its queue — so the syscall number is the most direct statement of
+/// the state the test needs, and far cheaper than inferring it from what the relay
+/// has stopped doing. `/proc/<pid>/syscall` gives a number and its arguments, or
+/// `running`; anything that does not parse, including a kernel that does not offer
+/// the file, reads as "not parked" and fails the wait that asks for it rather than
+/// letting some other state pass for it.
+fn parked_in_a_write(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/syscall"))
+        .ok()
+        .and_then(|reported| {
+            reported
+                .split_whitespace()
+                .next()?
+                .parse::<libc::c_long>()
+                .ok()
+        })
+        .is_some_and(|syscall| syscall == libc::SYS_writev)
+}
+
+/// Whether `marker` has reached `peer` yet, keeping whatever else arrives on the way.
+///
+/// Everything read is kept and the answer is about the whole of it, so a marker split
+/// across two reads is still found — and so a look that comes back empty cannot
+/// discard what an earlier one collected.
+fn marker_arrived(peer: &mut UnixStream, seen: &mut Vec<u8>, marker: &[u8]) -> bool {
+    let mut chunk = [0u8; 8192];
+    while let Ok(read) = read_uninterrupted(peer, &mut chunk) {
+        if read == 0 {
+            break;
+        }
+        seen.extend_from_slice(chunk.get(..read).unwrap_or(&[]));
+    }
+    seen.windows(marker.len()).any(|window| window == marker)
 }
 
 /// A `nomux attach` relaying onto a socket the test holds the other end of, with

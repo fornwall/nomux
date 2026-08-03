@@ -129,7 +129,10 @@ fn connect_or_spawn(paths: &SessionPaths, label: Option<&str>) -> io::Result<Uni
 /// client — `kill` has its own answer for that (`control::resolve`), and it is not
 /// this connection's business.
 fn await_publication(paths: &SessionPaths, deadline: Instant) {
-    while !paths.pid().exists() && Instant::now() < deadline {
+    // Built once. `SessionPaths::pid` allocates, and this loop runs every
+    // millisecond for as long as the caller's deadline allows.
+    let pid = paths.pid();
+    while !pid.exists() && Instant::now() < deadline {
         std::thread::sleep(PUBLISH_POLL_INTERVAL);
     }
 }
@@ -192,7 +195,11 @@ fn daemon_complaint(stderr: Option<ChildStderr>) -> Option<String> {
     let fd = stderr.as_fd();
     rustix::fs::fcntl_setfl(fd, rustix::fs::OFlags::NONBLOCK).ok()?;
     let mut buf = [0u8; 512];
-    let read = rustix::io::read(fd, &mut buf).ok()?;
+    // Through `nbio`, like every other read in the tree: a signal landing on this
+    // one would discard the only account of the failure anybody is going to get,
+    // and report a daemon that explained itself as one that said nothing. `EAGAIN`
+    // still falls through to `None`, which is what "it wrote nothing" means here.
+    let read = crate::nbio::read(fd, &mut buf).ok()?;
     let text = String::from_utf8_lossy(buf.get(..read)?).into_owned();
     let line = text.lines().find(|line| !line.trim().is_empty())?.trim();
     // The daemon reached this through `main`'s reporter, which prefixes the binary's

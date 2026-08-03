@@ -813,11 +813,15 @@ impl Client {
 
     /// Consumes whatever the daemon has already sent, without waiting for more.
     ///
-    /// For tests that are about to close on purpose: a socket closed with data
-    /// still unread makes the kernel send RST, which discards *both* directions —
-    /// including bytes this client wrote and the daemon had not yet read. Draining
-    /// first turns the close into an orderly FIN, so what happens to that input is
-    /// the daemon's behaviour rather than the kernel's timing.
+    /// For tests that are about to close on purpose: a socket closed with data still
+    /// unread makes the kernel send RST, and the daemon answers the `ECONNRESET` that
+    /// follows by letting the connection go without decoding what its last `fill`
+    /// had already buffered — so an `Input` frame written but not yet decoded is
+    /// lost. Not to the kernel, which delivers every byte and reports the error only
+    /// after the last of them, but to `Conn::fill` (`IMPLEMENTATION.md` § 3).
+    /// Draining first turns the close into an orderly FIN, where `fill` reports end
+    /// of file instead and those frames are decoded — so what happens to that input
+    /// is the daemon's behaviour rather than a matter of timing.
     ///
     /// A silent socket ends this after [`SOCKET_POLL`], which is the read timeout
     /// every client here carries — there is nothing to shorten, because nothing waits
@@ -836,8 +840,9 @@ impl Client {
     /// whatever else arrives on the way.
     ///
     /// For tests that are about to disconnect on purpose: an `Input` frame that was
-    /// written but not yet read is lost when the socket closes with output still
-    /// queued, so waiting for the ack is what makes "the daemon has this" true.
+    /// written but not yet *decoded* is lost when the socket closes with output
+    /// still queued — see [`Client::drain_available`] for where it actually goes —
+    /// so waiting for the ack is what makes "the daemon has this" true.
     pub(crate) fn wait_for_input_ack(&mut self, through: u64) {
         let awaiting = format!("an InputAck through offset {through}");
         let deadline = Instant::now() + PATIENCE;
@@ -965,6 +970,41 @@ fn has_unread_bytes(stream: &UnixStream) -> bool {
         }
         return peeked > 0;
     }
+}
+
+/// Shrinks `socket`'s send buffer to `bytes`, so that a write larger than it cannot
+/// complete in one go.
+///
+/// A unix socket splits a write into segments of half its send buffer and waits for
+/// room for each in turn, so the size of that buffer is what decides whether a write
+/// bigger than the space available comes back short or blocks with nothing
+/// transferred. The default 208 KiB is larger than anything this suite writes in one
+/// call, which makes every write all-or-nothing; a small one is what puts a
+/// destination into the state § 7's relay has to survive.
+///
+/// Through `libc` because rustix's socket options live behind its `net` feature,
+/// which this tree does not enable — the same reason [`has_unread_bytes`] is written
+/// by hand.
+pub(crate) fn shrink_send_buffer(socket: &UnixStream, bytes: libc::c_int) {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: `setsockopt` is given the address and length of a `c_int` that
+    // outlives the call, on a descriptor the borrow keeps open for it.
+    let set = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            std::ptr::from_ref(&bytes).cast::<libc::c_void>(),
+            u32::try_from(size_of::<libc::c_int>()).expect("the size of a c_int"),
+        )
+    };
+    assert_eq!(
+        set,
+        0,
+        "shrinking the send buffer failed: {}",
+        std::io::Error::last_os_error()
+    );
 }
 
 /// The greeting the tests send: the current protocol, [`WIN`], and a terminal type

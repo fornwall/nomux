@@ -55,7 +55,15 @@ recorded with what it was measured against.
   closing it: the lock goes as soon as the path exists, and the pidfile is created a
   syscall before it is filled, so the ordinary spawn can be caught holding an empty
   one. Both halves — no file, and a file with nothing in it — are waited out, so only
-  a daemon that stays unpublished past that grace is reported.
+  a daemon that stays unpublished past that grace is reported. The third half was the
+  one this argument missed, and is now closed: a pidfile that exists and parses is
+  still not evidence that the number in it is the process behind the socket, since a
+  `SIGKILL`ed daemon leaves its files and the kernel is free to reissue its pid. A
+  `kill` that signals such a number kills a stranger, and used to unlink the live
+  session's files afterwards regardless. It now confirms the session actually stopped
+  before it removes anything, and reports the pid as not the one serving the session
+  otherwise — so § 6.6's "a live session's files are never unlinked" holds without a
+  caveat, and only the identification window above is left.
 - **The run-directory check costs armv7 66 KiB.** Bisected to `4d5d465`, the commit
   that introduced it, and the jump is that architecture alone: 148,292 → 215,884
   bytes, a 46% step against roughly 6 KiB for the whole branch on each of the other
@@ -78,7 +86,7 @@ recorded with what it was measured against.
   them beside `SHA256SUMS`, keyed by the same hash, is the cheap half of the answer and
   belongs with the P3 release work.
 - **Nothing bounds how many sessions one host will run.** The cap of eight is enforced
-  client-side ([DESIGN.md § 5.1](DESIGN.md#51-bootstrap)) and the daemon knows nothing
+  client-side ([DESIGN.md § 5.1](DESIGN.md#51-identity)) and the daemon knows nothing
   of its siblings, so two devices on one account give sixteen and a client bug gives no
   limit at all. Each session is a daemon, a login shell and whatever that shell started,
   held for seven days. On a shared build host the only bound in the system is on the far
@@ -180,12 +188,30 @@ The four musl targets build, land under the 400 KiB budget, and are byte-reprodu
 - **The wire vectors cannot be run by the implementation that most needs them.**
   `crates/nomux-proto/tests/wire.rs` is written from the § 2.2 table rather than from
   the encoder, which is exactly what makes it able to catch a changed field order — and
-  it is locked inside a Rust integration test. [IMPLEMENTATION.md § 1](IMPLEMENTATION.md#1-architecture)
+  it is locked inside a Rust integration test. [IMPLEMENTATION.md § 1](IMPLEMENTATION.md#1-layout)
   allows the client to reimplement the codec, which a mobile client in Swift or Kotlin
   will, and it cannot run any of this. Emitting the same table as a language-neutral
   fixture from the same test — hex per frame, checked in — would let an independent
   implementation be verified against the identical bytes. Until something does, the
   protocol has never met a second implementation.
+- **Four documented numbers and arms still have nothing behind them.** Each was found
+  by reading § 9 against the suite rather than by a failure, and each is cheap except
+  where noted. `MAX_CHANNEL_QUEUE` — an agent channel whose local peer stops reading
+  is closed once its queue passes 256 KiB; `agent_channels_are_capped` covers the
+  count cap, not the byte cap. `MAX_RING_CAPACITY` — the ceiling exists because
+  `VecDeque::with_capacity` aborts the process on a request it cannot serve, so the
+  promise holds for a `NOMUX_RING_BYTES` that is mistyped downwards and is untested
+  for one mistyped upwards; it needs its own test rather than a row in the existing
+  table, since a huge value clamps to 1 GiB rather than falling back to the default.
+  The `frame is not valid from a client` arm — a server-only frame arriving *after* a
+  successful greeting, which is a different function from the ungreeted refusal that
+  is tested, and a different claim: that the session survives a client which
+  misbehaves once attached. And exit codes 126 and 127, which are deliberately left:
+  both are `attach`'s mapping of what it met, so reaching either honestly means a real
+  relay — a mode that goes on to serve and so cannot be run to completion by a test
+  that waits for it. What an argument-parsing test could reach is only the
+  `io::ErrorKind`-to-number mapping, and asserting on that pins which kind a refusal
+  happens to carry rather than anything a client depends on.
 - **`MAX_PENDING_READ` has no test and cannot easily have one.** The kernel's unix
   send buffer is roughly 212 KiB, five times tighter than the 1 MiB cap, so on a
   stock host the cap never binds and no socket-level test can pin it. Raising the
@@ -214,7 +240,7 @@ server-side contract already fixed here.
 - `direct-streamlocal` warm path; the exec relay is the fallback.
 - Bootstrap orchestration: probe, arch selection, upload, negative caching per host.
 - Codec retention and the "never auto-reconnect after `TAKEOVER`" rule. N-1 is stated in
-  [DESIGN.md § 6.4](DESIGN.md#64-versioning), and its safety argument — that the client
+  [DESIGN.md § 6.4](DESIGN.md#64-version-skew), and its safety argument — that the client
   offers a restart while the session is *still reachable* — assumes the client runs under
   every release. App stores batch updates in the background, so a user who does not open
   the app for a month goes from release 5 to release 8 without ever running 6 or 7, and

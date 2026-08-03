@@ -21,6 +21,7 @@
 
 mod harness;
 
+use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -29,6 +30,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 use std::thread;
 use std::time::Duration;
+
+use nomux_proto::PROTOCOL_VERSION;
 
 use harness::{
     Reaper, Spawned, collect, control, nomux, nomux_with_shell, poll_until, run_root, stderr,
@@ -159,6 +162,20 @@ fn an_attach_re_takes_a_spawn_lock_that_was_collected() {
     drop(lock);
 
     wait_for(&session.socket());
+    // The daemon this attach spawned has `setsid`ed away, so killing the relay does
+    // not reach it: without this it outlives the test by its whole 30-second
+    // first-attach timeout, holding a run directory that the *next* run's sweep
+    // deletes out from under it. Every other test here that brings a session up
+    // collects it; this one is the exception, and a `Reaper` covers a failing
+    // assertion below as well as a passing one.
+    wait_for(&session.pid_path());
+    let pid = fs::read_to_string(session.pid_path())
+        .expect("read the pidfile")
+        .trim()
+        .parse()
+        .expect("the pidfile holds a pid");
+    let _reaper = Reaper(pid);
+
     assert!(
         session.lock_path().exists(),
         "the session came up without the spawn lock the layout promises, so the \
@@ -372,6 +389,93 @@ fn the_control_surface_neither_creates_nor_complains_about_a_missing_run_directo
         assert!(
             !session.dir.exists(),
             "{mode:?} created the run directory it was only asked about"
+        );
+    }
+}
+
+/// The three answers a client gets out of this binary before it has a session: the
+/// bootstrap line, the protocol revision, and 64 for a command line that makes no
+/// sense.
+///
+/// `main.rs` has no other end-to-end coverage, and each of these is parsed by
+/// somebody. The bootstrap line is the one § 5.1 says the client reads to decide
+/// which artifact to upload, and its whole point is that it is the *second* probe
+/// with that prefix: the shell probe that runs before any binary exists speaks
+/// `uname`'s vocabulary — `Linux`, `x86_64`, `armv7l` — and this one speaks the
+/// vocabulary of the binary that was installed, which is Rust's. So `linux` is
+/// spelled out here rather than taken from `env::consts::OS`, which would agree with
+/// whatever the binary printed and pin nothing. The architecture has to come from
+/// `env::consts::ARCH`, since the suite is built for more than one — and on the ones
+/// it is built for today the two vocabularies agree anyway, which leaves the `Linux`
+/// that is not `linux` as the whole of what can be pinned here. The install
+/// directory is the field the client actually uses, and `XDG_DATA_HOME` is set
+/// because the default is the developer's own `~/.local/share`.
+///
+/// `--version` carries the protocol revision the client keys off, taken from
+/// `nomux_proto` rather than written out: pinning the number would make bumping the
+/// protocol a two-file change and say nothing about whether the binary reports the
+/// one it speaks.
+///
+/// 64 is `EX_USAGE` (§ 10), and both ways of reaching it are here because they are
+/// different code: an argument a mode that takes none was given, and a mode that does
+/// not exist. Neither may put anything on stdout, which is where the bootstrap line
+/// lives — a client that parses stdout must not find usage text in it.
+///
+/// The other two codes are left alone. 126 and 127 are `attach`'s, and § 10 defines
+/// them by what `attach` met — a session that exists but will not have us, and one
+/// that is absent and could not be spawned — so reaching either honestly means a real
+/// relay against a sabotaged session, which is a mode that goes on to serve and so
+/// cannot come through [`control`]. What is reachable from here is only the mapping
+/// from an `io::ErrorKind` onto a number, and asserting on that would be asserting
+/// which kind a refusal happens to carry.
+#[test]
+fn probe_and_version_report_what_a_client_bootstraps_from() {
+    let root = run_root("lk9");
+    let data_home = root.join("xdg-data");
+    fs::create_dir_all(&data_home).expect("create the install directory's parent");
+
+    let probed = collect(
+        nomux(&root, &["probe"])
+            .env("XDG_DATA_HOME", &data_home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
+    succeeded(&probed, "probe failed");
+    assert_eq!(
+        stdout(&probed),
+        format!(
+            "NOMUX-BOOTSTRAP linux {} {}\n",
+            env::consts::ARCH,
+            data_home.join("nomux").display()
+        ),
+        "probe must print the line § 5.1 has the client parse, in the installed \
+         binary's own vocabulary and against its own install directory"
+    );
+
+    let versioned = control(&root, &["--version"]);
+    succeeded(&versioned, "--version failed");
+    assert!(
+        stdout(&versioned).contains(&format!("protocol {PROTOCOL_VERSION}")),
+        "--version must carry the protocol revision the client keys off: {:?}",
+        stdout(&versioned)
+    );
+
+    for (mode, what) in [
+        (vec!["probe", "extra"], "an argument `probe` does not take"),
+        (vec!["frobnicate"], "a mode that does not exist"),
+    ] {
+        let refused = control(&root, &mode);
+        assert_eq!(
+            refused.status.code(),
+            Some(64),
+            "{what} must be EX_USAGE: {:?}",
+            stderr(&refused)
+        );
+        assert!(
+            refused.stdout.is_empty(),
+            "{what} put {:?} on stdout, where the client looks for the bootstrap line",
+            stdout(&refused)
         );
     }
 }

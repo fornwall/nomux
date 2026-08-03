@@ -60,7 +60,7 @@ it appears.
 
 | Type | Dir | Name | Payload |
 | --- | --- | --- | --- |
-| `0x01` | C→D | `Hello` | `u16` protocol, `u16` flags, `u64` out_offset, `u64` in_offset, winsize, `u16` term_len, term bytes |
+| `0x01` | C→D | `Hello` | `u16` protocol, `u16` flags, `u64` out_offset, `u64` in_offset, winsize, `u16` term_len, UTF-8 term bytes |
 | `0x02` | D→C | `HelloOk` | `u16` protocol, `u64` resume_from, `u64` in_applied, winsize, `u8` flags |
 | `0x03` | C→D | `Input` | `u64` offset, bytes |
 | `0x04` | D→C | `InputAck` | `u64` applied_through |
@@ -156,10 +156,15 @@ daemon, which ends the session anyway. Bounded, though — §4.1 says by what, a
 the daemon does instead once it is full.
 
 The other half of the invariant is the client's. An `Input` frame that was written
-but not yet read is **not** safe: a client that closes with output still queued
-makes the kernel send RST, which discards the socket's buffers in both directions.
-So a reconnecting client resends from the daemon's `in_applied`, never from what it
-believes it sent. `crates/nomux/tests/chaos.rs` exercises exactly this.
+but not yet read is **not** safe — though not for the reason it looks like. A client
+that closes with data still unread by the peer does make the kernel send RST, but on
+AF_UNIX that discards nothing already delivered: the daemon still reads every byte
+and *then* sees `ECONNRESET`. What loses the frames is the daemon's own answer to
+that error, which is to drop the client without decoding what the failing `fill`
+had just buffered — the right answer for a connection that is going away regardless,
+and the reason the loss is real. So a reconnecting client resends from the daemon's
+`in_applied`, never from what it believes it sent.
+`crates/nomux/tests/chaos.rs` exercises exactly this.
 
 ## 4. Ring buffer
 
@@ -996,19 +1001,20 @@ would be taken over.
 | --- | --- | --- |
 | Codec | `proptest` round-trip; truncated, oversized and malformed frames must error, never panic. | `crates/nomux-proto/` |
 | Wire format | Hand-written byte vectors for all sixteen frames, taken from the §2.2 table rather than from the encoder, and checked in both directions. Every other codec test compares a frame to a frame, so it checks the codec against itself; these are the only thing that would notice a changed field order, width or endianness — which matters because the client is a separate codebase built from that table. Each handshake frame appears three times so that no flag bit or enumerator is exercised at only one value, and the five `Error` codes are pinned as a table, since a frame carries one at a time. | `crates/nomux-proto/tests/wire.rs` |
-| Ring buffer | Model-based against a reference `Vec`, asserting `base_offset` monotonicity and that served ranges are byte-exact, with chunks both under and over capacity. | `src/ring.rs` |
+| Ring buffer | Model-based against a reference `Vec`, asserting `base_offset` monotonicity and that served ranges are byte-exact, with chunks both under and over capacity. `OutputAck` is pinned as the no-op §3 and §4 both promise it is: after acking everything it has read, a client that reconnects from the start is still served from base zero and still finds what was written before the ack. Nothing else in the suite sends that frame, so a daemon that trimmed on it would otherwise pass everything. | `src/ring.rs`, `tests/session.rs` |
 | Exactly-once input | The §3 scenario, replayed from a randomly chosen earlier offset after every disconnect. | `tests/chaos.rs` |
 | Session | Spawn daemon → write → sever the socket mid-stream → reattach → assert the output resumes exactly where it left off. Plus the handshake's two refusals of a client that has lost track of the streams: an `out_offset` above the end is clamped rather than believed (§4.2), and an `Input` above `in_applied` is `Error{INPUT_GAP}` and a closed connection (§3). | `tests/session.rs` |
 | Frames from the client | `Resize` reaches the child's `stty size`, and every attach restates its own geometry in both the greeting and the child; `Detach` ends the connection without ending the session, and `in_applied` survives it. Both are frames the daemon must honour and nothing else in the suite sends. | `tests/session.rs` |
 | Gap | Capacity forced small, and both of the places a gap is reported are pinned: the flag `on_hello` works out for a client that comes back below the ring's base, and the frame `pump_output` sends to one that never left and was overrun where it stood. The mid-stream case builds that state without a race — a client that stops reading pins `sent_through` while the child writes megabytes past it — so `base_offset` is exact rather than probable, checked against the offset the next `Output` carries. | `tests/session.rs`, `tests/chaos.rs` |
-| Backpressure | A client blasting input at a child that reads none of it has its socket refuse long before the daemon has taken a fraction of it, the session still serves a new client afterwards, and repeated reconnects do not raise the ceiling by a byte — the cap is enforced where the queue grows, not where the socket is read. | `tests/session.rs` |
+| Backpressure | A client blasting input at a child that reads none of it has its socket refuse long before the daemon has taken a fraction of it, the session still serves a new client afterwards, and repeated reconnects do not raise the ceiling by a byte — the cap is enforced where the queue grows, not where the socket is read. The output side has its own bound and its own test: a client that sends frames the daemon must answer and reads none of the answers is let go once the queue passes `ABANDON_PENDING_WRITE`, silently and without an `Error` it could not read anyway, and the lower bound asserted is what says that cap fired rather than something cheaper. | `tests/session.rs` |
 | Chaos | Randomised disconnect injection, seeded and reproducible, under an escape-heavy full-screen stream and under `yes`. | `tests/chaos.rs` |
-| Agent forwarding | Bidirectional proxying, the channel cap, ids never reused, fail-fast while detached, and off unless asked for. | `tests/session.rs` |
-| Relay | Bulk traffic both ways through `nomux attach`, byte-exact, over both the `splice` and copying paths of §7. | `tests/session.rs` |
+| Agent forwarding | Bidirectional proxying, the channel cap, ids never reused, fail-fast while detached, and off unless asked for. A channel the *client* closes while its local peer has stopped reading leaves the daemon asleep rather than spinning: its read half is shut down, which makes the socket permanently readable, so the poll set has to stop asking about it or the loop turns over at the speed of the scheduler. Measured as clock ticks burnt, since that is the only thing the bug shows up as. | `tests/session.rs` |
+| Relay | Bulk traffic both ways through `nomux attach`, byte-exact, over both the `splice` and copying paths of §7. Plus the one shape a blocking stdout can fail in: a write a signal cut short must not be resumed, because the relay's stdout may be a terminal it cannot set non-blocking, and `POLLOUT` promises only that *some* write will succeed — so going back for the rest parks the whole relay in the kernel with the other direction unserved. Provoked with `SIGSTOP`, which cannot be caught, against a send buffer shrunk small enough that the write is certain to be partial. | `tests/session.rs` |
 | Detachment | The `daemon` mode leads a session of its own, holds no controlling terminal, redirects the stdio it was handed, and records the surviving pid — including from a process group it leads, which is the only shape that reaches the fork. | `tests/session.rs` |
-| Shutdown | A daemon that reaps itself runs `terminate` to completion and unlinks its run files, and a signalled one collects a backgrounded process that ignores `SIGHUP`. | `tests/session.rs` |
+| Shutdown | A daemon that reaps itself runs `terminate` to completion and unlinks its run files, and a signalled one collects a backgrounded process that ignores `SIGHUP`. A child killed by a signal is reported as `Signalled` rather than as a status, which is the discrimination §10's `128+n` convention rests on. And a child that exits with input still queued for it delivers its last output in full: the state is composed against a stopped daemon, since the master holding unread output *and* the queue being non-empty *and* the master still being writable is otherwise a matter of microseconds. | `tests/session.rs` |
 | Run directory | A symlink in place of one is refused and whatever it points at is left untouched; a directory owned by another uid is refused against a real one, with its mode asserted unchanged; every mode the owner can open is repaired to exactly 0700, including a missing owner bit and `setgid` or `sticky`; a group- or other-writable one is refused rather than repaired, as is one the owner cannot open, which is reported as a judgement on the mode; and both modes that create a run directory say so and exit non-zero. | `src/rundir.rs`, `tests/session.rs` |
 | Spawn lock | Collection against a lock somebody else holds: `list` leaves the entry alone, `kill` exits non-zero rather than claiming it, and an attach whose lock file is collected while it waits goes back for the file that replaced it. A lock that cannot be opened at all is collected past rather than skipped, and `<id>.lock` is the last of the five files removed. | `tests/spawn_lock.rs`, `src/rundir.rs` |
+| Command line | `probe` emits exactly the `NOMUX-BOOTSTRAP <os> <arch> <install_dir>` line §5.1 has the client parse, with `linux` spelled out in the test rather than taken from `env::consts::OS` — which would agree with whatever the binary printed and pin nothing, when the `Linux`/`linux` split is the whole point. `--version` carries the protocol revision the client keys off, against `PROTOCOL_VERSION` rather than a literal. An argument too many and an unknown mode both exit `EX_USAGE` with nothing on stdout, which is where the client looks for that line. | `tests/spawn_lock.rs` |
 | Control surface | `attach`, `list` and `kill` each refuse a run directory that is a symlink into a world-writable one with a socket, a pidfile and a label planted in it, and the planted socket is never connected to; neither `list` nor `kill` creates a run directory it was only asked about; and `kill` leaves a live session's five files untouched and exits non-zero when its pidfile cannot be read. | `tests/spawn_lock.rs` |
 
 The two invariants that matter: **no duplicated input, ever**, and **no lost output

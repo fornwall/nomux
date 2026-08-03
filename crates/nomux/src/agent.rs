@@ -109,11 +109,25 @@ impl Agent {
         self.listener.as_fd()
     }
 
-    /// Every live channel as `(id, fd, wants_write)`, for the poll set.
-    pub(crate) fn watches(&self) -> impl Iterator<Item = (u32, BorrowedFd<'_>, bool)> {
-        self.channels
-            .iter()
-            .map(|chan| (chan.id, chan.stream.as_fd(), !chan.pending.is_empty()))
+    /// Every live channel as `(id, fd, wants_write, wants_read)`, for the poll set.
+    ///
+    /// A closing channel wants no reads, and asking for them would spin the loop at
+    /// full tilt: `close_from_client` shuts the read half down, and a unix socket in
+    /// that state reports itself readable on every pass for ever, while [`Agent::read`]
+    /// declines to act on it. With the peer's buffer full there is no `POLLOUT` to
+    /// make progress against either, so the daemon would burn a core until the peer
+    /// started reading. Such a channel always has something queued — `close_from_client`
+    /// forgets it on the spot otherwise — so it stays in the poll set on `POLLOUT`
+    /// alone, which is the only thing that can still move it.
+    pub(crate) fn watches(&self) -> impl Iterator<Item = (u32, BorrowedFd<'_>, bool, bool)> {
+        self.channels.iter().map(|chan| {
+            (
+                chan.id,
+                chan.stream.as_fd(),
+                !chan.pending.is_empty(),
+                !chan.closing,
+            )
+        })
     }
 
     /// The still-open channel with this id.

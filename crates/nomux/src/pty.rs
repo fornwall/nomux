@@ -10,7 +10,6 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -40,10 +39,15 @@ pub(crate) struct Spawn<'a> {
 }
 
 /// How long the child's group has to act on `SIGHUP` before `SIGKILL` follows.
-const TERM_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+///
+/// Named for the signal actually sent. `control.rs` has a `TERM_GRACE` of its own
+/// for the different two seconds a *daemon* gets after `SIGTERM`, and one name for
+/// two graces of different lengths, in different processes, after different signals
+/// is a collision worth not having.
+const HANGUP_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Interval between liveness checks while waiting out [`TERM_GRACE`].
-const TERM_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+/// Interval between liveness checks while waiting out [`HANGUP_GRACE`].
+const HANGUP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// A running session: the PTY master plus the child holding its slave.
 #[derive(Debug)]
@@ -78,8 +82,11 @@ impl Pty {
         let flags = rustix::fs::fcntl_getfl(&master)?;
         rustix::fs::fcntl_setfl(&master, flags | OFlags::NONBLOCK)?;
 
+        // As the `CString` `ptsname` returned. Going through `OsStr` would strip the
+        // terminator and have rustix copy the path back into a buffer to re-append
+        // it; a `&CStr` is passed straight through.
         let slave: OwnedFd = rustix::fs::open(
-            OsStr::from_bytes(slave_path.as_bytes()),
+            slave_path.as_c_str(),
             OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
             Mode::empty(),
         )?;
@@ -111,8 +118,10 @@ impl Pty {
         // CLOEXEC only takes effect at exec.
         let slave_fd = slave.as_raw_fd();
         // SAFETY: the closure runs in the forked child before exec, so it must be
-        // async-signal-safe. `setsid`, `ioctl` and `signal` are; nothing here
-        // allocates, takes a lock, or touches the Rust runtime.
+        // async-signal-safe. `setsid` and `signal` are named as such by
+        // signal-safety(7); `ioctl` is not on that list but is a bare syscall
+        // wrapper in both glibc and musl. Nothing here allocates, takes a lock, or
+        // touches the Rust runtime, which is what the guarantee rests on.
         unsafe {
             command.pre_exec(move || {
                 rustix::process::setsid()?;
@@ -221,8 +230,12 @@ impl Pty {
             // Waiting on the child alone would be satisfied the moment it goes,
             // while the backgrounded grandchildren this exists to collect are still
             // running — they are the whole reason for the `/proc` walk.
-            let deadline = std::time::Instant::now() + TERM_GRACE;
+            let deadline = std::time::Instant::now() + HANGUP_GRACE;
             let mut settled = false;
+            // What the last probe said, so the `SIGKILL` below is not sent to a
+            // group the loop has already watched go. `true` until one runs, which
+            // is the conservative answer for a deadline that expired immediately.
+            let mut group_alive = true;
             while std::time::Instant::now() < deadline {
                 // Reaped here, every pass, and not merely for tidiness: an unreaped
                 // zombie is still a member of its own process group, so
@@ -232,21 +245,29 @@ impl Pty {
                 // child unreaped, because `reap` only runs once the PTY has reported
                 // end of file, which on the `nomux kill` path it has not.
                 let _ = self.child.try_wait();
-                if rustix::process::test_kill_process_group(pid).is_err()
-                    && session_members(raw).is_empty()
-                {
+                group_alive = rustix::process::test_kill_process_group(pid).is_ok();
+                if !group_alive && session_members(raw).is_empty() {
                     settled = true;
                     break;
                 }
-                std::thread::sleep(TERM_POLL_INTERVAL);
+                std::thread::sleep(HANGUP_POLL_INTERVAL);
             }
             // Only if something is still standing. Breaking early means the group is
             // gone *and* the session is empty, so there is nothing left for these to
             // reach — and once the child has been reaped its pid is free for the
             // kernel to reissue, which is the one case where signalling a group that
             // no longer exists could land somewhere it was never meant to.
+            //
+            // The two reaches are separately conditional for that reason, because
+            // the two conditions come apart: a backgrounded job in a group of its
+            // own — the case this whole function exists for — outlives the grace
+            // while the *child's* group is already gone and reaped. Signalling that
+            // group anyway is a `SIGKILL` sent to a pid the kernel is free to have
+            // reissued, which is exactly what the paragraph above refuses to do.
             if !settled {
-                let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+                if group_alive {
+                    let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+                }
                 signal_session(raw, rustix::process::Signal::KILL);
             }
         }
@@ -500,7 +521,7 @@ mod tests {
         // on the job going away rather than on it having gone already.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline && !collected(job) {
-            std::thread::sleep(TERM_POLL_INTERVAL);
+            std::thread::sleep(HANGUP_POLL_INTERVAL);
         }
         assert!(
             collected(job),
@@ -530,7 +551,7 @@ mod tests {
         while std::time::Instant::now() < deadline {
             match read_pty(pty.master(), &mut buf) {
                 Ok(Read::Data(n)) => seen.push_str(&String::from_utf8_lossy(&buf[..n])),
-                Ok(Read::WouldBlock) => std::thread::sleep(TERM_POLL_INTERVAL),
+                Ok(Read::WouldBlock) => std::thread::sleep(HANGUP_POLL_INTERVAL),
                 Ok(Read::Eof) | Err(_) => break,
             }
             for (at, _) in seen.match_indices(marker) {

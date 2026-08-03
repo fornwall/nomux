@@ -82,10 +82,12 @@ pub(crate) fn info(session_id: &str, message: &str) {
 
 /// Flattens anything that would let a message forge a second one.
 ///
-/// Session ids are already `[A-Za-z0-9_-]` by the time they reach here, but the text
-/// beside them is usually an `io::Error`, which carries a path somebody else chose. A
-/// newline in a datagram is how one log line becomes two, the second one saying
-/// whatever its author wanted it to.
+/// Applied to the whole assembled line, which is what makes it enough: the text
+/// beside a session id is usually an `io::Error` carrying a path somebody else
+/// chose, and the id itself is not always validated either — `daemon::run` reports
+/// a startup failure before anything has looked at its argument, so a malformed id
+/// reaches here verbatim. A newline in a datagram is how one log line becomes two,
+/// the second one saying whatever its author wanted it to.
 fn sanitize(message: &str) -> String {
     message
         .chars()

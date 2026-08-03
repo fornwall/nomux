@@ -669,7 +669,7 @@ mod tests {
     fn hello_ok_flags_are_independent() {
         for gap in [false, true] {
             for agent in [false, true] {
-                for linger in [Linger::Unknown, Linger::Disabled, Linger::Enabled] {
+                for linger in Linger::ALL {
                     round_trip(Frame::HelloOk(HelloOk {
                         protocol: PROTOCOL_VERSION,
                         resume_from: 1,
@@ -742,6 +742,14 @@ mod tests {
         assert_eq!(
             Frame::decode(FrameType::Hello, &payload),
             Err(ProtoError::Malformed("TERM is not UTF-8"))
+        );
+
+        // The other text field, which earns its own diagnosis for the same reason
+        // the reserved encodings above do: `Error` with a valid code and a lone
+        // continuation byte for a message.
+        assert_eq!(
+            Frame::decode(FrameType::Error, &[0x00, 0x01, 0x80]),
+            Err(ProtoError::Malformed("error message is not UTF-8"))
         );
     }
 

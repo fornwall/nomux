@@ -6,7 +6,7 @@
 //! never change.
 
 use std::io::{self, Write};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -75,25 +75,48 @@ pub(crate) fn bind_socket_private(path: &Path) -> io::Result<UnixListener> {
 /// Longest label written to `<id>.label`, in bytes, per the frozen layout.
 const MAX_LABEL_LEN: usize = 256;
 
+/// Longest path a unix socket can be bound to, in bytes.
+///
+/// `sun_path` is 108 bytes and holds a terminator, so 107 is what is left for the
+/// path itself — the figure std checks before it will build the address at all.
+const SUN_PATH_MAX: usize = 107;
+
 /// Resolves the run directory, preferring `XDG_RUNTIME_DIR`.
 ///
 /// `XDG_RUNTIME_DIR` is tmpfs and cleared on last logout unless lingering is
 /// enabled, so the fallback under `XDG_STATE_HOME` is what makes a session outlive
 /// a logout on hosts without linger.
 ///
+/// Each source must be *absolute*, which the XDG specification requires anyway and
+/// which this daemon needs for a reason of its own: the resolved directory is held
+/// in a [`SessionPaths`] for the session's whole life, and § 6.2 moves the daemon
+/// to `/` partway through it. A relative path would therefore mean one directory
+/// while the daemon was starting and another one afterwards — the socket bound in
+/// the caller's working directory, the agent socket and the cleanup on exit
+/// looking for it under the root. Refused rather than half-honoured; an empty
+/// value is not absolute either, so this is the whole of the check.
+///
 /// # Errors
 ///
-/// Fails when none of `XDG_RUNTIME_DIR`, `XDG_STATE_HOME` or `HOME` is set.
+/// Fails when none of `XDG_RUNTIME_DIR`, `XDG_STATE_HOME` or `HOME` names an
+/// absolute path.
 pub(crate) fn run_dir() -> io::Result<PathBuf> {
-    if let Some(dir) = env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty()) {
+    let absolute = |value: &std::ffi::OsString| Path::new(value).is_absolute();
+    if let Some(dir) = env::var_os("XDG_RUNTIME_DIR").filter(absolute) {
         return Ok(PathBuf::from(dir).join("nomux"));
     }
     let state = env::var_os("XDG_STATE_HOME")
-        .filter(|value| !value.is_empty())
+        .filter(absolute)
         .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+        .or_else(|| {
+            env::var_os("HOME")
+                .filter(absolute)
+                .map(|home| PathBuf::from(home).join(".local/state"))
+        })
         .ok_or_else(|| {
-            io::Error::other("none of XDG_RUNTIME_DIR, XDG_STATE_HOME or HOME is set")
+            io::Error::other(
+                "none of XDG_RUNTIME_DIR, XDG_STATE_HOME or HOME names an absolute path",
+            )
         })?;
     Ok(state.join("nomux/run"))
 }
@@ -283,9 +306,10 @@ impl SessionPaths {
     ///
     /// # Errors
     ///
-    /// Fails if `id` is not a valid session id, or the run directory cannot be
-    /// resolved. Validation happens here rather than at each use so no caller can
-    /// build a path from an unchecked id.
+    /// Fails if `id` is not a valid session id, the run directory cannot be
+    /// resolved, or the two together are too long to name a socket. Validation
+    /// happens here rather than at each use so no caller can build a path from an
+    /// unchecked id.
     pub(crate) fn new(id: &str) -> io::Result<Self> {
         if !is_valid_session_id(id) {
             return Err(io::Error::new(
@@ -293,8 +317,28 @@ impl SessionPaths {
                 format!("invalid session id {id:?}: expected 1..=64 bytes of [A-Za-z0-9_-]"),
             ));
         }
+        let dir = run_dir()?;
+        // A valid id is not enough: `sun_path` is 108 bytes including its
+        // terminator, and a 64-byte id under a deep enough run directory overruns
+        // it. Refused here, where both halves are known, because the alternative is
+        // finding out at `bind` — and the failure that follows is not a session
+        // that did not start but one that can never exist, while `list` and `kill`
+        // read the unbindable address as a *live* session whose files they must not
+        // unlink. That leaves a `<id>.lock` behind on every attempt, from the very
+        // command whose job is to collect it.
+        let longest = dir.as_os_str().len() + "/".len() + id.len() + ".label".len();
+        if longest > SUN_PATH_MAX {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "session id {id:?} is too long for {}: the run files need {longest} bytes \
+                     of the {SUN_PATH_MAX} a unix socket path allows",
+                    dir.display()
+                ),
+            ));
+        }
         Ok(Self {
-            dir: run_dir()?,
+            dir,
             id: id.to_owned(),
         })
     }
@@ -586,6 +630,10 @@ impl SpawnLock {
     /// Every failure — no lock at all, an unreadable descriptor, a path that is
     /// gone — answers "no", which is the safe direction: the caller goes round
     /// again instead of acting on a lock it may not hold.
+    ///
+    /// The first of those cannot arise from the one caller, which has just locked
+    /// the descriptor it is asking about. It is still what reads `fd`, and the
+    /// field is otherwise held only for its `Drop`.
     fn locks_the_file_at(&self, path: &Path) -> bool {
         let Some(fd) = self.fd.as_ref() else {
             return false;
@@ -609,6 +657,36 @@ pub(crate) fn sanitize_label(label: &str) -> String {
     let mut out: String = label.chars().filter(|ch| !ch.is_control()).collect();
     out.truncate(out.floor_char_boundary(MAX_LABEL_LEN));
     out.trim().to_owned()
+}
+
+/// Reads a session's label, bounded by what the layout permits.
+///
+/// The write side caps the label at [`MAX_LABEL_LEN`]; the read side cannot assume
+/// it did, for the same reason it sanitizes what it finds — this is the frozen
+/// layout (§ 6.6), so the daemon that wrote the file may be any version, and a
+/// stray shell redirect into the run directory is not a daemon at all. `list` is
+/// the escape hatch that has to keep working on any host, which it would not if a
+/// file somebody left there decided how much memory it faulted in. So a bounded
+/// prefix is read rather than the file.
+///
+/// Anything unreadable is an empty label. A listing that names the session and its
+/// pid is worth more than one that fails over a decoration.
+pub(crate) fn read_label(path: &Path) -> String {
+    // A stack buffer one byte past the cap, filled by the same `open` and the same
+    // `read` the rest of the daemon uses: `File` with `Take` and `read_to_end`
+    // measured 1.6 KiB of machinery this binary otherwise does not link, against
+    // the § 8 budget, for a file that cannot exceed 257 bytes worth reading. One
+    // read is enough — a regular file returns what was asked for or reaches the end
+    // — and `nbio::read` covers the signal that would otherwise cut it short.
+    //
+    // Invalid UTF-8 is an empty label rather than a repaired one, which is what
+    // reading it as a `String` always did.
+    let mut buf = [0u8; MAX_LABEL_LEN + 1];
+    let Ok(fd) = rustix::fs::open(path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()) else {
+        return String::new();
+    };
+    let read = crate::nbio::read(fd.as_fd(), &mut buf).unwrap_or(0);
+    sanitize_label(str::from_utf8(buf.get(..read).unwrap_or(&[])).unwrap_or(""))
 }
 
 #[cfg(test)]
