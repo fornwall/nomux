@@ -56,14 +56,17 @@ Nothing has to be installed by hand: the toolchain is pinned in
 ```sh
 git clone https://github.com/fornwall/nomux && cd nomux
 cargo build     # rustup installs the pinned 1.97.1 on first use
-cargo test      # 111 tests plus 2 doctests, about 10 s
+cargo test      # 112 tests plus 2 doctests, about 10 s
 ```
 
-The tree is developed against `cargo-nextest` instead — one more tool, for one
-property: it runs every test in its own process. Several of these tests fork, and a
-forked child inherits every open descriptor of whichever other test happens to be
-mid-flight, which under `cargo test`'s single process is a sharpness the suite has
-to absorb rather than one it is spared ([PLAN.md § P2](PLAN.md#p2--structure)).
+Both runners are supported, and the line above is the one to start with. The tree is
+developed against `cargo-nextest` — one more tool, for one property: it runs every
+test in its own process. Several of these tests fork, and a forked child inherits
+every open descriptor of whichever other test happens to be mid-flight, so under
+`cargo test`'s single process that is a sharpness the suite absorbs rather than one
+it is spared. What it takes to absorb it is written down in
+[PLAN.md § P2](PLAN.md#p2--structure), and it is a standing obligation on new tests
+rather than a thing that was fixed once.
 
 ```sh
 cargo install cargo-nextest

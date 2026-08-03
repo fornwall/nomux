@@ -86,14 +86,38 @@ recorded with what it was measured against.
   at that point: three booleans is worse than two, so the answer then is one `Copy`
   `HelloFlags` value with named constructors — a single argument to thread — rather
   than N adjacent bools.
-- **A test can hold the spawn lock without meaning to.** `fork` duplicates every
-  open descriptor, and a duplicate of an `flock`ed one keeps that lock alive until it
-  is closed — for a child of the test binary, until its `exec`. So any test that
-  spawns a command while another holds `<id>.lock` open makes a concurrent `list`
-  correctly find the lock busy. `a_held_spawn_lock_survives_a_concurrent_list`
-  absorbs this with a bounded retry; the underlying sharpness is a property of
-  running several tests in one process, which nextest's process-per-test isolation
-  hides entirely.
+- **A test can hold another test's descriptor without meaning to.** `fork` duplicates
+  every open descriptor, and the copy lives until the child reaches `exec` —
+  close-on-exec decides when it goes, not whether it is made. Under `cargo test`, where
+  the whole binary is one process, that means every test's descriptors are briefly in
+  every other test's children, and nextest's process-per-test isolation hides it
+  entirely.
+
+  It has bitten twice, in both of the shapes it has. The mild one is a lock: a
+  duplicate of an `flock`ed descriptor keeps the lock alive, so a test that spawns
+  while another holds `<id>.lock` open makes a concurrent `list` correctly find it
+  busy. `a_held_spawn_lock_survives_a_concurrent_list` absorbs that with a bounded
+  retry, which works because the condition clears on its own.
+
+  The sharp one is a closed descriptor that is not closed: a pipe is broken when the
+  last descriptor onto its read end goes, and "the last" is not the closing test's to
+  decide. `the_relay_exits_when_its_stdout_dies_with_nothing_owed_to_it` and
+  `the_relay_exits_when_a_stdout_it_can_only_copy_to_stops_reading` provoke the relay
+  with a single write, so a duplicate alive for the microseconds of that one write
+  costs the whole test — measured at 4 and 5 failures in 25 whole-suite runs, with the
+  reader end outliving its close by between 0.5 ms and 50 ms, and `/proc` naming the
+  holders as forks of the test binary still carrying the forking test's thread name.
+  Nothing clears on its own afterwards, because a relay that has handed over its one
+  chunk never writes again and so never learns.
+
+  Two answers, and the choice between them is whether the condition can be made a
+  property of the object rather than of the descriptor. Where it can, it should be:
+  `shutdown(SHUT_RD)` on a socket is what "stopped reading" means and no duplicate can
+  undo it. Where it cannot — a pipe has nothing of the kind — the descriptor is made
+  and closed inside `harness::while_nothing_forks`, which every `Command` in the suite
+  takes the other side of, so no `fork` can be in flight to copy it. That is sound only
+  as long as every process the suite starts goes through `harness::launch`; a
+  `Command::spawn` called directly is what would quietly bring this back.
 
 ## P3 — release process
 

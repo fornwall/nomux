@@ -30,9 +30,9 @@ use nomux_proto::{
 };
 
 use harness::{
-    Reaper, Rng, Session, Spawned, accept_within, control, hello_frame, nomux, nomux_with_shell,
-    poll_until, push_until_refused, reconnect_until_gap, run_root, stderr, stdout, succeeded,
-    wait_for, write_frame,
+    Reaper, Rng, Session, Spawned, accept_within, collect, control, hello_frame, nomux,
+    nomux_with_shell, poll_until, push_until_refused, reconnect_until_gap, run_root, stderr,
+    stdout, succeeded, wait_for, while_nothing_forks, write_frame,
 };
 
 #[test]
@@ -688,9 +688,12 @@ fn a_symlinked_run_directory_is_refused_by_attach_and_daemon() {
             // modes are refused before they serve: were that refusal ever to
             // regress, this would hang rather than fail. `SHELL` is here for the
             // same reason — a regression that got past the refusal starts one.
-            let output = nomux_with_shell(&root, &[mode, "symdir"])
-                .output()
-                .expect("run nomux");
+            let output = collect(
+                nomux_with_shell(&root, &[mode, "symdir"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped()),
+            );
             (mode, output.status.success(), stderr(&output))
         })
         .collect();
@@ -1972,17 +1975,34 @@ fn the_relay_exits_when_its_stdout_dies_with_the_destination_latched_full() {
 /// the only thing that distinguishes the two: a discard loop accepts everything it
 /// is handed — 42 MB of it, when this was measured — and from the socket end looks
 /// exactly like a relay doing its job.
+///
+/// The pipe is built here rather than by `Stdio::piped()`, and its read end is closed
+/// before there is a relay at all, because a pipe is broken exactly when the last
+/// descriptor onto its read end goes — and under `cargo test`, where the whole suite
+/// shares one process, "the last" is not this test's to decide. Any other test's
+/// `fork` in flight holds a copy of everything open here (see [`while_nothing_forks`]),
+/// so a read end left open across the spawn and the connect is a read end another
+/// test's child can be holding when the relay writes. The relay is idle from birth
+/// either way: it does not touch stdout until it has something for it.
 #[test]
 fn the_relay_exits_when_its_stdout_dies_with_nothing_owed_to_it() {
-    let (mut child, mut peer, _listener) = relay_onto_a_socket("relay_idle", Stdio::null());
+    // Before a single byte has crossed, so the direction is idle rather than
+    // latched: nothing buffered, and no `splice` left sitting on a full pipe.
+    let broken = while_nothing_forks(|| {
+        let (reader, writer) = std::io::pipe().expect("a pipe for the relay's stdout");
+        drop(reader);
+        writer
+    });
+    let (mut child, mut peer, _listener) = relay_onto_a_socket_over(
+        "relay_idle",
+        Stdio::piped(),
+        Stdio::from(broken),
+        Stdio::null(),
+    );
     // Stdin stays open and idle, so the only thing that can end this relay is the
     // stdout it can no longer reach: the socket is held by the test, and a stdin
     // closed here would only half-close that.
     let _stdin = child.stdin.take().expect("stdin");
-
-    // Before a single byte has crossed, so the direction is idle rather than
-    // latched: nothing buffered, and no `splice` left sitting on a full pipe.
-    drop(child.stdout.take().expect("stdout"));
 
     // One chunk is the whole provocation. The relay wakes on the readable socket,
     // takes it — by `splice` where the kernel allows it, which a pipe with no
@@ -2010,9 +2030,10 @@ fn the_relay_exits_when_its_stdout_dies_with_nothing_owed_to_it() {
 /// long since latched.
 ///
 /// Cheap enough to be worth having: one chunk, one process, and no timing to get
-/// right, since the reader is gone before the relay has anything to hand it.
+/// right, since the reader stops reading before the relay has anything to hand it.
 #[test]
 fn the_relay_exits_when_a_stdout_it_can_only_copy_to_stops_reading() {
+    use std::net::Shutdown;
     use std::os::fd::OwnedFd;
 
     // Held open and idle, as in the two tests above: the socket is the test's own, so
@@ -2027,9 +2048,20 @@ fn the_relay_exits_when_a_stdout_it_can_only_copy_to_stops_reading() {
         Stdio::null(),
     );
 
-    // Gone before a byte has crossed, so nothing is owed to it and nothing is
-    // latched: the relay is not watching this descriptor and cannot be told about it.
-    drop(reader);
+    // Shut down rather than closed, and left open afterwards to make that the point:
+    // closing says "gone" only if this process holds the last descriptor onto it, and
+    // under `cargo test` any other test's `fork` in flight holds a copy of it (see
+    // `while_nothing_forks`) — for as long as that copy lives the peer is still a
+    // reader and the relay's `writev` is still accepted. `SHUT_RD` is a property of
+    // the socket rather than of any descriptor onto it, so a stray duplicate cannot
+    // undo it: the kernel marks this end as reading no more and the peer's end as
+    // sending no more, and the relay gets the same `EPIPE` either way.
+    //
+    // Before a byte has crossed, so nothing is owed to it and nothing is latched: the
+    // relay is not watching this descriptor and cannot be told about it.
+    reader
+        .shutdown(Shutdown::Read)
+        .expect("stop reading the relay's stdout");
 
     peer.write_all(&vec![b'x'; 8 * 1024])
         .expect("write to the relay's socket");
@@ -2047,7 +2079,7 @@ fn the_relay_exits_when_a_stdout_it_can_only_copy_to_stops_reading() {
 /// of the mode the binary insists on, a session socket bound by the test rather than
 /// by a daemon, and the relay started against it. What they do differ in is where the
 /// relay's complaints go, so that is the argument — the bulk test reads them into its
-/// failure messages, and the two about the relay leaving have nobody left to read
+/// failure messages, and the ones about the relay leaving have nobody left to read
 /// them.
 ///
 /// The listener comes back with the rest because it has to outlive the relay: a

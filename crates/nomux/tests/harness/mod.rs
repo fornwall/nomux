@@ -34,6 +34,7 @@ use std::ops::{Deref, DerefMut};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::{PoisonError, RwLock};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
@@ -166,16 +167,17 @@ impl Session {
     pub(crate) fn start_with_raw_ring(name: &str, value: &str) -> Self {
         let root = run_root(name);
         let id = intern(name);
-        let child = nomux_with_shell(&root, &["daemon", &id])
-            .env("PS1", "")
-            // The child's working directory, so `pwd` is assertable.
-            .env("HOME", &root)
-            .env("NOMUX_RING_BYTES", value)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn daemon");
+        let child = launch(
+            nomux_with_shell(&root, &["daemon", &id])
+                .env("PS1", "")
+                // The child's working directory, so `pwd` is assertable.
+                .env("HOME", &root)
+                .env("NOMUX_RING_BYTES", value)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        )
+        .expect("spawn daemon");
 
         let socket = root.join("nomux").join(format!("{id}.sock"));
         wait_for(&socket);
@@ -370,6 +372,41 @@ fn intern(name: &str) -> String {
     interned
 }
 
+/// Held shared by every `fork` this process performs, and exclusively by a test that
+/// needs a descriptor of its own to be closed *process-wide*.
+///
+/// `fork` copies the whole descriptor table, so a child started by one test carries a
+/// duplicate of everything every other test had open at that instant, and keeps it
+/// until it reaches `exec`. Until then a pipe or socket the other test has closed on
+/// purpose is not closed at all: it still has a reader, and a peer writing to it gets
+/// its bytes taken rather than the `EPIPE` the test set up. `PLAN.md` § P2 records the
+/// same hazard against `flock`; this is the general form of it, and it is invisible
+/// under `cargo nextest`, which gives each test a process of its own.
+static FORKS: RwLock<()> = RwLock::new(());
+
+/// Starts `command`, holding [`FORKS`] across the `fork` it performs.
+///
+/// Every process this suite starts comes through here, which is what makes
+/// [`while_nothing_forks`] mean anything. Releasing the guard on return is enough:
+/// `Command::spawn` does not come back until the child has `exec`ed — the `vfork` of
+/// `posix_spawn` suspends the caller until then, and the `fork` path std takes when a
+/// `pre_exec` closure is set waits on a close-on-exec pipe that the `exec` is what
+/// closes — so by then the copies are gone.
+fn launch(command: &mut Command) -> std::io::Result<Child> {
+    let _one_at_a_time = FORKS.read().unwrap_or_else(PoisonError::into_inner);
+    command.spawn()
+}
+
+/// Runs `f` with no `fork` in flight anywhere in this process, and none able to start.
+///
+/// For the window in which a test creates a descriptor it is going to close and then
+/// depend on being gone. Keep it to the descriptor work: everything else in the
+/// process that wants to start a child waits on it.
+pub(crate) fn while_nothing_forks<T>(f: impl FnOnce() -> T) -> T {
+    let _sole_owner = FORKS.write().unwrap_or_else(PoisonError::into_inner);
+    f()
+}
+
 /// A `nomux` invocation against the run directory under `root`, ready for whatever
 /// stdio and tuning the caller wants on top.
 ///
@@ -410,7 +447,26 @@ pub(crate) fn nomux_with_shell(root: &Path, args: &[&str]) -> Command {
 /// anything. A mode that would go on to serve must not come through here: waiting
 /// for it is waiting for ever.
 pub(crate) fn control(root: &Path, args: &[&str]) -> Output {
-    nomux(root, args).output().expect("run nomux")
+    collect(
+        nomux(root, args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+}
+
+/// [`Command::output`] with the `fork` under [`FORKS`] and the wait outside it.
+///
+/// The gate is the whole difference, and where it is released is the point of not
+/// calling `output`: waiting for the child under it would shut every other test out
+/// of `fork` for as long as this one ran, where all that has to be exclusive is the
+/// `fork` itself. Callers say what they want on the three descriptors, since there is
+/// no asking a `Command` what it has already been told.
+pub(crate) fn collect(command: &mut Command) -> Output {
+    launch(command)
+        .expect("start the process")
+        .wait_with_output()
+        .expect("collect what the process said")
 }
 
 /// Fails with `what` unless the process exited successfully, quoting whatever it
@@ -906,7 +962,7 @@ pub(crate) struct Spawned(Option<Child>);
 
 impl Spawned {
     pub(crate) fn spawn(command: &mut Command) -> Self {
-        Self(Some(command.spawn().expect("spawn a child")))
+        Self(Some(launch(command).expect("spawn a child")))
     }
 
     pub(crate) fn is_running(&mut self) -> bool {

@@ -30,8 +30,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use harness::{
-    Reaper, Spawned, control, nomux_with_shell, poll_until, run_root, stderr, stdout, succeeded,
-    wait_for,
+    Reaper, Spawned, collect, control, nomux_with_shell, poll_until, run_root, stderr, stdout,
+    succeeded, wait_for,
 };
 
 /// A `list` that finds the spawn lock held leaves the whole entry alone, and
@@ -444,12 +444,12 @@ struct LiveSession {
 impl LiveSession {
     fn create(id: &str) -> Self {
         let run = StaleSession::empty(id);
-        let started = nomux_with_shell(&run.root, &["attach", id])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .expect("run attach");
+        let started = collect(
+            nomux_with_shell(&run.root, &["attach", id])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped()),
+        );
         succeeded(&started, "attach failed");
         wait_for(&run.pid_path());
         let pid = fs::read_to_string(run.pid_path())
