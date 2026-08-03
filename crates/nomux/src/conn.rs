@@ -45,21 +45,38 @@ const _: () = assert!(
     "MAX_PENDING_READ must have room for a whole frame, or take_frame never completes one"
 );
 
-/// Compact a buffer once this many consumed bytes have accumulated.
-const COMPACT_THRESHOLD: usize = 64 * 1024;
-
 /// Reclaims the consumed prefix of a cursor-and-`Vec` buffer.
 ///
 /// Both directions carry one, and both would otherwise grow without bound across
 /// a long session: neither cursor ever moves backwards, so the bytes below it are
 /// dead the moment they are passed. Draining on every pass would memmove the
-/// remainder for each frame, hence the threshold — and the empty case is worth
+/// remainder for each frame, hence the condition — and the empty case is worth
 /// separating because clearing is free where draining is not.
+///
+/// The condition is a *ratio* rather than a number of bytes, because what a
+/// compaction costs is the remainder — the part that stays — and a threshold on the
+/// prefix says nothing about that. Draining a queue of n bytes in c-byte writes at a
+/// fixed 64 KiB threshold moves about n²/2c: every write past the first 64 KiB
+/// memmoves almost the whole queue, so the cost per byte delivered rises with the
+/// queue instead of staying put. It bites precisely where the queue is largest, which
+/// is the replay path — `pump_output` tops the queue back up to
+/// [`MAX_PENDING_WRITE`] after every write, so the remainder never shrinks. Halving
+/// moves at most as many bytes as the compaction retires, the remainder being no
+/// larger than the prefix by the test itself, so each byte pays for one move and is
+/// then gone: O(1) amortised per byte however the writes fall.
+///
+/// It is not free everywhere, and the receive direction is where it is not. There
+/// `fill` reads a chunk and `take_frame` decodes straight through it, so the cursor
+/// reaches the end and the fixed threshold was never met at all — the free `clear`
+/// above took every compaction. Halving instead memmoves each buffer roughly once
+/// before it empties. That is bounded by what a client sends, which is keystrokes
+/// and acknowledgements against a megabyte cap, where the send direction carries the
+/// session's whole output: the trade is deliberate and it is in the right direction.
 fn compact(buf: &mut Vec<u8>, pos: &mut usize) {
     if *pos == buf.len() {
         buf.clear();
         *pos = 0;
-    } else if *pos >= COMPACT_THRESHOLD {
+    } else if *pos * 2 >= buf.len() {
         buf.drain(..*pos);
         *pos = 0;
     }
