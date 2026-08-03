@@ -22,6 +22,7 @@
 mod harness;
 
 use std::fs::{self, File, OpenOptions};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -390,7 +391,7 @@ impl StaleSession {
     /// stale in § 6.6.
     fn create(id: &str) -> Self {
         let session = Self::empty(id);
-        drop(UnixListener::bind(session.socket()).expect("bind a socket to abandon"));
+        abandon_socket(&session.socket());
         fs::write(session.pid_path(), "999999999\n").expect("write pidfile");
         fs::write(session.dir.join(format!("{id}.label")), "stale").expect("write label");
         session
@@ -540,6 +541,41 @@ impl PlantedRunDir {
     fn nothing_connected(&self) -> bool {
         matches!(self.listener.accept(), Err(err) if err.kind() == std::io::ErrorKind::WouldBlock)
     }
+}
+
+/// Binds `path` and leaves it answering nothing, which is what stale means in
+/// § 6.6: the socket a daemon killed with `SIGKILL` leaves in the run directory,
+/// where only a refused `connect` distinguishes it from a session still in use.
+///
+/// The `shutdown` is the whole of the difference, and it is not belt and braces.
+/// `fork` copies the descriptor table, so a child any *other* test starts while
+/// this listener is open carries a duplicate of it until its `exec` — and a
+/// listening socket with a descriptor still onto it goes on accepting, however
+/// firmly this one closed its own. What the run directory then holds is a socket
+/// that answers, so `list` and `kill` correctly report a live session where this
+/// promised a dead one, and the tests below fail for the thing they exist to
+/// assert. Measured at 170–270 ms of afterlife on a machine with more runnable
+/// threads than cores, which is several `nomux list` invocations wide.
+///
+/// `PLAN.md` § P2 records both answers to that hazard, and this is the one it
+/// prefers wherever the object allows it: `shutdown` belongs to the socket rather
+/// than to the descriptor, so no duplicate can undo it — where
+/// `harness::while_nothing_forks` would only keep *this* process's forks out of the
+/// window, and would have to be right about every `Command` in the suite for ever.
+fn abandon_socket(path: &Path) {
+    let listener = UnixListener::bind(path).expect("bind a socket to abandon");
+    // SAFETY: `shutdown` is passed a descriptor the borrow above keeps open across
+    // the call, and a flag it defines. `UnixListener` has no safe spelling of this —
+    // `shutdown` is on `UnixStream` alone — and rustix's would mean adding its `net`
+    // feature to the whole crate for one line of one test.
+    let stopped = unsafe { libc::shutdown(listener.as_raw_fd(), libc::SHUT_RD) };
+    assert_eq!(
+        stopped,
+        0,
+        "stop the abandoned socket accepting: {}",
+        std::io::Error::last_os_error()
+    );
+    drop(listener);
 }
 
 fn inode(path: &Path) -> u64 {

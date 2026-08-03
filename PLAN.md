@@ -93,7 +93,7 @@ recorded with what it was measured against.
   every other test's children, and nextest's process-per-test isolation hides it
   entirely.
 
-  It has bitten twice, in both of the shapes it has. The mild one is a lock: a
+  It has bitten three times, in both of the shapes it has. The mild one is a lock: a
   duplicate of an `flock`ed descriptor keeps the lock alive, so a test that spawns
   while another holds `<id>.lock` open makes a concurrent `list` correctly find it
   busy. `a_held_spawn_lock_survives_a_concurrent_list` absorbs that with a bounded
@@ -110,14 +110,26 @@ recorded with what it was measured against.
   Nothing clears on its own afterwards, because a relay that has handed over its one
   chunk never writes again and so never learns.
 
+  It reaches a *listening* socket in the same shape, and there what lies is the run
+  directory itself: `StaleSession::create` binds `<id>.sock` and closes it to make the
+  dead session [IMPLEMENTATION.md § 6.6](IMPLEMENTATION.md#66-frozen-control-surface)
+  defines, and a duplicate keeps that socket accepting — so `list` and `kill`
+  correctly report a session alive that the test had promised was a corpse. Measured
+  at 170–270 ms of afterlife on a machine with several times as many runnable threads
+  as cores, with `/proc/net/unix` showing the socket still carrying `SO_ACCEPTCON` and
+  a reference the closing test no longer held, against 5 failures in 400 whole-binary
+  runs, shared between two of the three tests that start from one.
+
   Two answers, and the choice between them is whether the condition can be made a
   property of the object rather than of the descriptor. Where it can, it should be:
   `shutdown(SHUT_RD)` on a socket is what "stopped reading" means and no duplicate can
-  undo it. Where it cannot — a pipe has nothing of the kind — the descriptor is made
-  and closed inside `harness::while_nothing_forks`, which every `Command` in the suite
-  takes the other side of, so no `fork` can be in flight to copy it. That is sound only
-  as long as every process the suite starts goes through `harness::launch`; a
-  `Command::spawn` called directly is what would quietly bring this back.
+  undo it, and on a listener it is equally what "answers nothing" means — which is what
+  `abandon_socket` does before letting the stale socket go. Where it cannot — a pipe
+  has nothing of the kind — the descriptor is made and closed inside
+  `harness::while_nothing_forks`, which every `Command` in the suite takes the other
+  side of, so no `fork` can be in flight to copy it. That is sound only as long as
+  every process the suite starts goes through `harness::launch`; a `Command::spawn`
+  called directly is what would quietly bring this back.
 
 ## P3 — release process
 

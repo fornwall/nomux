@@ -180,7 +180,7 @@ impl Session {
         .expect("spawn daemon");
 
         let socket = root.join("nomux").join(format!("{id}.sock"));
-        wait_for(&socket);
+        wait_until_answering(&socket);
         Self {
             child,
             root,
@@ -191,10 +191,11 @@ impl Session {
     }
 
     pub(crate) fn connect(&self) -> Client {
-        // Named rather than `expect`ed: the socket is bound before the ring is
-        // built, so a daemon that died on the way up is refused here rather than
-        // missed by `wait_for`, and this is where a test that starts a session per
-        // case learns which of them it was.
+        // Named rather than `expect`ed, and never retried. `Session::start` waits
+        // until the daemon answers rather than until it has made the name, so a
+        // refusal here is a daemon that has stopped answering since — which is a
+        // failure whatever else the test was about, and this is where a test that
+        // starts a session per case learns which of them it was.
         let stream = UnixStream::connect(&self.socket)
             .unwrap_or_else(|err| panic!("connect to session {:?}: {err}", self.name));
         stream
@@ -499,12 +500,46 @@ pub(crate) fn stdout(out: &Output) -> String {
 /// Named for the file rather than for binding a socket: two of the callers wait on a
 /// pidfile, and a failure that says the daemon "never bound" one sends the reader
 /// looking in the wrong place.
+///
+/// Not for a socket a caller then means to *connect* to — see
+/// [`wait_until_answering`], which is a different question and the one those callers
+/// are really asking.
 pub(crate) fn wait_for(path: &Path) {
     assert!(
         poll_until(Duration::from_secs(10), || path.exists()),
         "the daemon never created {}",
         path.display()
     );
+}
+
+/// Waits for a daemon to be *answering* on `path`, rather than merely to have made
+/// the name.
+///
+/// A unix socket enters the filesystem at `bind` and starts answering at `listen`,
+/// and those are two syscalls: in between, the path exists and every `connect` is
+/// refused. So [`wait_for`] on a socket is satisfied one step before the thing every
+/// one of its callers goes on to do, and on a machine with more runnable threads
+/// than cores that step is wide enough to lose — a session start caught here refused
+/// a connection and accepted one 20 µs later, with the daemon running throughout and
+/// `/proc/net/unix` showing its socket bound and not yet listening.
+///
+/// Nothing in production waits on the name either: `nomux attach` retries a refused
+/// connect for five seconds (`IMPLEMENTATION.md` § 6.3), because a refusal from a
+/// daemon it has just spawned means "not yet" rather than "never". This is the
+/// suite's version of the same wait, which is what makes a refusal at
+/// [`Session::connect`] mean something.
+///
+/// The connection is dropped as soon as it is made, and costs the session nothing:
+/// § 6.4 has the daemon promote a connection on its `Hello` and never on the
+/// `connect`, precisely so that the liveness probe `nomux list` makes cannot evict a
+/// client. So this is not an attach, and does not stop the clock an attach stops —
+/// `a_daemon_nobody_ever_attaches_to_reaps_itself` still runs the full 30 seconds
+/// out with this ahead of it.
+pub(crate) fn wait_until_answering(path: &Path) {
+    let answered = poll_until(Duration::from_secs(10), || {
+        UnixStream::connect(path).is_ok()
+    });
+    assert!(answered, "the daemon never answered on {}", path.display());
 }
 
 /// A protocol client: enough of one to assert on daemon behaviour.
