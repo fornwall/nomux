@@ -1,3 +1,5 @@
+**NOTE**: Experimental, untested AI generated project.
+
 # nomux
 
 A single static Linux binary that runs on an SSH server and keeps a terminal
