@@ -329,8 +329,10 @@ impl<'a> Frame<'a> {
     ///
     /// [`ProtoError::PayloadTooLarge`] if the encoded payload exceeds
     /// [`crate::MAX_PAYLOAD`], or [`ProtoError::Malformed`] for a field too long
-    /// for its own length prefix. `out` is rewound to its original length in
-    /// either case.
+    /// for its own length prefix — or for the header slot going missing, which the
+    /// line that reserves it rules out and which is an error here rather than a
+    /// silence for the reason given below. `out` is rewound to its original length
+    /// in every case.
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), ProtoError> {
         // The payload goes straight into the caller's buffer and the header is
         // patched in behind it, so every error path rewinds to `start`: a refused
@@ -346,9 +348,20 @@ impl<'a> Frame<'a> {
             .map_err(|_| ProtoError::PayloadTooLarge(u32::MAX))
             .and_then(|len| encode_header(self.frame_type(), len))
             .inspect_err(|_| out.truncate(start))?;
-        if let Some(slot) = out.get_mut(start..start + HEADER_LEN) {
-            slot.copy_from_slice(&header);
-        }
+        // A patch that does not land must not pass for one that did: the frame would
+        // go out under the zero header reserved above, which the peer decodes as
+        // `UnknownFrameType(0x00)` and answers with `Error{Protocol}` — a bug
+        // reported at the far end of the connection, about a frame that end never
+        // had a say in. Unreachable behind the `extend_from_slice`, and so written
+        // as the one thing an unreachable case may be.
+        let Some(slot) = out
+            .get_mut(start..)
+            .and_then(<[u8]>::first_chunk_mut::<HEADER_LEN>)
+        else {
+            out.truncate(start);
+            return Err(ProtoError::Malformed("the header slot went missing"));
+        };
+        *slot = header;
         Ok(())
     }
 

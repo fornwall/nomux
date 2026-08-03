@@ -17,10 +17,12 @@ categories.workspace = true
 [dependencies]
 nomux-proto.workspace = true
 rustix = { version = "1.1.4", features = ["pty", "termios", "process", "event", "fs", "pipe", "stdio"] }
-# Only for `signal`, `fork` and `_exit`, all of which rustix puts in its `runtime`
-# module — documented as unusable in a process that has a libc, which this one does
-# via std. Declarations only, so it costs nothing in the binary, and it is already
-# in the tree beneath rustix.
+# For `signal`, `fork` and `_exit`, which rustix puts in its `runtime` module —
+# documented as unusable in a process that has a libc, which this one does via std —
+# and for the one `getsockopt` in `control::peer_pid`, where rustix's own
+# `socket_peercred` is unsound against an answer the kernel really gives. Declarations
+# only, so it costs nothing in the binary, and it is already in the tree beneath
+# rustix.
 libc = "0.2.189"
 
 [lints]

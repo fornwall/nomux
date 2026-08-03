@@ -74,8 +74,13 @@ pub(crate) fn drain_to(queue: &mut VecDeque<u8>, fd: BorrowedFd<'_>) -> Result<(
         };
         match written {
             Ok(0) | Err(Errno::AGAIN) => break,
+            // Clamped like every returned read count in this tree, and for the same
+            // reason: `drain` past the end panics, and this binary is built
+            // `panic = "abort"`. `writev` over exactly these slices cannot report
+            // more than it was given — which is why this is one `min` rather than a
+            // refusal to go on.
             Ok(n) => {
-                drop(queue.drain(..n));
+                drop(queue.drain(..n.min(queue.len())));
                 break;
             }
             Err(Errno::INTR) => {}

@@ -20,7 +20,8 @@
 
 use nomux_proto::{
     ErrorCode, ExitKind, Frame, FrameType, HEADER_LEN, HELLO_AGENT_FORWARD, HELLO_REPAINT_CTRL_L,
-    Hello, HelloOk, Linger, MAX_PAYLOAD, PROTOCOL_VERSION, RESUME_FROM_START, WinSize,
+    Hello, HelloOk, Linger, MAX_AGENT_CHANNELS, MAX_PAYLOAD, MAX_SESSION_ID_LEN, PROTOCOL_VERSION,
+    RESUME_FROM_START, WinSize,
 };
 
 /// Distinct in all four fields on purpose: `cols`, `rows`, `xpixel` and `ypixel`
@@ -710,4 +711,29 @@ fn the_length_field_is_a_u24_past_its_low_byte() {
             data_len + 8
         );
     }
+}
+
+/// The other two frozen numbers, held against the document rather than themselves.
+///
+/// Both are asserted elsewhere only through the constant: `session_ids_accept_
+/// minted_forms` takes a `MAX_SESSION_ID_LEN`-long id and
+/// `session_ids_reject_oversized_and_non_ascii` takes one byte more, and that pair
+/// passes for *any* value the constant might hold. So does every agent-channel test,
+/// which counts to `MAX_AGENT_CHANNELS` and asks for one more. That is the hole the
+/// assertion above closed for `MAX_PAYLOAD`, left open for these.
+///
+/// It matters because the far end is a separate codebase built from the document:
+/// § 6.3 fixes the id at 64 bytes and says "Both ends validate: the client before
+/// minting", so a re-tune here mints ids the daemon refuses — and § 6.7 fixes the
+/// channel cap at 8, which is what a client sizes its own table against.
+#[test]
+fn the_frozen_limits_are_the_numbers_the_document_gives() {
+    assert_eq!(
+        MAX_SESSION_ID_LEN, 64,
+        "IMPLEMENTATION.md § 6.3 caps a session id at 64 bytes"
+    );
+    assert_eq!(
+        MAX_AGENT_CHANNELS, 8,
+        "IMPLEMENTATION.md § 6.7 caps a session at 8 concurrent agent channels"
+    );
 }

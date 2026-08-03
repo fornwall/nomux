@@ -23,7 +23,7 @@ mod syslog;
 
 use std::env;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 /// `EX_USAGE`: malformed invocation. The one code borrowed from `sysexits.h`, and
@@ -64,10 +64,7 @@ fn main() -> ExitCode {
     };
 
     match mode.to_str() {
-        Some(word @ "probe") => only(args, word, || {
-            print_probe();
-            ExitCode::SUCCESS
-        }),
+        Some(word @ "probe") => only(args, word, print_probe),
         Some(word @ "list") => only(args, word, || report(control::list())),
         Some(word @ ("--version" | "-V")) => only(args, word, || {
             println!(
@@ -241,28 +238,41 @@ fn report(result: std::io::Result<()>) -> ExitCode {
 /// itself, but that the artifact it uploaded runs here. The shell probe in § 5.1
 /// runs before any binary exists and necessarily uses `uname`. Same prefix, two
 /// vocabularies, on purpose.
-fn print_probe() {
+///
+/// No install directory means no line at all, and the failure goes to stderr like
+/// any other. § 5.1 has the client read this one line off stdout and then `exec` a
+/// binary at the path in it, so a line naming a path that cannot work is worse than
+/// nothing: it would be uploaded to and `exec`ed against whatever directory the
+/// exec channel happened to start in.
+fn print_probe() -> ExitCode {
+    let Some(dir) = install_dir() else {
+        return report(Err(std::io::Error::other(
+            "neither XDG_DATA_HOME nor HOME names an absolute path, so there is no \
+             install directory to report",
+        )));
+    };
     println!(
         "NOMUX-BOOTSTRAP {} {} {}",
         env::consts::OS,
         env::consts::ARCH,
-        install_dir().display()
+        dir.display()
     );
+    ExitCode::SUCCESS
 }
 
 /// Resolves the install directory, matching the shell precedence in
 /// `IMPLEMENTATION.md` § 5.
-fn install_dir() -> PathBuf {
-    let base = env::var_os("XDG_DATA_HOME")
-        .filter(|dir| !dir.is_empty())
-        .map_or_else(
-            || {
-                let home = env::var_os("HOME").unwrap_or_else(|| OsString::from("."));
-                let mut path = PathBuf::from(home);
-                path.push(".local/share");
-                path
-            },
-            PathBuf::from,
-        );
-    base.join("nomux")
+///
+/// Each source must be *absolute*, which is [`rundir::run_dir`]'s rule and is here
+/// for a reason of its own: this path is what § 5.2 uploads a binary to and § 5.1
+/// `exec`s, over an exec channel whose working directory is nobody's to predict. An
+/// empty value is not absolute either, so this is the whole of the check — and where
+/// neither source passes it, there is no answer rather than a relative one.
+fn install_dir() -> Option<PathBuf> {
+    let absolute = |value: &OsString| Path::new(value).is_absolute();
+    let base = match env::var_os("XDG_DATA_HOME").filter(absolute) {
+        Some(data) => PathBuf::from(data),
+        None => PathBuf::from(env::var_os("HOME").filter(absolute)?).join(".local/share"),
+    };
+    Some(base.join("nomux"))
 }
