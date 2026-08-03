@@ -30,10 +30,10 @@ use nomux_proto::{
 };
 
 use harness::{
-    Reaper, Rng, Session, Spawned, accept_within, collect, control, has_unread_bytes, hello_frame,
-    join_within, nomux, nomux_with_shell, poll_until, push_until_refused, read_uninterrupted,
-    reconnect_until_gap, run_root, shrink_send_buffer, stderr, stdout, succeeded, wait_for,
-    while_nothing_forks, write_frame,
+    Client, Reaper, Rng, Session, Spawned, accept_within, collect, control, has_unread_bytes,
+    hello_frame, join_within, nomux, nomux_with_shell, poll_until, push_until_refused,
+    read_uninterrupted, reconnect_until_gap, run_root, shrink_send_buffer, stderr, stdout,
+    succeeded, wait_for, while_nothing_forks, write_frame,
 };
 
 #[test]
@@ -127,15 +127,33 @@ fn an_out_offset_past_the_end_of_the_stream_is_clamped_rather_than_believed() {
 
 /// The invariant that matters most: a client replaying input it already sent —
 /// because the `InputAck` was lost with the connection — must not run it twice.
+///
+/// Everything here happens with the line discipline's echo turned off, and that is
+/// not tidiness. With echo on, the first frame carrying `NOMUX-ONCE-MARKER` is the
+/// terminal repeating the *command* — measured against a hand-written client, which
+/// saw `OUTPUT off=0 "echo NOMUX-ONCE-MARKER\r\n"` before `OUTPUT off=24
+/// "NOMUX-ONCE-MARKER\r\n"` — so the resume point below was 24, ahead of a
+/// legitimate single occurrence rather than behind it, and the transcript compared
+/// at the end began before the marker the shell was about to print. What kept the
+/// test green on correct code was `dash` not having got round to running the
+/// command yet: warmed up, or with 300 ms between the read and the disconnect, it
+/// failed on a daemon that was doing exactly the right thing.
+///
+/// With `-echo` the marker can only be the shell's own output, so the resume point
+/// is past the one occurrence there may be, and the fence really is a fence: its
+/// text also only ever arrives from the shell, so reading it back proves everything
+/// queued in front of it — the replay included — has already been through the PTY.
 #[test]
 fn replayed_input_is_applied_exactly_once() {
     let (session, mut client, ok) = Session::attached("dedup");
+    let ready = client.make_ready("-echo -onlcr", None, ok.resume_from);
 
     // `printf` with a counter would need shell state; instead emit a unique marker
     // and assert it appears exactly once in the transcript.
     let command = b"echo NOMUX-ONCE-MARKER\n";
-    client.input(0, command);
-    let (_, offset) = client.read_until("NOMUX-ONCE-MARKER", ok.resume_from);
+    client.input(ready.in_offset, command);
+    let (_, offset) = client.read_until("NOMUX-ONCE-MARKER", ready.offset);
+    let applied = ready.in_offset + command.len() as u64;
 
     drop(client);
     let mut client = session.connect();
@@ -143,13 +161,12 @@ fn replayed_input_is_applied_exactly_once() {
     // Resume claiming we never got the ack, then replay the identical bytes.
     let ok = client.hello(offset);
     assert_eq!(
-        ok.in_applied,
-        command.len() as u64,
+        ok.in_applied, applied,
         "daemon must report input already applied"
     );
-    client.input(0, command);
+    client.input(ready.in_offset, command);
 
-    // Force a round trip so any duplicate would have been echoed by now.
+    // Force a round trip so any duplicate would have been run by now.
     client.input(ok.in_applied, b"echo NOMUX-FENCE\n");
     let (seen, _) = client.read_until("NOMUX-FENCE", ok.resume_from);
 
@@ -211,6 +228,259 @@ fn overflow_is_reported_as_a_gap_rather_than_silently_truncated() {
     );
 }
 
+/// Markers bracketing the stream [`predictable_blob`] produces.
+///
+/// Lower case, which that alphabet cannot contain, so neither marker can occur
+/// inside the data it delimits — and the read that stops at the opening one
+/// therefore stops at the byte before the stream rather than somewhere inside it.
+const BLOB_BEGIN: &str = "nomux-blob-begin";
+const BLOB_END: &str = "nomux-blob-end";
+
+/// A byte stream a test can predict exactly and a ring cannot hold cheaply.
+///
+/// Two properties, both load-bearing, and neither available from the `/dev/zero`
+/// the mid-stream gap test below used to run on. *Predictable*, so that a byte the
+/// daemon labels with an offset can be checked against the byte that offset names —
+/// which is the whole of what a `Gap` claims and the one thing no gap test in this
+/// suite asserted. *Aperiodic and near-incompressible*, so that "more than the ring
+/// holds" is a property of the data rather than an assumption about the ring: eight
+/// megabytes of `/dev/zero` fit in any ring that compresses, and a test resting on
+/// that would then find nothing dropped, no gap owed, and nothing to report.
+///
+/// Every byte carries six bits of the generator's stream, drawn from `0x21..=0x60`,
+/// which is what lets it cross a terminal in canonical mode untouched: no newline,
+/// no carriage return, no tab, nothing the line discipline has an opinion about. A
+/// compressor could take it to three quarters of its size, against a ring that
+/// holds a sixtieth of it.
+fn predictable_blob(len: usize) -> Vec<u8> {
+    // Any fixed seed; the generator is reproducible from it, which is the whole
+    // requirement — nothing here explores a space, it just needs the same stream
+    // every run so a failure can be looked at twice.
+    let mut blob = Rng::new(0x9e37_79b9_7f4a_7c15).bytes(len);
+    for byte in &mut blob {
+        *byte = 0x21 + *byte % 0x40;
+    }
+    blob
+}
+
+/// A session whose child is writing a stream the test knows byte for byte.
+struct Planted {
+    /// Absolute output offset of the first byte of that stream.
+    stream_start: u64,
+    /// The whole of what the child writes from there: the blob and the closing
+    /// marker, so an offset into the stream is an index into this.
+    expected: Vec<u8>,
+    /// Touched by the child once every byte above has been written, which is how a
+    /// client that is deliberately not reading learns the child has finished.
+    sentinel: PathBuf,
+    /// One past the last input byte sent here.
+    in_offset: u64,
+}
+
+/// Puts a blob where the session's child can read it, sets it writing, and leaves
+/// the client's stream positioned at exactly the first byte of it.
+///
+/// The opening marker goes on a line of its own and is read to completion before
+/// the line that produces the blob is sent. That ordering is what makes the
+/// arithmetic exact rather than nearly so: the shell writes nothing more until it
+/// has read the next line, so the offset that read returns is one past the marker
+/// and not one past whatever else happened to be in the frame carrying it.
+fn plant_blob(
+    session: &Session,
+    client: &mut Client,
+    from: u64,
+    in_offset: u64,
+    len: usize,
+) -> Planted {
+    let mut expected = predictable_blob(len);
+    fs::write(session.root.join("blob"), &expected).expect("plant the blob the child reads");
+
+    let begin = format!("printf '{BLOB_BEGIN}'\n");
+    client.input(in_offset, begin.as_bytes());
+    let (_, stream_start) = client.read_until(BLOB_BEGIN, from);
+
+    let run = format!("cat blob; printf '{BLOB_END}'; touch produced\n");
+    client.input(in_offset + begin.len() as u64, run.as_bytes());
+
+    expected.extend_from_slice(BLOB_END.as_bytes());
+    Planted {
+        stream_start,
+        expected,
+        sentinel: session.root.join("produced"),
+        in_offset: in_offset + (begin.len() + run.len()) as u64,
+    }
+}
+
+/// Reads the session's output to the end of `planted.expected`, checking every byte
+/// against the byte its offset names, and returns the gaps followed on the way.
+///
+/// This is the assertion the gap tests exist for and the one none of them made.
+/// Every one of them adopts `new_base_offset` or `resume_from` as ground truth and
+/// then checks contiguity *relative to it* — which cannot fail, whatever the daemon
+/// says. A base reported N too low replays N bytes the client already has; one
+/// reported N too high drops N it never will; both produce a perfectly contiguous
+/// stream and both corrupt the user's scrollback, which is the single failure
+/// `IMPLEMENTATION.md` § 9's second invariant exists to prevent. Indexing a model of
+/// the child's own output by absolute offset is what makes that claim falsifiable.
+#[expect(
+    clippy::panic,
+    reason = "clippy.toml's allow-panic-in-tests reaches `#[test]` bodies, not the \
+              helpers an integration test crate keeps beside them"
+)]
+fn read_against(client: &mut Client, planted: &Planted, from: u64) -> Vec<(u64, u64)> {
+    let expected = &planted.expected;
+    let end = planted.stream_start + expected.len() as u64;
+    let mut offset = from;
+    let mut gaps = Vec::new();
+    while offset < end {
+        let (ty, payload) = client.next_frame();
+        match Frame::decode(ty, &payload).expect("decode frame") {
+            Frame::Output { offset: at, data } => {
+                assert_eq!(
+                    at,
+                    offset,
+                    "output must join up unless a Gap said otherwise, and this frame \
+                     opens {} bytes from where the stream stood",
+                    at.abs_diff(offset)
+                );
+                let index = usize::try_from(at.saturating_sub(planted.stream_start))
+                    .expect("an offset within a stream this test wrote");
+                let want = expected.get(index..index + data.len()).unwrap_or_else(|| {
+                    panic!(
+                        "the daemon sent {} bytes at offset {at}, running {} past the \
+                         end of everything the child ever wrote",
+                        data.len(),
+                        index + data.len() - expected.len()
+                    )
+                });
+                assert_same_stream(want, data, at);
+                offset += data.len() as u64;
+            }
+            Frame::Gap { new_base_offset } => {
+                assert!(
+                    new_base_offset > offset,
+                    "a Gap must name a base past what the client was sent: \
+                     {new_base_offset} against {offset}"
+                );
+                gaps.push((offset, new_base_offset));
+                offset = new_base_offset;
+            }
+            Frame::InputAck { .. } | Frame::Pong { .. } => {}
+            other => panic!("unexpected {other:?} while reading the session's output"),
+        }
+    }
+    gaps
+}
+
+/// Fails saying which offset the stream stopped meaning what the child wrote there.
+///
+/// Quoted from both sides, because the number alone does not say which way the
+/// error went — a stream that resumed too early repeats bytes the client has, and
+/// one that resumed too late is missing bytes it never will.
+#[expect(
+    clippy::panic,
+    reason = "clippy.toml's allow-panic-in-tests reaches `#[test]` bodies, not the \
+              helpers an integration test crate keeps beside them"
+)]
+fn assert_same_stream(want: &[u8], got: &[u8], at: u64) {
+    if want == got {
+        return;
+    }
+    let diff = want
+        .iter()
+        .zip(got)
+        .position(|(a, b)| a != b)
+        .unwrap_or_else(|| want.len().min(got.len()));
+    let window = |bytes: &[u8]| {
+        String::from_utf8_lossy(bytes.get(diff..(diff + 48).min(bytes.len())).unwrap_or(&[]))
+            .into_owned()
+    };
+    panic!(
+        "the daemon labelled a byte with an offset that is not where the child wrote \
+         it: at offset {}, the session sent {:?} where the child wrote {:?}. The \
+         stream is contiguous and wrong, which is what an off-by-N ring base looks \
+         like from a client",
+        at + diff as u64,
+        window(got),
+        window(want),
+    );
+}
+
+/// A gap reported at the handshake must name the byte the stream really resumes at.
+///
+/// The handshake half of the wiring `Ring::base` → `HelloOk.resume_from`, which
+/// `src/ring.rs` pins only as arithmetic in isolation. Here the client comes back
+/// below the ring's base, is told where it may resume, and every byte from that
+/// point on is checked against what the child actually wrote there. A daemon whose
+/// base was off in either direction hands back a stream that joins up perfectly and
+/// says the wrong thing, and until this test nothing in the suite could tell the
+/// two apart.
+///
+/// The second assertion is the same fault caught by a different route and is cheap
+/// to state: what is left between `resume_from` and the end of the stream is what
+/// the ring is holding, so it can never exceed the ring. A base reported too low
+/// fails that one as well as the byte comparison, which is worth having — the two
+/// disagree about nothing, and a failure that fires twice is easier to read than
+/// one that fires once.
+#[test]
+fn a_gap_at_the_handshake_names_the_byte_the_stream_actually_resumes_at() {
+    /// Small enough that half a megabyte overruns it many times over, and larger
+    /// than the terminal setup that precedes the blob — so the only thing evicted
+    /// is data this test can predict.
+    const RING: usize = 16 * 1024;
+    /// Comfortably past [`RING`], and small enough to be produced and compared in
+    /// milliseconds. Nothing here needs the megabytes the mid-stream case does: the
+    /// client is *away*, so there is no send queue to outrun, only the ring.
+    const PRODUCED: usize = 512 * 1024;
+
+    let session = Session::start_with_ring("gap_exact_hello", RING);
+    let mut client = session.connect();
+    let ok = client.hello(RESUME_FROM_START);
+    // Echo off, so the stream from the marker on is the child's own bytes and the
+    // model below is the whole of it.
+    let ready = client.make_ready("-echo -onlcr", None, ok.resume_from);
+    let planted = plant_blob(
+        &session,
+        &mut client,
+        ready.offset,
+        ready.in_offset,
+        PRODUCED,
+    );
+
+    // The command that makes the gap has to be the daemon's before the connection
+    // goes: an `Input` written but not yet decoded is lost when the socket closes
+    // with output queued (see `Client::drain_available`).
+    client.wait_for_input_ack(planted.in_offset);
+    drop(client);
+
+    assert!(
+        poll_until(Duration::from_secs(30), || planted.sentinel.exists()),
+        "the child never finished writing its {PRODUCED} bytes"
+    );
+
+    let (mut client, resumed) = reconnect_until_gap(&session, 0, planted.stream_start);
+    assert!(
+        resumed.resume_from > planted.stream_start,
+        "the resume point must have advanced past bytes that were dropped"
+    );
+    let stream_end = planted.stream_start + planted.expected.len() as u64;
+    assert!(
+        stream_end - resumed.resume_from <= RING as u64,
+        "the daemon offered to resume at {}, leaving {} bytes still to come out of a \
+         {RING}-byte ring — so the base it reported is below the oldest byte it can \
+         actually serve",
+        resumed.resume_from,
+        stream_end - resumed.resume_from
+    );
+
+    let gaps = read_against(&mut client, &planted, resumed.resume_from);
+    assert!(
+        gaps.is_empty(),
+        "the child had finished before this client attached, so nothing could \
+         overflow while it read: {gaps:?}"
+    );
+}
+
 /// The mid-stream half of the same invariant: a client that never left is still
 /// told when the ring overran it.
 ///
@@ -231,6 +501,15 @@ fn overflow_is_reported_as_a_gap_rather_than_silently_truncated() {
 /// what collects it. Nothing here waits on the scheduler having got round to
 /// something — the sentinel file is how a client that is not reading learns the child
 /// has finished, since the stream it is ignoring cannot tell it.
+///
+/// The child writes [`predictable_blob`] rather than the `/dev/zero` it used to,
+/// and that buys two things. The premise "eight megabytes will not fit in a 128 KiB
+/// ring" stops being an unstated assumption about the ring — eight megabytes of
+/// zeroes fit in any ring that compresses, and the test would then pass with no gap
+/// owed and nothing dropped, having proved nothing. And the `Gap` stops being taken
+/// on trust: `read_against` checks every arriving byte against the byte its offset
+/// names, so the base the daemon reports has to be the right one rather than merely
+/// a plausible one.
 #[test]
 fn an_overflow_that_outruns_an_attached_client_is_reported_as_a_gap_mid_stream() {
     /// Larger than the 64 KiB the daemon takes off the PTY in one pass, so a client
@@ -238,19 +517,11 @@ fn an_overflow_that_outruns_an_attached_client_is_reported_as_a_gap_mid_stream()
     /// setup below silent and leaves exactly one way to reach a gap here: the client
     /// falling behind on purpose.
     const RING: usize = 128 * 1024;
-    /// What the child writes, in blocks of [`BLOCK`]. Eight megabytes is comfortably
-    /// past everything between it and the client put together — the daemon's
-    /// megabyte of queued output, the 256 KiB frame it may overshoot that by, the
-    /// kernel's socket buffers, and [`RING`].
+    /// What the child writes. Eight megabytes is comfortably past everything between
+    /// it and the client put together — the daemon's megabyte of queued output, the
+    /// 256 KiB frame it may overshoot that by, the kernel's socket buffers, and
+    /// [`RING`].
     const PRODUCED: usize = 8 << 20;
-    const BLOCK: usize = 64 * 1024;
-    /// What the child is asked to say once the filler is behind it, and what that
-    /// becomes once it has. The arithmetic is the point, exactly as it is in
-    /// `Client::make_ready`: the line discipline echoes the command line before any
-    /// of it runs, and that echo carries `$((6*7))` unexpanded — so the marker the
-    /// read below stops at cannot be satisfied by the request for it.
-    const DONE_ECHO: &str = "echo NOMUX-$((6*7))-MIDSTREAM-DONE";
-    const DONE: &str = "NOMUX-42-MIDSTREAM-DONE";
 
     let session = Session::start_with_ring("midstream_gap", RING);
     let mut client = session.connect();
@@ -261,71 +532,34 @@ fn an_overflow_that_outruns_an_attached_client_is_reported_as_a_gap_mid_stream()
          handshake, so every gap below is one this connection was sent"
     );
 
-    // `raw` for the output side: with `opost` off the child's bytes reach the ring
-    // unmangled and at memcpy speed, which is what makes eight megabytes cheap. The
-    // sentinel is touched last, so its arrival means every byte above is already in
-    // the ring — or already evicted from it.
-    let produced = session.root.join("produced");
-    client.input(
-        0,
-        format!(
-            "stty raw -echo; dd if=/dev/zero bs={BLOCK} count={} 2>/dev/null; \
-             {DONE_ECHO}; touch produced\n",
-            PRODUCED / BLOCK
-        )
-        .as_bytes(),
+    // Echo off, so everything from the opening marker on is the child's own bytes
+    // and the model is the whole of the stream. The sentinel is touched last, so its
+    // arrival means every byte before it is already in the ring — or already evicted
+    // from it.
+    let ready = client.make_ready("-echo -onlcr", None, ok.resume_from);
+    let planted = plant_blob(
+        &session,
+        &mut client,
+        ready.offset,
+        ready.in_offset,
+        PRODUCED,
     );
 
     // And from here to the sentinel the client reads nothing, which is the whole
     // setup: the daemon's send queue fills, `sent_through` stops with it, and the
     // ring runs away from a client that has not gone anywhere.
     assert!(
-        poll_until(Duration::from_secs(30), || produced.exists()),
+        poll_until(Duration::from_secs(30), || planted.sentinel.exists()),
         "the child never finished writing its {PRODUCED} bytes"
     );
 
-    let mut expected = ok.resume_from;
-    let mut first_gap = None;
-    let mut tail: Vec<u8> = Vec::new();
-    loop {
-        let (ty, payload) = client.next_frame();
-        match Frame::decode(ty, &payload).expect("decode frame") {
-            Frame::Output { offset, data } => {
-                assert_eq!(
-                    offset,
-                    expected,
-                    "output must join up unless a Gap said otherwise, and this \
-                     frame opens {} bytes from where the stream stood",
-                    offset.abs_diff(expected)
-                );
-                expected += data.len() as u64;
-                tail.extend_from_slice(data);
-                if String::from_utf8_lossy(&tail).contains(DONE) {
-                    break;
-                }
-                // Only what a marker split across two frames needs.
-                tail.drain(..tail.len().saturating_sub(DONE.len()));
-            }
-            Frame::Gap { new_base_offset } => {
-                assert!(
-                    new_base_offset > expected,
-                    "a Gap must name a base past what the client was sent: \
-                     {new_base_offset} against {expected}"
-                );
-                first_gap.get_or_insert((expected, new_base_offset));
-                expected = new_base_offset;
-            }
-            Frame::InputAck { .. } | Frame::Pong { .. } => {}
-            other => panic!("unexpected {other:?} while reading the session's output"),
-        }
-    }
-
-    let (sent_through, base) = first_gap.expect(
+    let gaps = read_against(&mut client, &planted, planted.stream_start);
+    let (sent_through, base) = *gaps.first().expect(
         "the ring overran a client that never detached and nothing said so: the \
          whole stream arrived contiguous, which it cannot have been",
     );
     assert!(
-        sent_through > ok.resume_from,
+        sent_through > planted.stream_start,
         "the gap must interrupt a stream this client was already receiving — that \
          is what makes it mid-stream rather than the handshake's"
     );
