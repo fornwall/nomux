@@ -18,8 +18,9 @@ pub use frame::{
 /// Protocol revision. Bumped on any wire change, including compatible ones.
 ///
 /// Revision 2 gave both flag fields meaning: agent forwarding and repaint policy
-/// in `Hello`, linger state and agent status in `HelloOk`.
-pub const PROTOCOL_VERSION: u16 = 2;
+/// in `Hello`, linger state and agent status in `HelloOk`. Revision 3 took
+/// `Hello.in_offset` back out, the daemon never having read it.
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Fixed frame header size, so reads are a two-stage `read_exact`.
 pub const HEADER_LEN: usize = 4;

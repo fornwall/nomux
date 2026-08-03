@@ -212,17 +212,15 @@ fn any_frame() -> impl Strategy<Value = OwnedFrame> {
             any::<u16>(),
             any_hello_flags(),
             any::<u64>(),
-            any::<u64>(),
             any_win(),
             any_term(),
         )
-            .prop_map(|(protocol, flags, out_offset, in_offset, win, term)| {
+            .prop_map(|(protocol, flags, out_offset, win, term)| {
                 OwnedFrame::with_text(
                     Frame::Hello(Hello {
                         protocol,
                         flags,
                         out_offset,
-                        in_offset,
                         win,
                         term: "",
                     }),

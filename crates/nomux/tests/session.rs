@@ -57,7 +57,7 @@ fn output_resumes_contiguously_after_a_reconnect() {
     // Sever the connection the way a network drop would.
     drop(client);
     let mut client = session.connect();
-    let ok = client.hello(offset, first.len() as u64);
+    let ok = client.hello(offset);
     assert_eq!(
         ok.resume_from, offset,
         "resume must continue from exactly where the client left off"
@@ -96,7 +96,7 @@ fn an_out_offset_past_the_end_of_the_stream_is_clamped_rather_than_believed() {
     drop(client);
 
     let mut client = session.connect();
-    let resumed = client.hello(end + FAR, first.len() as u64);
+    let resumed = client.hello(end + FAR);
     assert!(
         !resumed.gap,
         "nothing was dropped, so nothing may be reported as a gap"
@@ -141,7 +141,7 @@ fn replayed_input_is_applied_exactly_once() {
     let mut client = session.connect();
 
     // Resume claiming we never got the ack, then replay the identical bytes.
-    let ok = client.hello(offset, 0);
+    let ok = client.hello(offset);
     assert_eq!(
         ok.in_applied,
         command.len() as u64,
@@ -204,7 +204,7 @@ fn overflow_is_reported_as_a_gap_rather_than_silently_truncated() {
 
     // The daemon must keep draining the PTY while detached, so the ring overflows
     // even with nobody listening. Waited for rather than slept through.
-    let (_client, resumed) = reconnect_until_gap(&session, 0, ok.resume_from, filler.len() as u64);
+    let (_client, resumed) = reconnect_until_gap(&session, 0, ok.resume_from);
     assert!(
         resumed.resume_from > ok.resume_from,
         "resume point must advance past the discarded bytes"
@@ -254,7 +254,7 @@ fn an_overflow_that_outruns_an_attached_client_is_reported_as_a_gap_mid_stream()
 
     let session = Session::start_with_ring("midstream_gap", RING);
     let mut client = session.connect();
-    let ok = client.hello(RESUME_FROM_START, 0);
+    let ok = client.hello(RESUME_FROM_START);
     assert!(
         !ok.gap,
         "a session nobody has attached to before has nothing to report at the \
@@ -364,7 +364,7 @@ fn a_ring_capacity_the_daemon_cannot_use_falls_back_to_the_default() {
     ] {
         let session = Session::start_with_raw_ring(name, value);
         let mut client = session.connect();
-        let ok = client.hello(RESUME_FROM_START, 0);
+        let ok = client.hello(RESUME_FROM_START);
 
         // Serving, rather than merely having bound a socket. The socket is bound
         // before the ring is built, so a daemon that aborted on the assertion leaves
@@ -424,7 +424,7 @@ fn an_output_ack_never_trims_the_ring() {
     drop(client);
 
     let mut client = session.connect();
-    let resumed = client.hello(RESUME_FROM_START, command.len() as u64);
+    let resumed = client.hello(RESUME_FROM_START);
     assert!(
         !resumed.gap,
         "nothing was dropped, so nothing may be reported as a gap"
@@ -460,7 +460,7 @@ fn a_second_client_takes_over_and_the_first_is_told_why() {
     let (session, mut first, _) = Session::attached("takeover");
 
     let mut second = session.connect();
-    let ok = second.hello(RESUME_FROM_START, 0);
+    let ok = second.hello(RESUME_FROM_START);
 
     first.expect_error(
         ErrorCode::Takeover,
@@ -585,7 +585,7 @@ fn a_resize_reaches_the_child_and_every_attach_restates_the_geometry() {
     // A client arriving from a terminal of the original size gets it back, in the
     // greeting and in the child.
     let mut client = session.connect();
-    let resumed = client.hello(RESUME_FROM_START, command.len() as u64);
+    let resumed = client.hello(RESUME_FROM_START);
     assert_eq!(
         resumed.win,
         harness::WIN,
@@ -616,7 +616,7 @@ fn a_detach_ends_the_connection_but_not_the_session() {
     drop(client);
 
     let mut client = session.connect();
-    let resumed = client.hello(RESUME_FROM_START, command.len() as u64);
+    let resumed = client.hello(RESUME_FROM_START);
     assert_eq!(
         resumed.in_applied,
         command.len() as u64,
@@ -654,7 +654,7 @@ fn the_exit_status_arrives_after_the_final_output() {
 
     // Reattach inside the linger window, exactly the race the window is for.
     let mut client = session.connect();
-    let resumed = client.hello(RESUME_FROM_START, command.len() as u64);
+    let resumed = client.hello(RESUME_FROM_START);
     let mut seen = Vec::new();
     loop {
         let (ty, payload) = client.next_frame();
@@ -1067,7 +1067,7 @@ fn attach_spawns_the_daemon_and_relays_transparently() {
         }
     });
 
-    write_frame(&mut stdin, &hello_frame(0, RESUME_FROM_START, 0));
+    write_frame(&mut stdin, &hello_frame(0, RESUME_FROM_START));
     write_frame(
         &mut stdin,
         &Frame::Input {
@@ -1192,8 +1192,8 @@ fn input_the_child_never_reads_is_back_pressured_rather_than_buffered() {
 
     // A raw socket rather than the harness client, because the question is how much
     // the daemon will take before it stops taking.
-    let mut blaster = blaster(&session, ready.in_offset);
-    let (frames, offset) = input_frames(BLAST, ready.in_offset);
+    let mut blaster = blaster(&session);
+    let (frames, _) = input_frames(BLAST, ready.in_offset);
 
     // Three seconds of refusal, which is long enough that a daemon merely busy with
     // the megabytes it already took would have come back for more.
@@ -1208,7 +1208,7 @@ fn input_the_child_never_reads_is_back_pressured_rather_than_buffered() {
     // back is both proof the loop is alive and a statement about the input the
     // daemon really did accept.
     let mut client = session.connect();
-    let resumed = client.hello(RESUME_FROM_START, offset);
+    let resumed = client.hello(RESUME_FROM_START);
     let applied = resumed.in_applied.saturating_sub(ready.in_offset);
     assert!(applied > 0, "the daemon applied none of the input it took");
     assert!(
@@ -1259,7 +1259,7 @@ fn reconnecting_does_not_raise_the_input_ceiling() {
         let (frames, _) = input_frames(BLAST, resume);
 
         // A fresh connection each time, which is the takeover this is about.
-        let mut blaster = blaster(&session, resume);
+        let mut blaster = blaster(&session);
 
         // The socket having refused everything for a quarter of a second is the daemon
         // having stopped taking input, so the ceiling is reached rather than merely
@@ -1269,7 +1269,7 @@ fn reconnecting_does_not_raise_the_input_ceiling() {
         let _pushed = push_until_refused(&mut blaster, &frames, Duration::from_millis(250));
 
         let mut probe = session.connect();
-        let applied = probe.hello(RESUME_FROM_START, 0).in_applied;
+        let applied = probe.hello(RESUME_FROM_START).in_applied;
         drop(probe);
         drop(blaster);
         resume = applied;
@@ -1342,7 +1342,7 @@ fn a_client_that_never_reads_its_answers_is_dropped_rather_than_queued_for() {
 
     // The `Hello` this sends is what starts the session, and past it this peer never
     // reads another byte until the measurement is over.
-    let mut peer = blaster(&session, 0);
+    let mut peer = blaster(&session);
     let mut ping = Vec::new();
     Frame::Ping { nonce: 0x8B_ACED }
         .encode(&mut ping)
@@ -1422,7 +1422,7 @@ fn a_client_that_never_reads_its_answers_is_dropped_rather_than_queued_for() {
     // replays from the ring. Nothing was ever read off this session, so a fresh client
     // driving one command through the shell is the whole of that claim.
     let mut client = session.connect();
-    let ok = client.hello(RESUME_FROM_START, 0);
+    let ok = client.hello(RESUME_FROM_START);
     client.input(ok.in_applied, b"echo NOMUX-AFTER-ABANDON\n");
     client.read_until("NOMUX-AFTER-ABANDON", ok.resume_from);
 }
@@ -1505,7 +1505,7 @@ fn a_child_that_exits_with_input_still_queued_delivers_its_last_output_in_full()
         .expect("create the FIFO the child waits on");
 
     let mut client = session.connect();
-    let ok = client.hello(RESUME_FROM_START, 0);
+    let ok = client.hello(RESUME_FROM_START);
     // `-echo` so the keystroke below is not echoed into the stream being compared, and
     // `raw` so the line discipline neither mangles it nor throws it away — which is
     // what makes it reach `pending_input` rather than the floor. Past the marker the
@@ -1660,9 +1660,9 @@ fn frame_types(bytes: &[u8]) -> Vec<FrameType> {
 /// an `EAGAIN`; the third by letting go of the connection altogether, where it is an
 /// `EPIPE`. The measurement is the same one either way: how much this peer got rid of
 /// before the daemon stopped taking it.
-fn blaster(session: &Session, in_offset: u64) -> UnixStream {
+fn blaster(session: &Session) -> UnixStream {
     let mut socket = UnixStream::connect(&session.socket).expect("connect");
-    write_frame(&mut socket, &hello_frame(0, RESUME_FROM_START, in_offset));
+    write_frame(&mut socket, &hello_frame(0, RESUME_FROM_START));
     socket.set_nonblocking(true).expect("stop blocking");
     socket
 }
@@ -2133,7 +2133,7 @@ fn a_closed_agent_channel_whose_peer_stopped_reading_leaves_the_daemon_asleep() 
 fn repaint_transcript(name: &str, flags: u16) -> String {
     let session = Session::start_with_ring(name, 1024);
     let mut client = session.connect();
-    let ok = client.hello_with(flags, RESUME_FROM_START, 0);
+    let ok = client.hello_with(flags, RESUME_FROM_START);
 
     let ready = client.make_ready("-echo -onlcr", Some("cat"), ok.resume_from);
     let offset = ready.offset;
@@ -2152,7 +2152,7 @@ fn repaint_transcript(name: &str, flags: u16) -> String {
     // The repaint is the daemon's answer to a gap, so the gap has to have happened
     // before there is anything to look at. Waited for rather than slept through:
     // whether the ring has overflowed yet is a question about the scheduler.
-    let (mut client, resumed) = reconnect_until_gap(&session, flags, offset, in_offset);
+    let (mut client, resumed) = reconnect_until_gap(&session, flags, offset);
 
     // § 4.3: "`ctrl_l` goes through the same queue as client input ... It is not
     // client input, so `in_applied` does not move for it." Asserted for both
@@ -2528,7 +2528,7 @@ fn a_takeover_never_discards_input_already_delivered() {
 
         client.input(expected, command);
         expected += command.len() as u64;
-        let ok = next.hello(RESUME_FROM_START, expected);
+        let ok = next.hello(RESUME_FROM_START);
         assert_eq!(
             ok.in_applied, expected,
             "round {round}: input delivered before the takeover was lost"
@@ -2562,7 +2562,6 @@ fn a_version_mismatch_refuses_the_newcomer_without_evicting_the_client() {
         protocol: PROTOCOL_VERSION + 1,
         flags: 0,
         out_offset: RESUME_FROM_START,
-        in_offset: 0,
         win: harness::WIN,
         term: "xterm-256color",
     }));
@@ -2604,7 +2603,7 @@ fn an_abrupt_client_disconnect_does_not_kill_the_session() {
     // have dealt with the disconnect, since `in_applied` in the reply is authoritative
     // and the takeover path runs before it is answered.
     let mut client = session.connect();
-    let ok = client.hello(RESUME_FROM_START, 0);
+    let ok = client.hello(RESUME_FROM_START);
     assert_eq!(
         ok.in_applied,
         command.len() as u64,

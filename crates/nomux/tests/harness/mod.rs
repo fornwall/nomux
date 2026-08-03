@@ -273,7 +273,7 @@ impl Session {
     pub(crate) fn attached_with(name: &str, flags: u16) -> (Self, Client, nomux_proto::HelloOk) {
         let session = Self::start(name);
         let mut client = session.connect();
-        let ok = client.hello_with(flags, RESUME_FROM_START, 0);
+        let ok = client.hello_with(flags, RESUME_FROM_START);
         (session, client, ok)
     }
 
@@ -317,12 +317,11 @@ pub(crate) fn reconnect_until_gap(
     session: &Session,
     flags: u16,
     out_offset: u64,
-    in_offset: u64,
 ) -> (Client, nomux_proto::HelloOk) {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let mut client = session.connect();
-        let resumed = client.hello_with(flags, out_offset, in_offset);
+        let resumed = client.hello_with(flags, out_offset);
         if resumed.gap {
             return (client, resumed);
         }
@@ -597,17 +596,12 @@ impl Client {
         self.send(&Frame::Input { offset, data });
     }
 
-    pub(crate) fn hello(&mut self, out_offset: u64, in_offset: u64) -> nomux_proto::HelloOk {
-        self.hello_with(0, out_offset, in_offset)
+    pub(crate) fn hello(&mut self, out_offset: u64) -> nomux_proto::HelloOk {
+        self.hello_with(0, out_offset)
     }
 
-    pub(crate) fn hello_with(
-        &mut self,
-        flags: u16,
-        out_offset: u64,
-        in_offset: u64,
-    ) -> nomux_proto::HelloOk {
-        self.send(&hello_frame(flags, out_offset, in_offset));
+    pub(crate) fn hello_with(&mut self, flags: u16, out_offset: u64) -> nomux_proto::HelloOk {
+        self.send(&hello_frame(flags, out_offset));
         match self.next_frame() {
             (FrameType::HelloOk, payload) => {
                 match Frame::decode(FrameType::HelloOk, &payload).expect("decode HelloOk") {
@@ -1012,12 +1006,11 @@ pub(crate) fn shrink_send_buffer(socket: &UnixStream, bytes: libc::c_int) {
 ///
 /// One literal rather than four, since the three sites that write it straight at a
 /// socket are exactly the ones that would be missed if it ever changed.
-pub(crate) const fn hello_frame(flags: u16, out_offset: u64, in_offset: u64) -> Frame<'static> {
+pub(crate) const fn hello_frame(flags: u16, out_offset: u64) -> Frame<'static> {
     Frame::Hello(Hello {
         protocol: PROTOCOL_VERSION,
         flags,
         out_offset,
-        in_offset,
         win: WIN,
         term: "xterm-256color",
     })
