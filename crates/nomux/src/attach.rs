@@ -173,13 +173,18 @@ fn spawn_daemon(session_id: &str, label: Option<&str>) -> io::Result<Option<Chil
         command.arg("--label").arg(label);
     }
 
+    // Bound out here rather than written inside the block below, for the reason
+    // `pty::Pty::spawn` gives at the same shape: unsafe context reaches lexically
+    // into a closure body, so an unsafe call added in here would compile with no
+    // block of its own and nothing would ask it for a justification.
+    let pre_exec = || -> io::Result<()> {
+        rustix::process::setsid()?;
+        Ok(())
+    };
     // SAFETY: runs in the forked child before exec and must be async-signal-safe.
     // `setsid` is.
     unsafe {
-        command.pre_exec(|| {
-            rustix::process::setsid()?;
-            Ok(())
-        });
+        command.pre_exec(pre_exec);
     }
     command.spawn().map(|mut child| child.stderr.take())
 }
@@ -351,8 +356,25 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
 fn copy_in(fd: BorrowedFd<'_>, buf: &mut VecDeque<u8>) -> io::Result<bool> {
     let mut chunk = [0u8; 16 * 1024];
     match crate::nbio::read(fd, &mut chunk) {
-        // A PTY-backed peer reports end of session as EIO rather than 0.
-        Ok(0) | Err(rustix::io::Errno::IO) => Ok(false),
+        // Four shapes of one ending. A PTY-backed peer reports end of session as
+        // `EIO` rather than 0; a socket peer that closed with bytes of *ours* still
+        // unread hands over the last of its own and then answers `ECONNRESET`, and
+        // `ENOTCONN` where the connection is already gone by the time the read
+        // lands.
+        //
+        // That middle one is the ordinary way a session ends here, not an exotic
+        // one: § 4.1 stops the daemon draining a client it is holding back,
+        // `write_client` drops a peer that has stopped reading, and `shutdown`
+        // closes straight after its final flush — each of them leaves input of ours
+        // unread. Taken as a failure it costs the relay the exit status § 10 gives a
+        // delivered `Exit` frame, and costs the user whatever [`Pump::buf`] is still
+        // holding for stdout, which the loop would otherwise go back and write. The
+        // `splice` path never sees it, the first `splice` having consumed the error,
+        // so this is exactly the § 7 host whose stdio is a socketpair.
+        Ok(0)
+        | Err(rustix::io::Errno::IO | rustix::io::Errno::CONNRESET | rustix::io::Errno::NOTCONN) => {
+            Ok(false)
+        }
         Ok(n) => {
             buf.extend(chunk.get(..n).unwrap_or(&[]));
             Ok(true)
@@ -373,15 +395,19 @@ enum Spliced {
     Full,
     /// The kernel will not splice this pair — now or ever.
     Unusable,
+    /// Something else went wrong, and it is about this moment rather than about the
+    /// pair. The copying path meets the same condition on its own read.
+    Failed,
 }
 
 /// Moves up to [`SPLICE_CHUNK`] bytes from `src` to `dst` without them ever
 /// entering this process.
 ///
 /// Whether `splice` works for a pair is a property of the host rather than of this
-/// code (`IMPLEMENTATION.md` § 7), so it is discovered by trying: every failure that
-/// is not "try again" collapses into [`Spliced::Unusable`]. Deliberately blunt,
-/// because the copying path below handles all of them correctly anyway.
+/// code (`IMPLEMENTATION.md` § 7), so it is discovered by trying — and only by the
+/// two errors that are that same property. Everything else is about this one
+/// moment and falls through to the copying path, which handles all of them
+/// correctly anyway.
 fn splice_once(src: BorrowedFd<'_>, dst: BorrowedFd<'_>) -> Spliced {
     let flags = SpliceFlags::MOVE | SpliceFlags::NONBLOCK;
     loop {
@@ -391,7 +417,13 @@ fn splice_once(src: BorrowedFd<'_>, dst: BorrowedFd<'_>) -> Spliced {
             // Only ever reached with the source already reported readable, so this
             // is the destination refusing and never a source that had nothing.
             Err(rustix::io::Errno::AGAIN) => Spliced::Full,
-            Err(_) => Spliced::Unusable,
+            // `EINVAL` for a pair with neither end a pipe, `ENOSYS` for a kernel
+            // without the call: the two that say something about the pair and can
+            // therefore be believed for the rest of the run. An ending arrives here
+            // as `EPIPE` or `ECONNRESET`, and latching on one of those would give
+            // up the zero-copy path for good over a peer that had merely left.
+            Err(rustix::io::Errno::INVAL | rustix::io::Errno::NOSYS) => Spliced::Unusable,
+            Err(_) => Spliced::Failed,
         };
     }
 }
@@ -406,9 +438,10 @@ struct Pump {
     /// Bytes the destination would not take yet. Only ever filled by the copying
     /// path.
     buf: VecDeque<u8>,
-    /// Set for good the first time `splice` refuses this pair. Never reconsidered:
-    /// the reason it refuses — neither end is a pipe — cannot change while the
-    /// relay runs, and retrying would buy a wasted syscall per wakeup forever.
+    /// Set for good the first time `splice` refuses the *pair* rather than the
+    /// moment. Never reconsidered: neither reason it can refuse for — neither end
+    /// is a pipe, or this kernel has no `splice` — can change while the relay runs,
+    /// and retrying would buy a wasted syscall per wakeup forever.
     splice_refused: bool,
     /// `splice` reported the destination full. Distinct from a non-empty buffer in
     /// that nothing is held here; it only records that the source must be left
@@ -447,6 +480,7 @@ impl Pump {
                     return Ok(true);
                 }
                 Spliced::Unusable => self.splice_refused = true,
+                Spliced::Failed => {}
             }
         }
         copy_in(src, &mut self.buf)

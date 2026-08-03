@@ -106,12 +106,6 @@ pub struct Hello<'a> {
     pub flags: u16,
     /// Next output byte the client wants, or [`RESUME_FROM_START`].
     pub out_offset: u64,
-    /// Next input byte the client intends to send.
-    ///
-    /// Informational: the daemon never reads it, `in_applied` in the answering
-    /// [`HelloOk`] being the authoritative one. It is on the wire for the handover
-    /// sketched in `DESIGN.md` § 10 (`IMPLEMENTATION.md` § 2.2).
-    pub in_offset: u64,
     /// Terminal dimensions.
     pub win: WinSize,
     /// Value for the child's `TERM`. Ignored when resuming an existing session.
@@ -375,7 +369,6 @@ impl<'a> Frame<'a> {
                 out.extend_from_slice(&hello.protocol.to_be_bytes());
                 out.extend_from_slice(&hello.flags.to_be_bytes());
                 out.extend_from_slice(&hello.out_offset.to_be_bytes());
-                out.extend_from_slice(&hello.in_offset.to_be_bytes());
                 put_win(out, hello.win);
                 out.extend_from_slice(&term_len.to_be_bytes());
                 out.extend_from_slice(hello.term.as_bytes());
@@ -450,7 +443,6 @@ impl<'a> Frame<'a> {
                 let flags = r.u16()?;
                 checked_hello_flags(flags)?;
                 let out_offset = r.u64()?;
-                let in_offset = r.u64()?;
                 let win = r.win()?;
                 let term_len = usize::from(r.u16()?);
                 let term = core::str::from_utf8(r.take(term_len)?)
@@ -460,7 +452,6 @@ impl<'a> Frame<'a> {
                     protocol,
                     flags,
                     out_offset,
-                    in_offset,
                     win,
                     term,
                 })
@@ -712,7 +703,6 @@ mod tests {
             protocol: PROTOCOL_VERSION,
             flags: 0,
             out_offset: 0,
-            in_offset: 0,
             win: WIN,
             term: "",
         })
@@ -754,8 +744,9 @@ mod tests {
 
     #[test]
     fn non_utf8_text_is_rejected() {
-        // Hello with term_len 1 and a lone continuation byte.
-        let mut payload = vec![0; 2 + 2 + 8 + 8 + 8];
+        // Hello with term_len 1 and a lone continuation byte: protocol, flags,
+        // `out_offset` and the winsize ahead of it.
+        let mut payload = vec![0; 2 + 2 + 8 + 8];
         payload.extend_from_slice(&1u16.to_be_bytes());
         payload.push(0x80);
         assert_eq!(
@@ -800,7 +791,6 @@ mod tests {
             protocol: PROTOCOL_VERSION,
             flags: 0,
             out_offset: 0,
-            in_offset: 0,
             win: WIN,
             term: &long,
         })
@@ -815,7 +805,6 @@ mod tests {
             protocol: PROTOCOL_VERSION,
             flags: 0,
             out_offset: 0,
-            in_offset: 0,
             win: WIN,
             term: &exact,
         }));
@@ -830,7 +819,6 @@ mod tests {
             protocol: PROTOCOL_VERSION,
             flags: HELLO_AGENT_FORWARD | 0x8000,
             out_offset: 0,
-            in_offset: 0,
             win: WIN,
             term: "xterm",
         })
@@ -853,7 +841,6 @@ mod tests {
             protocol: PROTOCOL_VERSION,
             flags: HELLO_AGENT_FORWARD | 0x8000,
             out_offset: 0,
-            in_offset: 0,
             win: WIN,
             term: &long,
         })
@@ -876,7 +863,6 @@ mod tests {
             protocol: PROTOCOL_VERSION,
             flags: 0,
             out_offset: 0,
-            in_offset: 0,
             win: WIN,
             term: "xt\0rm",
         })
@@ -893,7 +879,6 @@ mod tests {
             protocol: PROTOCOL_VERSION,
             flags: 0,
             out_offset: 0,
-            in_offset: 0,
             win: WIN,
             term: "xt_rm",
         })

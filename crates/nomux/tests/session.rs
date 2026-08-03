@@ -30,8 +30,8 @@ use nomux_proto::{
 };
 
 use harness::{
-    Reaper, Rng, Session, Spawned, accept_within, collect, control, hello_frame, join_within,
-    nomux, nomux_with_shell, poll_until, push_until_refused, read_uninterrupted,
+    Reaper, Rng, Session, Spawned, accept_within, collect, control, has_unread_bytes, hello_frame,
+    join_within, nomux, nomux_with_shell, poll_until, push_until_refused, read_uninterrupted,
     reconnect_until_gap, run_root, shrink_send_buffer, stderr, stdout, succeeded, wait_for,
     while_nothing_forks, write_frame,
 };
@@ -57,7 +57,7 @@ fn output_resumes_contiguously_after_a_reconnect() {
     // Sever the connection the way a network drop would.
     drop(client);
     let mut client = session.connect();
-    let ok = client.hello(offset, first.len() as u64);
+    let ok = client.hello(offset);
     assert_eq!(
         ok.resume_from, offset,
         "resume must continue from exactly where the client left off"
@@ -96,7 +96,7 @@ fn an_out_offset_past_the_end_of_the_stream_is_clamped_rather_than_believed() {
     drop(client);
 
     let mut client = session.connect();
-    let resumed = client.hello(end + FAR, first.len() as u64);
+    let resumed = client.hello(end + FAR);
     assert!(
         !resumed.gap,
         "nothing was dropped, so nothing may be reported as a gap"
@@ -141,7 +141,7 @@ fn replayed_input_is_applied_exactly_once() {
     let mut client = session.connect();
 
     // Resume claiming we never got the ack, then replay the identical bytes.
-    let ok = client.hello(offset, 0);
+    let ok = client.hello(offset);
     assert_eq!(
         ok.in_applied,
         command.len() as u64,
@@ -204,7 +204,7 @@ fn overflow_is_reported_as_a_gap_rather_than_silently_truncated() {
 
     // The daemon must keep draining the PTY while detached, so the ring overflows
     // even with nobody listening. Waited for rather than slept through.
-    let (_client, resumed) = reconnect_until_gap(&session, 0, ok.resume_from, filler.len() as u64);
+    let (_client, resumed) = reconnect_until_gap(&session, 0, ok.resume_from);
     assert!(
         resumed.resume_from > ok.resume_from,
         "resume point must advance past the discarded bytes"
@@ -254,7 +254,7 @@ fn an_overflow_that_outruns_an_attached_client_is_reported_as_a_gap_mid_stream()
 
     let session = Session::start_with_ring("midstream_gap", RING);
     let mut client = session.connect();
-    let ok = client.hello(RESUME_FROM_START, 0);
+    let ok = client.hello(RESUME_FROM_START);
     assert!(
         !ok.gap,
         "a session nobody has attached to before has nothing to report at the \
@@ -364,7 +364,7 @@ fn a_ring_capacity_the_daemon_cannot_use_falls_back_to_the_default() {
     ] {
         let session = Session::start_with_raw_ring(name, value);
         let mut client = session.connect();
-        let ok = client.hello(RESUME_FROM_START, 0);
+        let ok = client.hello(RESUME_FROM_START);
 
         // Serving, rather than merely having bound a socket. The socket is bound
         // before the ring is built, so a daemon that aborted on the assertion leaves
@@ -424,7 +424,7 @@ fn an_output_ack_never_trims_the_ring() {
     drop(client);
 
     let mut client = session.connect();
-    let resumed = client.hello(RESUME_FROM_START, command.len() as u64);
+    let resumed = client.hello(RESUME_FROM_START);
     assert!(
         !resumed.gap,
         "nothing was dropped, so nothing may be reported as a gap"
@@ -460,7 +460,7 @@ fn a_second_client_takes_over_and_the_first_is_told_why() {
     let (session, mut first, _) = Session::attached("takeover");
 
     let mut second = session.connect();
-    let ok = second.hello(RESUME_FROM_START, 0);
+    let ok = second.hello(RESUME_FROM_START);
 
     first.expect_error(
         ErrorCode::Takeover,
@@ -487,6 +487,17 @@ fn list_and_kill_operate_without_the_protocol() {
     assert!(
         listed.contains(&session.id),
         "list should report the live session, got {listed:?}"
+    );
+    // One line per session and not per run file: `list` walks a directory holding
+    // several names that lead to this one id, and it is the only thing that folds
+    // them back together.
+    assert_eq!(
+        listed
+            .lines()
+            .filter(|line| line.starts_with(&format!("{}\t", session.id)))
+            .count(),
+        1,
+        "list reported the same session more than once, got {listed:?}"
     );
 
     succeeded(
@@ -574,7 +585,7 @@ fn a_resize_reaches_the_child_and_every_attach_restates_the_geometry() {
     // A client arriving from a terminal of the original size gets it back, in the
     // greeting and in the child.
     let mut client = session.connect();
-    let resumed = client.hello(RESUME_FROM_START, command.len() as u64);
+    let resumed = client.hello(RESUME_FROM_START);
     assert_eq!(
         resumed.win,
         harness::WIN,
@@ -605,7 +616,7 @@ fn a_detach_ends_the_connection_but_not_the_session() {
     drop(client);
 
     let mut client = session.connect();
-    let resumed = client.hello(RESUME_FROM_START, command.len() as u64);
+    let resumed = client.hello(RESUME_FROM_START);
     assert_eq!(
         resumed.in_applied,
         command.len() as u64,
@@ -643,7 +654,7 @@ fn the_exit_status_arrives_after_the_final_output() {
 
     // Reattach inside the linger window, exactly the race the window is for.
     let mut client = session.connect();
-    let resumed = client.hello(RESUME_FROM_START, command.len() as u64);
+    let resumed = client.hello(RESUME_FROM_START);
     let mut seen = Vec::new();
     loop {
         let (ty, payload) = client.next_frame();
@@ -1114,7 +1125,7 @@ fn attach_spawns_the_daemon_and_relays_transparently() {
         }
     });
 
-    write_frame(&mut stdin, &hello_frame(0, RESUME_FROM_START, 0));
+    write_frame(&mut stdin, &hello_frame(0, RESUME_FROM_START));
     write_frame(
         &mut stdin,
         &Frame::Input {
@@ -1239,8 +1250,8 @@ fn input_the_child_never_reads_is_back_pressured_rather_than_buffered() {
 
     // A raw socket rather than the harness client, because the question is how much
     // the daemon will take before it stops taking.
-    let mut blaster = blaster(&session, ready.in_offset);
-    let (frames, offset) = input_frames(BLAST, ready.in_offset);
+    let mut blaster = blaster(&session);
+    let (frames, _) = input_frames(BLAST, ready.in_offset);
 
     // Three seconds of refusal, which is long enough that a daemon merely busy with
     // the megabytes it already took would have come back for more.
@@ -1255,7 +1266,7 @@ fn input_the_child_never_reads_is_back_pressured_rather_than_buffered() {
     // back is both proof the loop is alive and a statement about the input the
     // daemon really did accept.
     let mut client = session.connect();
-    let resumed = client.hello(RESUME_FROM_START, offset);
+    let resumed = client.hello(RESUME_FROM_START);
     let applied = resumed.in_applied.saturating_sub(ready.in_offset);
     assert!(applied > 0, "the daemon applied none of the input it took");
     assert!(
@@ -1306,7 +1317,7 @@ fn reconnecting_does_not_raise_the_input_ceiling() {
         let (frames, _) = input_frames(BLAST, resume);
 
         // A fresh connection each time, which is the takeover this is about.
-        let mut blaster = blaster(&session, resume);
+        let mut blaster = blaster(&session);
 
         // The socket having refused everything for a quarter of a second is the daemon
         // having stopped taking input, so the ceiling is reached rather than merely
@@ -1316,7 +1327,7 @@ fn reconnecting_does_not_raise_the_input_ceiling() {
         let _pushed = push_until_refused(&mut blaster, &frames, Duration::from_millis(250));
 
         let mut probe = session.connect();
-        let applied = probe.hello(RESUME_FROM_START, 0).in_applied;
+        let applied = probe.hello(RESUME_FROM_START).in_applied;
         drop(probe);
         drop(blaster);
         resume = applied;
@@ -1389,7 +1400,7 @@ fn a_client_that_never_reads_its_answers_is_dropped_rather_than_queued_for() {
 
     // The `Hello` this sends is what starts the session, and past it this peer never
     // reads another byte until the measurement is over.
-    let mut peer = blaster(&session, 0);
+    let mut peer = blaster(&session);
     let mut ping = Vec::new();
     Frame::Ping { nonce: 0x8B_ACED }
         .encode(&mut ping)
@@ -1469,7 +1480,7 @@ fn a_client_that_never_reads_its_answers_is_dropped_rather_than_queued_for() {
     // replays from the ring. Nothing was ever read off this session, so a fresh client
     // driving one command through the shell is the whole of that claim.
     let mut client = session.connect();
-    let ok = client.hello(RESUME_FROM_START, 0);
+    let ok = client.hello(RESUME_FROM_START);
     client.input(ok.in_applied, b"echo NOMUX-AFTER-ABANDON\n");
     client.read_until("NOMUX-AFTER-ABANDON", ok.resume_from);
 }
@@ -1552,7 +1563,7 @@ fn a_child_that_exits_with_input_still_queued_delivers_its_last_output_in_full()
         .expect("create the FIFO the child waits on");
 
     let mut client = session.connect();
-    let ok = client.hello(RESUME_FROM_START, 0);
+    let ok = client.hello(RESUME_FROM_START);
     // `-echo` so the keystroke below is not echoed into the stream being compared, and
     // `raw` so the line discipline neither mangles it nor throws it away — which is
     // what makes it reach `pending_input` rather than the floor. Past the marker the
@@ -1707,9 +1718,9 @@ fn frame_types(bytes: &[u8]) -> Vec<FrameType> {
 /// an `EAGAIN`; the third by letting go of the connection altogether, where it is an
 /// `EPIPE`. The measurement is the same one either way: how much this peer got rid of
 /// before the daemon stopped taking it.
-fn blaster(session: &Session, in_offset: u64) -> UnixStream {
+fn blaster(session: &Session) -> UnixStream {
     let mut socket = UnixStream::connect(&session.socket).expect("connect");
-    write_frame(&mut socket, &hello_frame(0, RESUME_FROM_START, in_offset));
+    write_frame(&mut socket, &hello_frame(0, RESUME_FROM_START));
     socket.set_nonblocking(true).expect("stop blocking");
     socket
 }
@@ -2244,7 +2255,7 @@ fn a_daemon_that_cannot_accept_stands_back_rather_than_spinning() {
     set_open_file_limit(daemon, restore);
     drop(starved);
     let mut client = session.connect();
-    let ok = client.hello(RESUME_FROM_START, 0);
+    let ok = client.hello(RESUME_FROM_START);
     client.input(0, b"echo NOMUX-AFTER-EMFILE\n");
     client.read_until("NOMUX-AFTER-EMFILE", ok.resume_from);
 }
@@ -2326,7 +2337,7 @@ fn set_open_file_limit(pid: u32, soft: u64) {
 fn repaint_transcript(name: &str, flags: u16) -> String {
     let session = Session::start_with_ring(name, 1024);
     let mut client = session.connect();
-    let ok = client.hello_with(flags, RESUME_FROM_START, 0);
+    let ok = client.hello_with(flags, RESUME_FROM_START);
 
     let ready = client.make_ready("-echo -onlcr", Some("cat"), ok.resume_from);
     let offset = ready.offset;
@@ -2345,7 +2356,7 @@ fn repaint_transcript(name: &str, flags: u16) -> String {
     // The repaint is the daemon's answer to a gap, so the gap has to have happened
     // before there is anything to look at. Waited for rather than slept through:
     // whether the ring has overflowed yet is a question about the scheduler.
-    let (mut client, resumed) = reconnect_until_gap(&session, flags, offset, in_offset);
+    let (mut client, resumed) = reconnect_until_gap(&session, flags, offset);
 
     // § 4.3: "`ctrl_l` goes through the same queue as client input ... It is not
     // client input, so `in_applied` does not move for it." Asserted for both
@@ -2721,7 +2732,7 @@ fn a_takeover_never_discards_input_already_delivered() {
 
         client.input(expected, command);
         expected += command.len() as u64;
-        let ok = next.hello(RESUME_FROM_START, expected);
+        let ok = next.hello(RESUME_FROM_START);
         assert_eq!(
             ok.in_applied, expected,
             "round {round}: input delivered before the takeover was lost"
@@ -2755,7 +2766,6 @@ fn a_version_mismatch_refuses_the_newcomer_without_evicting_the_client() {
         protocol: PROTOCOL_VERSION + 1,
         flags: 0,
         out_offset: RESUME_FROM_START,
-        in_offset: 0,
         win: harness::WIN,
         term: "xterm-256color",
     }));
@@ -2797,7 +2807,7 @@ fn an_abrupt_client_disconnect_does_not_kill_the_session() {
     // have dealt with the disconnect, since `in_applied` in the reply is authoritative
     // and the takeover path runs before it is answered.
     let mut client = session.connect();
-    let ok = client.hello(RESUME_FROM_START, 0);
+    let ok = client.hello(RESUME_FROM_START);
     assert_eq!(
         ok.in_applied,
         command.len() as u64,
@@ -3159,6 +3169,87 @@ fn the_relay_exits_when_a_stdout_it_can_only_copy_to_stops_reading() {
     assert!(
         poll_until(Duration::from_secs(10), || !child.is_running()),
         "the relay was still running with a stdout it could only copy to gone"
+    );
+}
+
+/// Regression: a session that ends with the relay's own input still unread is a
+/// clean exit, and what is buffered for stdout still gets there.
+///
+/// That is the ordinary way a session ends rather than an exotic one. § 4.1 stops
+/// the daemon draining a client it is holding back, `write_client` drops a peer that
+/// has stopped reading, and `shutdown` closes straight after `flush_final` — each of
+/// them closes with bytes of the relay's still in the socket's receive queue, and a
+/// unix socket closed in that state hands the peer the last of the data and then
+/// `ECONNRESET` where an orderly close gives it a zero. Confirmed against a
+/// socketpair before this test was written, since the whole thing rests on it.
+///
+/// `copy_in` mapped only `EIO` to an ending, so that reset came back out of `relay`
+/// as a failure: `nomux: Connection reset by peer` and exit 126, where § 10 gives 0
+/// to "the session ended and the `Exit` frame was delivered". And the last of the
+/// session's output went with it — a `relay` that returns `Err` never goes back for
+/// what stdout is owed, and the buffer holds it precisely here, since a direction
+/// that had nothing queued when `poll` was called is not asking for `POLLOUT` yet.
+///
+/// Stdio on a socketpair for the reason [`the_relay_moves_the_same_traffic_by_copying_when_the_kernel_will_not_splice_it`]
+/// gives, and here it is what makes the bug reachable at all: the first `splice`
+/// consumes the socket's pending error, so a host whose stdio is a pipe never sees
+/// the reset. § 7 gives the other kind a socketpair.
+#[test]
+fn a_session_that_ends_with_the_relays_input_unread_still_exits_clean() {
+    use std::os::fd::OwnedFd;
+
+    /// Written in the same breath as the close, so it is still in the relay's
+    /// buffer when the reset arrives.
+    const LAST: &[u8] = b"NOMUX-LAST-OUTPUT";
+
+    let (mut feed, relay_stdin) = UnixStream::pair().expect("a socketpair for the relay's stdin");
+    let (mut drain, relay_stdout) =
+        UnixStream::pair().expect("a socketpair for the relay's stdout");
+    let (mut child, mut peer, _listener) = relay_onto_a_socket_over(
+        "relay_reset",
+        Stdio::from(OwnedFd::from(relay_stdin)),
+        Stdio::from(OwnedFd::from(relay_stdout)),
+        Stdio::piped(),
+    );
+
+    // Never read from this end, which is the whole provocation: the reset is the
+    // kernel's answer to a close over a receive queue that still has something in it.
+    feed.write_all(b"a keystroke this session never drains")
+        .expect("write to the relay's stdin");
+    // Waited for rather than assumed. A close that beats the relay's delivery of
+    // those bytes is an orderly FIN, and this test would then pass having provoked
+    // nothing at all.
+    assert!(
+        poll_until(RELAY_PATIENCE, || has_unread_bytes(&peer)),
+        "the relay never delivered the input this test leaves unread"
+    );
+
+    peer.write_all(LAST)
+        .expect("write the session's last words");
+    drop(peer);
+
+    assert!(
+        poll_until(RELAY_PATIENCE, || !child.is_running()),
+        "the relay never left after its session ended"
+    );
+    // After the exit, so nothing here can park: the relay's own end of this
+    // socketpair went with it, and what it wrote is waiting in the buffer.
+    let mut got = Vec::new();
+    drop(drain.read_to_end(&mut got));
+    let finished = child
+        .into_exited()
+        .wait_with_output()
+        .expect("collect the relay");
+    let complaints = String::from_utf8_lossy(&finished.stderr).into_owned();
+
+    assert_eq!(
+        got, LAST,
+        "the relay dropped the output it was still holding; it said {complaints:?}"
+    );
+    assert!(
+        finished.status.success(),
+        "a session that ended is exit 0 (§ 10), got {}; the relay said {complaints:?}",
+        finished.status
     );
 }
 

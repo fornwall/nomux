@@ -2,11 +2,11 @@
 //!
 //! Everything else in this crate's suite tests the codec against *itself*: encode
 //! then decode, and assert you got back what you put in. That proves the two halves
-//! agree, which is not the same as either being right. Swap `Hello`'s `out_offset`
-//! and `in_offset` in both directions and every round-trip test still passes — the
-//! two fields are the same width, so the frames stay symmetric while the bytes on
-//! the wire are wrong. The property tests in `codec.rs` inherit the same blind spot,
-//! because they generate frames and compare frames.
+//! agree, which is not the same as either being right. Swap `HelloOk`'s
+//! `resume_from` and `in_applied` in both directions and every round-trip test still
+//! passes — the two fields are the same width, so the frames stay symmetric while
+//! the bytes on the wire are wrong. The property tests in `codec.rs` inherit the
+//! same blind spot, because they generate frames and compare frames.
 //!
 //! So these vectors are written out by hand from the § 2.2 table rather than
 //! produced by the encoder, and are checked in *both* directions. They are the only
@@ -20,7 +20,7 @@
 
 use nomux_proto::{
     ErrorCode, ExitKind, Frame, FrameType, HEADER_LEN, HELLO_AGENT_FORWARD, HELLO_REPAINT_CTRL_L,
-    Hello, HelloOk, Linger, MAX_PAYLOAD, RESUME_FROM_START, WinSize,
+    Hello, HelloOk, Linger, MAX_PAYLOAD, PROTOCOL_VERSION, RESUME_FROM_START, WinSize,
 };
 
 /// Distinct in all four fields on purpose: `cols`, `rows`, `xpixel` and `ypixel`
@@ -71,23 +71,26 @@ fn vectors() -> Vec<Vector> {
 /// The client's opening frame, at three different flag words.
 fn hello_vectors() -> Vec<Vector> {
     vec![
-        // 0x01 Hello: u16 proto, u16 flags, u64 out_offset, u64 in_offset,
-        // winsize, u16 term_len, term bytes.
+        // 0x01 Hello: u16 proto, u16 flags, u64 out_offset, winsize, u16 term_len,
+        // term bytes.
+        //
+        // Protocol and flags read alike here, revision 3 and both bits set being
+        // the same number, so this is the one vector where a swap between those two
+        // neighbours moves no byte. The two below, at flags 1 and 0 against the same
+        // revision, are what keep it visible.
         Vector {
             frame: Frame::Hello(Hello {
-                protocol: 2,
+                protocol: 3,
                 flags: HELLO_AGENT_FORWARD | HELLO_REPAINT_CTRL_L,
                 out_offset: 0x0102_0304_0506_0708,
-                in_offset: 0x1112_1314_1516_1718,
                 win: WIN,
                 term: "xterm-256color",
             }),
             bytes: &[
-                0x01, 0x00, 0x00, 0x2c, // header: type, u24 len = 44
-                0x00, 0x02, // protocol
+                0x01, 0x00, 0x00, 0x24, // header: type, u24 len = 36
+                0x00, 0x03, // protocol
                 0x00, 0x03, // flags: bit 0 agent forward, bit 1 repaint ctrl-l
                 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // out_offset
-                0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, // in_offset
                 0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
                 0x00, 0x0e, // term_len = 14
                 b'x', b't', b'e', b'r', b'm', b'-', b'2', b'5', b'6', b'c', b'o', b'l', b'o', b'r',
@@ -100,19 +103,17 @@ fn hello_vectors() -> Vec<Vector> {
         // have", which no other vector shows on the wire.
         Vector {
             frame: Frame::Hello(Hello {
-                protocol: 2,
+                protocol: 3,
                 flags: HELLO_AGENT_FORWARD,
                 out_offset: RESUME_FROM_START,
-                in_offset: 0,
                 win: WIN,
                 term: "vt100",
             }),
             bytes: &[
-                0x01, 0x00, 0x00, 0x23, // header: type, u24 len = 35
-                0x00, 0x02, // protocol
+                0x01, 0x00, 0x00, 0x1b, // header: type, u24 len = 27
+                0x00, 0x03, // protocol
                 0x00, 0x01, // flags: bit 0 agent forward, bit 1 clear
                 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // RESUME_FROM_START
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // in_offset
                 0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
                 0x00, 0x05, // term_len = 5
                 b'v', b't', b'1', b'0', b'0',
@@ -124,19 +125,17 @@ fn hello_vectors() -> Vec<Vector> {
         // either of the others compares.
         Vector {
             frame: Frame::Hello(Hello {
-                protocol: 2,
+                protocol: 3,
                 flags: 0,
                 out_offset: 0x8182_8384_8586_8788,
-                in_offset: 0x9192_9394_9596_9798,
                 win: WIN,
                 term: "dumb",
             }),
             bytes: &[
-                0x01, 0x00, 0x00, 0x22, // header: type, u24 len = 34
-                0x00, 0x02, // protocol
+                0x01, 0x00, 0x00, 0x1a, // header: type, u24 len = 26
+                0x00, 0x03, // protocol
                 0x00, 0x00, // flags: both bits clear
                 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, // out_offset
-                0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, // in_offset
                 0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
                 0x00, 0x04, // term_len = 4
                 b'd', b'u', b'm', b'b',
@@ -154,7 +153,7 @@ fn hello_ok_vectors() -> Vec<Vector> {
         // bit 0 gap, bits 1-2 linger = 2 (enabled), bit 3 agent (§ 2.3).
         Vector {
             frame: Frame::HelloOk(HelloOk {
-                protocol: 2,
+                protocol: 3,
                 resume_from: 0x2122_2324_2526_2728,
                 in_applied: 0x3132_3334_3536_3738,
                 win: WIN,
@@ -164,7 +163,7 @@ fn hello_ok_vectors() -> Vec<Vector> {
             }),
             bytes: &[
                 0x02, 0x00, 0x00, 0x1b, // header: type, u24 len = 27
-                0x00, 0x02, // protocol
+                0x00, 0x03, // protocol
                 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, // resume_from
                 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, // in_applied
                 0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
@@ -177,7 +176,7 @@ fn hello_ok_vectors() -> Vec<Vector> {
         // set together as they are above, they can be exchanged for free.
         Vector {
             frame: Frame::HelloOk(HelloOk {
-                protocol: 2,
+                protocol: 3,
                 resume_from: 0x4142_4344_4546_4748,
                 in_applied: 0x5152_5354_5556_5758,
                 win: WIN,
@@ -187,7 +186,7 @@ fn hello_ok_vectors() -> Vec<Vector> {
             }),
             bytes: &[
                 0x02, 0x00, 0x00, 0x1b, // header: type, u24 len = 27
-                0x00, 0x02, // protocol
+                0x00, 0x03, // protocol
                 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, // resume_from
                 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, // in_applied
                 0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
@@ -202,7 +201,7 @@ fn hello_ok_vectors() -> Vec<Vector> {
         // clear, so `agent` is now pinned in both directions and not just when set.
         Vector {
             frame: Frame::HelloOk(HelloOk {
-                protocol: 2,
+                protocol: 3,
                 resume_from: 0x6162_6364_6566_6768,
                 in_applied: 0x7172_7374_7576_7778,
                 win: WIN,
@@ -212,7 +211,7 @@ fn hello_ok_vectors() -> Vec<Vector> {
             }),
             bytes: &[
                 0x02, 0x00, 0x00, 0x1b, // header: type, u24 len = 27
-                0x00, 0x02, // protocol
+                0x00, 0x03, // protocol
                 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, // resume_from
                 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, // in_applied
                 0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
@@ -500,10 +499,9 @@ fn every_hello_flag_bit_is_pinned_in_both_states() {
 
     for bit in (0..u16::BITS).map(|shift| 1u16 << shift) {
         let defined = Frame::Hello(Hello {
-            protocol: 2,
+            protocol: 3,
             flags: bit,
             out_offset: 0,
-            in_offset: 0,
             win: WIN,
             term: "",
         })
@@ -568,6 +566,50 @@ fn every_hello_ok_flag_is_pinned_in_both_states() {
         assert!(
             states.iter().any(|set| !*set),
             "no HelloOk vector clears the {name} flag"
+        );
+    }
+}
+
+/// The protocol revision is the number § 2.2 gives, and it is the one the
+/// handshake vectors carry.
+///
+/// [`PROTOCOL_VERSION`] was the last wire constant nothing here compared against
+/// the document, and this file is why: the six handshake vectors write the revision
+/// out as a literal, the way everything else in them is written out, so the
+/// constant could be moved to any number at all and every test in the workspace
+/// stayed green — measured at 4, which passed 132 of 132. Every other use compares
+/// it to itself, `session.rs` asserting a `HelloOk` carries what this crate put
+/// there and `spawn_lock.rs` formatting it into the string it then looks for.
+///
+/// The failure that hides behind that is the one the daemon is built to make loud:
+/// it refuses a `Hello` whose `protocol` is not this number, so a client written
+/// from § 2.2 would be turned away at the handshake, and the table it was written
+/// from would be right.
+///
+/// Beside the handshake rather than beside the § 2.1 limits, which is where
+/// [`the_length_field_is_a_u24_past_its_low_byte`] keeps `MAX_PAYLOAD`'s pin: the
+/// revision is not a bound on anything, it is the first field of two frames, and
+/// the vectors are where it is spent. The second assertion is what that placement
+/// buys — the literals stay hand-written from the document, and are now checked to
+/// be the number the code will accept rather than merely a number.
+#[test]
+fn the_protocol_revision_is_the_number_the_document_gives() {
+    assert_eq!(
+        PROTOCOL_VERSION, 3,
+        "IMPLEMENTATION.md § 2.2 puts the current revision at 3"
+    );
+
+    for vector in vectors() {
+        let carried = match vector.frame {
+            Frame::Hello(hello) => hello.protocol,
+            Frame::HelloOk(ok) => ok.protocol,
+            _ => continue,
+        };
+        assert_eq!(
+            carried, PROTOCOL_VERSION,
+            "a handshake vector is written at a revision the daemon would refuse: \
+             {:?}",
+            vector.frame
         );
     }
 }

@@ -87,7 +87,7 @@ fn an_escape_heavy_stream_is_byte_exact_across_random_disconnects() {
     let chaos_seed = chaos_seed();
     let session = Session::start_with_ring("chaos_exact", 8 << 20);
     let mut client = session.connect();
-    let ok = client.hello(RESUME_FROM_START, 0);
+    let ok = client.hello(RESUME_FROM_START);
 
     // Echo and newline translation silenced, so what arrives is exactly what the
     // child wrote and the comparison below can be literal.
@@ -132,7 +132,7 @@ fn an_escape_heavy_stream_is_byte_exact_across_random_disconnects() {
         if since_disconnect >= 4 * 1024 + usize::try_from(rng.below(12 * 1024)).unwrap_or(0) {
             drop(client);
             client = session.connect();
-            let resumed = client.hello(offset, in_offset);
+            let resumed = client.hello(offset);
             assert!(
                 !resumed.gap,
                 "nothing should be dropped (seed {chaos_seed})"
@@ -187,16 +187,15 @@ fn overflow_during_disconnects_is_always_reported() {
     let chaos_seed = chaos_seed();
     let session = Session::start_with_ring("chaos_firehose", 32 * 1024);
     let mut client = session.connect();
-    let ok = client.hello(RESUME_FROM_START, 0);
+    let ok = client.hello(RESUME_FROM_START);
 
     let ready = client.make_ready("-echo -onlcr", None, ok.resume_from);
     let mut offset = ready.offset;
-    let mut in_offset = ready.in_offset;
+    let in_offset = ready.in_offset;
 
     // `yes` outruns anything the client can do about it, which is the point.
     let command = b"yes\n";
     client.input(in_offset, command);
-    in_offset += command.len() as u64;
     // Wait for the first of its output before starting to disconnect. Otherwise
     // the very first drop could discard the command itself — a client that closes
     // with output queued makes the kernel send RST, taking unread input with it —
@@ -257,7 +256,7 @@ fn overflow_during_disconnects_is_always_reported() {
         drop(client);
         std::thread::sleep(Duration::from_millis(rng.below(30)));
         client = session.connect();
-        let resumed = client.hello(offset, in_offset);
+        let resumed = client.hello(offset);
         assert!(
             resumed.resume_from >= offset,
             "round {round}: the daemon must never rewind (seed {chaos_seed})"
@@ -300,7 +299,7 @@ fn replayed_input_across_random_disconnects_is_applied_once() {
     let chaos_seed = chaos_seed();
     let session = Session::start_with_ring("chaos_input", 4 << 20);
     let mut client = session.connect();
-    let ok = client.hello(RESUME_FROM_START, 0);
+    let ok = client.hello(RESUME_FROM_START);
 
     let ready = client.make_ready("-echo -onlcr", None, ok.resume_from);
     let mut offset = ready.offset;
@@ -321,7 +320,7 @@ fn replayed_input_across_random_disconnects_is_applied_once() {
 
         drop(client);
         client = session.connect();
-        let resumed = client.hello(offset, intended.len() as u64);
+        let resumed = client.hello(offset);
         assert!(
             resumed.in_applied <= intended.len() as u64,
             "round {round}: the daemon applied input the client never sent (seed {chaos_seed})"
