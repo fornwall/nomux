@@ -1599,6 +1599,12 @@ fn an_abrupt_client_disconnect_does_not_kill_the_session() {
 /// reordered at a path boundary then shows up as a first-difference index instead
 /// of as output that still looks plausible.
 ///
+/// Which of the two this one takes is not in doubt, though: `Stdio::piped()` puts a
+/// pipe on one end of every transfer, which is exactly what `splice` asks for, so
+/// both directions here splice and neither ever copies. The test below is the same
+/// traffic over stdio the kernel refuses, and is the only thing that pins the other
+/// path.
+///
 /// No daemon here on purpose. The relay never parses a frame, so a bare socket is
 /// a complete peer, and the assertions can be about bytes rather than about the
 /// protocol.
@@ -1657,6 +1663,110 @@ fn the_relay_moves_bulk_traffic_both_ways_without_losing_a_byte() {
     push.join().expect("pusher thread");
     // Only now: the relay ends the moment the socket reports EOF, so closing this
     // any earlier would truncate the direction under test rather than test it.
+    peer.shutdown(Shutdown::Write)
+        .expect("half-close the socket");
+    let downlink = downlink.join().expect("stdout reader thread");
+
+    let mut complaints = String::new();
+    drop(stderr.read_to_string(&mut complaints));
+    drop(child);
+
+    assert_same(&upstream, &uplink, "stdin -> socket", &complaints);
+    assert_same(&downstream, &downlink, "socket -> stdout", &complaints);
+}
+
+/// The same traffic again, over stdio no kernel will splice — which is the only way
+/// to reach the half of the relay the test above never runs.
+///
+/// `Pump::transfer` reaches for `splice` first and copies through a 16 KiB buffer
+/// only once the kernel has refused the pair, latching that refusal for the life of
+/// the direction. On a developer's machine and on CI the kernel never refuses,
+/// because `Stdio::piped()` hands it the pipe it wants, so the fallback — the path
+/// whose own comment says it "handles every case correctly anyway" — was asserted
+/// about by nothing. A byte quietly dropped in `copy_in` passed the whole suite.
+///
+/// Stdio on a `socketpair` is what takes the pipe away. Not a contrivance for the
+/// test: it is the case `splice_once` names in so many words, sshd handing the
+/// client socket-backed stdio instead of pipes, and it is why the fallback exists at
+/// all. Socket to socket is `EINVAL`, which is neither `EINTR` nor `EAGAIN` and so
+/// arrives as `Spliced::Unusable`, so from the first wakeup in each direction every
+/// byte below crosses through `copy_in` and `drain_to` and none through the kernel.
+///
+/// Both endings are the fallback's too, and both are asserted here rather than in
+/// tests of their own: the half-close on stdin and the one on the socket each reach
+/// the relay as `copy_in` reading zero, and getting either wrong truncates or hangs
+/// one of the two comparisons below.
+#[test]
+fn the_relay_moves_the_same_traffic_by_copying_when_the_kernel_will_not_splice_it() {
+    use std::net::Shutdown;
+    use std::os::fd::OwnedFd;
+    use std::sync::Arc;
+
+    // A quarter of what the splice test moves, and still 32 buffers per direction:
+    // what a mis-slice or a swallowed short read does at one 16 KiB boundary it does
+    // at every one of them, so the extra megabytes buy only seconds. Copying is the
+    // slower path by construction — one `read` and one `writev` per chunk, against
+    // one `splice` per 64 KiB.
+    const BULK: usize = 512 * 1024;
+
+    let (mut feed, relay_stdin) = UnixStream::pair().expect("a socketpair for the relay's stdin");
+    let (mut drain, relay_stdout) =
+        UnixStream::pair().expect("a socketpair for the relay's stdout");
+    let (mut child, peer, _listener) = relay_onto_a_socket_over(
+        "relay_copy",
+        Stdio::from(OwnedFd::from(relay_stdin)),
+        Stdio::from(OwnedFd::from(relay_stdout)),
+        Stdio::piped(),
+    );
+    let peer = Arc::new(peer);
+    let mut stderr = child.stderr.take().expect("stderr");
+
+    let upstream = Rng::new(0x0c07_9114).bytes(BULK);
+    let downstream = Rng::new(0xc0de_5a1e).bytes(BULK);
+
+    // Four threads for the same reason as above: all four flows have to run at once
+    // or the relay's back pressure parks the other three. More sharply here, in fact
+    // — the copying path writes to a *blocking* stdout, so a reader that stops
+    // reading stops the relay rather than filling a buffer.
+    let feeder = {
+        let data = upstream.clone();
+        thread::spawn(move || {
+            feed.write_all(&data).expect("write to relay stdin");
+            // The half-close the relay must turn into shutdown(SHUT_WR) on the
+            // socket while it goes on draining the other direction. A socket's, not
+            // a pipe's, but `copy_in` reads the same zero from either.
+            feed.shutdown(Shutdown::Write)
+                .expect("half-close the relay's stdin");
+        })
+    };
+    let push = {
+        let data = downstream.clone();
+        let peer = Arc::clone(&peer);
+        thread::spawn(move || {
+            let mut peer = &*peer;
+            peer.write_all(&data).expect("write to relay socket");
+        })
+    };
+    let uplink = {
+        let peer = Arc::clone(&peer);
+        thread::spawn(move || {
+            let mut peer = &*peer;
+            let mut got = Vec::new();
+            peer.read_to_end(&mut got).expect("read from relay socket");
+            got
+        })
+    };
+    let downlink = thread::spawn(move || {
+        let mut got = Vec::new();
+        drain.read_to_end(&mut got).expect("read relay stdout");
+        got
+    });
+
+    feeder.join().expect("feeder thread");
+    let uplink = uplink.join().expect("socket reader thread");
+    push.join().expect("pusher thread");
+    // Only now, as above: the relay ends on the socket's EOF, so an earlier
+    // half-close would truncate the direction under test rather than test it.
     peer.shutdown(Shutdown::Write)
         .expect("half-close the socket");
     let downlink = downlink.join().expect("stdout reader thread");
@@ -1761,6 +1871,49 @@ fn the_relay_exits_when_its_stdout_dies_with_nothing_owed_to_it() {
     );
 }
 
+/// The same ending on a relay that was already copying before its stdout died.
+///
+/// The two above take stdio the kernel will splice, so the death and the fallback
+/// arrive together: `splice` into a pipe with no reader is `EPIPE`, `splice_once`
+/// folds that into `Spliced::Unusable`, and the copying path is switched on *by* the
+/// very thing it then has to report. Which leaves the ordinary case untested — a
+/// relay that has been copying all along, on a host that never had a pipe to splice
+/// through, losing its reader mid-session. Over a `socketpair` the two come apart:
+/// `splice` is refused for being handed no pipe at all, and the `EPIPE` arrives
+/// later and from somewhere else, `nbio::drain_to`'s `writev`, with `splice_refused`
+/// long since latched.
+///
+/// Cheap enough to be worth having: one chunk, one process, and no timing to get
+/// right, since the reader is gone before the relay has anything to hand it.
+#[test]
+fn the_relay_exits_when_a_stdout_it_can_only_copy_to_stops_reading() {
+    use std::os::fd::OwnedFd;
+
+    // Held open and idle, as in the two tests above: the socket is the test's own, so
+    // a stdin closed here would half-close the one direction that could otherwise end
+    // this relay for a reason that is not the one under test.
+    let (_stdin, relay_stdin) = UnixStream::pair().expect("a socketpair for the relay's stdin");
+    let (reader, relay_stdout) = UnixStream::pair().expect("a socketpair for the relay's stdout");
+    let (mut child, mut peer, _listener) = relay_onto_a_socket_over(
+        "relay_copy_epipe",
+        Stdio::from(OwnedFd::from(relay_stdin)),
+        Stdio::from(OwnedFd::from(relay_stdout)),
+        Stdio::null(),
+    );
+
+    // Gone before a byte has crossed, so nothing is owed to it and nothing is
+    // latched: the relay is not watching this descriptor and cannot be told about it.
+    drop(reader);
+
+    peer.write_all(&vec![b'x'; 8 * 1024])
+        .expect("write to the relay's socket");
+
+    assert!(
+        poll_until(Duration::from_secs(10), || !child.is_running()),
+        "the relay was still running with a stdout it could only copy to gone"
+    );
+}
+
 /// A `nomux attach` relaying onto a socket the test holds the other end of, with
 /// its first connection already accepted.
 ///
@@ -1775,6 +1928,23 @@ fn the_relay_exits_when_its_stdout_dies_with_nothing_owed_to_it() {
 /// connection arriving at a closed one is refused, and a refusal would look like the
 /// relay giving up rather than like the test having tidied away too early.
 fn relay_onto_a_socket(id: &str, complaints: Stdio) -> (Spawned, UnixStream, UnixListener) {
+    relay_onto_a_socket_over(id, Stdio::piped(), Stdio::piped(), complaints)
+}
+
+/// [`relay_onto_a_socket`] with the relay's stdin and stdout chosen by the caller.
+///
+/// What is on the far end of those two is not a detail of the scaffolding for the
+/// tests about the copying path: `splice` wants one end of each transfer to be a
+/// pipe, so `Stdio::piped()` is the reason the relay never copies, and a
+/// `socketpair` is the reason it always does. Kept apart from the common form so
+/// that the tests which only want a relay do not have to say which of the two they
+/// are getting — the answer is the pipes everybody assumes.
+fn relay_onto_a_socket_over(
+    id: &str,
+    input: Stdio,
+    output: Stdio,
+    complaints: Stdio,
+) -> (Spawned, UnixStream, UnixListener) {
     use std::os::unix::fs::PermissionsExt;
 
     let root = run_root(id);
@@ -1783,10 +1953,13 @@ fn relay_onto_a_socket(id: &str, complaints: Stdio) -> (Spawned, UnixStream, Uni
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("tighten run dir");
     let listener = UnixListener::bind(dir.join(format!("{id}.sock"))).expect("bind session socket");
 
+    // The `Command` is a temporary and dies with the statement, which is what closes
+    // this process's copies of anything the caller passed in: a `socketpair` end
+    // still held here would be a stdout that never reaches EOF.
     let child = Spawned::spawn(
         nomux(&root, &["attach", id])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
+            .stdin(input)
+            .stdout(output)
             .stderr(complaints),
     );
 
