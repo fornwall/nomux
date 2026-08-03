@@ -44,9 +44,10 @@ protocol it speaks. Mechanics: [IMPLEMENTATION.md](IMPLEMENTATION.md).
 
 ## P1 — known gaps
 
-Four, and in the first two the honest answer is a known cost rather than a
-missing line of code; the third is a gap nothing can close, and the fourth a limit
-nobody has built yet. Each was found by review or by measurement rather than by
+Five, and in the first two the honest answer is a known cost rather than a
+missing line of code; the third is a gap nothing can close, the fourth a limit
+nobody has built yet, and the fifth the one wait on the control surface that has no
+bound. Each was found by review or by measurement rather than by
 guessing, and is recorded with what it was measured against.
 
 - **A hand-started daemon has a bind-to-publish window.** `attach` holds the spawn
@@ -96,6 +97,21 @@ guessing, and is recorded with what it was measured against.
   side of a boundary this repository cannot see. The daemon already reads the run
   directory in `list`; counting entries at startup and refusing past a generous ceiling
   would put a floor under it without the client's cooperation.
+- **The liveness probe is the one call on the escape hatch with no deadline.** Every
+  other wait `list` and `kill` make is bounded — the spawn lock, the publish grace, the
+  two signal graces
+  ([IMPLEMENTATION.md § 6.6](IMPLEMENTATION.md#66-frozen-control-surface)) — but the
+  `connect` that decides whether a session is alive is a blocking one, and an `AF_UNIX`
+  `connect` to a listener whose backlog is full does not fail, it waits. A daemon that
+  has stopped accepting with a full queue therefore parks both modes for as long as it
+  stays that way: against a listener that never accepts, with its queue filled, `list`
+  and `kill` both come back only as rc=124 from `timeout`. It is standing rather than
+  new — the probe has been a blocking `connect` since `a886313`, the commit that first
+  wrote this surface — and it is the reason the backlog is the host's ceiling rather
+  than a literal ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)), which is
+  mitigation and not a fix, `somaxconn` being finite. The fix is a non-blocking
+  `connect` with a `poll` deadline, read exactly as the blocking one is: anything that
+  is not a refusal is a session too alive to unlink.
 
 ## P2 — structure
 
@@ -166,16 +182,6 @@ guessing, and is recorded with what it was measured against.
   through, for the same reason `nbio::read` is the only raw read in the daemon, and a
   bare `stream.read` added later is what would bring this back.
 
-- **"Frozen" is promised for a layout that has already grown once.**
-  [IMPLEMENTATION.md § 6.6](IMPLEMENTATION.md#66-frozen-control-surface) says filenames
-  and permissions may never change, and the set is five files having gained
-  `<id>.agent`. Nothing says what an *older* binary's `kill` does with a name it does
-  not know, and the answer today is that it leaves it behind — one leaked file per
-  collected session, for as long as the two versions coexist. The promise holds for what
-  it needs to cover if it is stated as the five existing names, their permissions and
-  the pidfile format, with collection removing `<id>.*` rather than an enumerated list.
-  That is a small change now and an impossible one once a sixth file exists in the wild.
-
 ## P3 — release process
 
 The four musl targets build, land under the 400 KiB budget, and are byte-reproducible;
@@ -218,6 +224,19 @@ The four musl targets build, land under the 400 KiB budget, and are byte-reprodu
   that waits for it. What an argument-parsing test could reach is only the
   `io::ErrorKind`-to-number mapping, and asserting on that pins which kind a refusal
   happens to carry rather than anything a client depends on.
+- **One arm of the publish grace decides nothing the suite can see.** `kill` waits out a
+  `<id>.pid` that is *missing* as well as one that is empty
+  ([IMPLEMENTATION.md § 6.6](IMPLEMENTATION.md#66-frozen-control-surface)), and the
+  empty arm is pinned twice over. The missing one is not: mutating it to settle at once
+  rather than wait leaves the suite green, because the wait only decides an outcome
+  where the socket names nobody, and every test that takes a live session's pidfile away
+  leaves a socket that names its daemon. The state where it *does* decide is a
+  fork-detached daemon between its own `bind` and its `listen` — § 6.2's parent has
+  `_exit`ed, so the credentials on the socket name nothing extant and the pidfile is
+  still to come — which is the same window P1's first entry is about, one witness
+  narrower. Composing it means holding a daemon inside a few syscalls of its own
+  startup, which is why it is recorded here rather than fixed with a test that would be
+  a race.
 - **`MAX_PENDING_READ` has no test and cannot easily have one.** The kernel's unix
   send buffer is roughly 212 KiB, five times tighter than the 1 MiB cap, so on a
   stock host the cap never binds and no socket-level test can pin it. Raising the

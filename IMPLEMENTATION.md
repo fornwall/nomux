@@ -491,6 +491,19 @@ still reported with an exit status somebody sees, and before the pidfile is writ
 `nomux kill` (§6.6) reads the pid of the process that survived rather than of the one
 that started.
 
+The socket has to be told about the fork too, and is, by a second `listen(2)`
+immediately after it. `SO_PEERCRED` on a listening socket is stamped at `listen` from
+the process performing it, and `unix_listen` accepts a socket already listening and
+re-stamps it — so until the survivor restates it, the credentials §6.6 reads off a
+connection are the parent's, and that number is one the kernel is free to reissue the
+moment the parent `_exit`s. Both halves were measured on this kernel: that the stamp
+moves, and that a connection queued in between survives the call. The backlog goes
+back in with it (§6.3), since `listen` installs one rather than keeping what is in
+force and has no way to ask what that was. A failure is discarded rather than
+propagated: it leaves the socket named after the half that left, which costs §6.6 one
+of its two witnesses and leaves it the pidfile — not a reason to refuse a session that
+is otherwise ready to serve.
+
 `SIGHUP` is ignored before any of that, and there it is load-bearing rather than tidy.
 When the parent leaves through `_exit` it is the session leader of the terminal it was
 `exec`ed from, so the kernel hangs that terminal up and sends `SIGHUP` to its
@@ -575,12 +588,48 @@ Path precedence:
 1. `$XDG_RUNTIME_DIR/nomux/<id>.sock` — tmpfs, but removed on last logout unless linger is on.
 2. `$XDG_STATE_HOME/nomux/run/<id>.sock`, default `~/.local/state/nomux/run/`.
 
+The rule above is the whole of what a client can check, and it is not the whole of
+what the daemon enforces. `SessionPaths::new` applies a second refusal that depends on
+which of those two the run directory came from: a `sun_path` is 108 bytes including
+its terminator, so the directory, a `/`, the id and `.label` — six bytes, the longest
+of the five suffixes, with `.agent` the same length — have to fit in 107. Under
+`$XDG_RUNTIME_DIR` at `/run/user/1000` that leaves room for an id of 80 and the
+64-byte ceiling above is what binds. Under the fallback it does not:
+`$HOME/.local/state/nomux/run` is 23 bytes past `$HOME`, so the longest id that fits
+is `77 - len($HOME)` — 63 bytes for a home of 14, one short of an id the same client
+mints happily on the same host with `XDG_RUNTIME_DIR` set. A refused id is therefore
+not necessarily a bad id, which is what §10 has to turn into an exit code and what a
+client must not cache as a property of the id.
+
+It is refused there, where both halves are known, rather than at the `bind` that would
+meet it: an address that can never be formed is not a session that failed to start but
+one that can never exist, and `list` and `kill` read an unbindable address as a *live*
+session whose files they must not unlink — so every attempt would leave a `<id>.lock`
+behind, from the command whose job is to collect it. The bound is taken against
+`.label` so that `<id>.sock` is a byte shorter still, which is what lets the probe in
+§6.6 read every `connect` failure it is not told about as a live session rather than as
+an address it could not build.
+
 Directory `0700`, socket `0600`, and the three plain files — pidfile, lock, label —
 `0600` as well. Every one of those is exact rather than an upper bound: the umask is
 suppressed around each creating call, since `mkdir`, `bind` and `open` all subtract
 it, and a `<id>.lock` created `0400` under `umask 0200` is one no later process can
 open at all, which loses the mutex the control surface rests on. Filesystem sockets
 only, never abstract ones ([DESIGN.md § 8](DESIGN.md#8-security-model)).
+
+The backlog is the host's ceiling rather than a number this program picks. `-1` is
+what `UnixListener::bind` passes on Linux, and it is not a length: `listen(2)` takes
+its argument as a signed `int` and casts it to unsigned before clamping to
+`net.core.somaxconn`, so it asks for more than any host can give and gets exactly the
+ceiling — 4096 where this was measured. The re-listen of §6.2 has to restate it,
+because `listen` installs a backlog rather than keeping the one in force, and it must
+not restate it as a literal. An `AF_UNIX` `connect` to a *full*
+backlog blocks rather than being refused, and every mode here connects: a queue the
+daemon has stopped draining then parks `list`, `kill` and every attach on that id
+inside the kernel, with no timeout on any of them
+([PLAN.md § P1](PLAN.md#p1--known-gaps)). Writing 128 for "what std uses" shrank the
+queue 32-fold for one commit, and a *failed* re-listen would have preserved what the
+successful one destroyed.
 
 The directory is *checked* rather than merely created, because on every run but the
 first it already exists, and that it exists says nothing about what it is. It is
@@ -767,6 +816,25 @@ reach walks `/proc` and signals each member. It is ordered after the group probe
 rather than merged with it: the walk costs a directory scan and a read per process,
 and on most shutdowns the common case is already over before it runs.
 
+Both reaches address the child by *number* — a pgid and a session id are pids — and
+the daemon reaps the child on every pass, so from the reaping onwards that number is
+the kernel's to hand out again. Two guards keep a shutdown off a stranger. The group
+`SIGKILL` is conditional where the walk's is not, because the `waitpid` inside the
+`SIGHUP` grace is itself what frees the number: a group the probe found alive may be
+one somebody else has since been given, while the walk can only signal processes whose
+own `stat` line still claims this session. The second guard is the other half of a
+pid's identity. Field 22 of `/proc/<pid>/stat` — the start time — is read when the
+child is spawned and compared again before the hangup and before the kill, and a
+change skips **both** reaches, since pids are reissued and start times are not
+reissued with them. A *missing*
+`/proc/<pid>` is deliberately not a reissue, and that is the case the guard turns on
+rather than an oversight: no task holds the number, so it cannot have been given away,
+and the kernel keeps a pid reserved for as long as anything still names it as a session
+or a group — precisely the state a reaped shell with a surviving job leaves behind, and
+the state the walk exists to collect from. Unknown at either end is not a reissue
+either, which leaves the hazard open only on a host where the walk could not have run
+anyway.
+
 A session nobody ever attaches to is reaped after 30 s rather than the idle
 timeout: a daemon spawned by a connection that died mid-handshake has no client
 coming and would otherwise sit there for a week.
@@ -825,12 +893,27 @@ $RUNDIR/<id>.label   UTF-8 display label, no newline, <= 256 bytes, 0600
 $RUNDIR/<id>.agent   ssh-agent socket, 0600 (§6.7)
 ```
 
+The two plain files either mode reads by hand — `<id>.pid` and `<id>.label` — go
+through one bounded helper and are never read whole, opened `O_NONBLOCK | O_NOFOLLOW`
+so that a FIFO left at either name cannot park the escape hatch in `open(2)` and a
+symlink cannot send it elsewhere. What somebody dropped in the run directory does not
+get to decide how much memory `list` faults in either: an allocation that fails under
+§8's `-Cpanic=immediate-abort` is an abort with no message, not an error the escape
+hatch could report and go on from. The two
+ends of that bargain are deliberately asymmetric. A label that reaches its bound is
+truncated, and costs a column; a pid body that reaches **32 bytes is refused
+outright**, because a prefix ending mid-number is not the number in the file but a
+smaller, plausible, live one — `" "*25 + "32770419\n"` reads back as 3277041 — and
+what the prefix cannot settle it does not get to answer. The layout puts a pid and a
+newline there, eleven bytes at the widest; nothing legitimate reaches the bound.
+
 - Both establish first that the run directory is this user's alone (§6.3), before any name in it is read, connected to or signalled. Neither creates it: on a host that has never run a session, `list` prints nothing and exits 0, and `kill` reports the "no such session" that already holds.
 - `list` reads the directory and probes each socket with `connect`; `ECONNREFUSED` — or a socket that is no longer there at all — means stale, and stale entries are unlinked. The probe is safe because connecting is not attaching (§6.4) — it costs a live session nothing.
 - Unlinking happens under `<id>.lock`, and the probe is repeated once it is held, since that is the only point at which the answer cannot change between being read and being acted on. An entry whose lock somebody else holds is skipped: it is a session being started rather than garbage, and it stays collectable for as long as it stays dead. An entry whose lock is not *obtainable at all* is collected anyway, per §6.3 — a collector that stops collecting because of the mutex protecting it leaks under exactly the conditions it exists for.
-- `kill` takes `<id>.lock` first and holds it to the end, so nothing can spawn into the id it is removing; then probes the socket, reads the pidfile, sends `SIGTERM`, waits up to 2 s, then `SIGKILL`, and unlinks all five files once the session has actually stopped answering. It waits up to 2 s for that lock — which is long enough to win the race against an attach creating the session, rather than merely lose it.
-- **A live session's files are never unlinked.** Where the socket answers and the pidfile cannot be read, `kill` exits non-zero and leaves all five alone. Removing them there takes the socket away from a daemon that is still holding the user's shell: the session answers nothing, appears in no listing, and the id is free for a second daemon to bind over. The one benign reason for that state is the daemon's own bind-to-publish window (§6.2), so a *missing* pidfile is waited out for 2 s; a mode that hides it, or a body that is not a pid, is reported at once, since waiting cannot change either.
-- `kill` exits non-zero rather than reporting a "no such session" it did not establish. Three states do that, and each is honest rather than ideal: the live-but-unreadable case above; a session still answering half a second after `SIGKILL`, which nothing survives — so the pid it published is not the process serving it, a stale pidfile whose number the kernel has reissued being how that happens, and the five files are left alone for the same reason as above; and a lock still held at the 2 s deadline. That deadline is shorter than the five seconds an attach spends waiting for a daemon that never starts, so an attach parked on that timeout makes `kill` report a session that by then does not exist. The attach is about to fail, and its own failure is the better account of what happened.
+- `kill` takes `<id>.lock` first and holds it to the end, so nothing can spawn into the id it is removing; then probes the socket, identifies the daemon from the two witnesses below, sends `SIGTERM`, waits up to 2 s, then `SIGKILL`, and unlinks all five files once the session has actually stopped answering. It waits up to 2 s for that lock, which is what makes it *win* the race against an attach creating the session rather than merely lose it. That budget has to cover a healthy spawn — a `fork`, an `exec` and a `bind` — and, since the daemon takes this same lock before it probes for a stale socket (§6.3), the blocking `connect` in front of that bind as well: a start wedged there holds the lock across it, and holds off `list`'s collection of the id as much as it holds off this.
+- **Which process gets signalled has two witnesses, and neither is senior.** `SO_PEERCRED` on the probe connection names the process that called `listen` (§6.2), which no name in a directory can forge; `<id>.pid` names what the daemon published. Each is the only account of a state the other cannot describe. The socket names nobody in three places: inside the bind-to-publish window, where a `connect` failed for a reason that is not death, and where the peer sits in a pid namespace this process cannot see — the kernel writes 0 into that field there, and 0 is read as "will not say" rather than as a pid. The file names the wrong process where a dead daemon's number outlived it and the kernel handed that number to somebody else. So each is discarded when it names no live process, which settles both ordinary shapes, and a disagreement between two *live* numbers is put to `/proc/<pid>/cmdline`: this session's daemon runs `nomux daemon <id>`, and no reissued number wears that by accident. Both wearing it is §6.2's fork and nothing else — one image, two halves — and there the file is right by construction, since the pid is published after the fork by the half that survives it. Neither wearing it is a refusal, and so is a candidate that could not be asked: "it is not the daemon" and "I could not tell" are kept apart, because the first, said of a daemon, strands a healthy session for as long as it runs. `list` weighs the same two the same way and prints `?` where they cannot be reconciled, so the number a user reads is the number `kill` would signal.
+- **A live session's files are never unlinked.** Where the socket answers and *neither* witness will say which process serves it, `kill` exits non-zero and leaves all five alone. Removing them there takes the socket away from a daemon that is still holding the user's shell: the session answers nothing, appears in no listing, and the id is free for a second daemon to bind over. The one benign reason for that state is the daemon's own bind-to-publish window (§6.2), so a pidfile that is *missing or still empty* is waited out for 2 s — even where the socket has already named somebody, since a second witness one interval away is worth more than the interval — while a mode that hides it, a body that is not a pid, and a body that runs past 32 bytes are settled at once, on the socket's word where there is one, since waiting cannot change any of the three.
+- `kill` exits non-zero rather than reporting a "no such session" it did not establish. Four states do that, and each is honest rather than ideal. Two are the identification above: neither witness yields a live pid, and two live candidates of which neither is a `nomux daemon <id>` — where the refusal prints both numbers and what each came from, and recommends nothing, since the repair that suggests itself, removing the pidfile, is the catastrophic one exactly half the time. The third is a session still answering half a second after `SIGKILL`, which nothing survives — so the pid that was signalled is not the process serving it, and the five files are left alone for the same reason as above. The fourth is a lock still held at the 2 s deadline. That deadline is shorter than the five seconds an attach spends waiting for a daemon that never starts, so an attach parked on that timeout makes `kill` report a session that by then does not exist. The attach is about to fail, and its own failure is the better account of what happened.
 - One further non-zero exit is not about establishing anything, and is the one case where the session really did stop: the unlink itself failing. Absence is success — the five go in one order, and a collection often finishes one that was interrupted — but a read-only run directory, an `EIO`, or an immutable `<id>.lock` is reported rather than swallowed. Every path is still attempted, so one stubborn file does not strand the other four, and the first real failure is what `kill` exits on. Silence here would be worse than it sounds: exit status is the caller's only account of whether the session went, and a surviving `<id>.lock` is a session `list` rediscovers and tries to collect on every run from then on.
 
 `<id>.label` exists because ids are opaque per-tab identifiers
@@ -848,9 +931,19 @@ control characters and truncates to 256 bytes on a character boundary: the value
 a tab title typed by a human, `list` writes it straight to a terminal, and a label
 containing `ESC ]0;` would otherwise retitle the window of whoever ran it.
 
-Neither opens a session, sends a frame, or reads `PROTOCOL_VERSION`. This layout is
-frozen: filenames, permissions and pidfile format may never change. Everything
-version-dependent lives behind the socket.
+Neither opens a session, sends a frame, or reads `PROTOCOL_VERSION`. What is frozen is
+what is written above: **these five names, their permissions and the pidfile's format
+may never change**, and everything version-dependent lives behind the socket. The set
+is not sealed against *growth* — it was four names until `<id>.agent` arrived — and the
+promise is stated over the existing five rather than over the layout as a whole because
+that is the part anything can be built against.
+
+Growth is not free, and the bill goes to whoever is older. Collection removes an
+enumerated list, so a `kill` that predates a name collects the four it knows and leaves
+the fifth: one file per collected session, for as long as the two versions share a
+host. A sixth name would do the same again, and collecting `<id>.*` instead is what
+would close it — cheap now, impossible once a binary in the wild depends on the
+enumeration.
 
 Corollary: a *new* binary can reap an *old* daemon, so recovery does not depend on
 the old binary still being present on the host.
@@ -1032,7 +1125,8 @@ pin is dated at all.
 | Run directory | A symlink in place of one is refused and whatever it points at is left untouched; a directory owned by another uid is refused against a real one, with its mode asserted unchanged; every mode the owner can open is repaired to exactly 0700, including a missing owner bit and `setgid` or `sticky`; a group- or other-writable one is refused rather than repaired, as is one the owner cannot open, which is reported as a judgement on the mode; and both modes that create a run directory say so and exit non-zero. | `src/rundir.rs`, `tests/session.rs` |
 | Spawn lock | Collection against a lock somebody else holds: `list` leaves the entry alone, `kill` exits non-zero rather than claiming it, and an attach whose lock file is collected while it waits goes back for the file that replaced it. A lock that cannot be opened at all is collected past rather than skipped, and `<id>.lock` is the last of the five files removed. | `tests/spawn_lock.rs`, `src/rundir.rs` |
 | Command line | `probe` emits exactly the `NOMUX-BOOTSTRAP <os> <arch> <install_dir>` line §5.1 has the client parse, with `linux` spelled out in the test rather than taken from `env::consts::OS` — which would agree with whatever the binary printed and pin nothing, when the `Linux`/`linux` split is the whole point. `--version` carries the protocol revision the client keys off, against `PROTOCOL_VERSION` rather than a literal. An argument too many and an unknown mode both exit `EX_USAGE` with nothing on stdout, which is where the client looks for that line. | `tests/spawn_lock.rs` |
-| Control surface | `attach`, `list` and `kill` each refuse a run directory that is a symlink into a world-writable one with a socket, a pidfile and a label planted in it, and the planted socket is never connected to; neither `list` nor `kill` creates a run directory it was only asked about; and `kill` leaves a live session's five files untouched and exits non-zero when its pidfile cannot be read. | `tests/spawn_lock.rs` |
+| Control surface | `attach`, `list` and `kill` each refuse a run directory that is a symlink into a world-writable one with a socket, a pidfile and a label planted in it, and the planted socket is never connected to; neither `list` nor `kill` creates a run directory it was only asked about; and `kill` leaves a live session's five files untouched, saying it is still running, when *neither* witness will name a process — both have to be shut at once, since either alone still identifies the daemon. No run file can park either mode in a syscall, which is asserted against a deadline rather than by waiting: a FIFO at `<id>.pid` or `<id>.label` is what the bounded `O_NONBLOCK` read exists for, and a test that simply waits for a wait with no end never fails. | `tests/spawn_lock.rs` |
+| Session identity | The two witnesses of §6.6, each against the other, with a live bystander planted as the wrong answer every time. `SO_PEERCRED` naming the process that called `listen` is checked against a daemon in another process rather than taken from the manual page. A pidfile holding a stranger's number loses to the socket; a socket carrying another daemon's credentials — the shape §6.2's fork produced before the re-listen, built by moving a second session's socket over this one's — loses to the pidfile; and the tie is decided by `/proc/<pid>/cmdline` in both directions, including for a daemon installed deep enough that its command line runs past 512 bytes — the size that buffer once was, asserted in the test rather than assumed — and one whose `--label` runs an order of magnitude past the buffer, since a read that cannot see the end must say "cannot tell" rather than "not the daemon". A pidfile whose number is cut off by that bound is refused rather than signalled, against a bystander planted at exactly the pid the prefix parses to, and `list` prints `?` there rather than half a number. | `tests/spawn_lock.rs` |
 
 The two invariants that matter: **no duplicated input, ever**, and **no lost output
 unless a `Gap` was reported**.
@@ -1065,7 +1159,7 @@ says which run must pass and which must fail.
 | Code | Meaning |
 | --- | --- |
 | 0 | The relay ended cleanly: the client detached, the session ended and the `Exit` frame was delivered, or the relay's own stdout was closed by its reader |
-| 64 | Malformed invocation (`EX_USAGE`) |
+| 64 | Malformed invocation (`EX_USAGE`), or an id this run directory has no room for — the smaller table below has the difference |
 | 126 | Session exists but is unattachable (permissions, protocol) |
 | 127 | No such session and spawn failed |
 
@@ -1091,19 +1185,32 @@ and it arrives on stdout rather than in the status.
 | Code | Meaning |
 | --- | --- |
 | 0 | The postcondition holds: for `kill`, that there is no such session — whether it was stopped and its five files removed, or already gone before the command ran |
-| 64 | A session id that could never have named a session (`EX_USAGE`) — the sole source is `SessionPaths::new`, so it is always a malformed command line rather than an operation that failed |
+| 64 | An id that could not name a session here (`EX_USAGE`) — the sole source is `SessionPaths::new`, which refuses both an id outside the character rule and one too long for this run directory's `sun_path` (§6.3) |
 | 1 | Everything else |
 
-That last row is deliberately coarse, and §6.6 lists the four states behind it: a
-live session whose pidfile cannot be read, a session still answering after
-`SIGKILL`, a spawn lock still held at the 2 s deadline, and an unlink that failed
-over a session that did stop. The temptation is to give each a code of its own out
-of the range `EX_USAGE` came from, and it is worth writing down why that is
-refused. `EX_TEMPFAIL` is the fit that suggests itself and is wrong for two of the
-four: it means *"user is invited to retry"*, and the pid a stale pidfile names is
-not the process serving the session, so retrying re-signals somebody else's
-process — the code would be recommending the harm. Only the held lock is genuinely
-temporary. Splitting the rest would add a third convention to a surface §6.6
+The 64 covers two refusals that read differently to whoever gets it, and only the
+first is a property of the id. An id outside `[A-Za-z0-9_-]`, or past 64 bytes, fails
+on every host and is the client's own bug. An id that overruns `sun_path` fails against
+*this run directory* — the same id is accepted on the same host when
+`XDG_RUNTIME_DIR` is set, since the fallback under `$HOME` is the longer path (§6.3).
+So what the code says is that the id cannot name a session in the directory this
+command found, never that the id is malformed, and the stderr line carries the
+directory and both byte counts because that is where the difference is. A client that
+caches it as the latter caches its way out of ids that work.
+
+That last row is deliberately coarse, and §6.6 lists the five states behind it: a live
+session neither witness will identify, two live candidates and nothing to tell which
+serves it, a session still answering after `SIGKILL`, a spawn lock still held at the
+2 s deadline, and an unlink that failed over a session that did stop. The §6.3
+run-directory refusal reaches the same row without being one of them, and reaches it
+from all three modes rather than from `kill` alone. The temptation is to give each a
+code of its own out of the range `EX_USAGE` came from, and it is worth writing down why
+that is refused. `EX_TEMPFAIL` is the fit that suggests itself and is wrong for three
+of the five: it means *"user is invited to retry"*, and none of the three that turn on
+which process the pidfile named clears on its own — a retry either refuses identically
+or, where the two signals have already gone to a stranger, sends them again, so the
+code would be recommending the harm. Only the held lock is genuinely temporary.
+Splitting the rest would add a third convention to a surface §6.6
 freezes, for a private contract with one consumer, and buy resolution the stderr
 line already carries in words.
 
