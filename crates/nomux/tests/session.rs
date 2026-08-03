@@ -143,8 +143,22 @@ fn an_out_offset_past_the_end_of_the_stream_is_clamped_rather_than_believed() {
 /// is past the one occurrence there may be, and the fence really is a fence: its
 /// text also only ever arrives from the shell, so reading it back proves everything
 /// queued in front of it — the replay included — has already been through the PTY.
+///
+/// Three resends, because `on_input` has two defences and the obvious replay
+/// exercises neither. Sending the applied bytes again *exactly* — which is the § 3
+/// scenario and was the whole of this test — lands on `end == in_applied`, where
+/// the `end > in_applied` guard is false and the trim inside it never runs. The
+/// other two put a frame on each side of that line: one ending below it, which only
+/// the guard stops from rewinding the session's position, and one straddling it,
+/// which only the trim stops from running its overlap a second time. Each of the
+/// two, removed on its own, now fails this test; before, neither did.
 #[test]
 fn replayed_input_is_applied_exactly_once() {
+    /// How much of the command the short resend below carries. Any amount that
+    /// leaves the frame ending below `in_applied` asks the same question; this one
+    /// is a whole word of it, so a transcript that does show it is readable.
+    const PREFIX: usize = 8;
+
     let (session, mut client, ok) = Session::attached("dedup");
     let ready = client.make_ready("-echo -onlcr", None, ok.resume_from);
 
@@ -166,9 +180,46 @@ fn replayed_input_is_applied_exactly_once() {
     );
     client.input(ready.in_offset, command);
 
-    // Force a round trip so any duplicate would have been run by now.
-    client.input(ok.in_applied, b"echo NOMUX-FENCE\n");
-    let (seen, _) = client.read_until("NOMUX-FENCE", ok.resume_from);
+    // The same resend cut short, which is the one shape that can move `in_applied`
+    // *backwards*. `on_input` has two defences and they answer different frames:
+    // the `end > in_applied` guard is the only thing that stops a frame ending
+    // below the session's position from rewinding it, and the trim is the only
+    // thing that stops one ending above it re-running its overlap. Replaying the
+    // command exactly reaches neither — `end == in_applied` falls through both —
+    // so a test built on that alone passes with either defence removed, which is
+    // what this one used to do. Measured: each of the two, taken out on its own,
+    // left the whole workspace green.
+    client.input(
+        ready.in_offset,
+        command.get(..PREFIX).expect("part of a line"),
+    );
+    // Frames are handled in the order they arrive, so a `Pong` for a ping behind
+    // them is the daemon having decoded both — and decoded is what matters, since a
+    // socket closed with output queued loses whatever `fill` had buffered.
+    client.send(&Frame::Ping { nonce: 0xD00D });
+    drop(client.next_of(FrameType::Pong));
+    drop(client);
+
+    let mut client = session.connect();
+    let resumed = client.hello(offset);
+    assert_eq!(
+        resumed.in_applied,
+        applied,
+        "a resend that stopped {} bytes short of where the daemon had got to moved \
+         the session's input position backwards, so every offset the client sends \
+         from here is one the daemon will refuse as an input gap",
+        command.len() - PREFIX
+    );
+
+    // And a resend that overlaps what was applied *and* carries something new,
+    // which is what a client actually sends: `offset < in_applied < end`, the frame
+    // the trim exists for. The overlap is the whole command, so a daemon that
+    // stopped trimming runs the marker a second time rather than something
+    // unrecognisable.
+    let mut overlapping = command.to_vec();
+    overlapping.extend_from_slice(b"echo NOMUX-FENCE\n");
+    client.input(ready.in_offset, &overlapping);
+    let (seen, _) = client.read_until("NOMUX-FENCE", resumed.resume_from);
 
     let echoes = seen.matches("NOMUX-ONCE-MARKER").count();
     assert_eq!(
