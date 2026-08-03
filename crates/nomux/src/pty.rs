@@ -788,15 +788,22 @@ mod tests {
             "the ordinary case sent no SIGHUP, so the two assertions below are \
              about an instrument that measures nothing"
         );
-        // Pinned rather than discarded, so that a panic from anywhere else in
-        // `terminate` is not swallowed by this one being expected: the trap is what
-        // takes rustix's assertion with it, and that assertion is compiled in for
-        // exactly as long as this crate's own are.
+        // Pinned rather than discarded, and it says something different in each
+        // profile because the trap does. Where rustix's assertions are compiled in,
+        // the trapped `kill` takes one with it and `terminate` never returns from
+        // its first reach — so what this pins is that the trap really did stop the
+        // call it was aimed at, and nothing later in `terminate` is reachable to
+        // panic for another reason. Where they are not, the same call returns and
+        // `terminate` runs to its end, so an unwind can only be somebody else's and
+        // this is what refuses to swallow it. A panic *before* the first reach is
+        // the assertion above's business in either profile: no `SIGHUP` would have
+        // gone out.
         assert_eq!(
             unwound.is_err(),
             cfg!(debug_assertions),
-            "the only panic wanted here is rustix's own, on the return value of the \
-             syscall the filter has just rolled back"
+            "a debug build must take rustix's assertion on the return value of the \
+             syscall the filter rolled back, and a release build must not unwind \
+             here at all"
         );
         // What `terminate` may not have got round to, having possibly left through
         // the trapped syscall rather than through its own end.
