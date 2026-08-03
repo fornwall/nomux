@@ -12,14 +12,14 @@
 use std::collections::VecDeque;
 use std::fs;
 use std::io;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use nomux_proto::{
-    ErrorCode, ExitKind, Frame, FrameType, Hello, HelloOk, Linger, PROTOCOL_VERSION,
-    RESUME_FROM_START, WinSize,
+    ErrorCode, ExitKind, Frame, FrameType, Hello, HelloOk, Linger, MAX_AGENT_CHANNELS,
+    PROTOCOL_VERSION, RESUME_FROM_START, WinSize,
 };
 use rustix::event::{PollFd, PollFlags, Timespec};
 
@@ -456,6 +456,19 @@ enum Source {
     AgentChannel(u32),
 }
 
+/// Slots the poll set can ever need at once: the six sources that exist at most once
+/// each — the listener, the signal pipe, the PTY master, the client, the connection
+/// that has not greeted, the agent listener — plus one per agent channel, which
+/// `Agent::accept` caps at [`MAX_AGENT_CHANNELS`].
+///
+/// Derived from that cap rather than counted out, so raising it cannot leave a number
+/// here behind.
+const POLL_SLOTS: usize = 6 + MAX_AGENT_CHANNELS as usize;
+
+/// What one `poll` came back with: the readiness of each source in the order
+/// [`Daemon::watches`] registered them, and how many of the slots it used.
+type Ready = ([(Source, PollFlags); POLL_SLOTS], usize);
+
 impl Daemon {
     fn event_loop(&mut self) -> io::Result<()> {
         let mut scratch = Vec::new();
@@ -466,6 +479,17 @@ impl Daemon {
                 return Ok(());
             }
             self.poll_once(&mut read_buf, &mut scratch)?;
+            // Given back at the end of the pass that grew it. `take_frame` copies each
+            // payload in here, so a single large `Input` leaves one `MAX_PAYLOAD` —
+            // 256 KiB — held for the rest of the session, which can be a week, over a
+            // frame nothing will look at again. It costs the steady state nothing: a
+            // pass that decoded no frame leaves the capacity where the last shrink put
+            // it, and `shrink_to` below its own argument makes no call at all.
+            //
+            // `read_buf` is left alone deliberately. It is a fixed 64 KiB that every
+            // pass reads into, so giving it back would be one allocation per pass
+            // rather than one saved.
+            scratch.shrink_to(0);
         }
     }
 
@@ -558,22 +582,47 @@ impl Daemon {
         self.stop_reason().is_some()
     }
 
-    /// Everything the poll set watches, in the order it is registered.
+    /// Everything the poll set watches, in the order it is registered, written into
+    /// `sources` and `fds` in step. Returns how many slots were used.
     ///
     /// Named rather than positional because the set is variable-length: agent
     /// forwarding adds the socket plus one entry per live channel, and an index
-    /// arithmetic bug there would silently apply one fd's readiness to another.
-    fn watches(&self) -> Vec<(Source, BorrowedFd<'_>, PollFlags)> {
-        let mut watches = Vec::with_capacity(5);
+    /// arithmetic bug there would silently apply one fd's readiness to another. The
+    /// two arrays are written and read back together, so the tag still travels with
+    /// the descriptor and nothing downstream counts slots.
+    ///
+    /// Into the caller's arrays rather than a `Vec` because this is the steady-state
+    /// relay loop: one pass per ≤ 64 KiB of terminal output, doing three syscalls,
+    /// and the set has a compile-time maximum ([`POLL_SLOTS`]). The `Vec` here, the
+    /// `Vec<PollFd>` built from it and the `Vec` of results were three allocations and
+    /// three frees on every one of them.
+    fn watches<'a>(
+        &'a self,
+        sources: &mut [Source; POLL_SLOTS],
+        fds: &mut [PollFd<'a>; POLL_SLOTS],
+    ) -> usize {
+        let mut len = 0;
+        let mut watch = |source, fd, flags| {
+            // Through `get_mut` rather than by index: the count below is bounded by
+            // the same constants [`POLL_SLOTS`] is derived from, so this cannot be
+            // reached, and an entry that could not be placed is a wakeup missed
+            // rather than a write past the end of the caller's frame.
+            if let (Some(slot), Some(entry)) = (sources.get_mut(len), fds.get_mut(len)) {
+                *slot = source;
+                *entry = PollFd::from_borrowed_fd(fd, flags);
+                len += 1;
+            }
+        };
+
         // Out of the set while an `accept` that failed is being waited out, which is
         // the only way to stand back from it: the queued connection that failure left
         // behind keeps the descriptor readable, so a `poll` that still asks about it
         // returns immediately however long the timeout says.
         if self.accept_retry.is_none() {
-            watches.push((Source::Listener, self.listener.as_fd(), PollFlags::IN));
+            watch(Source::Listener, self.listener.as_fd(), PollFlags::IN);
         }
         if let Some(stop) = self.stop_pipe.as_ref() {
-            watches.push((Source::Signal, stop.as_fd(), PollFlags::IN));
+            watch(Source::Signal, stop.as_fd(), PollFlags::IN);
         }
 
         // Dropped from the set once the child is gone: the master reports `HUP`
@@ -584,7 +633,7 @@ impl Daemon {
             if !self.pending_input.is_empty() {
                 flags |= PollFlags::OUT;
             }
-            watches.push((Source::Pty, pty.master(), flags));
+            watch(Source::Pty, pty.master(), flags);
         }
 
         if let Some(client) = self.client.as_ref() {
@@ -617,10 +666,10 @@ impl Daemon {
             // held-back peer has died (§ 4.1). `poll_once` answers that wakeup by
             // letting the client go, so it cannot repeat, and it is what arms the idle
             // deadline and fails the agent's waiting callers (§ 6.7).
-            watches.push((Source::Client, client.conn.stream().as_fd(), flags));
+            watch(Source::Client, client.conn.stream().as_fd(), flags);
         }
         if let Some(pending) = self.pending.as_ref() {
-            watches.push((Source::Pending, pending.stream().as_fd(), PollFlags::IN));
+            watch(Source::Pending, pending.stream().as_fd(), PollFlags::IN);
         }
 
         if let Some(agent) = self.agent.as_ref() {
@@ -628,7 +677,7 @@ impl Daemon {
                 .client
                 .as_ref()
                 .is_some_and(|client| client.conn.is_write_saturated());
-            watches.push((Source::AgentListener, agent.listener(), PollFlags::IN));
+            watch(Source::AgentListener, agent.listener(), PollFlags::IN);
             for (id, fd, wants_write, wants_read) in agent.watches() {
                 // A saturated client is the one back pressure signal available:
                 // stop draining agent sockets until the queue it feeds has room.
@@ -643,11 +692,11 @@ impl Daemon {
                     flags |= PollFlags::OUT;
                 }
                 if !flags.is_empty() {
-                    watches.push((Source::AgentChannel(id), fd, flags));
+                    watch(Source::AgentChannel(id), fd, flags);
                 }
             }
         }
-        watches
+        len
     }
 
     /// Blocks until something in the poll set is ready, and returns what.
@@ -657,16 +706,18 @@ impl Daemon {
     /// this file worth reading, and poll mechanics sitting in front of it only get in
     /// the way. `None` is the `EINTR` case, which is not an event. Confining the
     /// borrows of `self` here is also what lets the caller take `&mut self` freely
-    /// while handling what this returns.
-    fn wait(&self) -> io::Result<Option<Vec<(Source, PollFlags)>>> {
-        let watches = self.watches();
-        let mut fds: Vec<PollFd<'_>> = watches
-            .iter()
-            .map(|(_, fd, flags)| PollFd::from_borrowed_fd(*fd, *flags))
-            .collect();
+    /// while handling what this returns — which is why the readiness comes back by
+    /// value: a `PollFd` borrows the descriptor it was built from, and a `Source` and
+    /// its flags borrow nothing.
+    fn wait(&self) -> io::Result<Option<Ready>> {
+        let mut sources = [Source::Listener; POLL_SLOTS];
+        let mut fds = std::array::from_fn(|_| {
+            PollFd::from_borrowed_fd(self.listener.as_fd(), PollFlags::empty())
+        });
+        let len = self.watches(&mut sources, &mut fds);
 
         let timeout = self.poll_timeout();
-        match rustix::event::poll(&mut fds, Some(&timeout)) {
+        match rustix::event::poll(fds.get_mut(..len).unwrap_or(&mut []), Some(&timeout)) {
             Ok(_) => {}
             // A stop signal delivered while blocked here lands as `EINTR`, and
             // `poll` is never restarted whatever the handler's flags say. That
@@ -677,13 +728,11 @@ impl Daemon {
             Err(err) => return Err(err.into()),
         }
 
-        Ok(Some(
-            watches
-                .iter()
-                .zip(fds.iter())
-                .map(|((source, _, _), fd)| (*source, fd.revents()))
-                .collect(),
-        ))
+        let mut ready = [(Source::Listener, PollFlags::empty()); POLL_SLOTS];
+        for (slot, (source, fd)) in ready.iter_mut().zip(sources.iter().zip(fds.iter())) {
+            *slot = (*source, fd.revents());
+        }
+        Ok(Some((ready, len)))
     }
 
     fn poll_once(&mut self, read_buf: &mut [u8], scratch: &mut Vec<u8>) -> io::Result<()> {
@@ -696,9 +745,10 @@ impl Daemon {
         if self.accept_retry.is_some_and(|at| Instant::now() >= at) {
             self.accept_retry = None;
         }
-        let Some(events) = self.wait()? else {
+        let Some((ready, used)) = self.wait()? else {
             return Ok(());
         };
+        let events = ready.get(..used).unwrap_or(&[]);
         let revents = |want: Source| {
             events
                 .iter()
@@ -764,7 +814,7 @@ impl Daemon {
             self.read_client(scratch)?;
         }
 
-        for (source, flags) in &events {
+        for (source, flags) in events {
             if let Source::AgentChannel(id) = *source {
                 self.service_agent_channel(id, *flags, read_buf);
             }
@@ -979,6 +1029,21 @@ impl Daemon {
         // only once the master is dry.
         if crate::nbio::drain_to(&mut self.pending_input, pty.master()).is_err() {
             self.pending_input.clear();
+        }
+        // Given back on the way through empty, because the capacity that is left
+        // otherwise outlives the client that caused it and is held for the rest of the
+        // session — one paste into a child that has stopped reading is
+        // `MAX_PENDING_INPUT` plus a frame, 1.25 MiB, kept for up to seven days.
+        //
+        // Here rather than anywhere the queue merely shrinks, and only where it has
+        // gone empty, which is what keeps it off the steady state: the master is in
+        // the poll set asking for `POLLOUT` exactly while this queue is non-empty, so
+        // the pass that empties it is the last one to call this until the client
+        // sends again. What that costs is one allocation per burst of typing, against
+        // a relay loop that goes round once per 64 KiB of *output* and never comes
+        // through here at all.
+        if self.pending_input.is_empty() {
+            self.pending_input.shrink_to(0);
         }
     }
 

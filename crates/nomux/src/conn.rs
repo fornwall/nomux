@@ -45,21 +45,34 @@ const _: () = assert!(
     "MAX_PENDING_READ must have room for a whole frame, or take_frame never completes one"
 );
 
-/// Compact a buffer once this many consumed bytes have accumulated.
-const COMPACT_THRESHOLD: usize = 64 * 1024;
-
 /// Reclaims the consumed prefix of a cursor-and-`Vec` buffer.
 ///
 /// Both directions carry one, and both would otherwise grow without bound across
 /// a long session: neither cursor ever moves backwards, so the bytes below it are
 /// dead the moment they are passed. Draining on every pass would memmove the
-/// remainder for each frame, hence the threshold — and the empty case is worth
+/// remainder for each frame, hence the condition — and the empty case is worth
 /// separating because clearing is free where draining is not.
+///
+/// The condition is a *ratio* rather than a number of bytes, because what a
+/// compaction costs is the remainder — the part that stays — and a threshold on the
+/// prefix says nothing about that. Draining a queue of n bytes in c-byte writes at a
+/// fixed 64 KiB threshold moves about n²/2c, so the cost per byte delivered rises
+/// with the queue rather than staying put. It bites precisely where the queue is
+/// largest, which is the replay path: `pump_output` tops the queue back up to
+/// [`MAX_PENDING_WRITE`] after every write, so the remainder never shrinks. Simulated
+/// against that pattern with a full 1 MiB queue, delivering one megabyte moves
+/// 7.50 MiB at the 64 KiB floor a socket buffer can be shrunk to and 1.97 MiB at the
+/// `AF_UNIX` default of some 208 KiB a wakeup; halving moves 0.94 MiB and 0.58 MiB.
+///
+/// Halving moves at most as many bytes as the compaction retires — the remainder is
+/// no larger than the prefix, by the test itself — so each byte pays for one move and
+/// is then gone, which is O(1) amortised per byte however the writes fall, and never
+/// more than the fixed threshold would have moved.
 fn compact(buf: &mut Vec<u8>, pos: &mut usize) {
     if *pos == buf.len() {
         buf.clear();
         *pos = 0;
-    } else if *pos >= COMPACT_THRESHOLD {
+    } else if *pos * 2 >= buf.len() {
         buf.drain(..*pos);
         *pos = 0;
     }
