@@ -713,9 +713,19 @@ fn a_second_client_takes_over_and_the_first_is_told_why() {
     second.read_until("NOMUX-TOOK-OVER", ok.resume_from);
 }
 
+/// The frozen control surface reaches a live session through the files on disk
+/// alone (`IMPLEMENTATION.md` § 6.6) — `list` finds it and `kill` stops it.
+///
+/// "Stops it" was the half nobody checked. The assertion was that the socket had
+/// gone, which is a statement about `unlink` and not about the session: a `kill`
+/// that removed the five files and left the daemon running would pass it unchanged,
+/// and § 10's whole contract for `kill` is that a zero status means "there is no
+/// such session". What such a daemon leaves behind is the worst of both — a shell
+/// still holding the user's work, with nothing on disk to attach to it by and
+/// nothing for `list` to report, until the seven-day idle deadline collects it.
 #[test]
 fn list_and_kill_operate_without_the_protocol() {
-    let (session, _client, _) = Session::attached("control");
+    let (mut session, _client, _) = Session::attached("control");
 
     let listed = stdout(&control(&session.root, &["list"]));
     assert!(
@@ -740,6 +750,19 @@ fn list_and_kill_operate_without_the_protocol() {
     );
 
     assert!(!session.socket.exists(), "kill must unlink the run files");
+    // `kill` returns once the daemon has stopped answering, so the process is either
+    // already gone or on its way; the wait is for the reaping rather than for the
+    // signal. Collected here as well as asserted, since the harness would otherwise
+    // `SIGKILL` a corpse and learn nothing.
+    assert!(
+        poll_until(Duration::from_secs(10), || session
+            .child
+            .try_wait()
+            .expect("wait for the daemon")
+            .is_some()),
+        "kill removed the session's five files and left the daemon running, so the \
+         user's shell is still there with nothing left on disk to reach it by"
+    );
 }
 
 /// Connecting is not attaching.
@@ -763,6 +786,144 @@ fn a_liveness_probe_does_not_evict_the_attached_client() {
     // fails this rather than being skipped over.
     client.input(0, b"echo NOMUX-STILL-ATTACHED\n");
     client.read_until("NOMUX-STILL-ATTACHED", ok.resume_from);
+}
+
+/// The refusals an *attached* client can earn, and the session surviving each.
+///
+/// `handle_frame`'s "frame is not valid from a client" arm and both of
+/// `read_client`'s `reject(Protocol, …)` sites had no caller in the suite at all:
+/// every test here speaks the protocol correctly once greeted, so a daemon that
+/// answered a server-only frame by acting on it, or a bad header by carrying on
+/// reading the socket as though the stream were still framed, would go unnoticed.
+/// The last of those is the one that matters — a frame boundary the daemon has lost
+/// track of is a stream in which every subsequent `Input` offset is somebody else's
+/// number.
+///
+/// Three shapes, and they are three because they reach the refusal by three
+/// different routes. A `HelloOk`, an `Output` and a `Gap` are well-formed frames the
+/// *daemon* sends, so they decode perfectly and fall through the match; the daemon
+/// must not mistake its own vocabulary for the client's. A discriminant no
+/// `FrameType` has never reaches the match, because the header will not decode. And
+/// a `Resize` whose payload is four bytes rather than eight has a header that
+/// decodes and a body that does not, which is the one case between them where the
+/// daemon knows how many bytes to skip and still must not.
+///
+/// Each row asserts all three of what a refusal is: the code, that the connection
+/// then closes without a second complaint — which is what `Client::expect_eof`
+/// separates from a frame that was quietly *honoured* — and that a fresh client can
+/// still drive the shell afterwards. A daemon that took the session down with the
+/// misbehaving connection would satisfy the first two.
+#[test]
+fn frames_a_client_may_not_send_are_refused_and_the_connection_closed() {
+    /// One case: what the client puts on the wire, and what the failure says it was.
+    struct Refused {
+        what: &'static str,
+        write: fn(&mut Client),
+    }
+
+    let cases = [
+        Refused {
+            what: "a HelloOk, which is the daemon's own answer coming back at it",
+            write: |client| {
+                client.send(&Frame::HelloOk(nomux_proto::HelloOk {
+                    protocol: PROTOCOL_VERSION,
+                    resume_from: 0,
+                    in_applied: 0,
+                    win: harness::WIN,
+                    gap: false,
+                    linger: nomux_proto::Linger::Unknown,
+                    agent: false,
+                }));
+            },
+        },
+        Refused {
+            what: "an Output, which only the session has any business producing",
+            write: |client| {
+                client.send(&Frame::Output {
+                    offset: 0,
+                    data: b"not from here",
+                });
+            },
+        },
+        Refused {
+            what: "a Gap, which is a claim about a ring the client does not own",
+            write: |client| {
+                client.send(&Frame::Gap {
+                    new_base_offset: 1 << 40,
+                });
+            },
+        },
+        Refused {
+            what: "a header carrying a discriminant no FrameType has",
+            // `0xff` is past every variant in the table, and the length is zero so
+            // that a daemon which skipped the frame rather than refusing it would
+            // find the stream still framed — the failure has to come from the
+            // header being unreadable, not from what followed it.
+            write: |client| client.send_raw(&[0xff, 0x00, 0x00, 0x00]),
+        },
+        Refused {
+            what: "a Resize whose payload is half a WinSize",
+            // A header that decodes and a body that does not: four bytes where the
+            // frame's four `u16`s need eight.
+            write: |client| client.send_raw(&[0x07, 0x00, 0x00, 0x04, 0, 80, 0, 24]),
+        },
+    ];
+
+    for (round, case) in cases.iter().enumerate() {
+        let session = Session::start(&format!("refuse_{round}"));
+        let mut client = session.connect();
+        let ok = client.hello(RESUME_FROM_START);
+        // Greeted *and* serving: the session is created by the first `Hello`, so a
+        // round trip through the child is what puts the connection in the state this
+        // is about rather than in the middle of its own handshake.
+        client.input(0, b"echo NOMUX-BEFORE-REFUSAL\n");
+        let (_, offset) = client.read_until("NOMUX-BEFORE-REFUSAL", ok.resume_from);
+
+        (case.write)(&mut client);
+        client.expect_error_among_output(ErrorCode::Protocol, case.what);
+        client.expect_eof(case.what);
+        drop(client);
+
+        // The whole point of refusing on the connection's own terms: the shell is
+        // still there, at the offsets it had, for whoever attaches next.
+        let mut fresh = session.connect();
+        let resumed = fresh.hello(offset);
+        assert!(
+            !resumed.gap,
+            "{}: the session lost output while refusing one connection",
+            case.what
+        );
+        fresh.input(resumed.in_applied, b"echo NOMUX-STILL-SERVING\n");
+        fresh.read_until("NOMUX-STILL-SERVING", resumed.resume_from);
+    }
+}
+
+/// A session whose shell cannot be started is refused with `Error{INTERNAL}`.
+///
+/// The one `ErrorCode` a running daemon never produced anywhere in the suite. It is
+/// the answer to the single failure that can happen *after* a client has been
+/// accepted and before it has a session — `Pty::spawn` failing — and a client that
+/// gets silence there waits out its own attach deadline instead of reporting a host
+/// whose `$SHELL` is wrong. `DESIGN.md` § 6.4 has the client treat `INTERNAL` and
+/// `PROTOCOL` differently, so answering with the wrong one is not cosmetic either.
+///
+/// A directory rather than a missing file, so the failure is `execve` refusing what
+/// it was handed rather than `$SHELL` naming nothing: `login_shell` falls back
+/// through the password database only when the variable is *absent*, and a path that
+/// resolves to something unexecutable is what a real misconfiguration looks like.
+#[test]
+fn a_session_whose_shell_cannot_be_started_is_refused_as_an_internal_failure() {
+    let session = Session::start_with_shell("shell_broken", "/tmp");
+    let mut client = session.connect();
+
+    // Written by hand rather than through `Client::hello`, which expects a `HelloOk`
+    // and would panic on the refusal that is the whole point.
+    client.send(&hello_frame(0, RESUME_FROM_START));
+    client.expect_error_among_output(
+        ErrorCode::Internal,
+        "a shell that cannot be started must be reported as the daemon's failure",
+    );
+    client.expect_eof("an Error{INTERNAL}");
 }
 
 /// A connection that speaks out of turn is refused on its own terms, without
@@ -2212,6 +2373,53 @@ fn agent_forwarding_proxies_a_connection_in_both_directions() {
     assert_eq!(client.next_chan(FrameType::AgentClose), chan);
 }
 
+/// An agent socket the daemon cannot bind costs the session its forwarding and
+/// nothing else, and `HelloOk` says so.
+///
+/// `start_session` calls this the daemon's "one remaining silent degradation": a
+/// client that asked for forwarding is answered `agent: false` with no reason
+/// given. Silent to the *user* is not the same as untested, and it was both — every
+/// agent test here asks for forwarding and gets it, so nothing exercised the arm
+/// that logs and carries on. A daemon that instead refused the `Hello`, or started
+/// the session and reported `agent: true` off the flag it was asked for rather than
+/// off the socket it has, would pass the whole agent suite.
+///
+/// A directory in the socket's place is the cheapest real version of the failure:
+/// `Agent::bind` unlinks first, which a directory survives, and then `bind` refuses
+/// it. What is asserted is the honest flag, a session that still starts and serves,
+/// and — the half a bare flag does not cover — that the child is not handed an
+/// `SSH_AUTH_SOCK` pointing at a socket nothing is listening on, which would hang
+/// `git push` rather than failing it.
+#[test]
+fn an_agent_socket_that_cannot_be_bound_leaves_an_honest_flag_and_a_live_session() {
+    // Started before the directory is planted, because the run directory is the
+    // daemon's to create — and the agent socket is not bound until the first
+    // `Hello`, which is what leaves room to plant anything at all.
+    let session = Session::start("agent_unbindable");
+    fs::create_dir_all(session.agent_socket())
+        .expect("plant a directory where the agent socket goes");
+
+    let mut client = session.connect();
+    let ok = client.hello_with(HELLO_AGENT_FORWARD, RESUME_FROM_START);
+    assert!(
+        !ok.agent,
+        "the daemon reported an agent socket it never bound"
+    );
+
+    client.input(0, b"echo \"sock=[$SSH_AUTH_SOCK]\"\n");
+    let (seen, _) = client.read_until("sock=[", ok.resume_from);
+    assert!(
+        !seen.contains(&session.agent_socket().display().to_string()),
+        "the child was pointed at an agent socket the daemon does not serve, so \
+         everything it signs with will hang rather than fail: {seen:?}"
+    );
+
+    assert!(
+        session.agent_socket().is_dir(),
+        "the daemon replaced something it does not own"
+    );
+}
+
 /// With no client attached there is nothing to answer a signature request, so a
 /// connection is accepted and closed at once: `git push` fails with the same error
 /// as a missing agent instead of hanging until the user reattaches.
@@ -2274,6 +2482,117 @@ fn agent_channels_are_capped() {
         "the connection past the cap must be closed, not queued"
     );
     drop(held);
+}
+
+/// The *per-channel* queue is capped too, and reaching it costs that channel and
+/// nothing else.
+///
+/// `MAX_AGENT_CHANNELS` has a test above; `MAX_CHANNEL_QUEUE` had none, and the one
+/// test that comes near it sizes itself "comfortably short of" the cap on purpose —
+/// so `Agent::deliver` returning `false`, and the `close_agent_channel` the daemon
+/// answers that with, were both unreachable from the suite. § 6.7 makes this the
+/// bound on what one stalled `ssh-add` can make the daemon hold: without it a client
+/// can push a quarter of the default ring per channel, eight times over, into a
+/// process that has stopped reading.
+///
+/// What has to be true is not just that the channel goes but that *only* it goes. A
+/// daemon answering the overflow by dropping the client, or by forgetting every
+/// channel the way `on_detached` does, would also stop the queue growing — and would
+/// take a second, innocent agent connection and the user's shell with it. So the
+/// sibling channel is opened first, left idle across the whole overflow, and then
+/// used; and the session is driven through the PTY afterwards.
+#[test]
+fn an_agent_channel_whose_queue_outgrows_the_cap_is_closed_alone() {
+    /// `agent::MAX_CHANNEL_QUEUE`, which is private to the daemon. Written down
+    /// rather than derived, and the assertions do not rest on the number being
+    /// exact: everything below sends *past* it by a wide margin, so a cap that moved
+    /// down still closes the channel and one that moved up fails here loudly rather
+    /// than passing quietly.
+    const CAP: usize = 256 * 1024;
+    /// One frame's worth. Comfortably under `MAX_PAYLOAD`, and large enough that the
+    /// burst below is a few dozen frames rather than thousands.
+    const CHUNK: usize = 32 * 1024;
+    /// How far past the cap the client pushes. The daemon flushes between passes, so
+    /// what it can shed is bounded by what the peer's socket will take — measured
+    /// below — and everything beyond that has to sit in the queue.
+    const OVERSHOOT: usize = 256 * 1024;
+
+    let (session, mut client, ok) = Session::attached_with("agent_queue", HELLO_AGENT_FORWARD);
+    let ready = client.make_ready("-echo", None, ok.resume_from);
+
+    // How much a unix socket on this host takes from a peer that has stopped
+    // reading, measured rather than assumed for the reason
+    // `a_closed_agent_channel_whose_peer_stopped_reading_leaves_the_daemon_asleep`
+    // gives: the limit is a sysctl away from any number written here.
+    let capacity = {
+        let (mut probe, _other_end) = UnixStream::pair().expect("a socketpair to measure");
+        probe.set_nonblocking(true).expect("stop blocking");
+        push_until_refused(&mut probe, &vec![0u8; 8 << 20], Duration::from_millis(100))
+    };
+
+    // The bystander, opened first so that it is unambiguously live before anything
+    // goes wrong on the other channel.
+    let mut bystander = session.connect_agent();
+    let quiet = client.next_chan(FrameType::AgentOpen);
+    let mut drowned_peer = session.connect_agent();
+    let drowned = client.next_chan(FrameType::AgentOpen);
+
+    // Neither peer ever reads, so past `capacity` every byte stays in the daemon's
+    // own queue for that channel. No fence between the frames, which is the whole
+    // difference from the spin test: it round-trips each one precisely to keep the
+    // queue under the cap, and this one is about crossing it.
+    let filler = vec![b'q'; CHUNK];
+    let mut sent = 0usize;
+    while sent < capacity + CAP + OVERSHOOT {
+        client.send(&Frame::AgentData {
+            chan: drowned,
+            data: &filler,
+        });
+        sent += filler.len();
+    }
+
+    assert_eq!(
+        client.next_chan(FrameType::AgentClose),
+        drowned,
+        "a channel whose queue passed {CAP} bytes must be closed, and it must be \
+         that channel: {sent} bytes were pushed at a peer that read none of them"
+    );
+    // And the process on the other end learns now rather than blocking on a socket
+    // nothing will ever write to again — § 6.7's argument for closing over holding,
+    // reached here by the queue rather than by the client going away. Whatever the
+    // daemon had already flushed comes out first; what it was still holding is
+    // exactly what it refused to go on holding.
+    let mut delivered = 0usize;
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        match read_uninterrupted(&mut drowned_peer, &mut chunk) {
+            Ok(0) => break,
+            Ok(read) => delivered += read,
+            Err(err) => panic!("reading from the channel the daemon closed: {err}"),
+        }
+    }
+    assert!(
+        delivered < sent,
+        "the daemon delivered all {sent} bytes, so nothing was ever queued and the \
+         close above was not the cap firing"
+    );
+
+    // The bystander is still a channel: bytes cross it in the direction the daemon
+    // has to be awake to serve.
+    bystander.write_all(b"\0\0\0\x01\x0b").expect("write");
+    let payload = client.next_of(FrameType::AgentData);
+    assert_eq!(
+        Frame::decode(FrameType::AgentData, &payload).expect("decode"),
+        Frame::AgentData {
+            chan: quiet,
+            data: b"\0\0\0\x01\x0b",
+        },
+        "the daemon took a second agent channel down with the one that overflowed"
+    );
+
+    // And the session itself, which is what a client would actually notice losing.
+    client.input(ready.in_offset, b"echo NOMUX-STILL-SERVING\n");
+    client.read_until("NOMUX-STILL-SERVING", ready.offset);
 }
 
 /// Ids come from a counter that never rewinds, so a channel closing and another
@@ -2572,35 +2891,96 @@ fn set_open_file_limit(pid: u32, soft: u64) {
     );
 }
 
+/// What the child prints when the terminal it is on changes size. See
+/// [`repaint_transcript`].
+///
+/// Built out of `$((6*7))` for the reason `Client::make_ready` gives: the line
+/// discipline echoes the command line that installs the trap before `stty -echo`
+/// takes effect, and that echo carries the arithmetic unexpanded — so the marker
+/// cannot be satisfied by the request for it. `dash` evaluates a trap's body when
+/// the signal arrives, which is what makes the substitution happen then rather than
+/// at definition.
+const WINCHED: &str = "NOMUX-42-WINCHED";
+
 /// Drives a session to an overflow gap and returns what the child saw afterwards.
 ///
 /// `cat` is the child because it hands back whatever reaches the PTY's input side,
-/// which is the only way to observe a repaint that is delivered as a keystroke.
-/// The ring is tiny so a few kilobytes echoed while detached is enough to overflow
-/// it.
+/// which is the only way to observe a repaint that is delivered as a keystroke. In
+/// front of it sits a `SIGWINCH` trap, which is the only way to observe the other
+/// policy at all: the default repaint writes nothing to the terminal, so a test
+/// that can only see the PTY's input side reads it as "nothing happened" — which is
+/// also what a daemon whose default branch does nothing produces. The ring is tiny
+/// so a few kilobytes echoed while detached is enough to overflow it.
+///
+/// Two things about the trap are `dash`'s doing rather than the daemon's, and both
+/// were measured against a bare PTY before being written down here. `set +m`,
+/// because with job control on the shell puts `cat` in a foreground process group
+/// of its own and `TIOCSWINSZ` signals *that* group — so the shell holding the trap
+/// never hears about it. And the trap sits in a background subshell parked on
+/// `wait` rather than in the shell itself, because `dash` defers a trap until the
+/// foreground job finishes: with `cat` in front of it the marker arrives when the
+/// session ends, which is far too late, and the first version of this printed
+/// nothing at all. `wait` is the one thing POSIX requires a trapped signal to
+/// interrupt, which is what makes the marker prompt.
+///
+/// The filler is drained *before* the client leaves, which is what makes the
+/// `SIGWINCH` half observable at all. The repaint fires the instant the daemon
+/// answers the reconnecting `Hello`, and the marker the child prints then has to
+/// survive a one-kilobyte ring: with tens of kilobytes of echo still in flight it
+/// does not, and the first version of this test failed with a transcript of nothing
+/// but filler. Reading to a marker of its own leaves the child idle and the ring
+/// holding only what comes after — and it also turns the reconnect below into
+/// arithmetic rather than a wait, since `base` is already tens of kilobytes above
+/// where this client resumes from.
 fn repaint_transcript(name: &str, flags: u16) -> String {
-    let session = Session::start_with_ring(name, 1024);
+    /// The child echoes far more than this, so what the client comes back to is a
+    /// gap by construction.
+    const RING: usize = 1024;
+    /// The last line of the filler, and how the client learns the child has caught
+    /// up: `cat` echoes it, so seeing it means everything before it is behind us.
+    const DRAINED: &str = "NOMUX-FILLER-DRAINED";
+
+    let session = Session::start_with_ring(name, RING);
     let mut client = session.connect();
     let ok = client.hello_with(flags, RESUME_FROM_START);
 
-    let ready = client.make_ready("-echo -onlcr", Some("cat"), ok.resume_from);
+    // The sleep is short so that a subshell which somehow outlived its session is
+    // asleep rather than looping, and gone within seconds either way. It does not
+    // normally have to be: everything here shares the shell's process group, so
+    // closing the PTY master hangs the lot up.
+    let ready = client.make_ready(
+        "-echo -onlcr",
+        Some(
+            "set +m; (trap 'printf NOMUX-$((6*7))-WINCHED' WINCH; \
+             while :; do sleep 5 & wait; done) & cat",
+        ),
+        ok.resume_from,
+    );
     let offset = ready.offset;
 
-    // Echoed back by `cat` with nobody reading, which is what overflows the ring.
-    // In lines, because the line discipline is still canonical: `cat` would see
-    // nothing at all until a newline arrived, and the overflow would never happen.
-    let filler = format!("{}\n", "x".repeat(63)).repeat(512);
+    // Echoed back by `cat`, which is what overflows the ring. In lines, because the
+    // line discipline is still canonical: `cat` would see nothing at all until a
+    // newline arrived, and the overflow would never happen.
+    let filler = format!("{}{DRAINED}\n", format!("{}\n", "x".repeat(63)).repeat(512));
     let filler = filler.as_bytes();
     let mut in_offset = ready.in_offset;
     client.input(in_offset, filler);
     in_offset += filler.len() as u64;
-    client.wait_for_input_ack(in_offset);
+    // Past gaps, since overflowing the ring is the point; what this waits for is the
+    // newest bytes on the stream, which are the ones a ring never discards.
+    client.read_past_gaps(DRAINED, offset);
     drop(client);
 
-    // The repaint is the daemon's answer to a gap, so the gap has to have happened
-    // before there is anything to look at. Waited for rather than slept through:
-    // whether the ring has overflowed yet is a question about the scheduler.
-    let (mut client, resumed) = reconnect_until_gap(&session, flags, offset);
+    // A gap by arithmetic rather than by timing: the ring holds a kilobyte and the
+    // child has just echoed thirty-two, so `base` is far above where this resumes.
+    let mut client = session.connect();
+    let resumed = client.hello_with(flags, offset);
+    assert!(
+        resumed.gap,
+        "the child echoed {} bytes through a {RING}-byte ring and the daemon \
+         reported no gap to a client resuming from {offset}",
+        filler.len()
+    );
 
     // § 4.3: "`ctrl_l` goes through the same queue as client input ... It is not
     // client input, so `in_applied` does not move for it." Asserted for both
@@ -2624,9 +3004,17 @@ fn repaint_transcript(name: &str, flags: u16) -> String {
     transcript
 }
 
-/// The post-gap repaint is the client's choice, and `ctrl_l` reaches the child as
-/// an actual keystroke — the one thing a bare shell prompt responds to, since it
-/// ignores `SIGWINCH` entirely.
+/// The post-gap repaint is the client's choice, and each policy does its own thing
+/// and only its own thing (`IMPLEMENTATION.md` § 4.3).
+///
+/// Both halves are asserted positively as well as negatively, which the default one
+/// was not. `assert!(!default.contains('\u{c}'))` is satisfied by a daemon whose
+/// `winch` branch does nothing at all — and doing nothing is the shape a regression
+/// here would actually take, since the `TIOCSWINSZ` dance is the fiddly half and
+/// the one that can be lost to a refactor without any client noticing. A gap with
+/// no repaint behind it leaves a full-screen program showing the tail of a stream
+/// with a hole in it and no reason to redraw, which is the whole of what § 4.3
+/// exists to prevent.
 #[test]
 fn a_gap_repaints_with_ctrl_l_only_when_the_client_asks() {
     let asked = repaint_transcript("repaint_ctrl_l", HELLO_REPAINT_CTRL_L);
@@ -2634,8 +3022,18 @@ fn a_gap_repaints_with_ctrl_l_only_when_the_client_asks() {
         asked.contains('\u{c}'),
         "no Ctrl-L reached the child: {asked:?}"
     );
+    assert!(
+        !asked.contains(WINCHED),
+        "a client that asked for Ctrl-L was also sent through the winsize dance, so \
+         an editor gets both a redraw it did not want and a keystroke: {asked:?}"
+    );
 
     let default = repaint_transcript("repaint_winch", 0);
+    assert!(
+        default.contains(WINCHED),
+        "the gap was reported and the child was never told the terminal had \
+         changed, so nothing asked it to redraw: {default:?}"
+    );
     assert!(
         !default.contains('\u{c}'),
         "the default policy must not write to the PTY: {default:?}"

@@ -210,14 +210,29 @@ impl Session {
     /// the daemon cannot parse (`IMPLEMENTATION.md` § 4), which is the thing
     /// [`Session::start_with_ring`] cannot say.
     pub(crate) fn start_with_raw_ring(name: &str, value: &str) -> Self {
+        Self::start_with(name, value, "/bin/sh")
+    }
+
+    /// Starts a daemon whose `SHELL` is `shell`, however unusable that path is.
+    ///
+    /// For the one test that is about a session that cannot be created: everything
+    /// else here wants the `/bin/sh` [`nomux_with_shell`] pins, and gets it.
+    pub(crate) fn start_with_shell(name: &str, shell: &str) -> Self {
+        Self::start_with(name, &DEFAULT_TEST_RING.to_string(), shell)
+    }
+
+    /// The body all three go through, so what every daemon in this suite is told —
+    /// an empty prompt, a home it can be asserted to have started in — is said once.
+    fn start_with(name: &str, ring_bytes: &str, shell: &str) -> Self {
         let root = run_root(name);
         let id = intern(name);
         let child = launch(
             nomux_with_shell(&root, &["daemon", &id])
+                .env("SHELL", shell)
                 .env("PS1", "")
                 // The child's working directory, so `pwd` is assertable.
                 .env("HOME", &root)
-                .env("NOMUX_RING_BYTES", value)
+                .env("NOMUX_RING_BYTES", ring_bytes)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null()),
@@ -588,6 +603,17 @@ impl Client {
         write_frame(&mut self.stream, frame);
     }
 
+    /// Writes bytes at the socket without going through the codec.
+    ///
+    /// For the frames the encoder cannot be made to produce: a header carrying a
+    /// discriminant no [`FrameType`] has, and a payload too short for the type it
+    /// declares. Both are what a peer from another release — or a confused one —
+    /// would put on the wire, and the daemon has an answer for each that nothing
+    /// else here asks it for.
+    pub(crate) fn send_raw(&mut self, bytes: &[u8]) {
+        self.stream.write_all(bytes).expect("write raw bytes");
+    }
+
     /// Sends keystrokes at `offset`.
     ///
     /// The most-sent frame in the suite by a wide margin, and the only one whose
@@ -705,11 +731,19 @@ impl Client {
     /// ignoring the session's own chatter. Anything else is a bug in the daemon's
     /// frame ordering.
     pub(crate) fn next_of(&mut self, want: FrameType) -> Vec<u8> {
-        let awaiting = format!("a {want:?} frame");
+        self.next_of_awaiting(want, &format!("a {want:?} frame"))
+    }
+
+    /// [`Client::next_of`] where the caller can say what the wait was *for*.
+    ///
+    /// A table-driven test runs the same wait once per row, so "timed out waiting
+    /// for a Error frame" names neither the row nor the behaviour — and every row
+    /// fails identically. The sentence belongs to whoever built the table.
+    fn next_of_awaiting(&mut self, want: FrameType, awaiting: &str) -> Vec<u8> {
         let deadline = Instant::now() + PATIENCE;
         loop {
             let (ty, payload) = self
-                .frame_before(deadline, &awaiting)
+                .frame_before(deadline, awaiting)
                 .unwrap_or_else(|| panic!("timed out waiting for {awaiting}"));
             if ty == want {
                 return payload;
@@ -739,7 +773,7 @@ impl Client {
     /// [`Client::expect_error`] for a connection the session is also writing output
     /// to, where the refusal is not the only thing that can be in flight.
     pub(crate) fn expect_error_among_output(&mut self, code: ErrorCode, what: &str) {
-        let payload = self.next_of(FrameType::Error);
+        let payload = self.next_of_awaiting(FrameType::Error, &format!("a refusal ({what})"));
         assert_refusal(FrameType::Error, &payload, code, what);
     }
 
