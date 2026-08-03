@@ -24,6 +24,17 @@ use harness::{Rng, Session};
 /// separate reads, so disconnects land mid-stream rather than between commands.
 const EMIT_ROUNDS: u32 = 20_000;
 
+/// How long a chaos test waits for its workload before calling it stalled.
+///
+/// Under the termination in `.config/nextest.toml`, which is what makes it mean
+/// anything: the runner kills at forty seconds, so a minute — which is what this
+/// was — is a deadline that can never fire. A stalled run was killed from outside
+/// with nothing said, and § 9's promise that every chaos failure carries the seed
+/// that produced it held only for the failures that were not stalls. Both tests
+/// finish in under two seconds, so this is more than an order of magnitude of
+/// headroom either way.
+const PATIENCE: Duration = Duration::from_secs(30);
+
 /// Seed used when `NOMUX_CHAOS_SEED` is unset.
 const DEFAULT_SEED: u64 = 0x6e6f_6d75_785f_3031;
 
@@ -103,7 +114,7 @@ fn an_escape_heavy_stream_is_byte_exact_across_random_disconnects() {
     let mut seen: Vec<u8> = Vec::new();
     let mut disconnects = 0u32;
     let mut since_disconnect = 0usize;
-    let deadline = Instant::now() + Duration::from_mins(1);
+    let deadline = Instant::now() + PATIENCE;
 
     while find(&seen, b"CHAOS-END").is_none() {
         assert!(
@@ -216,7 +227,7 @@ fn overflow_during_disconnects_is_always_reported() {
     let mut rng = Rng::new(chaos_seed);
     let mut gaps = 0u32;
     let mut received = 0u64;
-    let deadline = Instant::now() + Duration::from_mins(1);
+    let deadline = Instant::now() + PATIENCE;
 
     for round in 0..24 {
         assert!(

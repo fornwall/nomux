@@ -646,11 +646,17 @@ mod tests {
 
     /// The daemon must never appear in the set it is about to signal, whatever
     /// `/proc` says.
+    ///
+    /// `getsid` is asked about *this* process, which is the one call it cannot fail
+    /// for — `ESRCH` needs a pid that is not there and `EPERM` needs another
+    /// session. It used to be answered with an early `return`, which reports as a
+    /// pass: the test would have gone green on every host where the walk was never
+    /// run, which is the thing `wait_until_flock` in `tests/spawn_lock.rs`
+    /// explicitly refuses to be.
     #[test]
     fn the_walk_never_returns_this_process() {
-        let Ok(sid) = rustix::process::getsid(None) else {
-            return;
-        };
+        let sid = rustix::process::getsid(None)
+            .expect("this process's own session id, which the kernel cannot refuse");
         let sid = rustix::process::Pid::as_raw(Some(sid));
         let members = session_members(sid);
         let self_pid = i32::try_from(std::process::id()).unwrap_or(0);
@@ -866,20 +872,64 @@ mod tests {
 
     /// A shell on a PTY of its own, which is what the four tests around this
     /// terminate.
-    fn shell(session_id: &str) -> Pty {
-        Pty::spawn(&Spawn {
-            term: "dumb",
-            win: WinSize {
-                cols: 80,
-                rows: 24,
-                xpixel: 0,
-                ypixel: 0,
-            },
-            session_id,
-            cwd: Path::new("/tmp"),
-            agent_sock: None,
-        })
-        .expect("spawn a shell on a pty")
+    fn shell(session_id: &str) -> Owned {
+        Owned(Some(
+            Pty::spawn(&Spawn {
+                term: "dumb",
+                win: WinSize {
+                    cols: 80,
+                    rows: 24,
+                    xpixel: 0,
+                    ypixel: 0,
+                },
+                session_id,
+                cwd: Path::new("/tmp"),
+                agent_sock: None,
+            })
+            .expect("spawn a shell on a pty"),
+        ))
+    }
+
+    /// A [`Pty`] whose shell is collected however the test holding it ends.
+    ///
+    /// `Pty` has no `Drop` of its own, and should not have one: the daemon tears its
+    /// session down through `terminate`, in an order `shutdown` decides, and a
+    /// destructor doing any of that behind its back is the wrong shape entirely. But
+    /// the tests below reach `terminate` only on the path the author had in mind, and
+    /// an `expect` firing before it — a shell that never reported its job pid, a
+    /// filter the host refused — leaves a `dash` behind unwaited for the rest of the
+    /// run and past it.
+    ///
+    /// The kill is the whole of what this does. Closing the master, which dropping
+    /// the inner `Pty` does anyway, already hangs up the foreground process group;
+    /// what it does not do is *wait* for the child, so the leak this closes is the
+    /// zombie. It deliberately does not walk the session: signalling by a raw pid
+    /// after the child has been reaped is the hazard `Pty::pid_reissued` exists for,
+    /// and a `sleep 30` that outlives a failing test is gone within the half-minute
+    /// it was given.
+    struct Owned(Option<Pty>);
+
+    impl std::ops::Deref for Owned {
+        type Target = Pty;
+
+        fn deref(&self) -> &Pty {
+            self.0.as_ref().expect("the pty is still held")
+        }
+    }
+
+    impl std::ops::DerefMut for Owned {
+        fn deref_mut(&mut self) -> &mut Pty {
+            self.0.as_mut().expect("the pty is still held")
+        }
+    }
+
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            if let Some(pty) = self.0.as_mut() {
+                drop(pty.child.kill());
+                drop(pty.child.wait());
+            }
+        }
     }
 
     /// Collects the child once it goes, the way the daemon does at an ordinary

@@ -30,10 +30,10 @@ use nomux_proto::{
 };
 
 use harness::{
-    Reaper, Rng, Session, Spawned, accept_within, collect, control, has_unread_bytes, hello_frame,
-    join_within, nomux, nomux_with_shell, poll_until, push_until_refused, read_uninterrupted,
-    reconnect_until_gap, run_root, shrink_send_buffer, stderr, stdout, succeeded, wait_for,
-    while_nothing_forks, write_frame,
+    Client, Reaper, Rng, Session, Spawned, accept_within, collect, control, has_unread_bytes,
+    hello_frame, join_before, nomux, nomux_with_shell, poll_by, poll_until, push_until_refused,
+    read_uninterrupted, reconnect_until_gap, run_root, shrink_send_buffer, stderr, stdout,
+    succeeded, wait_for, while_nothing_forks, write_frame,
 };
 
 #[test]
@@ -127,15 +127,47 @@ fn an_out_offset_past_the_end_of_the_stream_is_clamped_rather_than_believed() {
 
 /// The invariant that matters most: a client replaying input it already sent —
 /// because the `InputAck` was lost with the connection — must not run it twice.
+///
+/// Everything here happens with the line discipline's echo turned off, and that is
+/// not tidiness. With echo on, the first frame carrying `NOMUX-ONCE-MARKER` is the
+/// terminal repeating the *command* — measured against a hand-written client, which
+/// saw `OUTPUT off=0 "echo NOMUX-ONCE-MARKER\r\n"` before `OUTPUT off=24
+/// "NOMUX-ONCE-MARKER\r\n"` — so the resume point below was 24, ahead of a
+/// legitimate single occurrence rather than behind it, and the transcript compared
+/// at the end began before the marker the shell was about to print. What kept the
+/// test green on correct code was `dash` not having got round to running the
+/// command yet: warmed up, or with 300 ms between the read and the disconnect, it
+/// failed on a daemon that was doing exactly the right thing.
+///
+/// With `-echo` the marker can only be the shell's own output, so the resume point
+/// is past the one occurrence there may be, and the fence really is a fence: its
+/// text also only ever arrives from the shell, so reading it back proves everything
+/// queued in front of it — the replay included — has already been through the PTY.
+///
+/// Three resends, because `on_input` has two defences and the obvious replay
+/// exercises neither. Sending the applied bytes again *exactly* — which is the § 3
+/// scenario and was the whole of this test — lands on `end == in_applied`, where
+/// the `end > in_applied` guard is false and the trim inside it never runs. The
+/// other two put a frame on each side of that line: one ending below it, which only
+/// the guard stops from rewinding the session's position, and one straddling it,
+/// which only the trim stops from running its overlap a second time. Each of the
+/// two, removed on its own, now fails this test; before, neither did.
 #[test]
 fn replayed_input_is_applied_exactly_once() {
+    /// How much of the command the short resend below carries. Any amount that
+    /// leaves the frame ending below `in_applied` asks the same question; this one
+    /// is a whole word of it, so a transcript that does show it is readable.
+    const PREFIX: usize = 8;
+
     let (session, mut client, ok) = Session::attached("dedup");
+    let ready = client.make_ready("-echo -onlcr", None, ok.resume_from);
 
     // `printf` with a counter would need shell state; instead emit a unique marker
     // and assert it appears exactly once in the transcript.
     let command = b"echo NOMUX-ONCE-MARKER\n";
-    client.input(0, command);
-    let (_, offset) = client.read_until("NOMUX-ONCE-MARKER", ok.resume_from);
+    client.input(ready.in_offset, command);
+    let (_, offset) = client.read_until("NOMUX-ONCE-MARKER", ready.offset);
+    let applied = ready.in_offset + command.len() as u64;
 
     drop(client);
     let mut client = session.connect();
@@ -143,15 +175,51 @@ fn replayed_input_is_applied_exactly_once() {
     // Resume claiming we never got the ack, then replay the identical bytes.
     let ok = client.hello(offset);
     assert_eq!(
-        ok.in_applied,
-        command.len() as u64,
+        ok.in_applied, applied,
         "daemon must report input already applied"
     );
-    client.input(0, command);
+    client.input(ready.in_offset, command);
 
-    // Force a round trip so any duplicate would have been echoed by now.
-    client.input(ok.in_applied, b"echo NOMUX-FENCE\n");
-    let (seen, _) = client.read_until("NOMUX-FENCE", ok.resume_from);
+    // The same resend cut short, which is the one shape that can move `in_applied`
+    // *backwards*. `on_input` has two defences and they answer different frames:
+    // the `end > in_applied` guard is the only thing that stops a frame ending
+    // below the session's position from rewinding it, and the trim is the only
+    // thing that stops one ending above it re-running its overlap. Replaying the
+    // command exactly reaches neither — `end == in_applied` falls through both —
+    // so a test built on that alone passes with either defence removed, which is
+    // what this one used to do. Measured: each of the two, taken out on its own,
+    // left the whole workspace green.
+    client.input(
+        ready.in_offset,
+        command.get(..PREFIX).expect("part of a line"),
+    );
+    // Frames are handled in the order they arrive, so a `Pong` for a ping behind
+    // them is the daemon having decoded both — and decoded is what matters, since a
+    // socket closed with output queued loses whatever `fill` had buffered.
+    client.send(&Frame::Ping { nonce: 0xD00D });
+    drop(client.next_of(FrameType::Pong));
+    drop(client);
+
+    let mut client = session.connect();
+    let resumed = client.hello(offset);
+    assert_eq!(
+        resumed.in_applied,
+        applied,
+        "a resend that stopped {} bytes short of where the daemon had got to moved \
+         the session's input position backwards, so every offset the client sends \
+         from here is one the daemon will refuse as an input gap",
+        command.len() - PREFIX
+    );
+
+    // And a resend that overlaps what was applied *and* carries something new,
+    // which is what a client actually sends: `offset < in_applied < end`, the frame
+    // the trim exists for. The overlap is the whole command, so a daemon that
+    // stopped trimming runs the marker a second time rather than something
+    // unrecognisable.
+    let mut overlapping = command.to_vec();
+    overlapping.extend_from_slice(b"echo NOMUX-FENCE\n");
+    client.input(ready.in_offset, &overlapping);
+    let (seen, _) = client.read_until("NOMUX-FENCE", resumed.resume_from);
 
     let echoes = seen.matches("NOMUX-ONCE-MARKER").count();
     assert_eq!(
@@ -211,6 +279,298 @@ fn overflow_is_reported_as_a_gap_rather_than_silently_truncated() {
     );
 }
 
+/// Markers bracketing the stream [`predictable_blob`] produces.
+///
+/// Lower case, which that alphabet cannot contain, so neither marker can occur
+/// inside the data it delimits — and the read that stops at the opening one
+/// therefore stops at the byte before the stream rather than somewhere inside it.
+const BLOB_BEGIN: &str = "nomux-blob-begin";
+const BLOB_END: &str = "nomux-blob-end";
+
+/// A byte stream a test can predict exactly and a ring cannot hold cheaply.
+///
+/// Two properties, both load-bearing, and neither available from the `/dev/zero`
+/// the mid-stream gap test below used to run on. *Predictable*, so that a byte the
+/// daemon labels with an offset can be checked against the byte that offset names —
+/// which is the whole of what a `Gap` claims and the one thing no gap test in this
+/// suite asserted. *Aperiodic and near-incompressible*, so that "more than the ring
+/// holds" is a property of the data rather than an assumption about the ring: eight
+/// megabytes of `/dev/zero` fit in any ring that compresses, and a test resting on
+/// that would then find nothing dropped, no gap owed, and nothing to report.
+///
+/// Every byte carries six bits of the generator's stream, drawn from `0x21..=0x60`,
+/// which is what lets it cross a terminal in canonical mode untouched: no newline,
+/// no carriage return, no tab, nothing the line discipline has an opinion about. A
+/// compressor could take it to three quarters of its size, against a ring that
+/// holds a sixtieth of it.
+fn predictable_blob(len: usize) -> Vec<u8> {
+    // Any fixed seed; the generator is reproducible from it, which is the whole
+    // requirement — nothing here explores a space, it just needs the same stream
+    // every run so a failure can be looked at twice.
+    let mut blob = Rng::new(0x9e37_79b9_7f4a_7c15).bytes(len);
+    for byte in &mut blob {
+        *byte = 0x21 + *byte % 0x40;
+    }
+    blob
+}
+
+/// A session whose child is writing a stream the test knows byte for byte.
+struct Planted {
+    /// Absolute output offset of the first byte of that stream.
+    stream_start: u64,
+    /// The whole of what the child writes from there: the blob and the closing
+    /// marker, so an offset into the stream is an index into this.
+    expected: Vec<u8>,
+    /// Touched by the child once every byte above has been written, which is how a
+    /// client that is deliberately not reading learns the child has finished.
+    sentinel: PathBuf,
+    /// One past the last input byte sent here.
+    in_offset: u64,
+}
+
+/// Puts a blob where the session's child can read it, sets it writing, and leaves
+/// the client's stream positioned at exactly the first byte of it.
+///
+/// The opening marker goes on a line of its own and is read to completion before
+/// the line that produces the blob is sent. That ordering is what makes the
+/// arithmetic exact rather than nearly so: the shell writes nothing more until it
+/// has read the next line, so the offset that read returns is one past the marker
+/// and not one past whatever else happened to be in the frame carrying it.
+fn plant_blob(
+    session: &Session,
+    client: &mut Client,
+    from: u64,
+    in_offset: u64,
+    len: usize,
+) -> Planted {
+    let mut expected = predictable_blob(len);
+    fs::write(session.root.join("blob"), &expected).expect("plant the blob the child reads");
+
+    let begin = format!("printf '{BLOB_BEGIN}'\n");
+    client.input(in_offset, begin.as_bytes());
+    let (_, stream_start) = client.read_until(BLOB_BEGIN, from);
+
+    let run = format!("cat blob; printf '{BLOB_END}'; touch produced\n");
+    client.input(in_offset + begin.len() as u64, run.as_bytes());
+
+    expected.extend_from_slice(BLOB_END.as_bytes());
+    Planted {
+        stream_start,
+        expected,
+        sentinel: session.root.join("produced"),
+        in_offset: in_offset + (begin.len() + run.len()) as u64,
+    }
+}
+
+/// Reads the session's output to the end of `planted.expected`, checking every byte
+/// against the byte its offset names, and returns the gaps followed on the way.
+///
+/// This is the assertion the gap tests exist for and the one none of them made.
+/// Every one of them adopts `new_base_offset` or `resume_from` as ground truth and
+/// then checks contiguity *relative to it* — which cannot fail, whatever the daemon
+/// says. A base reported N too low replays N bytes the client already has; one
+/// reported N too high drops N it never will; both produce a perfectly contiguous
+/// stream and both corrupt the user's scrollback, which is the single failure
+/// `IMPLEMENTATION.md` § 9's second invariant exists to prevent. Indexing a model of
+/// the child's own output by absolute offset is what makes that claim falsifiable.
+///
+/// One deadline for the whole read rather than one per frame. A loop over
+/// `next_frame` renews its patience on every frame that arrives, so a daemon
+/// handing over a byte every fourteen seconds is never late by that measure and the
+/// read has no bound at all — it would run until nextest's kill, which is exactly
+/// the failure `join_within` and `.config/nextest.toml` are written to avoid.
+#[expect(
+    clippy::panic,
+    reason = "clippy.toml's allow-panic-in-tests reaches `#[test]` bodies, not the \
+              helpers an integration test crate keeps beside them"
+)]
+fn read_against(client: &mut Client, planted: &Planted, from: u64) -> Vec<(u64, u64)> {
+    /// Two orders of magnitude above the tenth of a second the largest of these
+    /// reads takes, and well under the kill in `.config/nextest.toml`.
+    const PATIENCE: Duration = Duration::from_secs(15);
+
+    let expected = &planted.expected;
+    let end = planted.stream_start + expected.len() as u64;
+    let mut offset = from;
+    let mut gaps = Vec::new();
+    let awaiting = format!("the {} bytes the child wrote", expected.len());
+    let deadline = Instant::now() + PATIENCE;
+    while offset < end {
+        let (ty, payload) = client.frame_before(deadline, &awaiting).unwrap_or_else(|| {
+            panic!(
+                "the session stopped {} bytes short of everything the child wrote, \
+                 with the stream standing at {offset}",
+                end - offset
+            )
+        });
+        match Frame::decode(ty, &payload).expect("decode frame") {
+            Frame::Output { offset: at, data } => {
+                assert_eq!(
+                    at,
+                    offset,
+                    "output must join up unless a Gap said otherwise, and this frame \
+                     opens {} bytes from where the stream stood",
+                    at.abs_diff(offset)
+                );
+                let index = usize::try_from(at.saturating_sub(planted.stream_start))
+                    .expect("an offset within a stream this test wrote");
+                let want = expected.get(index..index + data.len()).unwrap_or_else(|| {
+                    panic!(
+                        "the daemon sent {} bytes at offset {at}, running {} past the \
+                         end of everything the child ever wrote",
+                        data.len(),
+                        index + data.len() - expected.len()
+                    )
+                });
+                assert_same_stream(want, data, at);
+                offset += data.len() as u64;
+            }
+            Frame::Gap { new_base_offset } => {
+                assert!(
+                    new_base_offset > offset,
+                    "a Gap must name a base past what the client was sent: \
+                     {new_base_offset} against {offset}"
+                );
+                gaps.push((offset, new_base_offset));
+                offset = new_base_offset;
+            }
+            Frame::InputAck { .. } | Frame::Pong { .. } => {}
+            other => panic!("unexpected {other:?} while reading the session's output"),
+        }
+    }
+    gaps
+}
+
+/// Fails saying which offset the stream stopped meaning what the child wrote there.
+///
+/// Quoted from both sides, because the number alone does not say which way the
+/// error went — a stream that resumed too early repeats bytes the client has, and
+/// one that resumed too late is missing bytes it never will.
+#[expect(
+    clippy::panic,
+    reason = "clippy.toml's allow-panic-in-tests reaches `#[test]` bodies, not the \
+              helpers an integration test crate keeps beside them"
+)]
+fn assert_same_stream(want: &[u8], got: &[u8], at: u64) {
+    if want == got {
+        return;
+    }
+    let diff = want
+        .iter()
+        .zip(got)
+        .position(|(a, b)| a != b)
+        .unwrap_or_else(|| want.len().min(got.len()));
+    let window = |bytes: &[u8]| {
+        String::from_utf8_lossy(bytes.get(diff..(diff + 48).min(bytes.len())).unwrap_or(&[]))
+            .into_owned()
+    };
+    panic!(
+        "the daemon labelled a byte with an offset that is not where the child wrote \
+         it: at offset {}, the session sent {:?} where the child wrote {:?}. The \
+         stream is contiguous and wrong, which is what an off-by-N ring base looks \
+         like from a client",
+        at + diff as u64,
+        window(got),
+        window(want),
+    );
+}
+
+/// A gap reported at the handshake must name the byte the stream really resumes at.
+///
+/// The handshake half of the wiring `Ring::base` → `HelloOk.resume_from`, which
+/// `src/ring.rs` pins only as arithmetic in isolation. Here the client comes back
+/// below the ring's base, is told where it may resume, and every byte from that
+/// point on is checked against what the child actually wrote there. A daemon whose
+/// base was off in either direction hands back a stream that joins up perfectly and
+/// says the wrong thing, and until this test nothing in the suite could tell the
+/// two apart.
+///
+/// The byte comparison is only half of it, and on its own it catches only half the
+/// fault. A base reported *too low* serves bytes the ring no longer starts at and
+/// the model comparison fires. A base reported too *high* — `resume_from + 16`, say
+/// — is a daemon silently throwing away sixteen bytes of scrollback it is still
+/// holding, and every byte it then sends is at the offset it claims, so nothing
+/// about the stream is wrong: it is simply short. Measured, on the first version of
+/// this test: that injection left the whole workspace green.
+///
+/// So `resume_from` is pinned to the value it must have rather than to a range. The
+/// child has finished before this client attaches, the ring is exactly full, and a
+/// `VecDeque` of `RING` bytes retains exactly `RING` — so the oldest byte the daemon
+/// can serve is `stream_end - RING` and there is nothing approximate to allow for.
+/// One equality catches both directions, and it is the only assertion here that
+/// catches the second.
+#[test]
+fn a_gap_at_the_handshake_names_the_byte_the_stream_actually_resumes_at() {
+    /// Small enough that half a megabyte overruns it many times over, and larger
+    /// than the terminal setup that precedes the blob — so the only thing evicted
+    /// is data this test can predict.
+    const RING: usize = 16 * 1024;
+    /// Comfortably past [`RING`], and small enough to be produced and compared in
+    /// milliseconds. Nothing here needs the megabytes the mid-stream case does: the
+    /// client is *away*, so there is no send queue to outrun, only the ring.
+    const PRODUCED: usize = 512 * 1024;
+
+    let session = Session::start_with_ring("gap_exact_hello", RING);
+    let mut client = session.connect();
+    let ok = client.hello(RESUME_FROM_START);
+    // Echo off, so the stream from the marker on is the child's own bytes and the
+    // model below is the whole of it.
+    let ready = client.make_ready("-echo -onlcr", None, ok.resume_from);
+    let planted = plant_blob(
+        &session,
+        &mut client,
+        ready.offset,
+        ready.in_offset,
+        PRODUCED,
+    );
+
+    // The command that makes the gap has to be the daemon's before the connection
+    // goes: an `Input` written but not yet decoded is lost when the socket closes
+    // with output queued (see `Client::drain_available`).
+    client.wait_for_input_ack(planted.in_offset);
+    drop(client);
+
+    assert!(
+        poll_until(Duration::from_secs(10), || planted.sentinel.exists()),
+        "the child never finished writing its {PRODUCED} bytes"
+    );
+
+    // Connected and greeted once rather than through `reconnect_until_gap`, which
+    // exists for the case where whether the ring has overflowed *yet* is a question
+    // about the scheduler. It is not one here: the sentinel says the child has
+    // written every byte, so the overflow is behind us and the gap is owed on the
+    // first `Hello`. Retrying would only make a failure take twenty seconds to
+    // arrive.
+    let mut client = session.connect();
+    let resumed = client.hello(planted.stream_start);
+    assert!(
+        resumed.gap,
+        "the child wrote {PRODUCED} bytes through a {RING}-byte ring while this \
+         client was away, and the daemon reported no gap"
+    );
+
+    let stream_end = planted.stream_start + planted.expected.len() as u64;
+    let oldest_held = stream_end - RING as u64;
+    assert_eq!(
+        resumed.resume_from,
+        oldest_held,
+        "the daemon offered to resume at {}, where the oldest byte a full \
+         {RING}-byte ring can still serve is {oldest_held}. Below it and the daemon \
+         is serving bytes from somewhere other than where it says; above it and it \
+         has thrown away {} bytes of the user's scrollback that it was still \
+         holding",
+        resumed.resume_from,
+        oldest_held.abs_diff(resumed.resume_from)
+    );
+
+    let gaps = read_against(&mut client, &planted, resumed.resume_from);
+    assert!(
+        gaps.is_empty(),
+        "the child had finished before this client attached, so nothing could \
+         overflow while it read: {gaps:?}"
+    );
+}
+
 /// The mid-stream half of the same invariant: a client that never left is still
 /// told when the ring overran it.
 ///
@@ -231,6 +591,25 @@ fn overflow_is_reported_as_a_gap_rather_than_silently_truncated() {
 /// what collects it. Nothing here waits on the scheduler having got round to
 /// something — the sentinel file is how a client that is not reading learns the child
 /// has finished, since the stream it is ignoring cannot tell it.
+///
+/// The child writes [`predictable_blob`] rather than the `/dev/zero` it used to,
+/// and that buys two things. The premise "eight megabytes will not fit in a 128 KiB
+/// ring" stops being an unstated assumption about the ring — eight megabytes of
+/// zeroes fit in any ring that compresses, and the test would then pass with no gap
+/// owed and nothing dropped, having proved nothing. And the `Gap` stops being taken
+/// on trust: `read_against` checks every arriving byte against the byte its offset
+/// names, so the base the daemon reports has to be the right one rather than merely
+/// a plausible one.
+///
+/// And, as at the handshake, the byte comparison alone catches only a base that is
+/// too *low*. One that is too high sends every byte at the offset it claims and
+/// simply omits the ones in front of it, which is scrollback the ring was still
+/// holding thrown away without a word. So the gap is pinned to a number rather than
+/// to a property: there can be exactly one, at exactly `stream_end - RING`. Both
+/// halves of that follow from the setup rather than from timing — the ring's base
+/// can only pass `sent_through` once the send queue has saturated, and it stays
+/// saturated until this client reads, by which time the sentinel says the child has
+/// finished and the ring is static.
 #[test]
 fn an_overflow_that_outruns_an_attached_client_is_reported_as_a_gap_mid_stream() {
     /// Larger than the 64 KiB the daemon takes off the PTY in one pass, so a client
@@ -238,19 +617,11 @@ fn an_overflow_that_outruns_an_attached_client_is_reported_as_a_gap_mid_stream()
     /// setup below silent and leaves exactly one way to reach a gap here: the client
     /// falling behind on purpose.
     const RING: usize = 128 * 1024;
-    /// What the child writes, in blocks of [`BLOCK`]. Eight megabytes is comfortably
-    /// past everything between it and the client put together — the daemon's
-    /// megabyte of queued output, the 256 KiB frame it may overshoot that by, the
-    /// kernel's socket buffers, and [`RING`].
+    /// What the child writes. Eight megabytes is comfortably past everything between
+    /// it and the client put together — the daemon's megabyte of queued output, the
+    /// 256 KiB frame it may overshoot that by, the kernel's socket buffers, and
+    /// [`RING`].
     const PRODUCED: usize = 8 << 20;
-    const BLOCK: usize = 64 * 1024;
-    /// What the child is asked to say once the filler is behind it, and what that
-    /// becomes once it has. The arithmetic is the point, exactly as it is in
-    /// `Client::make_ready`: the line discipline echoes the command line before any
-    /// of it runs, and that echo carries `$((6*7))` unexpanded — so the marker the
-    /// read below stops at cannot be satisfied by the request for it.
-    const DONE_ECHO: &str = "echo NOMUX-$((6*7))-MIDSTREAM-DONE";
-    const DONE: &str = "NOMUX-42-MIDSTREAM-DONE";
 
     let session = Session::start_with_ring("midstream_gap", RING);
     let mut client = session.connect();
@@ -261,79 +632,53 @@ fn an_overflow_that_outruns_an_attached_client_is_reported_as_a_gap_mid_stream()
          handshake, so every gap below is one this connection was sent"
     );
 
-    // `raw` for the output side: with `opost` off the child's bytes reach the ring
-    // unmangled and at memcpy speed, which is what makes eight megabytes cheap. The
-    // sentinel is touched last, so its arrival means every byte above is already in
-    // the ring — or already evicted from it.
-    let produced = session.root.join("produced");
-    client.input(
-        0,
-        format!(
-            "stty raw -echo; dd if=/dev/zero bs={BLOCK} count={} 2>/dev/null; \
-             {DONE_ECHO}; touch produced\n",
-            PRODUCED / BLOCK
-        )
-        .as_bytes(),
+    // Echo off, so everything from the opening marker on is the child's own bytes
+    // and the model is the whole of the stream. The sentinel is touched last, so its
+    // arrival means every byte before it is already in the ring — or already evicted
+    // from it.
+    let ready = client.make_ready("-echo -onlcr", None, ok.resume_from);
+    let planted = plant_blob(
+        &session,
+        &mut client,
+        ready.offset,
+        ready.in_offset,
+        PRODUCED,
     );
 
     // And from here to the sentinel the client reads nothing, which is the whole
     // setup: the daemon's send queue fills, `sent_through` stops with it, and the
     // ring runs away from a client that has not gone anywhere.
     assert!(
-        poll_until(Duration::from_secs(30), || produced.exists()),
+        poll_until(Duration::from_secs(10), || planted.sentinel.exists()),
         "the child never finished writing its {PRODUCED} bytes"
     );
 
-    let mut expected = ok.resume_from;
-    let mut first_gap = None;
-    let mut tail: Vec<u8> = Vec::new();
-    loop {
-        let (ty, payload) = client.next_frame();
-        match Frame::decode(ty, &payload).expect("decode frame") {
-            Frame::Output { offset, data } => {
-                assert_eq!(
-                    offset,
-                    expected,
-                    "output must join up unless a Gap said otherwise, and this \
-                     frame opens {} bytes from where the stream stood",
-                    offset.abs_diff(expected)
-                );
-                expected += data.len() as u64;
-                tail.extend_from_slice(data);
-                if String::from_utf8_lossy(&tail).contains(DONE) {
-                    break;
-                }
-                // Only what a marker split across two frames needs.
-                tail.drain(..tail.len().saturating_sub(DONE.len()));
-            }
-            Frame::Gap { new_base_offset } => {
-                assert!(
-                    new_base_offset > expected,
-                    "a Gap must name a base past what the client was sent: \
-                     {new_base_offset} against {expected}"
-                );
-                first_gap.get_or_insert((expected, new_base_offset));
-                expected = new_base_offset;
-            }
-            Frame::InputAck { .. } | Frame::Pong { .. } => {}
-            other => panic!("unexpected {other:?} while reading the session's output"),
-        }
-    }
-
-    let (sent_through, base) = first_gap.expect(
+    let stream_end = planted.stream_start + planted.expected.len() as u64;
+    let oldest_held = stream_end - RING as u64;
+    let gaps = read_against(&mut client, &planted, planted.stream_start);
+    let (sent_through, base) = *gaps.first().expect(
         "the ring overran a client that never detached and nothing said so: the \
          whole stream arrived contiguous, which it cannot have been",
     );
     assert!(
-        sent_through > ok.resume_from,
+        sent_through > planted.stream_start,
         "the gap must interrupt a stream this client was already receiving — that \
          is what makes it mid-stream rather than the handshake's"
     );
-    assert!(
-        base - sent_through > RING as u64,
-        "only {} bytes were reported lost, which is less than the ring itself \
-         holds: this client was not overrun",
-        base - sent_through
+    assert_eq!(
+        base,
+        oldest_held,
+        "the daemon resumed this client at {base}, where the oldest byte a full \
+         {RING}-byte ring can still serve is {oldest_held}. Below it and the stream \
+         is being served from somewhere other than where it says; above it and {} \
+         bytes the ring was still holding were thrown away without a word",
+        oldest_held.abs_diff(base)
+    );
+    assert_eq!(
+        gaps.len(),
+        1,
+        "the child had finished before this client read a byte, so the ring was \
+         static and one gap is all there was to report: {gaps:?}"
     );
 }
 
@@ -479,9 +824,19 @@ fn a_second_client_takes_over_and_the_first_is_told_why() {
     second.read_until("NOMUX-TOOK-OVER", ok.resume_from);
 }
 
+/// The frozen control surface reaches a live session through the files on disk
+/// alone (`IMPLEMENTATION.md` § 6.6) — `list` finds it and `kill` stops it.
+///
+/// "Stops it" was the half nobody checked. The assertion was that the socket had
+/// gone, which is a statement about `unlink` and not about the session: a `kill`
+/// that removed the five files and left the daemon running would pass it unchanged,
+/// and § 10's whole contract for `kill` is that a zero status means "there is no
+/// such session". What such a daemon leaves behind is the worst of both — a shell
+/// still holding the user's work, with nothing on disk to attach to it by and
+/// nothing for `list` to report, until the seven-day idle deadline collects it.
 #[test]
 fn list_and_kill_operate_without_the_protocol() {
-    let (session, _client, _) = Session::attached("control");
+    let (mut session, _client, _) = Session::attached("control");
 
     let listed = stdout(&control(&session.root, &["list"]));
     assert!(
@@ -506,6 +861,19 @@ fn list_and_kill_operate_without_the_protocol() {
     );
 
     assert!(!session.socket.exists(), "kill must unlink the run files");
+    // `kill` returns once the daemon has stopped answering, so the process is either
+    // already gone or on its way; the wait is for the reaping rather than for the
+    // signal. Collected here as well as asserted, since the harness would otherwise
+    // `SIGKILL` a corpse and learn nothing.
+    assert!(
+        poll_until(Duration::from_secs(10), || session
+            .child
+            .try_wait()
+            .expect("wait for the daemon")
+            .is_some()),
+        "kill removed the session's five files and left the daemon running, so the \
+         user's shell is still there with nothing left on disk to reach it by"
+    );
 }
 
 /// Connecting is not attaching.
@@ -529,6 +897,144 @@ fn a_liveness_probe_does_not_evict_the_attached_client() {
     // fails this rather than being skipped over.
     client.input(0, b"echo NOMUX-STILL-ATTACHED\n");
     client.read_until("NOMUX-STILL-ATTACHED", ok.resume_from);
+}
+
+/// The refusals an *attached* client can earn, and the session surviving each.
+///
+/// `handle_frame`'s "frame is not valid from a client" arm and both of
+/// `read_client`'s `reject(Protocol, …)` sites had no caller in the suite at all:
+/// every test here speaks the protocol correctly once greeted, so a daemon that
+/// answered a server-only frame by acting on it, or a bad header by carrying on
+/// reading the socket as though the stream were still framed, would go unnoticed.
+/// The last of those is the one that matters — a frame boundary the daemon has lost
+/// track of is a stream in which every subsequent `Input` offset is somebody else's
+/// number.
+///
+/// Three shapes, and they are three because they reach the refusal by three
+/// different routes. A `HelloOk`, an `Output` and a `Gap` are well-formed frames the
+/// *daemon* sends, so they decode perfectly and fall through the match; the daemon
+/// must not mistake its own vocabulary for the client's. A discriminant no
+/// `FrameType` has never reaches the match, because the header will not decode. And
+/// a `Resize` whose payload is four bytes rather than eight has a header that
+/// decodes and a body that does not, which is the one case between them where the
+/// daemon knows how many bytes to skip and still must not.
+///
+/// Each row asserts all three of what a refusal is: the code, that the connection
+/// then closes without a second complaint — which is what `Client::expect_eof`
+/// separates from a frame that was quietly *honoured* — and that a fresh client can
+/// still drive the shell afterwards. A daemon that took the session down with the
+/// misbehaving connection would satisfy the first two.
+#[test]
+fn frames_a_client_may_not_send_are_refused_and_the_connection_closed() {
+    /// One case: what the client puts on the wire, and what the failure says it was.
+    struct Refused {
+        what: &'static str,
+        write: fn(&mut Client),
+    }
+
+    let cases = [
+        Refused {
+            what: "a HelloOk, which is the daemon's own answer coming back at it",
+            write: |client| {
+                client.send(&Frame::HelloOk(nomux_proto::HelloOk {
+                    protocol: PROTOCOL_VERSION,
+                    resume_from: 0,
+                    in_applied: 0,
+                    win: harness::WIN,
+                    gap: false,
+                    linger: nomux_proto::Linger::Unknown,
+                    agent: false,
+                }));
+            },
+        },
+        Refused {
+            what: "an Output, which only the session has any business producing",
+            write: |client| {
+                client.send(&Frame::Output {
+                    offset: 0,
+                    data: b"not from here",
+                });
+            },
+        },
+        Refused {
+            what: "a Gap, which is a claim about a ring the client does not own",
+            write: |client| {
+                client.send(&Frame::Gap {
+                    new_base_offset: 1 << 40,
+                });
+            },
+        },
+        Refused {
+            what: "a header carrying a discriminant no FrameType has",
+            // `0xff` is past every variant in the table, and the length is zero so
+            // that a daemon which skipped the frame rather than refusing it would
+            // find the stream still framed — the failure has to come from the
+            // header being unreadable, not from what followed it.
+            write: |client| client.send_raw(&[0xff, 0x00, 0x00, 0x00]),
+        },
+        Refused {
+            what: "a Resize whose payload is half a WinSize",
+            // A header that decodes and a body that does not: four bytes where the
+            // frame's four `u16`s need eight.
+            write: |client| client.send_raw(&[0x07, 0x00, 0x00, 0x04, 0, 80, 0, 24]),
+        },
+    ];
+
+    for (round, case) in cases.iter().enumerate() {
+        let session = Session::start(&format!("refuse_{round}"));
+        let mut client = session.connect();
+        let ok = client.hello(RESUME_FROM_START);
+        // Greeted *and* serving: the session is created by the first `Hello`, so a
+        // round trip through the child is what puts the connection in the state this
+        // is about rather than in the middle of its own handshake.
+        client.input(0, b"echo NOMUX-BEFORE-REFUSAL\n");
+        let (_, offset) = client.read_until("NOMUX-BEFORE-REFUSAL", ok.resume_from);
+
+        (case.write)(&mut client);
+        client.expect_error_among_output(ErrorCode::Protocol, case.what);
+        client.expect_eof(case.what);
+        drop(client);
+
+        // The whole point of refusing on the connection's own terms: the shell is
+        // still there, at the offsets it had, for whoever attaches next.
+        let mut fresh = session.connect();
+        let resumed = fresh.hello(offset);
+        assert!(
+            !resumed.gap,
+            "{}: the session lost output while refusing one connection",
+            case.what
+        );
+        fresh.input(resumed.in_applied, b"echo NOMUX-STILL-SERVING\n");
+        fresh.read_until("NOMUX-STILL-SERVING", resumed.resume_from);
+    }
+}
+
+/// A session whose shell cannot be started is refused with `Error{INTERNAL}`.
+///
+/// The one `ErrorCode` a running daemon never produced anywhere in the suite. It is
+/// the answer to the single failure that can happen *after* a client has been
+/// accepted and before it has a session — `Pty::spawn` failing — and a client that
+/// gets silence there waits out its own attach deadline instead of reporting a host
+/// whose `$SHELL` is wrong. `DESIGN.md` § 6.4 has the client treat `INTERNAL` and
+/// `PROTOCOL` differently, so answering with the wrong one is not cosmetic either.
+///
+/// A directory rather than a missing file, so the failure is `execve` refusing what
+/// it was handed rather than `$SHELL` naming nothing: `login_shell` falls back
+/// through the password database only when the variable is *absent*, and a path that
+/// resolves to something unexecutable is what a real misconfiguration looks like.
+#[test]
+fn a_session_whose_shell_cannot_be_started_is_refused_as_an_internal_failure() {
+    let session = Session::start_with_shell("shell_broken", "/tmp");
+    let mut client = session.connect();
+
+    // Written by hand rather than through `Client::hello`, which expects a `HelloOk`
+    // and would panic on the refusal that is the whole point.
+    client.send(&hello_frame(0, RESUME_FROM_START));
+    client.expect_error_among_output(
+        ErrorCode::Internal,
+        "a shell that cannot be started must be reported as the daemon's failure",
+    );
+    client.expect_eof("an Error{INTERNAL}");
 }
 
 /// A connection that speaks out of turn is refused on its own terms, without
@@ -1034,9 +1540,15 @@ fn a_symlinked_run_directory_is_refused_by_attach_and_daemon() {
     fs::set_permissions(&target, fs::Permissions::from_mode(0o777)).expect("loosen the target");
     std::os::unix::fs::symlink(&target, root.join("nomux")).expect("plant the symlink");
 
-    let refusals: Vec<(&str, bool, String)> = ["attach", "daemon"]
+    // The exit code each mode owes § 10 for this refusal. `attach` reports 126 — the
+    // shell's "found but not executable", applied to a session — and `DESIGN.md` § 7
+    // has the client cache a host as unattachable on exactly that number, so a
+    // refusal answered with 127 instead would have it retry a host that will never
+    // work and one answered with 1 would have it give up on none. `daemon` is on the
+    // other table, where everything that is not a malformed command line is 1.
+    let refusals: Vec<(&str, i32, Option<i32>, String)> = [("attach", 126), ("daemon", 1)]
         .into_iter()
-        .map(|mode| {
+        .map(|(mode, owed)| {
             // Waited out rather than backgrounded, which is safe only because both
             // modes are refused before they serve: were that refusal ever to
             // regress, this would hang rather than fail. `SHELL` is here for the
@@ -1047,7 +1559,7 @@ fn a_symlinked_run_directory_is_refused_by_attach_and_daemon() {
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped()),
             );
-            (mode, output.status.success(), stderr(&output))
+            (mode, owed, output.status.code(), stderr(&output))
         })
         .collect();
 
@@ -1057,10 +1569,12 @@ fn a_symlinked_run_directory_is_refused_by_attach_and_daemon() {
     // reached. Nothing else in this test would collect it.
     drop(control(&root, &["kill", "symdir"]));
 
-    for (mode, started, stderr) in &refusals {
-        assert!(
-            !started,
-            "{mode} started a session in a symlinked run directory"
+    for (mode, owed, code, stderr) in &refusals {
+        assert_eq!(
+            *code,
+            Some(*owed),
+            "{mode} must refuse a symlinked run directory with {owed}, got {code:?}: \
+             {stderr:?}"
         );
         assert!(
             stderr.contains("run directory") && stderr.contains("symlink"),
@@ -1086,10 +1600,123 @@ fn a_symlinked_run_directory_is_refused_by_attach_and_daemon() {
     );
 }
 
-/// Exercises the path a real bootstrap takes: `nomux attach` with no daemon
-/// running, which must spawn one under the flock and then relay transparently.
+/// A daemon that cannot publish `<id>.pid` refuses to start rather than serving a
+/// session nothing can find.
+///
+/// The pidfile is what `nomux kill` reads to know what to signal (§ 6.6), so a
+/// daemon that carried on without one would hold the user's shell behind a socket
+/// `list` reports as live and `kill` cannot stop — the worst of the states § 6.6
+/// exists to make impossible. Nothing exercised that `?`: every other way of
+/// refusing to start is on the *bind*, which happens first, so the whole window
+/// between binding a socket and publishing the pid was untested.
+///
+/// What it leaves behind is asserted too, because that is the half a refusal cannot
+/// tidy up itself: the socket is already bound when the failure happens, and it is
+/// the one file whose presence is how everything else decides a session exists. A
+/// `connect` to it is refused, which § 6.6 defines as stale, so the next `list` is
+/// what collects it — and does not report a session in the meantime.
 #[test]
-fn attach_spawns_the_daemon_and_relays_transparently() {
+fn a_daemon_that_cannot_publish_its_pidfile_refuses_to_start() {
+    let root = run_root("nopid");
+    let run_dir = root.join("nomux");
+    fs::create_dir_all(run_dir.join("nopid.pid"))
+        .expect("plant a directory where the pidfile goes");
+
+    // Waited out rather than backgrounded, which is safe only because the refusal is
+    // what this asserts: a regression that got past it would hang here rather than
+    // fail, and `SHELL` is set so that what it started would at least be predictable.
+    let refused = collect(
+        nomux_with_shell(&root, &["daemon", "nopid"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
+    assert_eq!(
+        refused.status.code(),
+        Some(1),
+        "a daemon that cannot publish its pidfile must refuse to start (§ 10): {:?}",
+        stderr(&refused)
+    );
+    // Only that it said something, which is all it says. `write_pid` propagates the
+    // bare `io::Error` from `fs::write`, so the line the user gets is `nomux: Is a
+    // directory (os error 21)` with no path in it — every other refusal on this path
+    // names what it refused, and this one is worth an errno with a filename beside
+    // it. Left as a note rather than asserted, because tightening it is a change to
+    // the daemon rather than to its tests.
+    assert!(
+        !stderr(&refused).is_empty(),
+        "a daemon that refuses to start must say why"
+    );
+
+    let listed = control(&root, &["list"]);
+    succeeded(
+        &listed,
+        "list over the wreckage of a daemon that never started",
+    );
+    assert!(
+        !stdout(&listed).contains("nopid"),
+        "a session that never started must not be listed as one: {:?}",
+        stdout(&listed)
+    );
+    assert!(
+        !run_dir.join("nopid.sock").exists(),
+        "the socket the refusal left bound is stale by § 6.6's own test — a refused \
+         connect — so `list` must have collected it"
+    );
+}
+
+/// The other half of `attach`'s exit table: a session that is not there and could
+/// not be started is 127, the shell's "not found" (`IMPLEMENTATION.md` § 10).
+///
+/// The pair matters more than either number. `DESIGN.md` § 7 has the client cache a
+/// host as *unattachable* on 126 and go on trying on 127, so the two are read as
+/// "stop" and "try again" — and until this test and the one above them, nothing in
+/// the suite would have noticed them swapped, collapsed into 1, or both answered
+/// with whichever branch `run_session_mode` reached first.
+///
+/// A directory where the socket goes is a daemon that cannot start rather than one
+/// that is slow: `connect` to a non-socket is refused, which `attach` reads as
+/// absent and answers by spawning, and the daemon's own `bind_socket` then finds
+/// something at the path it cannot remove. So the timeout below is reached with the
+/// daemon's complaint in hand rather than by waiting out a race.
+#[test]
+fn attach_reports_a_session_it_could_not_start_as_no_such_session() {
+    let root = run_root("attach_nostart");
+    fs::create_dir_all(root.join("nomux").join("nostart.sock"))
+        .expect("plant a directory where the session socket goes");
+
+    let refused = collect(
+        nomux_with_shell(&root, &["attach", "nostart"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
+    assert_eq!(
+        refused.status.code(),
+        Some(127),
+        "a session that does not exist and could not be started must be reported \
+         the way a shell reports a missing command: {:?}",
+        stderr(&refused)
+    );
+    assert!(
+        stdout(&refused).is_empty(),
+        "stdout is where § 5.1 has the client read the bootstrap line, so a failing \
+         attach must leave it alone: {:?}",
+        stdout(&refused)
+    );
+}
+
+/// Exercises the path a real bootstrap takes: `nomux attach` with no daemon
+/// running, which must spawn one under the flock and then carry the conversation.
+///
+/// Named for what it asserts. It used to say "relays transparently", and what it
+/// looks for is a substring in a byte stream — which says the frames got through in
+/// *some* form and nothing about transparency. That property has tests of its own
+/// and they are byte-exact over both the `splice` and the copying paths of § 7;
+/// this one is about the spawn, and the round trip through the child is how it
+/// establishes that the daemon it started is really serving.
+#[test]
+fn attach_spawns_a_daemon_for_a_session_that_does_not_exist_yet() {
     use std::sync::mpsc;
 
     let root = run_root("relay");
@@ -1978,6 +2605,53 @@ fn agent_forwarding_proxies_a_connection_in_both_directions() {
     assert_eq!(client.next_chan(FrameType::AgentClose), chan);
 }
 
+/// An agent socket the daemon cannot bind costs the session its forwarding and
+/// nothing else, and `HelloOk` says so.
+///
+/// `start_session` calls this the daemon's "one remaining silent degradation": a
+/// client that asked for forwarding is answered `agent: false` with no reason
+/// given. Silent to the *user* is not the same as untested, and it was both — every
+/// agent test here asks for forwarding and gets it, so nothing exercised the arm
+/// that logs and carries on. A daemon that instead refused the `Hello`, or started
+/// the session and reported `agent: true` off the flag it was asked for rather than
+/// off the socket it has, would pass the whole agent suite.
+///
+/// A directory in the socket's place is the cheapest real version of the failure:
+/// `Agent::bind` unlinks first, which a directory survives, and then `bind` refuses
+/// it. What is asserted is the honest flag, a session that still starts and serves,
+/// and — the half a bare flag does not cover — that the child is not handed an
+/// `SSH_AUTH_SOCK` pointing at a socket nothing is listening on, which would hang
+/// `git push` rather than failing it.
+#[test]
+fn an_agent_socket_that_cannot_be_bound_leaves_an_honest_flag_and_a_live_session() {
+    // Started before the directory is planted, because the run directory is the
+    // daemon's to create — and the agent socket is not bound until the first
+    // `Hello`, which is what leaves room to plant anything at all.
+    let session = Session::start("agent_unbindable");
+    fs::create_dir_all(session.agent_socket())
+        .expect("plant a directory where the agent socket goes");
+
+    let mut client = session.connect();
+    let ok = client.hello_with(HELLO_AGENT_FORWARD, RESUME_FROM_START);
+    assert!(
+        !ok.agent,
+        "the daemon reported an agent socket it never bound"
+    );
+
+    client.input(0, b"echo \"sock=[$SSH_AUTH_SOCK]\"\n");
+    let (seen, _) = client.read_until("sock=[", ok.resume_from);
+    assert!(
+        !seen.contains(&session.agent_socket().display().to_string()),
+        "the child was pointed at an agent socket the daemon does not serve, so \
+         everything it signs with will hang rather than fail: {seen:?}"
+    );
+
+    assert!(
+        session.agent_socket().is_dir(),
+        "the daemon replaced something it does not own"
+    );
+}
+
 /// With no client attached there is nothing to answer a signature request, so a
 /// connection is accepted and closed at once: `git push` fails with the same error
 /// as a missing agent instead of hanging until the user reattaches.
@@ -2040,6 +2714,117 @@ fn agent_channels_are_capped() {
         "the connection past the cap must be closed, not queued"
     );
     drop(held);
+}
+
+/// The *per-channel* queue is capped too, and reaching it costs that channel and
+/// nothing else.
+///
+/// `MAX_AGENT_CHANNELS` has a test above; `MAX_CHANNEL_QUEUE` had none, and the one
+/// test that comes near it sizes itself "comfortably short of" the cap on purpose —
+/// so `Agent::deliver` returning `false`, and the `close_agent_channel` the daemon
+/// answers that with, were both unreachable from the suite. § 6.7 makes this the
+/// bound on what one stalled `ssh-add` can make the daemon hold: without it a client
+/// can push a quarter of the default ring per channel, eight times over, into a
+/// process that has stopped reading.
+///
+/// What has to be true is not just that the channel goes but that *only* it goes. A
+/// daemon answering the overflow by dropping the client, or by forgetting every
+/// channel the way `on_detached` does, would also stop the queue growing — and would
+/// take a second, innocent agent connection and the user's shell with it. So the
+/// sibling channel is opened first, left idle across the whole overflow, and then
+/// used; and the session is driven through the PTY afterwards.
+#[test]
+fn an_agent_channel_whose_queue_outgrows_the_cap_is_closed_alone() {
+    /// `agent::MAX_CHANNEL_QUEUE`, which is private to the daemon. Written down
+    /// rather than derived, and the assertions do not rest on the number being
+    /// exact: everything below sends *past* it by a wide margin, so a cap that moved
+    /// down still closes the channel and one that moved up fails here loudly rather
+    /// than passing quietly.
+    const CAP: usize = 256 * 1024;
+    /// One frame's worth. Comfortably under `MAX_PAYLOAD`, and large enough that the
+    /// burst below is a few dozen frames rather than thousands.
+    const CHUNK: usize = 32 * 1024;
+    /// How far past the cap the client pushes. The daemon flushes between passes, so
+    /// what it can shed is bounded by what the peer's socket will take — measured
+    /// below — and everything beyond that has to sit in the queue.
+    const OVERSHOOT: usize = 256 * 1024;
+
+    let (session, mut client, ok) = Session::attached_with("agent_queue", HELLO_AGENT_FORWARD);
+    let ready = client.make_ready("-echo", None, ok.resume_from);
+
+    // How much a unix socket on this host takes from a peer that has stopped
+    // reading, measured rather than assumed for the reason
+    // `a_closed_agent_channel_whose_peer_stopped_reading_leaves_the_daemon_asleep`
+    // gives: the limit is a sysctl away from any number written here.
+    let capacity = {
+        let (mut probe, _other_end) = UnixStream::pair().expect("a socketpair to measure");
+        probe.set_nonblocking(true).expect("stop blocking");
+        push_until_refused(&mut probe, &vec![0u8; 8 << 20], Duration::from_millis(100))
+    };
+
+    // The bystander, opened first so that it is unambiguously live before anything
+    // goes wrong on the other channel.
+    let mut bystander = session.connect_agent();
+    let quiet = client.next_chan(FrameType::AgentOpen);
+    let mut drowned_peer = session.connect_agent();
+    let drowned = client.next_chan(FrameType::AgentOpen);
+
+    // Neither peer ever reads, so past `capacity` every byte stays in the daemon's
+    // own queue for that channel. No fence between the frames, which is the whole
+    // difference from the spin test: it round-trips each one precisely to keep the
+    // queue under the cap, and this one is about crossing it.
+    let filler = vec![b'q'; CHUNK];
+    let mut sent = 0usize;
+    while sent < capacity + CAP + OVERSHOOT {
+        client.send(&Frame::AgentData {
+            chan: drowned,
+            data: &filler,
+        });
+        sent += filler.len();
+    }
+
+    assert_eq!(
+        client.next_chan(FrameType::AgentClose),
+        drowned,
+        "a channel whose queue passed {CAP} bytes must be closed, and it must be \
+         that channel: {sent} bytes were pushed at a peer that read none of them"
+    );
+    // And the process on the other end learns now rather than blocking on a socket
+    // nothing will ever write to again — § 6.7's argument for closing over holding,
+    // reached here by the queue rather than by the client going away. Whatever the
+    // daemon had already flushed comes out first; what it was still holding is
+    // exactly what it refused to go on holding.
+    let mut delivered = 0usize;
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        match read_uninterrupted(&mut drowned_peer, &mut chunk) {
+            Ok(0) => break,
+            Ok(read) => delivered += read,
+            Err(err) => panic!("reading from the channel the daemon closed: {err}"),
+        }
+    }
+    assert!(
+        delivered < sent,
+        "the daemon delivered all {sent} bytes, so nothing was ever queued and the \
+         close above was not the cap firing"
+    );
+
+    // The bystander is still a channel: bytes cross it in the direction the daemon
+    // has to be awake to serve.
+    bystander.write_all(b"\0\0\0\x01\x0b").expect("write");
+    let payload = client.next_of(FrameType::AgentData);
+    assert_eq!(
+        Frame::decode(FrameType::AgentData, &payload).expect("decode"),
+        Frame::AgentData {
+            chan: quiet,
+            data: b"\0\0\0\x01\x0b",
+        },
+        "the daemon took a second agent channel down with the one that overflowed"
+    );
+
+    // And the session itself, which is what a client would actually notice losing.
+    client.input(ready.in_offset, b"echo NOMUX-STILL-SERVING\n");
+    client.read_until("NOMUX-STILL-SERVING", ready.offset);
 }
 
 /// Ids come from a counter that never rewinds, so a channel closing and another
@@ -2338,35 +3123,115 @@ fn set_open_file_limit(pid: u32, soft: u64) {
     );
 }
 
+/// What the child prints when the terminal it is on changes size. See
+/// [`repaint_transcript`].
+///
+/// Built out of `$((6*7))` for the reason `Client::make_ready` gives: the line
+/// discipline echoes the command line that installs the trap before `stty -echo`
+/// takes effect, and that echo carries the arithmetic unexpanded — so the marker
+/// cannot be satisfied by the request for it. `dash` evaluates a trap's body when
+/// the signal arrives, which is what makes the substitution happen then rather than
+/// at definition.
+const WINCHED: &str = "NOMUX-42-WINCHED";
+
 /// Drives a session to an overflow gap and returns what the child saw afterwards.
 ///
 /// `cat` is the child because it hands back whatever reaches the PTY's input side,
-/// which is the only way to observe a repaint that is delivered as a keystroke.
-/// The ring is tiny so a few kilobytes echoed while detached is enough to overflow
-/// it.
+/// which is the only way to observe a repaint that is delivered as a keystroke. In
+/// front of it sits a `SIGWINCH` trap, which is the only way to observe the other
+/// policy at all: the default repaint writes nothing to the terminal, so a test
+/// that can only see the PTY's input side reads it as "nothing happened" — which is
+/// also what a daemon whose default branch does nothing produces. The ring is tiny
+/// so a few kilobytes echoed while detached is enough to overflow it.
+///
+/// Two things about the trap are `dash`'s doing rather than the daemon's, and both
+/// were measured against a bare PTY before being written down here. `set +m`,
+/// because with job control on the shell puts `cat` in a foreground process group
+/// of its own and `TIOCSWINSZ` signals *that* group — so the shell holding the trap
+/// never hears about it. And the trap sits in a background subshell parked on
+/// `wait` rather than in the shell itself, because `dash` defers a trap until the
+/// foreground job finishes: with `cat` in front of it the marker arrives when the
+/// session ends, which is far too late, and the first version of this printed
+/// nothing at all. `wait` is the one thing POSIX requires a trapped signal to
+/// interrupt, which is what makes the marker prompt.
+///
+/// The filler is drained *before* the client leaves, which is what makes the
+/// `SIGWINCH` half observable at all. The repaint fires the instant the daemon
+/// answers the reconnecting `Hello`, and the marker the child prints then has to
+/// survive a one-kilobyte ring: with tens of kilobytes of echo still in flight it
+/// does not, and the first version of this test failed with a transcript of nothing
+/// but filler. Reading to a marker of its own leaves the child idle and the ring
+/// holding only what comes after — and it also turns the reconnect below into
+/// arithmetic rather than a wait, since `base` is already tens of kilobytes above
+/// where this client resumes from.
+///
+/// The setup line is written out here rather than through `Client::make_ready`, and
+/// the reason is the whole of why the subshell announces itself. That helper's
+/// marker is printed by the shell *before* the command behind it starts, so at the
+/// moment it arrives the subshell may not exist and certainly has not run `trap` — a
+/// `SIGWINCH` in that window lands on the default disposition, which is to ignore
+/// it, and no marker ever comes. That is a failure of the fixture wearing the face
+/// of a daemon that never repainted, and it was seen once in a full parallel run.
+///
+/// Waiting for a *second* marker behind the helper's does not fix it: `read_until`
+/// returns the offset one past everything it consumed, so a subshell quick enough
+/// to have printed before the daemon's next read puts both markers in one frame,
+/// and the wait for the second one starts already past it. That failed one run in
+/// three. One marker, printed by the subshell itself, is the shape with no race in
+/// it: reaching it proves the `stty` in front of it took effect *and* that the trap
+/// is armed, which is what the two markers were separately for.
 fn repaint_transcript(name: &str, flags: u16) -> String {
-    let session = Session::start_with_ring(name, 1024);
+    /// The child echoes far more than this, so what the client comes back to is a
+    /// gap by construction.
+    const RING: usize = 1024;
+    /// The last line of the filler, and how the client learns the child has caught
+    /// up: `cat` echoes it, so seeing it means everything before it is behind us.
+    const DRAINED: &str = "NOMUX-FILLER-DRAINED";
+    /// Printed by the subshell once its `SIGWINCH` trap is in place, which is behind
+    /// the `stty` in the same line — so arriving at it is proof of both. Arithmetic
+    /// for the reason [`WINCHED`] is: the line discipline echoes the command that
+    /// sets it up before `stty -echo` takes effect, and that echo carries `$((6*7))`
+    /// unexpanded.
+    const ARMED: &str = "NOMUX-42-TRAP-ARMED";
+
+    let session = Session::start_with_ring(name, RING);
     let mut client = session.connect();
     let ok = client.hello_with(flags, RESUME_FROM_START);
 
-    let ready = client.make_ready("-echo -onlcr", Some("cat"), ok.resume_from);
-    let offset = ready.offset;
+    // The sleep is short so that a subshell which somehow outlived its session is
+    // asleep rather than looping, and gone within seconds either way. It does not
+    // normally have to be: everything here shares the shell's process group, so
+    // closing the PTY master hangs the lot up.
+    let setup = "stty -echo -onlcr; set +m; \
+                 (trap 'printf NOMUX-$((6*7))-WINCHED' WINCH; \
+                 printf NOMUX-$((6*7))-TRAP-ARMED; \
+                 while :; do sleep 5 & wait; done) & cat\n";
+    client.input(0, setup.as_bytes());
+    let (_, offset) = client.read_until(ARMED, ok.resume_from);
 
-    // Echoed back by `cat` with nobody reading, which is what overflows the ring.
-    // In lines, because the line discipline is still canonical: `cat` would see
-    // nothing at all until a newline arrived, and the overflow would never happen.
-    let filler = format!("{}\n", "x".repeat(63)).repeat(512);
+    // Echoed back by `cat`, which is what overflows the ring. In lines, because the
+    // line discipline is still canonical: `cat` would see nothing at all until a
+    // newline arrived, and the overflow would never happen.
+    let filler = format!("{}{DRAINED}\n", format!("{}\n", "x".repeat(63)).repeat(512));
     let filler = filler.as_bytes();
-    let mut in_offset = ready.in_offset;
+    let mut in_offset = setup.len() as u64;
     client.input(in_offset, filler);
     in_offset += filler.len() as u64;
-    client.wait_for_input_ack(in_offset);
+    // Past gaps, since overflowing the ring is the point; what this waits for is the
+    // newest bytes on the stream, which are the ones a ring never discards.
+    client.read_past_gaps(DRAINED, offset);
     drop(client);
 
-    // The repaint is the daemon's answer to a gap, so the gap has to have happened
-    // before there is anything to look at. Waited for rather than slept through:
-    // whether the ring has overflowed yet is a question about the scheduler.
-    let (mut client, resumed) = reconnect_until_gap(&session, flags, offset);
+    // A gap by arithmetic rather than by timing: the ring holds a kilobyte and the
+    // child has just echoed thirty-two, so `base` is far above where this resumes.
+    let mut client = session.connect();
+    let resumed = client.hello_with(flags, offset);
+    assert!(
+        resumed.gap,
+        "the child echoed {} bytes through a {RING}-byte ring and the daemon \
+         reported no gap to a client resuming from {offset}",
+        filler.len()
+    );
 
     // § 4.3: "`ctrl_l` goes through the same queue as client input ... It is not
     // client input, so `in_applied` does not move for it." Asserted for both
@@ -2390,9 +3255,17 @@ fn repaint_transcript(name: &str, flags: u16) -> String {
     transcript
 }
 
-/// The post-gap repaint is the client's choice, and `ctrl_l` reaches the child as
-/// an actual keystroke — the one thing a bare shell prompt responds to, since it
-/// ignores `SIGWINCH` entirely.
+/// The post-gap repaint is the client's choice, and each policy does its own thing
+/// and only its own thing (`IMPLEMENTATION.md` § 4.3).
+///
+/// Both halves are asserted positively as well as negatively, which the default one
+/// was not. `assert!(!default.contains('\u{c}'))` is satisfied by a daemon whose
+/// `winch` branch does nothing at all — and doing nothing is the shape a regression
+/// here would actually take, since the `TIOCSWINSZ` dance is the fiddly half and
+/// the one that can be lost to a refactor without any client noticing. A gap with
+/// no repaint behind it leaves a full-screen program showing the tail of a stream
+/// with a hole in it and no reason to redraw, which is the whole of what § 4.3
+/// exists to prevent.
 #[test]
 fn a_gap_repaints_with_ctrl_l_only_when_the_client_asks() {
     let asked = repaint_transcript("repaint_ctrl_l", HELLO_REPAINT_CTRL_L);
@@ -2400,8 +3273,18 @@ fn a_gap_repaints_with_ctrl_l_only_when_the_client_asks() {
         asked.contains('\u{c}'),
         "no Ctrl-L reached the child: {asked:?}"
     );
+    assert!(
+        !asked.contains(WINCHED),
+        "a client that asked for Ctrl-L was also sent through the winsize dance, so \
+         an editor gets both a redraw it did not want and a keystroke: {asked:?}"
+    );
 
     let default = repaint_transcript("repaint_winch", 0);
+    assert!(
+        default.contains(WINCHED),
+        "the gap was reported and the child was never told the terminal had \
+         changed, so nothing asked it to redraw: {default:?}"
+    );
     assert!(
         !default.contains('\u{c}'),
         "the default policy must not write to the PTY: {default:?}"
@@ -2601,19 +3484,93 @@ fn a_signalled_daemon_collects_a_process_that_ignores_sighup() {
 /// once the PTY has reported end of file, which on the `nomux kill` path it has
 /// not.
 ///
-/// Hence the bound below sits under the grace period rather than under § 6.6's
-/// two-second budget: the regression this guards has a hard floor of 500 ms, so
-/// anything that reintroduces it lands strictly above the bound however lightly
-/// loaded the machine is. What is left is the honest work — two `/proc` walks and
-/// a poll interval or two — which measures in tens of milliseconds.
+/// This used to assert one wall-clock number — under 400 ms — against an honest
+/// path that measures about fifty and a regression with a hard floor of five
+/// hundred. Defensible in intent and indefensible in mechanism: the bound was
+/// wedged between the two with runqueue delay, which nothing here bounds, free to
+/// move either. So the comparison is now between two shutdowns rather than between
+/// one shutdown and a constant.
+///
+/// What is asserted is the *difference*, and the arithmetic is why. The grace is an
+/// additive constant, not a factor: the stubborn shutdown costs `GRACE + W` and the
+/// quiet one `W`, for whatever the shared work `W` comes to on the day. A ratio
+/// reduces to `W < (GRACE + W)/2`, which is `W < GRACE`, an absolute half-second
+/// ceiling wearing a disguise — better than the old one, since it is anchored to a
+/// measurement rather than to a literal, but not the load-cancelling thing it looks
+/// like. The difference is `GRACE + (W_s − W_q)`, where the two `W`s are the same
+/// work on the same machine moments apart, so what has to stay small is their
+/// *spread* rather than either of them. Under the regression both shutdowns pay the
+/// grace and the difference collapses to that spread, which is what fails.
+///
+/// The two measurements are sequential rather than simultaneous — about half a
+/// second apart, since the first is the one that waits — so "the same machine" is a
+/// claim about half a second of it and not a guarantee. That is the residual risk,
+/// and it is why the load average goes into both messages.
+///
+/// The stubborn measurement is checked against the grace period first, so a run
+/// where nothing waited for anything fails as an instrument rather than passing as
+/// a result.
 #[test]
 fn a_signalled_daemon_with_a_quiet_child_does_not_wait_out_the_grace_period() {
-    let (mut session, mut client, ok) = Session::attached("fastkill");
+    /// `pty::HANGUP_GRACE`, which is private to the daemon. Used only to say that
+    /// the stubborn measurement really did wait for something.
+    const GRACE: Duration = Duration::from_millis(500);
+
+    // Set up together, and signalled together below, so the two measurements meet
+    // the same machine.
+    let (mut stubborn, mut client, ok) = Session::attached("slowkill");
+    // The shape `a_signalled_daemon_collects_a_process_that_ignores_sighup` uses,
+    // and for the same reason: an *ignored* `SIGHUP` survives `exec` where a trapped
+    // one is reset, so this is a process the daemon's first reach cannot collect and
+    // must wait out. `set +m` keeps it in the shell's own group, which is what
+    // `Pty::terminate` signals.
+    client.input(
+        0,
+        b"set +m; trap '' HUP; sleep 300 & echo \"$!-NOMUX-ORPHAN-$((6*7))\"\n",
+    );
+    let (seen, _) = client.read_until("-NOMUX-ORPHAN-42", ok.resume_from);
+    let orphan = trailing_pid(&seen, "-NOMUX-ORPHAN-42")
+        .unwrap_or_else(|| panic!("no background pid in the transcript: {seen:?}"));
+    // Deliberately in nobody's reach until the daemon collects it, so nothing else
+    // would clean it up if an assertion below fired first.
+    let _collected = Reaper(orphan);
+
+    let (mut quiet, mut settled, ok) = Session::attached("fastkill");
     // So the measurement covers a session with a live shell in it, rather than the
     // window before the child exists at all.
-    client.input(0, b"echo NOMUX-READY\n");
-    client.read_until("NOMUX-READY", ok.resume_from);
+    settled.input(0, b"echo NOMUX-READY\n");
+    settled.read_until("NOMUX-READY", ok.resume_from);
 
+    let stubborn = time_shutdown(&mut stubborn);
+    let quiet = time_shutdown(&mut quiet);
+    let load =
+        fs::read_to_string("/proc/loadavg").unwrap_or_else(|err| format!("unreadable: {err}"));
+
+    assert!(
+        stubborn >= GRACE,
+        "the stubborn session went in {stubborn:?}, inside the {GRACE:?} its \
+         un-hangupable child should have cost it — so it is not a grace period this \
+         run measured, and the comparison below would mean nothing. Load: {load}"
+    );
+    // `saturating_sub`, because `Duration` subtraction panics rather than going
+    // negative — and the case that would is precisely the failure, a quiet shutdown
+    // that took longer than the stubborn one.
+    assert!(
+        stubborn.saturating_sub(quiet) > GRACE / 2,
+        "a session with nothing left running took {quiet:?} to stop against \
+         {stubborn:?} for one with a process that ignores SIGHUP — a difference of \
+         {:?}, where the grace period only one of them should pay is {GRACE:?}. The \
+         two are the same shutdown, so it is being paid whether or not anything is \
+         still there. Load: {load}",
+        stubborn.saturating_sub(quiet)
+    );
+}
+
+/// Signals a daemon and reports how long it took to leave.
+///
+/// Collected here as well as timed, so the harness does not go on to `SIGKILL` a
+/// process that has already gone and the caller can compare two of these.
+fn time_shutdown(session: &mut Session) -> Duration {
     let daemon = rustix::process::Pid::from_raw(session.child.id().cast_signed())
         .expect("the daemon's own pid");
     let began = Instant::now();
@@ -2627,15 +3584,11 @@ fn a_signalled_daemon_with_a_quiet_child_does_not_wait_out_the_grace_period() {
             .expect("wait for the daemon")
             .is_some()
     });
-    // Read before the assertions, since the first of them is about how long the
-    // second one took to become true.
+    // Read before the assertion, since what is being measured is how long the
+    // condition took to become true.
     let elapsed = began.elapsed();
     assert!(exited, "the signalled daemon never exited");
-    assert!(
-        elapsed < Duration::from_millis(400),
-        "shutdown took {elapsed:?}, at or over the 500 ms grace period it \
-         should only pay when something is still running"
-    );
+    elapsed
 }
 
 /// The run of digits immediately before `marker`, as a pid.
@@ -2932,13 +3885,25 @@ fn the_relay_moves_the_same_traffic_by_copying_when_the_kernel_will_not_splice_i
     );
 }
 
-/// How long one direction of a relay has to finish before the wait on it is called a
-/// hang rather than slowness.
+/// The budget a relay test gives the relay, as a whole rather than per wait.
 ///
 /// Far above the second or so the transfers really take, and far below the
 /// termination in `.config/nextest.toml`, so a stalled relay fails here — naming the
 /// direction that stopped — rather than being killed there with nothing to point at.
-const RELAY_PATIENCE: Duration = Duration::from_secs(30);
+///
+/// A *whole*, at every site that makes more than one wait: the four joins in
+/// [`assert_relay_moves_bulk`] share one deadline, and so do the two waits in
+/// [`a_session_that_ends_with_the_relays_input_unread_still_exits_clean`]. Each of
+/// those used to spend the figure again per wait, which came to a hundred and twenty
+/// seconds and fifty against a runner that kills at forty — so a relay that stalled
+/// anywhere but in the first wait was killed by nextest, and the named failure this
+/// exists to produce never ran.
+///
+/// The read timeout in [`relay_onto_a_socket_over`] is the one place it is a per-call
+/// figure, and it is not a deadline: it is what stops a `read_to_end` on a socket
+/// with no timeout of its own from parking a test thread for ever, so the wait that
+/// *is* bounded — the join around that thread — can report it.
+const RELAY_PATIENCE: Duration = Duration::from_secs(25);
 
 /// Moves `bulk` bytes each way through a relay and compares both directions.
 ///
@@ -2994,14 +3959,15 @@ fn assert_relay_moves_bulk(
     };
     let downlink = thread::spawn(drain);
 
-    join_within(feeder, RELAY_PATIENCE, "feeder");
-    let uplink = join_within(uplink, RELAY_PATIENCE, "socket reader");
-    join_within(push, RELAY_PATIENCE, "pusher");
+    let deadline = Instant::now() + RELAY_PATIENCE;
+    join_before(feeder, deadline, "feeder");
+    let uplink = join_before(uplink, deadline, "socket reader");
+    join_before(push, deadline, "pusher");
     // Only now: the relay ends the moment the socket reports EOF, so closing this
     // any earlier would truncate the direction under test rather than test it.
     peer.shutdown(Shutdown::Write)
         .expect("half-close the socket");
-    let downlink = join_within(downlink, RELAY_PATIENCE, "stdout reader");
+    let downlink = join_before(downlink, deadline, "stdout reader");
 
     // Killed before its stderr is read to the end. Every wait above goes through
     // `join_within` so that a stalled relay fails rather than hangs, and this read
@@ -3222,6 +4188,12 @@ fn a_session_that_ends_with_the_relays_input_unread_still_exits_clean() {
         Stdio::piped(),
     );
 
+    // One deadline across both waits below rather than one each, for the reason
+    // [`RELAY_PATIENCE`] gives: two of them in sequence is fifty seconds against a
+    // runner that kills at forty, and a stall in the second would have been killed
+    // rather than reported.
+    let deadline = Instant::now() + RELAY_PATIENCE;
+
     // Never read from this end, which is the whole provocation: the reset is the
     // kernel's answer to a close over a receive queue that still has something in it.
     feed.write_all(b"a keystroke this session never drains")
@@ -3230,7 +4202,7 @@ fn a_session_that_ends_with_the_relays_input_unread_still_exits_clean() {
     // those bytes is an orderly FIN, and this test would then pass having provoked
     // nothing at all.
     assert!(
-        poll_until(RELAY_PATIENCE, || has_unread_bytes(&peer)),
+        poll_by(deadline, || has_unread_bytes(&peer)),
         "the relay never delivered the input this test leaves unread"
     );
 
@@ -3239,7 +4211,7 @@ fn a_session_that_ends_with_the_relays_input_unread_still_exits_clean() {
     drop(peer);
 
     assert!(
-        poll_until(RELAY_PATIENCE, || !child.is_running()),
+        poll_by(deadline, || !child.is_running()),
         "the relay never left after its session ended"
     );
     // After the exit, so nothing here can park: the relay's own end of this

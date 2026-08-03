@@ -580,7 +580,19 @@ fn a_daemon_started_from_a_long_path_is_still_told_from_a_stranger() {
     }
     fs::create_dir_all(&deep).expect("create the deep install directory");
     let exe = deep.join("nomux");
-    fs::copy(env!("CARGO_BIN_EXE_nomux"), &exe).expect("install the binary deep");
+    // Under the fork gate, and not for tidiness: this is `ETXTBSY` waiting to
+    // happen. Another test's `Command::spawn` forking between the `open` inside
+    // `fs::copy` and the `close` that ends it leaves the forked child holding a
+    // *writable* descriptor onto this file until it `exec`s, and the kernel refuses
+    // to execute a file anybody has open for writing — so the `Command::new(&exe)`
+    // a few lines down fails with `ExecutableFileBusy`. Measured at one run in
+    // fifteen under `cargo test --test spawn_lock`, and invisible under nextest,
+    // which gives each test a process of its own and so has never shown it in CI.
+    // `PLAN.md` § P2 records the same hazard for `flock`; [`while_nothing_forks`]
+    // is the seam that already exists for it.
+    while_nothing_forks(|| {
+        fs::copy(env!("CARGO_BIN_EXE_nomux"), &exe).expect("install the binary deep");
+    });
     // What the daemon's `/proc/<pid>/cmdline` will hold: the three arguments and the
     // NUL after each. Asserted rather than assumed, since the whole test is about
     // where that length falls — this is the lower bound `MAX_CMDLINE_LEN` has to clear

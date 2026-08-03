@@ -3,10 +3,26 @@
 # answers holds the runner with no failing test to point at.
 #
 # Twenty seconds is well clear of the slowest ordinary test, which finishes in six.
-# Terminating at two periods puts the kill at forty, above every deadline a test sets
-# for itself — the longest is the thirty seconds one direction of the relay is given —
-# so the kill stays a backstop for a test that has outlived its own patience and is
-# never the thing that decides a result.
+# Terminating at two periods puts the kill at forty, above every *single* wait any
+# test makes: the longest are the thirty seconds a chaos workload is given, the
+# twenty-five the four directions of a relay share, and the twenty a spawn race is
+# allowed. So a test that outlives one wait fails on that wait and says which.
+#
+# What this cannot promise, and used to claim, is that the kill "is never the thing
+# that decides a result". A test that makes several waits one after another is
+# bounded by their sum, and several here can add up past forty — the refusal table in
+# tests/session.rs runs five rows of a handful of fifteen-second waits each, and any
+# test that starts a session has that daemon's own ten before it begins. Every one of
+# those is a wait for something that has already happened or never will, so in
+# practice they cost milliseconds; the exposure is that a genuinely wedged daemon can
+# still be killed from outside rather than reported from within.
+#
+# The mitigation is one deadline per test rather than one per wait, which is what
+# `join_before` and `poll_by` in tests/harness/mod.rs exist for, and what the relay
+# and chaos tests now use. It was written down here because two of them were well
+# past the kill and neither was visibly wrong: the chaos tests allowed themselves a
+# minute, which also lost the seed IMPLEMENTATION.md § 9 promises every failure
+# carries, and the relay tests four consecutive thirty-second joins.
 [profile.default]
 slow-timeout = { period = "20s", terminate-after = 2 }
 
