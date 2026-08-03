@@ -92,6 +92,17 @@ Nothing in `Hello` says where the client's *input* stream stands. `HelloOk`'s
 `in_applied` is authoritative and the client fast-forwards to it (§3), so a claim
 from the client would be one the daemon has no use for.
 
+`Hello.term_len` counts **bytes**, not characters: `term` is UTF-8, so a name whose
+characters are multi-byte costs more than it reads, and the `u16` ceiling of 65535
+is a byte count too. A `TERM` past it is refused rather than truncated — a session
+opened under a silently shortened terminal type is one nobody chose, and neither end
+can see it happen.
+
+`Hello.term` may not contain a NUL, refused encoding as well as decoding. U+0000 is
+valid UTF-8, so nothing else catches it; let through, it reaches the child's
+environment (§6.1.1), where `execve` refuses it and a malformed frame surfaces as
+`Error{Internal}` — the host blamed for what the client sent.
+
 ### 2.3 Flags
 
 Both flag fields are exhaustive: an undefined bit is a protocol error, not a
@@ -135,7 +146,7 @@ sequenceDiagram
   D->>D: queue for the PTY → in_applied = 106
   D--xC: InputAck{106} lost with the connection
   Note over C: still believes in_applied = 100
-  C->>D: Hello{out_offset} on a fresh connection
+  C->>D: Hello
   D-->>C: HelloOk{in_applied: 106}
   Note over C: fast-forwards, discards 100..106
   C->>D: Input{offset: 106, ...}
