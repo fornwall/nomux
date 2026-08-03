@@ -777,14 +777,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
-    /// A scratch directory of this process's own, so concurrent test binaries do
-    /// not share one.
-    fn scratch(name: &str) -> PathBuf {
-        let dir = env::temp_dir().join(format!("nomux-{}-{name}", std::process::id()));
-        drop(fs::remove_dir_all(&dir));
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
+    use crate::scratch::Scratch;
 
     /// The permission bits as they are on disk, never as the symlink pointing at it
     /// would report them.
@@ -794,7 +787,7 @@ mod tests {
 
     #[test]
     fn a_run_directory_is_created_owner_only_and_then_accepted_as_it_stands() {
-        let root = scratch("rundir-new");
+        let root = Scratch::new("rundir-new");
         let dir = root.join("nomux/run");
 
         ensure_dir_at(&dir).unwrap();
@@ -808,7 +801,6 @@ mod tests {
         // The second call is the one every attach after the first makes.
         ensure_dir_at(&dir).unwrap();
         assert_eq!(mode_of(&dir), DIR_MODE);
-        drop(fs::remove_dir_all(&root));
     }
 
     /// Neither a symlink nor a plain file is a run directory, and the symlink is the
@@ -817,7 +809,7 @@ mod tests {
     /// directory — before filling that with the session's sockets.
     #[test]
     fn a_symlink_or_a_file_in_place_of_the_run_directory_is_refused() {
-        let root = scratch("rundir-symlink");
+        let root = Scratch::new("rundir-symlink");
         let target = root.join("elsewhere");
         fs::create_dir_all(&target).unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(0o777)).unwrap();
@@ -845,7 +837,6 @@ mod tests {
         let err = ensure_dir_at(&file).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotADirectory, "{err}");
         assert!(err.to_string().contains("it is not a directory"), "{err}");
-        drop(fs::remove_dir_all(&root));
     }
 
     /// Three answers for one field, separated by what can still be done about the
@@ -854,7 +845,7 @@ mod tests {
     /// three loops below are those three answers; [`check_run_dir`] argues them.
     #[test]
     fn a_run_directory_mode_is_repaired_where_it_can_be_and_refused_where_it_cannot() {
-        let root = scratch("rundir-mode");
+        let root = Scratch::new("rundir-mode");
         let dir = root.join("nomux");
         ensure_dir_at(&dir).unwrap();
 
@@ -893,37 +884,52 @@ mod tests {
             );
             assert_eq!(mode_of(&dir), shut, "mode {shut:o} is left as it stands");
         }
-
-        fs::set_permissions(&dir, fs::Permissions::from_mode(DIR_MODE)).unwrap();
-        drop(fs::remove_dir_all(&root));
     }
 
-    /// The owner check needs no second uid and no mock: every Linux host has
-    /// readable directories belonging to root, and the check returns before anything
-    /// is created or any mode changed — which is what makes the target being
-    /// untouched an assertion here rather than a hope.
+    /// The owner check needs no second uid and no mock as an ordinary user: every
+    /// Linux host has readable directories belonging to root, and the check returns
+    /// before anything is created or any mode changed — which is what makes the
+    /// target being untouched an assertion here rather than a hope.
+    ///
+    /// As root it does need one, and it makes one rather than standing down. The
+    /// early `return` this used to take reports as a pass, so on a host where the
+    /// suite runs as root — a container, which is where CI usually is — the check
+    /// went entirely unexercised and said so nowhere. A directory of this test's own
+    /// handed to another uid asks exactly the same question of exactly the same
+    /// branch, and root is the one user who can arrange it.
     #[test]
     fn a_run_directory_owned_by_another_uid_is_refused() {
         let us = rustix::process::getuid();
-        if us.is_root() {
-            // As root there is no second uid to find: every candidate below would
-            // be ours, and the check under test would rightly pass on all of them.
-            return;
-        }
-        let theirs = ["/usr/lib", "/usr", "/etc"]
-            .into_iter()
-            .map(Path::new)
-            .find(|path| {
-                fs::metadata(path).is_ok_and(|meta| meta.is_dir() && meta.uid() != us.as_raw())
-            })
-            .unwrap_or_else(|| panic!("no readable directory of another uid to test against"));
+        let root = Scratch::new("rundir-uid");
+        let theirs: PathBuf = if us.is_root() {
+            let dir = root.join("somebody-else");
+            fs::create_dir_all(&dir).unwrap();
+            // `nobody` on every distribution this could run on, and it does not have
+            // to exist as an account: the check compares numbers.
+            rustix::fs::chown(
+                &dir,
+                Some(rustix::fs::Uid::from_raw(65_534)),
+                Some(rustix::fs::Gid::from_raw(65_534)),
+            )
+            .expect("hand a directory of ours to another uid");
+            dir
+        } else {
+            ["/usr/lib", "/usr", "/etc"]
+                .into_iter()
+                .map(Path::new)
+                .find(|path| {
+                    fs::metadata(path).is_ok_and(|meta| meta.is_dir() && meta.uid() != us.as_raw())
+                })
+                .unwrap_or_else(|| panic!("no readable directory of another uid to test against"))
+                .to_path_buf()
+        };
 
-        let before = mode_of(theirs);
-        let err = ensure_dir_at(theirs).unwrap_err();
+        let before = mode_of(&theirs);
+        let err = ensure_dir_at(&theirs).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
         assert!(err.to_string().contains("it belongs to uid"), "{err}");
         assert_eq!(
-            mode_of(theirs),
+            mode_of(&theirs),
             before,
             "somebody else's directory was never ours to repair"
         );

@@ -31,7 +31,7 @@ use nomux_proto::{
 
 use harness::{
     Client, Reaper, Rng, Session, Spawned, accept_within, collect, control, has_unread_bytes,
-    hello_frame, join_within, nomux, nomux_with_shell, poll_until, push_until_refused,
+    hello_frame, join_before, nomux, nomux_with_shell, poll_until, push_until_refused,
     read_uninterrupted, reconnect_until_gap, run_root, shrink_send_buffer, stderr, stdout,
     succeeded, wait_for, while_nothing_forks, write_frame,
 };
@@ -1429,9 +1429,15 @@ fn a_symlinked_run_directory_is_refused_by_attach_and_daemon() {
     fs::set_permissions(&target, fs::Permissions::from_mode(0o777)).expect("loosen the target");
     std::os::unix::fs::symlink(&target, root.join("nomux")).expect("plant the symlink");
 
-    let refusals: Vec<(&str, bool, String)> = ["attach", "daemon"]
+    // The exit code each mode owes § 10 for this refusal. `attach` reports 126 — the
+    // shell's "found but not executable", applied to a session — and `DESIGN.md` § 7
+    // has the client cache a host as unattachable on exactly that number, so a
+    // refusal answered with 127 instead would have it retry a host that will never
+    // work and one answered with 1 would have it give up on none. `daemon` is on the
+    // other table, where everything that is not a malformed command line is 1.
+    let refusals: Vec<(&str, i32, Option<i32>, String)> = [("attach", 126), ("daemon", 1)]
         .into_iter()
-        .map(|mode| {
+        .map(|(mode, owed)| {
             // Waited out rather than backgrounded, which is safe only because both
             // modes are refused before they serve: were that refusal ever to
             // regress, this would hang rather than fail. `SHELL` is here for the
@@ -1442,7 +1448,7 @@ fn a_symlinked_run_directory_is_refused_by_attach_and_daemon() {
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped()),
             );
-            (mode, output.status.success(), stderr(&output))
+            (mode, owed, output.status.code(), stderr(&output))
         })
         .collect();
 
@@ -1452,10 +1458,12 @@ fn a_symlinked_run_directory_is_refused_by_attach_and_daemon() {
     // reached. Nothing else in this test would collect it.
     drop(control(&root, &["kill", "symdir"]));
 
-    for (mode, started, stderr) in &refusals {
-        assert!(
-            !started,
-            "{mode} started a session in a symlinked run directory"
+    for (mode, owed, code, stderr) in &refusals {
+        assert_eq!(
+            *code,
+            Some(*owed),
+            "{mode} must refuse a symlinked run directory with {owed}, got {code:?}: \
+             {stderr:?}"
         );
         assert!(
             stderr.contains("run directory") && stderr.contains("symlink"),
@@ -1481,10 +1489,58 @@ fn a_symlinked_run_directory_is_refused_by_attach_and_daemon() {
     );
 }
 
-/// Exercises the path a real bootstrap takes: `nomux attach` with no daemon
-/// running, which must spawn one under the flock and then relay transparently.
+/// The other half of `attach`'s exit table: a session that is not there and could
+/// not be started is 127, the shell's "not found" (`IMPLEMENTATION.md` § 10).
+///
+/// The pair matters more than either number. `DESIGN.md` § 7 has the client cache a
+/// host as *unattachable* on 126 and go on trying on 127, so the two are read as
+/// "stop" and "try again" — and until this test and the one above them, nothing in
+/// the suite would have noticed them swapped, collapsed into 1, or both answered
+/// with whichever branch `run_session_mode` reached first.
+///
+/// A directory where the socket goes is a daemon that cannot start rather than one
+/// that is slow: `connect` to a non-socket is refused, which `attach` reads as
+/// absent and answers by spawning, and the daemon's own `bind_socket` then finds
+/// something at the path it cannot remove. So the timeout below is reached with the
+/// daemon's complaint in hand rather than by waiting out a race.
 #[test]
-fn attach_spawns_the_daemon_and_relays_transparently() {
+fn attach_reports_a_session_it_could_not_start_as_no_such_session() {
+    let root = run_root("attach_nostart");
+    fs::create_dir_all(root.join("nomux").join("nostart.sock"))
+        .expect("plant a directory where the session socket goes");
+
+    let refused = collect(
+        nomux_with_shell(&root, &["attach", "nostart"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
+    assert_eq!(
+        refused.status.code(),
+        Some(127),
+        "a session that does not exist and could not be started must be reported \
+         the way a shell reports a missing command: {:?}",
+        stderr(&refused)
+    );
+    assert!(
+        stdout(&refused).is_empty(),
+        "stdout is where § 5.1 has the client read the bootstrap line, so a failing \
+         attach must leave it alone: {:?}",
+        stdout(&refused)
+    );
+}
+
+/// Exercises the path a real bootstrap takes: `nomux attach` with no daemon
+/// running, which must spawn one under the flock and then carry the conversation.
+///
+/// Named for what it asserts. It used to say "relays transparently", and what it
+/// looks for is a substring in a byte stream — which says the frames got through in
+/// *some* form and nothing about transparency. That property has tests of its own
+/// and they are byte-exact over both the `splice` and the copying paths of § 7;
+/// this one is about the spawn, and the round trip through the child is how it
+/// establishes that the daemon it started is really serving.
+#[test]
+fn attach_spawns_a_daemon_for_a_session_that_does_not_exist_yet() {
     use std::sync::mpsc;
 
     let root = run_root("relay");
@@ -3233,19 +3289,76 @@ fn a_signalled_daemon_collects_a_process_that_ignores_sighup() {
 /// once the PTY has reported end of file, which on the `nomux kill` path it has
 /// not.
 ///
-/// Hence the bound below sits under the grace period rather than under § 6.6's
-/// two-second budget: the regression this guards has a hard floor of 500 ms, so
-/// anything that reintroduces it lands strictly above the bound however lightly
-/// loaded the machine is. What is left is the honest work — two `/proc` walks and
-/// a poll interval or two — which measures in tens of milliseconds.
+/// This used to assert one wall-clock number — under 400 ms — against an honest
+/// path that measures about fifty and a regression with a hard floor of five
+/// hundred. Defensible in intent and indefensible in mechanism: the bound was
+/// wedged between the two with runqueue delay, which nothing here bounds, free to
+/// move either. So the comparison is now between two shutdowns rather than between
+/// one shutdown and a constant. Both sessions are signalled in the same test within
+/// milliseconds of each other, so whatever the machine is doing it is doing to
+/// both, and the ratio survives what an absolute bound cannot.
+///
+/// `quiet < stubborn / 2` is the assertion because the two answers are an order of
+/// magnitude apart when the daemon is right and identical when it is wrong: the
+/// regression makes *every* shutdown the stubborn one. The stubborn measurement is
+/// itself checked against the grace period, so a run where nothing waited for
+/// anything fails as an instrument rather than passing as a result.
 #[test]
 fn a_signalled_daemon_with_a_quiet_child_does_not_wait_out_the_grace_period() {
-    let (mut session, mut client, ok) = Session::attached("fastkill");
+    /// `pty::HANGUP_GRACE`, which is private to the daemon. Used only to say that
+    /// the stubborn measurement really did wait for something.
+    const GRACE: Duration = Duration::from_millis(500);
+
+    // Set up together, and signalled together below, so the two measurements meet
+    // the same machine.
+    let (mut stubborn, mut client, ok) = Session::attached("slowkill");
+    // The shape `a_signalled_daemon_collects_a_process_that_ignores_sighup` uses,
+    // and for the same reason: an *ignored* `SIGHUP` survives `exec` where a trapped
+    // one is reset, so this is a process the daemon's first reach cannot collect and
+    // must wait out. `set +m` keeps it in the shell's own group, which is what
+    // `Pty::terminate` signals.
+    client.input(
+        0,
+        b"set +m; trap '' HUP; sleep 300 & echo \"$!-NOMUX-ORPHAN-$((6*7))\"\n",
+    );
+    let (seen, _) = client.read_until("-NOMUX-ORPHAN-42", ok.resume_from);
+    let orphan = trailing_pid(&seen, "-NOMUX-ORPHAN-42")
+        .unwrap_or_else(|| panic!("no background pid in the transcript: {seen:?}"));
+    // Deliberately in nobody's reach until the daemon collects it, so nothing else
+    // would clean it up if an assertion below fired first.
+    let _collected = Reaper(orphan);
+
+    let (mut quiet, mut settled, ok) = Session::attached("fastkill");
     // So the measurement covers a session with a live shell in it, rather than the
     // window before the child exists at all.
-    client.input(0, b"echo NOMUX-READY\n");
-    client.read_until("NOMUX-READY", ok.resume_from);
+    settled.input(0, b"echo NOMUX-READY\n");
+    settled.read_until("NOMUX-READY", ok.resume_from);
 
+    let stubborn = time_shutdown(&mut stubborn);
+    let quiet = time_shutdown(&mut quiet);
+    let load =
+        fs::read_to_string("/proc/loadavg").unwrap_or_else(|err| format!("unreadable: {err}"));
+
+    assert!(
+        stubborn >= GRACE,
+        "the stubborn session went in {stubborn:?}, inside the {GRACE:?} its \
+         un-hangupable child should have cost it — so it is not a grace period this \
+         run measured, and the comparison below would mean nothing. Load: {load}"
+    );
+    assert!(
+        quiet < stubborn / 2,
+        "a session with nothing left running took {quiet:?} to stop against \
+         {stubborn:?} for one with a process that ignores SIGHUP: the two are the \
+         same shutdown, so the grace period is being paid whether or not anything \
+         is still there. Load: {load}"
+    );
+}
+
+/// Signals a daemon and reports how long it took to leave.
+///
+/// Collected here as well as timed, so the harness does not go on to `SIGKILL` a
+/// process that has already gone and the caller can compare two of these.
+fn time_shutdown(session: &mut Session) -> Duration {
     let daemon = rustix::process::Pid::from_raw(session.child.id().cast_signed())
         .expect("the daemon's own pid");
     let began = Instant::now();
@@ -3259,15 +3372,11 @@ fn a_signalled_daemon_with_a_quiet_child_does_not_wait_out_the_grace_period() {
             .expect("wait for the daemon")
             .is_some()
     });
-    // Read before the assertions, since the first of them is about how long the
-    // second one took to become true.
+    // Read before the assertion, since what is being measured is how long the
+    // condition took to become true.
     let elapsed = began.elapsed();
     assert!(exited, "the signalled daemon never exited");
-    assert!(
-        elapsed < Duration::from_millis(400),
-        "shutdown took {elapsed:?}, at or over the 500 ms grace period it \
-         should only pay when something is still running"
-    );
+    elapsed
 }
 
 /// The run of digits immediately before `marker`, as a pid.
@@ -3564,13 +3673,19 @@ fn the_relay_moves_the_same_traffic_by_copying_when_the_kernel_will_not_splice_i
     );
 }
 
-/// How long one direction of a relay has to finish before the wait on it is called a
-/// hang rather than slowness.
+/// How long *all four* of a relay's directions have between them before the wait on
+/// them is called a hang rather than slowness.
 ///
 /// Far above the second or so the transfers really take, and far below the
 /// termination in `.config/nextest.toml`, so a stalled relay fails here — naming the
 /// direction that stopped — rather than being killed there with nothing to point at.
-const RELAY_PATIENCE: Duration = Duration::from_secs(30);
+///
+/// The four joins share it rather than each getting one, which is what makes the
+/// second half of that sentence true. Thirty seconds apiece was a hundred and twenty
+/// against a runner that kills at forty: a relay that stalled in any direction but
+/// the first was killed by nextest, and the named failure this exists to produce
+/// never ran.
+const RELAY_PATIENCE: Duration = Duration::from_secs(25);
 
 /// Moves `bulk` bytes each way through a relay and compares both directions.
 ///
@@ -3626,14 +3741,15 @@ fn assert_relay_moves_bulk(
     };
     let downlink = thread::spawn(drain);
 
-    join_within(feeder, RELAY_PATIENCE, "feeder");
-    let uplink = join_within(uplink, RELAY_PATIENCE, "socket reader");
-    join_within(push, RELAY_PATIENCE, "pusher");
+    let deadline = Instant::now() + RELAY_PATIENCE;
+    join_before(feeder, deadline, "feeder");
+    let uplink = join_before(uplink, deadline, "socket reader");
+    join_before(push, deadline, "pusher");
     // Only now: the relay ends the moment the socket reports EOF, so closing this
     // any earlier would truncate the direction under test rather than test it.
     peer.shutdown(Shutdown::Write)
         .expect("half-close the socket");
-    let downlink = join_within(downlink, RELAY_PATIENCE, "stdout reader");
+    let downlink = join_before(downlink, deadline, "stdout reader");
 
     // Killed before its stderr is read to the end. Every wait above goes through
     // `join_within` so that a stalled relay fails rather than hangs, and this read

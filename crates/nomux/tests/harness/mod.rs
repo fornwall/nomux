@@ -89,8 +89,21 @@ pub(crate) fn poll_until(within: Duration, mut condition: impl FnMut() -> bool) 
 /// deadline, and the guard in `.config/nextest.toml` can only kill the process
 /// without saying which wait never ended.
 pub(crate) fn join_within<T>(handle: thread::JoinHandle<T>, within: Duration, what: &str) -> T {
+    join_before(handle, Instant::now() + within, what)
+}
+
+/// [`join_within`] against a deadline the caller shares between several waits.
+///
+/// A test that joins four threads one after another with a bound each is bounded by
+/// the *sum* of them, which is how the relay tests came to allow themselves two
+/// minutes against a runner that kills at forty seconds — so a relay that stalled in
+/// the last direction was killed by nextest with nothing to point at, which is the
+/// exact failure `join_within` exists to prevent. One deadline for the sequence
+/// keeps the promise the individual bounds were written to make.
+pub(crate) fn join_before<T>(handle: thread::JoinHandle<T>, deadline: Instant, what: &str) -> T {
+    let remaining = deadline.saturating_duration_since(Instant::now());
     assert!(
-        poll_until(within, || handle.is_finished()),
+        poll_until(remaining, || handle.is_finished()),
         "the {what} thread never finished"
     );
     handle

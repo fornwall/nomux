@@ -18,6 +18,8 @@ mod passwd;
 mod pty;
 mod ring;
 mod rundir;
+#[cfg(test)]
+mod scratch;
 mod startup;
 mod syslog;
 

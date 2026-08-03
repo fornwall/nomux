@@ -88,31 +88,28 @@ fn username() -> Option<String> {
 mod tests {
     use super::*;
 
-    /// A scratch directory of this process's own, so concurrent test binaries do
-    /// not share one.
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("nomux-{}-{name}", std::process::id()));
-        drop(fs::remove_dir_all(&dir));
-        dir
-    }
+    use crate::scratch::Scratch;
 
     #[test]
     fn a_marker_file_means_enabled_and_its_absence_means_disabled() {
-        let dir = scratch("linger");
-        fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch::new("linger");
         fs::write(dir.join("lingerer"), "").unwrap();
 
-        assert_eq!(state_of(&dir, "lingerer"), Linger::Enabled);
-        assert_eq!(state_of(&dir, "someone_else"), Linger::Disabled);
-        drop(fs::remove_dir_all(&dir));
+        assert_eq!(state_of(dir.path(), "lingerer"), Linger::Enabled);
+        assert_eq!(state_of(dir.path(), "someone_else"), Linger::Disabled);
     }
 
     /// A host where no one has ever enabled lingering has no directory, which is
     /// still a definite "off" rather than an unknown.
+    ///
+    /// Under a scratch directory that does exist, so the absence being asked about
+    /// is `LINGER_DIR` itself rather than `$TMPDIR` — and so the guard has something
+    /// to collect either way.
     #[test]
     fn a_missing_directory_is_disabled_not_unknown() {
+        let root = Scratch::new("linger-absent");
         assert_eq!(
-            state_of(&scratch("linger-absent"), "anyone"),
+            state_of(&root.join("never-created"), "anyone"),
             Linger::Disabled
         );
     }

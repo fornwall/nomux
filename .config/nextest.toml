@@ -4,9 +4,17 @@
 #
 # Twenty seconds is well clear of the slowest ordinary test, which finishes in six.
 # Terminating at two periods puts the kill at forty, above every deadline a test sets
-# for itself — the longest is the thirty seconds one direction of the relay is given —
-# so the kill stays a backstop for a test that has outlived its own patience and is
-# never the thing that decides a result.
+# for itself — the longest are the thirty seconds a chaos workload is given and the
+# twenty-five the four directions of a relay share — so the kill stays a backstop for
+# a test that has outlived its own patience and is never the thing that decides a
+# result.
+#
+# "Every deadline a test sets for itself" has to mean the whole of what a test can
+# wait for and not the largest single wait in it, which is where this used to be
+# wrong twice over: the chaos tests allowed themselves a minute and the relay tests
+# four consecutive thirty-second joins. Both were above the kill, so a stall in
+# either was terminated from outside with nothing to point at — and for chaos that
+# also lost the seed IMPLEMENTATION.md § 9 promises every failure carries.
 [profile.default]
 slow-timeout = { period = "20s", terminate-after = 2 }
 
