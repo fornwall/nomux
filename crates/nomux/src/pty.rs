@@ -118,10 +118,13 @@ impl Pty {
         // CLOEXEC only takes effect at exec.
         let slave_fd = slave.as_raw_fd();
         // SAFETY: the closure runs in the forked child before exec, so it must be
-        // async-signal-safe. `setsid` and `signal` are named as such by
-        // signal-safety(7); `ioctl` is not on that list but is a bare syscall
-        // wrapper in both glibc and musl. Nothing here allocates, takes a lock, or
-        // touches the Rust runtime, which is what the guarantee rests on.
+        // async-signal-safe. `setsid` and `ioctl_tiocsctty` are rustix on its
+        // `linux_raw` backend — inline syscalls with no libc between them and the
+        // kernel (`IMPLEMENTATION.md` § 8 makes that a property of the whole tree) —
+        // so both are trivially reentrant whatever signal-safety(7) says about the C
+        // functions of the same names. `libc::signal` below is the one real libc call
+        // here, and it *is* on that list. Nothing allocates, takes a lock, or touches
+        // the Rust runtime, which is what the guarantee rests on.
         unsafe {
             command.pre_exec(move || {
                 rustix::process::setsid()?;
@@ -145,6 +148,14 @@ impl Pty {
         }
 
         let child = command.spawn()?;
+        // Both the copy in this frame and the three `Stdio::from` took: std only
+        // *borrows* an owned descriptor for the child, so `Command` holds all three
+        // until it is itself dropped. The master reports `EIO` — which `read_pty`
+        // turns into the end of the session — only once no descriptor onto the slave
+        // is left in this process, so a copy outliving this function is a child that
+        // exits without the daemon ever noticing. Explicit rather than left to the
+        // end of the scope, since that is an invariant something depends on.
+        drop(command);
         drop(slave);
         Ok(Self { master, child })
     }
@@ -310,7 +321,7 @@ fn session_members(sid: i32) -> Vec<i32> {
         .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
         .filter(|pid| *pid != self_pid)
         .filter(|pid| {
-            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            std::fs::read(format!("/proc/{pid}/stat"))
                 .ok()
                 .and_then(|stat| stat_session(&stat))
                 .is_some_and(|(session, zombie)| session == sid && !zombie)
@@ -326,8 +337,19 @@ fn session_members(sid: i32) -> Vec<i32> {
 /// and splitting from the left hands back whatever they put there. Everything after
 /// the final `)` is fixed-width and space-separated, so it is safe to count through
 /// — state, ppid, pgrp, then the session.
-fn stat_session(stat: &str) -> Option<(i32, bool)> {
-    let (_, rest) = stat.rsplit_once(')')?;
+///
+/// Bytes rather than a `&str` for the same reason, taken one step further. That
+/// name is copied from the executable's basename, and the kernel escapes only `\n`
+/// and `\\` in it, so a binary called `ba<0xff>sh` puts a byte in this line that is
+/// not UTF-8. Read as a string the whole line is then undecodable, the pid drops
+/// out of the walk, and the consequences are silent and both bad: [`Pty::terminate`]
+/// never signals that process, and — because the walk is also what decides the
+/// session has settled — it skips the `SIGKILL` escalation and reports a clean
+/// shutdown over a job that is still running. Only the fixed-width tail is decoded,
+/// which is ASCII by construction.
+fn stat_session(stat: &[u8]) -> Option<(i32, bool)> {
+    let close = stat.iter().rposition(|byte| *byte == b')')?;
+    let rest = str::from_utf8(stat.get(close + 1..)?).ok()?;
     let mut fields = rest.split_whitespace();
     let state = fields.next()?;
     let session = fields.nth(2)?.parse().ok()?;
@@ -442,24 +464,35 @@ mod tests {
     /// and spaces included, and the fields that matter here sit after it.
     #[test]
     fn a_stat_line_parses_past_a_hostile_process_name() {
-        let ordinary = "42 (bash) S 1 42 42 34816 99 4194304 0 0";
+        let ordinary = b"42 (bash) S 1 42 42 34816 99 4194304 0 0";
         assert_eq!(stat_session(ordinary), Some((42, false)));
 
         // A name chosen to break a left-to-right split: it contains spaces, a
         // closing paren, and digits that would be read as the session id.
-        let hostile = "42 (evil) 1 2 3) S 1 42 7 34816 99 4194304 0 0";
+        let hostile = b"42 (evil) 1 2 3) S 1 42 7 34816 99 4194304 0 0";
         assert_eq!(
             stat_session(hostile),
             Some((7, false)),
             "the session must come from after the *last* paren"
         );
 
-        let zombie = "42 (sh) Z 1 42 42 0 -1 4194304 0 0";
+        // A `comm` the kernel does not escape and UTF-8 cannot hold. Read as a
+        // string the whole line is undecodable, and this process would then be
+        // invisible to the walk that is supposed to signal it — so it would
+        // survive `nomux kill` while the daemon reported a clean shutdown.
+        let not_utf8 = b"42 (ba\xffsh) S 1 42 42 34816 99 4194304 0 0";
+        assert_eq!(
+            stat_session(not_utf8),
+            Some((42, false)),
+            "a name outside UTF-8 must not hide the process from the walk"
+        );
+
+        let zombie = b"42 (sh) Z 1 42 42 0 -1 4194304 0 0";
         assert_eq!(stat_session(zombie), Some((42, true)));
 
-        assert_eq!(stat_session("truncated"), None);
+        assert_eq!(stat_session(b"truncated"), None);
         assert_eq!(
-            stat_session("42 (sh) S 1"),
+            stat_session(b"42 (sh) S 1"),
             None,
             "too few fields to answer"
         );
@@ -532,7 +565,7 @@ mod tests {
     /// Whether `pid` is gone, counting a zombie as gone: it has exited and is
     /// waiting on a parent that this test does not control.
     fn collected(pid: i32) -> bool {
-        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        std::fs::read(format!("/proc/{pid}/stat"))
             .ok()
             .and_then(|stat| stat_session(&stat))
             .is_none_or(|(_, zombie)| zombie)
