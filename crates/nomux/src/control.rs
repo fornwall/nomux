@@ -156,26 +156,25 @@ pub(crate) fn kill(session_id: &str) -> io::Result<()> {
     // a fresh daemon between the signal below and the unlink that follows loses
     // its socket to a kill it was never the target of.
     let lock = hold_spawn_lock(&paths)?;
-    let pid = match resolve(&paths)? {
-        Target::Gone => {
-            paths.unlink_all_locked(&lock);
-            return Ok(());
+    if let Target::Daemon(pid) = resolve(&paths)? {
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
+        // Liveness first, deadline second, so a daemon that let go on the last
+        // interval is not signalled again: the pid it published is reusable the
+        // moment it is reaped, and `SIGKILL` is the one signal nothing survives.
+        let deadline = Instant::now() + TERM_GRACE;
+        while liveness(&paths) == Liveness::Alive {
+            if Instant::now() >= deadline {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+                break;
+            }
+            thread::sleep(POLL_INTERVAL);
         }
-        Target::Daemon(pid) => pid,
-    };
-
-    let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
-
-    let deadline = Instant::now() + TERM_GRACE;
-    while Instant::now() < deadline {
-        if liveness(&paths) == Liveness::Stale {
-            paths.unlink_all_locked(&lock);
-            return Ok(());
-        }
-        thread::sleep(POLL_INTERVAL);
     }
-
-    let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+    // The one *successful* exit from the locked region, and so the one place the
+    // files go: a session that was already gone, one that stopped on `SIGTERM` and
+    // one that had to be killed all leave the same nothing behind. The other exit is
+    // `resolve`'s `?` above, which deliberately unlinks nothing — § 6.6 keeps all
+    // five files when `kill` cannot establish that the session is dead.
     paths.unlink_all_locked(&lock);
     Ok(())
 }

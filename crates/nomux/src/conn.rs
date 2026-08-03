@@ -311,11 +311,10 @@ impl Conn {
         scratch: &mut Vec<u8>,
     ) -> Result<Option<FrameType>, nomux_proto::ProtoError> {
         let available = self.rx.get(self.rx_pos..).unwrap_or(&[]);
-        let Some(head) = available.get(..HEADER_LEN) else {
+        let Some(head) = available.first_chunk::<HEADER_LEN>() else {
             return Ok(None);
         };
-        let head: [u8; HEADER_LEN] = head.try_into().unwrap_or([0; HEADER_LEN]);
-        let Header { ty, len } = decode_header(&head)?;
+        let Header { ty, len } = decode_header(head)?;
 
         let len = len as usize;
         let Some(payload) = available.get(HEADER_LEN..HEADER_LEN + len) else {

@@ -33,57 +33,78 @@ pub const MAX_PAYLOAD: u32 = 256 * 1024;
 // unrelated places have to agree on, and the compiler only notices some of the
 // ways they can drift apart. `Frame::decode` matches on `FrameType` exhaustively,
 // so adding a variant here stops the build until the payload side has learnt to
-// read one. `from_byte` stops nothing: it ends in a catch-all `_ => None`, which
-// quietly absorbs a variant nobody taught it about. That combination compiles,
-// passes the suite, and is broken in the field — this end can *send* the new frame
-// but never *receives* one, because every header carrying it comes back as an
-// unknown type, and the symptom points at the peer rather than at the arm that was
-// never written. The two test suites had a hole of the same shape: both swept a
-// hand-written `[FrameType; 16]`, so a variant missing from those arrays was simply
-// never exercised, and nothing said so.
+// read one. A hand-written `from_byte` stops nothing: it ends in a catch-all
+// `_ => None`, which quietly absorbs a variant nobody taught it about. That
+// combination compiles, passes the suite, and is broken in the field — this end
+// can *send* the new frame but never *receives* one, because every header carrying
+// it comes back as an unknown type, and the symptom points at the peer rather than
+// at the arm that was never written. The two test suites had a hole of the same
+// shape: both swept a hand-written `[FrameType; 16]`, so a variant missing from
+// those arrays was simply never exercised, and nothing said so.
 //
 // So the list is written once, here, and everything mechanically derived from it —
-// the enum, `from_byte`, and the `ALL` the suites sweep — is generated from it.
-// This is a plain `macro_rules!` expanding to the same items that used to be typed
-// out by hand, so it costs nothing at runtime and nothing against the size budget
-// `Cargo.toml` sets out. `as_byte` is deliberately not in here: it is one line that
-// does not vary with the list, and it reads better in the ordinary `impl` below.
-macro_rules! frame_types {
-    ($($(#[$doc:meta])* $name:ident = $byte:literal,)+) => {
-        /// Frame discriminant.
-        ///
-        /// Exhaustive on purpose: both endpoints are built from this repository, so an
-        /// unrecognised variant is a bug rather than a forward-compatibility case.
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-        #[repr(u8)]
-        pub enum FrameType {
-            $($(#[$doc])* $name = $byte,)+
+// the enum, both directions of the conversion, and the `ALL` the suites sweep — is
+// generated from it. This is a plain `macro_rules!` expanding to the same items
+// that used to be typed out by hand, so it costs nothing at runtime and nothing
+// against the size budget `Cargo.toml` sets out.
+//
+// `FrameType` is the list this crate is built around but not the only closed set on
+// the wire: `IMPLEMENTATION.md` § 2.3 applies the same rule to `Error.code`,
+// `Exit.kind` and the linger field, so those go through this macro too rather than
+// through three more hand-written matches — see `frame.rs`. Hence the parameters:
+// the sets differ in their repr and in what the two accessors are called. The
+// encode direction is a cast, which is why each list's numbers are declared as real
+// discriminants under `#[repr($repr)]` rather than as the arms of a second match
+// that could disagree with the first.
+macro_rules! wire_enum {
+    (
+        $(#[$enum_meta:meta])*
+        $name:ident: $repr:ident, $as_fn:ident / $from_fn:ident,
+        $($(#[$variant_meta:meta])* $variant:ident = $value:literal,)+
+    ) => {
+        $(#[$enum_meta])*
+        #[repr($repr)]
+        pub enum $name {
+            $($(#[$variant_meta])* $variant = $value,)+
         }
 
-        impl FrameType {
-            /// Every frame type, in wire order.
+        impl $name {
+            /// Every variant, in wire order.
             ///
             /// Public because the crate's integration tests sweep it — offering every
-            /// payload to every type, and checking every discriminant round-trips —
-            /// and a test that has to be told about a new variant is a test that will
-            /// eventually not be. Nothing outside the test suites has a use for it,
-            /// but this protocol is private to this repository, so exposing it commits
-            /// to nothing.
-            pub const ALL: [Self; [$(Self::$name),+].len()] = [$(Self::$name),+];
+            /// payload to every frame type, checking every discriminant round-trips,
+            /// and generating every value of every closed set — and a test that has to
+            /// be told about a new variant is a test that will eventually not be.
+            /// Nothing outside the test suites has a use for it, but this protocol is
+            /// private to this repository, so exposing it commits to nothing.
+            pub const ALL: [Self; [$(Self::$variant),+].len()] = [$(Self::$variant),+];
+
+            /// Returns the wire discriminant.
+            #[must_use]
+            pub const fn $as_fn(self) -> $repr {
+                self as $repr
+            }
 
             /// Parses a wire discriminant, returning `None` if unrecognised.
             #[must_use]
-            pub const fn from_byte(byte: u8) -> Option<Self> {
-                match byte {
-                    $($byte => Some(Self::$name),)+
+            pub const fn $from_fn(value: $repr) -> Option<Self> {
+                match value {
+                    $($value => Some(Self::$variant),)+
                     _ => None,
                 }
             }
         }
     };
 }
+pub(crate) use wire_enum;
 
-frame_types! {
+wire_enum! {
+    /// Frame discriminant.
+    ///
+    /// Exhaustive on purpose: both endpoints are built from this repository, so an
+    /// unrecognised variant is a bug rather than a forward-compatibility case.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    FrameType: u8, as_byte / from_byte,
     /// Client opens a session, carrying its resume offsets and window size.
     Hello = 0x01,
     /// Daemon accepts, reporting where output will resume from.
@@ -116,14 +137,6 @@ frame_types! {
     AgentData = 0x0f,
     /// One agent channel is finished, in either direction.
     AgentClose = 0x10,
-}
-
-impl FrameType {
-    /// Returns the wire discriminant.
-    #[must_use]
-    pub const fn as_byte(self) -> u8 {
-        self as u8
-    }
 }
 
 /// Maximum session id length, in bytes.

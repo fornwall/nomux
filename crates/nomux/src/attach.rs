@@ -5,6 +5,7 @@
 //! needs a version bump. It exists for hosts where the client cannot open a
 //! `direct-streamlocal` channel straight to the socket.
 
+use std::collections::VecDeque;
 use std::env;
 use std::io::{self, Write};
 use std::net::Shutdown;
@@ -195,8 +196,13 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
     let mut to_stdout = Pump::default();
     let mut stdin_open = true;
     let mut socket_open = true;
+    // The third of the three, and the only one about a *destination*. The relay
+    // exists to put the session's output somewhere; once that somewhere has no
+    // reader left, there is nothing for it to go on doing, so it ends the loop the
+    // way the two above do rather than carrying on with nowhere to deliver.
+    let mut stdout_open = true;
 
-    while socket_open || to_stdout.has_data() {
+    while stdout_open && (socket_open || to_stdout.has_data()) {
         let mut fds = Vec::with_capacity(3);
         let want_stdin = stdin_open && to_socket.wants_source();
         if want_stdin {
@@ -239,23 +245,16 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
         // below rather than recomputed, so a `Pump` that changed state during the
         // `poll` cannot shift the mapping under it.
         let mut events = fds.iter().map(rustix::event::PollFd::revents);
-        let stdin_events = if want_stdin {
-            events.next().unwrap_or_else(PollFlags::empty)
-        } else {
-            PollFlags::empty()
+        let mut revents = |registered: bool| {
+            if registered {
+                events.next().unwrap_or_else(PollFlags::empty)
+            } else {
+                PollFlags::empty()
+            }
         };
-        let socket_events = if socket_flags.is_empty() {
-            PollFlags::empty()
-        } else {
-            events.next().unwrap_or_else(PollFlags::empty)
-        };
-        let stdout_events = if want_stdout {
-            events.next().unwrap_or_else(PollFlags::empty)
-        } else {
-            PollFlags::empty()
-        };
-        drop(events);
-        drop(fds);
+        let stdin_events = revents(want_stdin);
+        let socket_events = revents(!socket_flags.is_empty());
+        let stdout_events = revents(want_stdout);
 
         // `ERR` alongside `HUP`, as the socket direction below and
         // `daemon::poll_once` both have it: a source reporting only `ERR` would
@@ -274,48 +273,60 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
         {
             socket_open = false;
         }
+        // Deliberately not read back into an ending. An `EPIPE` towards the socket
+        // is a client that has gone, and the relay already ends on that: the same
+        // departure arrives as EOF from the socket's *read* side above, where
+        // `socket_open` is cleared. Anything still queued for it is dropped there
+        // and then, which is all that is owed to a peer that has stopped listening.
         if socket_events.contains(PollFlags::OUT) || to_socket.has_data() {
-            to_socket.drain_to(sock_fd)?;
+            let _client_still_reading = to_socket.drain_to(sock_fd)?;
         }
-        // Before the drain, and terminal. `POLLOUT` is the only thing that clears
-        // `Pump::dest_full`, and a destination whose reader has gone never reports
-        // it — a full pipe with no reader is not writable, it is broken. So the
-        // relay would poll a descriptor that answers `ERR` forever, match neither
-        // this condition nor the one below (the buffer is empty: `splice` moved
-        // those bytes inside the kernel), change nothing, and come straight back
-        // round — a busy loop at the speed of the scheduler, for as long as the
-        // socket stayed open. Leaving is the whole of the answer: there is nothing
-        // left to deliver output to, which is the same conclusion the socket
-        // direction already draws from its own `HUP | ERR` above.
+        // Before the drain, and one of the two ways the same fact arrives.
+        // `POLLOUT` is the only thing that clears `Pump::dest_full`, and a
+        // destination whose reader has gone never reports it — a full pipe with no
+        // reader is not writable, it is broken. So the relay would poll a
+        // descriptor that answers `ERR` forever, match neither this condition nor
+        // the one below (the buffer is empty: `splice` moved those bytes inside the
+        // kernel), change nothing, and come straight back round — a busy loop at
+        // the speed of the scheduler, for as long as the socket stayed open.
         if stdout_events.intersects(PollFlags::ERR | PollFlags::HUP) {
-            return Ok(());
-        }
-        if stdout_events.contains(PollFlags::OUT) || to_stdout.has_data() {
-            to_stdout.drain_to(stdout_fd)?;
+            stdout_open = false;
+        } else if stdout_events.contains(PollFlags::OUT) || to_stdout.has_data() {
+            // The other way, and the only one available while this direction is
+            // idle: an empty buffer wants nothing from `poll`, so stdout is not in
+            // the set and `ERR` above is never delivered. A reader that dies then
+            // is discovered by writing to it and by nothing else — which is why an
+            // `EPIPE` here has to be the ending rather than a cleared buffer.
+            // Swallowing it left the relay reading the socket into a buffer it
+            // emptied over a dead pipe, for as long as the session went on
+            // producing output, while holding the session's one client slot.
+            stdout_open = to_stdout.drain_to(stdout_fd)?;
         }
     }
 
-    to_stdout.drain_to(stdout_fd)?;
-    stdout.lock().flush()
+    // The loop can exit still owing the last batch — the socket reaches EOF with
+    // the buffer non-empty — but only a destination that is still there is owed
+    // anything.
+    if stdout_open && to_stdout.drain_to(stdout_fd)? {
+        stdout.lock().flush()?;
+    }
+    Ok(())
 }
 
 /// Reads once into `buf`. `false` means the source reached EOF.
-fn copy_in(fd: BorrowedFd<'_>, buf: &mut Buffer) -> io::Result<bool> {
+fn copy_in(fd: BorrowedFd<'_>, buf: &mut VecDeque<u8>) -> io::Result<bool> {
     let mut chunk = [0u8; 16 * 1024];
-    loop {
-        return match rustix::io::read(fd, &mut chunk) {
-            // A PTY-backed peer reports end of session as EIO rather than 0.
-            Ok(0) | Err(rustix::io::Errno::IO) => Ok(false),
-            Ok(n) => {
-                buf.push(chunk.get(..n).unwrap_or(&[]));
-                Ok(true)
-            }
-            Err(rustix::io::Errno::INTR) => continue,
-            // Nothing pending is not EOF; the peer is still there, it just had
-            // nothing to say.
-            Err(rustix::io::Errno::AGAIN) => Ok(true),
-            Err(err) => Err(err.into()),
-        };
+    match crate::nbio::read(fd, &mut chunk) {
+        // A PTY-backed peer reports end of session as EIO rather than 0.
+        Ok(0) | Err(rustix::io::Errno::IO) => Ok(false),
+        Ok(n) => {
+            buf.extend(chunk.get(..n).unwrap_or(&[]));
+            Ok(true)
+        }
+        // Nothing pending is not EOF; the peer is still there, it just had
+        // nothing to say.
+        Err(rustix::io::Errno::AGAIN) => Ok(true),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -358,35 +369,28 @@ fn splice_once(src: BorrowedFd<'_>, dst: BorrowedFd<'_>) -> Spliced {
 ///
 /// Two paths through the single component that must never break, which is worth
 /// being uneasy about — so they are kept from ever interleaving: `splice` is
-/// attempted only when [`Buffer`] is empty, and a `splice` never leaves anything
+/// attempted only when the buffer is empty, and a `splice` never leaves anything
 /// behind in it. Bytes therefore leave in the order they arrived under either
 /// path, and the choice between them cannot reorder anything.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Pump {
     /// Bytes the destination would not take yet. Only ever filled by the copying
     /// path.
-    buf: Buffer,
-    /// Cleared for good the first time `splice` refuses this pair. Never retried:
+    buf: VecDeque<u8>,
+    /// Set for good the first time `splice` refuses this pair. Never reconsidered:
     /// the reason it refuses — neither end is a pipe — cannot change while the
     /// relay runs, and retrying would buy a wasted syscall per wakeup forever.
-    splice_usable: bool,
+    ///
+    /// Named for the refusal rather than for the capability so that the default is
+    /// the optimistic one, which is the behaviour wanted: one refused syscall is
+    /// the entire cost of finding out whether this host can splice, and it is paid
+    /// once per direction.
+    splice_refused: bool,
     /// `splice` reported the destination full. Distinct from a non-empty buffer in
     /// that nothing is held here; it only records that the source must be left
     /// alone until the destination reports `POLLOUT`, since re-reading it would
     /// spin on `EAGAIN`.
     dest_full: bool,
-}
-
-impl Default for Pump {
-    /// Starts optimistic. One refused syscall is the entire cost of finding out
-    /// whether this host can splice, and it is paid once per direction.
-    fn default() -> Self {
-        Self {
-            buf: Buffer::default(),
-            splice_usable: true,
-            dest_full: false,
-        }
-    }
 }
 
 impl Pump {
@@ -400,18 +404,18 @@ impl Pump {
     /// between the two directions cannot reorder anything — and stating it this way
     /// makes it a fact about the code rather than a coincidence each reader has to
     /// re-derive.
-    const fn wants_source(&self) -> bool {
+    fn wants_source(&self) -> bool {
         !self.wants_dest()
     }
 
     /// Whether the destination is worth polling for writability.
-    const fn wants_dest(&self) -> bool {
-        self.buf.has_data() || self.dest_full
+    fn wants_dest(&self) -> bool {
+        self.has_data() || self.dest_full
     }
 
     /// Whether anything is still held in userspace for the destination.
-    const fn has_data(&self) -> bool {
-        self.buf.has_data()
+    fn has_data(&self) -> bool {
+        !self.buf.is_empty()
     }
 
     /// Moves one batch from `src` towards `dst`. `false` means `src` reached EOF.
@@ -419,67 +423,46 @@ impl Pump {
     /// Falling back within the same call keeps a host that cannot splice from
     /// losing a wakeup to the discovery.
     fn transfer(&mut self, src: BorrowedFd<'_>, dst: BorrowedFd<'_>) -> io::Result<bool> {
-        if self.splice_usable && !self.buf.has_data() {
+        if !self.splice_refused && !self.has_data() {
             match splice_once(src, dst) {
                 Spliced::Moved(moved) => return Ok(moved != 0),
                 Spliced::Full => {
                     self.dest_full = true;
                     return Ok(true);
                 }
-                Spliced::Unusable => self.splice_usable = false,
+                Spliced::Unusable => self.splice_refused = true,
             }
         }
         copy_in(src, &mut self.buf)
     }
 
     /// Hands the destination whatever is owed it, and forgets that it was full.
+    /// `false` means the destination has stopped reading.
     ///
     /// Called on `POLLOUT`, and also speculatively whenever something is buffered —
     /// an optimistic write that either saves a wakeup or costs one `EAGAIN`.
     /// Clearing [`Pump::dest_full`] is sound either way: it only ever gates
     /// re-reading the source, and the write below is what establishes whether the
     /// destination has room.
-    fn drain_to(&mut self, fd: BorrowedFd<'_>) -> io::Result<()> {
+    fn drain_to(&mut self, fd: BorrowedFd<'_>) -> io::Result<bool> {
         self.dest_full = false;
-        self.buf.drain_to(fd)
-    }
-}
-
-/// A byte queue awaiting a writable destination.
-#[derive(Debug, Default)]
-struct Buffer {
-    data: Vec<u8>,
-    pos: usize,
-}
-
-impl Buffer {
-    const fn has_data(&self) -> bool {
-        self.pos < self.data.len()
-    }
-
-    fn push(&mut self, bytes: &[u8]) {
-        self.data.extend_from_slice(bytes);
-    }
-
-    fn drain_to(&mut self, fd: BorrowedFd<'_>) -> io::Result<()> {
-        while self.has_data() {
-            let pending = self.data.get(self.pos..).unwrap_or(&[]);
-            match rustix::io::write(fd, pending) {
-                Ok(0) | Err(rustix::io::Errno::AGAIN) => break,
-                Ok(n) => self.pos += n,
-                Err(rustix::io::Errno::INTR) => {}
-                Err(rustix::io::Errno::PIPE) => {
-                    self.data.clear();
-                    self.pos = 0;
-                    return Ok(());
-                }
-                Err(err) => return Err(err.into()),
+        match crate::nbio::drain_to(&mut self.buf, fd) {
+            // `EPIPE` is `nbio`'s to report and each caller's to interpret: to an
+            // agent channel it is a dead socket, and here it is the destination's
+            // reader having gone, which is an ordinary ending rather than a
+            // failure — so what was owed it is dropped and the answer comes back as
+            // `false` rather than as an error nobody could act on.
+            //
+            // Which direction that ends is `relay`'s to say and not this method's,
+            // because the two do not agree: towards the socket it is a client that
+            // has left, which the socket's own read side reports again as EOF, and
+            // towards stdout it is the relay's entire purpose gone. Both arrive
+            // here identically, and only one of them stops the loop.
+            Err(rustix::io::Errno::PIPE) => {
+                self.buf.clear();
+                Ok(false)
             }
+            outcome => outcome.map(|()| true).map_err(Into::into),
         }
-        if !self.has_data() {
-            self.data.clear();
-            self.pos = 0;
-        }
-        Ok(())
     }
 }

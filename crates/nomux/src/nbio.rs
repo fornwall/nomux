@@ -1,4 +1,5 @@
-//! The two non-blocking transfers the PTY master and the agent channels are moved by.
+//! The two non-blocking transfers the PTY master, the agent channels and the relay
+//! are moved by.
 //!
 //! Every descriptor in this daemon is non-blocking, because a single-threaded
 //! `poll` loop cannot afford to be parked inside a `read` or a `write`. That makes
@@ -7,17 +8,22 @@
 //! bytes to any signal, and treating `EAGAIN` as end of file reports the session as
 //! over every time the kernel has nothing to hand over yet.
 //!
-//! Two of them come through here — the PTY master and the agent listener's
-//! channels. The client socket (`conn`) and the relay's stdio (`attach`) keep loops
-//! of their own on purpose: both queue into a `Vec` with a cursor rather than a
-//! `VecDeque`, and both answer outcomes this module deliberately does not, such as
-//! `conn`'s short-write `WriteZero` and the relay's `EPIPE`.
+//! Three callers come through here — the PTY master, the agent listener's channels
+//! and the relay's stdio (`attach`). Only the client socket (`conn`) still keeps a
+//! loop of its own, and on purpose: it queues into a `Vec` with a cursor rather than
+//! a `VecDeque`, so there is nothing for [`drain_to`] to take, and it reads a
+//! zero-length write as `WriteZero` where this module reads it as "not now".
 //!
-//! What is *not* here is what each outcome means. A closed peer ends the session
-//! for the PTY and ends one channel for the agent, and folding that decision in
-//! would make one of the two callers wrong.
+//! What is *not* here is what each outcome means. A closed peer ends the session for
+//! the PTY, ends one channel for the agent, and half-closes one direction for the
+//! relay; `EPIPE` is a dead channel to the agent, and to the relay an ordinary
+//! ending that nonetheless ends only one of its two directions — the stdout one,
+//! since a client that goes away arrives a second time as EOF on the socket's read
+//! side. Folding either decision in would make two of the three callers wrong, so
+//! both come back as they arrived.
 
 use std::collections::VecDeque;
+use std::io::IoSlice;
 use std::os::fd::BorrowedFd;
 
 use rustix::io::Errno;
@@ -45,28 +51,26 @@ pub(crate) fn read(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<usize, Errno> {
 /// `POLLOUT` and come back. Errors are the caller's to interpret: the same `EIO`
 /// that ends the session on the PTY master is one dead channel to the agent.
 ///
-/// The `as_slices` dance is load-bearing. A `VecDeque` that has wrapped hands back
-/// a front and a back, and writing the back without the front ahead of it would
-/// deliver the queue out of order — which for a terminal is transposed keystrokes
-/// rather than an error anybody could see. Hence the front, always, and a second
-/// pass for whatever is behind it.
+/// The `writev` is load-bearing rather than an optimisation. A `VecDeque` that has
+/// wrapped hands back a front and a back, and writing the back without the front
+/// ahead of it would deliver the queue out of order — which for a terminal is
+/// transposed keystrokes rather than an error anybody could see. One `writev` over
+/// both, in that order, is what makes that unrepresentable; halving the syscalls a
+/// wrapped queue costs is the side benefit.
+///
+/// It also disposes of the empty front. `as_slices` on a non-empty deque is not
+/// documented to put anything in the front slice, and an empty one handed to
+/// `write` comes back `Ok(0)` — the break below — so the queue would stop draining
+/// and every later `POLLOUT` would find it in the same state, a session that
+/// quietly stops accepting keystrokes. As one of two `iovec`s an empty slice
+/// contributes nothing and the call still writes what is beside it.
 pub(crate) fn drain_to(queue: &mut VecDeque<u8>, fd: BorrowedFd<'_>) -> Result<(), Errno> {
     while !queue.is_empty() {
-        let (front, _) = queue.as_slices();
-        if front.is_empty() {
-            // Unreachable as `VecDeque` is written today: for a non-empty deque the
-            // head index is always inside the buffer, so the front slice always
-            // holds at least one byte and the `while` above has excluded the empty
-            // case. Kept as insurance rather than deleted, because the failure it
-            // would prevent is silent and permanent: `write` of an empty slice
-            // returns `Ok(0)`, which is the break below, so the queue would simply
-            // stop draining and every later `POLLOUT` would find it in the same
-            // state — a session that quietly stops accepting keystrokes. One branch
-            // against that is a good trade.
-            queue.make_contiguous();
-            continue;
-        }
-        match rustix::io::write(fd, front) {
+        let written = {
+            let (front, back) = queue.as_slices();
+            rustix::io::writev(fd, &[IoSlice::new(front), IoSlice::new(back)])
+        };
+        match written {
             Ok(0) | Err(Errno::AGAIN) => break,
             Ok(n) => drop(queue.drain(..n)),
             Err(Errno::INTR) => {}

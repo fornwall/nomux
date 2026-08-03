@@ -116,6 +116,17 @@ impl Agent {
             .map(|chan| (chan.id, chan.stream.as_fd(), !chan.pending.is_empty()))
     }
 
+    /// The still-open channel with this id.
+    ///
+    /// A scan rather than a keyed lookup: the list is capped at
+    /// [`MAX_AGENT_CHANNELS`], and keying it by a `BTreeMap` instead costs 8 KiB
+    /// of monomorphised B-tree in the release binary — measured, `x86_64`, against
+    /// the 400 KiB budget of `IMPLEMENTATION.md` § 8 — to save a linear search
+    /// over at most eight entries.
+    fn channel(&mut self, id: u32) -> Option<&mut Channel> {
+        self.channels.iter_mut().find(|chan| chan.id == id)
+    }
+
     /// Accepts one connection, returning the id of the channel to announce.
     ///
     /// `serving` is whether a client is attached and greeted. When it is not, the
@@ -151,7 +162,7 @@ impl Agent {
 
     /// Reads from one channel's socket.
     pub(crate) fn read(&mut self, id: u32, buf: &mut [u8]) -> Read {
-        let Some(chan) = self.channels.iter_mut().find(|chan| chan.id == id) else {
+        let Some(chan) = self.channel(id) else {
             return Read::Closed;
         };
         match crate::nbio::read(chan.stream.as_fd(), buf) {
@@ -174,7 +185,7 @@ impl Agent {
     /// bytes; a queue this size is a local process that has stopped reading, and
     /// the daemon must not hold megabytes per channel on its behalf.
     pub(crate) fn deliver(&mut self, id: u32, data: &[u8]) -> bool {
-        let Some(chan) = self.channels.iter_mut().find(|chan| chan.id == id) else {
+        let Some(chan) = self.channel(id) else {
             return true;
         };
         chan.pending.extend(data);
@@ -183,7 +194,7 @@ impl Agent {
 
     /// Writes what it can of one channel's queue.
     pub(crate) fn flush(&mut self, id: u32) -> Flush {
-        let Some(chan) = self.channels.iter_mut().find(|chan| chan.id == id) else {
+        let Some(chan) = self.channel(id) else {
             return Flush::Gone;
         };
         if crate::nbio::drain_to(&mut chan.pending, chan.stream.as_fd()).is_err() {
@@ -199,7 +210,7 @@ impl Agent {
     /// Marks a channel closed by the client. Its queue is flushed first, so a reply
     /// the client has already sent still reaches the waiting process.
     pub(crate) fn close_from_client(&mut self, id: u32) {
-        if let Some(chan) = self.channels.iter_mut().find(|chan| chan.id == id) {
+        if let Some(chan) = self.channel(id) {
             chan.closing = true;
             drop(chan.stream.shutdown(std::net::Shutdown::Read));
         }
@@ -212,9 +223,11 @@ impl Agent {
     /// the caller uses that to decide whether the client needs telling, since a
     /// channel the client itself closed needs no answer.
     pub(crate) fn forget(&mut self, id: u32) -> bool {
-        let before = self.channels.len();
-        self.channels.retain(|chan| chan.id != id);
-        self.channels.len() != before
+        let Some(at) = self.channels.iter().position(|chan| chan.id == id) else {
+            return false;
+        };
+        drop(self.channels.remove(at));
+        true
     }
 
     /// Drops every channel, for when the client goes away.

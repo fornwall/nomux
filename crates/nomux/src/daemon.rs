@@ -367,26 +367,41 @@ impl Daemon {
         self.child_gone.map(|gone| gone + EXIT_LINGER)
     }
 
+    /// When idle reaping falls due, if the session is clientless.
+    ///
+    /// An `Instant` rather than the `elapsed() >= limit` test it replaces, for the
+    /// reason [`Daemon::detach_limit`] gives above: `should_stop` and
+    /// `poll_timeout` need the same rule as a *predicate* and as a *duration*, and
+    /// writing it twice is how the wakeup and the deadline it enforces drift apart.
+    fn detach_deadline(&self) -> Option<Instant> {
+        self.detached_since.map(|since| since + self.detach_limit())
+    }
+
+    /// The soonest a deadline could stop the daemon, if either is armed.
+    fn stop_deadline(&self) -> Option<Instant> {
+        [self.exit_deadline(), self.detach_deadline()]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
     /// Whether the PTY queue has grown past [`MAX_PENDING_INPUT`].
     fn input_is_saturated(&self) -> bool {
         self.pending_input.len() >= MAX_PENDING_INPUT
     }
 
+    /// Queues a control frame for the attached client, if there is one.
+    ///
+    /// Most control frames are answers — a `Pong` per `Ping`, an `InputAck` per
+    /// `Input` — and a session with nobody attached simply has nowhere to put them.
+    fn tell_client(&mut self, frame: &Frame<'_>) {
+        if let Some(client) = self.client.as_mut() {
+            client.conn.send_control(frame);
+        }
+    }
+
     fn should_stop(&self) -> bool {
-        if self.stopping {
-            return true;
-        }
-        if let Some(deadline) = self.exit_deadline()
-            && Instant::now() >= deadline
-        {
-            return true;
-        }
-        if let Some(since) = self.detached_since
-            && since.elapsed() >= self.detach_limit()
-        {
-            return true;
-        }
-        false
+        self.stopping || self.stop_deadline().is_some_and(|at| Instant::now() >= at)
     }
 
     /// Everything the poll set watches, in the order it is registered.
@@ -598,14 +613,9 @@ impl Daemon {
         }
 
         self.pump_output();
-        if client_events.contains(PollFlags::OUT)
-            || self
-                .client
-                .as_ref()
-                .is_some_and(|client| client.conn.wants_write())
-        {
-            self.write_client();
-        }
+        // Unconditional: `flush_some` on an empty queue makes no syscall, so asking
+        // every pass costs nothing and there is no readiness test to get wrong.
+        self.write_client();
         Ok(())
     }
 
@@ -617,13 +627,9 @@ impl Daemon {
     /// behaviour. The hourly floor stays as the backstop for a session that is
     /// simply quiet.
     fn poll_timeout(&self) -> Timespec {
-        let mut remaining = IDLE_TICK;
-        if let Some(deadline) = self.exit_deadline() {
-            remaining = remaining.min(deadline.saturating_duration_since(Instant::now()));
-        }
-        if let Some(since) = self.detached_since {
-            remaining = remaining.min(self.detach_limit().saturating_sub(since.elapsed()));
-        }
+        let mut remaining = self.stop_deadline().map_or(IDLE_TICK, |at| {
+            at.saturating_duration_since(Instant::now()).min(IDLE_TICK)
+        });
         // The child has let go of the terminal but `waitpid` has not produced its
         // status yet; come back promptly rather than reporting one we invented.
         if self.child_gone.is_some() && self.exited.is_none() {
@@ -727,9 +733,17 @@ impl Daemon {
         if !ACCEPT_BEFORE_READ && self.client.is_some() {
             drop(self.read_client(scratch));
         }
-        self.evict_client();
-        self.client = self.pending.take().map(Attached::new);
+        // Hands the session over: the connection being replaced is usually one the
+        // daemon has not yet noticed is dead (`IMPLEMENTATION.md` § 6.4). It leaves
+        // by the same door as any other refusal, which also drops its agent channels
+        // — the arriving client knows nothing of them, and their ids are never
+        // reissued. That departure stamps the session clientless, which this one is
+        // not, so the stamp is undone on the next line: it must stay next to the
+        // `reject` that sets it, since a stamp left standing under a live client
+        // reaps the session out from under it at `IDLE_TIMEOUT`.
+        self.reject(ErrorCode::Takeover, "another client attached");
         self.detached_since = None;
+        self.client = self.pending.take().map(Attached::new);
         self.on_hello(&hello)?;
         // Clients pipeline: input riding behind the `Hello` in the same read is
         // already buffered in the connection that was just promoted.
@@ -745,20 +759,6 @@ impl Daemon {
     fn reject_pending(&mut self, code: ErrorCode, message: &'static str) {
         if let Some(mut pending) = self.pending.take() {
             pending.send_last(&Frame::Error { code, message });
-        }
-    }
-
-    /// Hands the session over: the previous connection is usually one the daemon
-    /// has not yet noticed is dead (`IMPLEMENTATION.md` § 6.4).
-    fn evict_client(&mut self) {
-        if let Some(mut old) = self.client.take() {
-            old.conn.send_last(&Frame::Error {
-                code: ErrorCode::Takeover,
-                message: "another client attached",
-            });
-            // The arriving client knows nothing of the outgoing one's channels,
-            // and their ids are never reissued.
-            self.forget_agent_channels();
         }
     }
 
@@ -911,11 +911,7 @@ impl Daemon {
             // waiting for the child to say something. Acting on its contents is what
             // would be wrong here, not ignoring them.
             Frame::OutputAck { .. } => {}
-            Frame::Ping { nonce } => {
-                if let Some(client) = self.client.as_mut() {
-                    client.conn.send_control(&Frame::Pong { nonce });
-                }
-            }
+            Frame::Ping { nonce } => self.tell_client(&Frame::Pong { nonce }),
             Frame::Detach => self.drop_client(),
             Frame::AgentData { chan, data } => {
                 if let Some(agent) = self.agent.as_mut()
@@ -978,10 +974,10 @@ impl Daemon {
         self.win = hello.win;
         self.repaint_ctrl_l = hello.repaint_ctrl_l();
 
-        if self.pty.is_none() {
-            self.start_session(hello)?;
-        } else if let Some(pty) = self.pty.as_ref() {
+        if let Some(pty) = self.pty.as_ref() {
             drop(pty.resize(hello.win));
+        } else {
+            self.start_session(hello)?;
         }
 
         let base = self.ring.base();
@@ -995,23 +991,19 @@ impl Daemon {
             // to catch up.
             hello.out_offset.clamp(base, self.ring.end())
         };
-        let agent = self.agent.is_some();
-        let linger = self.logind_linger;
-        let in_applied = self.in_applied;
-        let win = self.win;
         if let Some(client) = self.client.as_mut() {
             client.sent_through = resume_from;
             client.greeted = true;
-            client.conn.send_control(&Frame::HelloOk(HelloOk {
-                protocol: PROTOCOL_VERSION,
-                resume_from,
-                in_applied,
-                win,
-                gap,
-                linger,
-                agent,
-            }));
         }
+        self.tell_client(&Frame::HelloOk(HelloOk {
+            protocol: PROTOCOL_VERSION,
+            resume_from,
+            in_applied: self.in_applied,
+            win: self.win,
+            gap,
+            linger: self.logind_linger,
+            agent: self.agent.is_some(),
+        }));
         if gap {
             self.repaint();
         }
@@ -1053,12 +1045,9 @@ impl Daemon {
             self.pending_input.extend(data.get(skip..).unwrap_or(&[]));
             self.in_applied = end;
         }
-        let applied_through = self.in_applied;
-        if let Some(client) = self.client.as_mut() {
-            client
-                .conn
-                .send_control(&Frame::InputAck { applied_through });
-        }
+        self.tell_client(&Frame::InputAck {
+            applied_through: self.in_applied,
+        });
     }
 
     fn pump_output(&mut self) {
@@ -1066,57 +1055,56 @@ impl Daemon {
         let end = self.ring.end();
         let exited = self.exited;
         let mut gapped = false;
-        {
-            let Some(client) = self.client.as_mut() else {
-                return;
-            };
-            if !client.greeted {
-                return;
-            }
-            if !client.conn.is_write_saturated() && client.sent_through < end {
-                if client.sent_through < base {
-                    // Overflowed while this client was slow or away: the stream is
-                    // discontinuous and the client must reset its emulator.
-                    client.conn.send_control(&Frame::Gap {
-                        new_base_offset: base,
-                    });
-                    client.sent_through = base;
-                    gapped = true;
-                }
-
-                // Both halves of the wrapped deque were addressed in one call, so
-                // the second half's offset is only correct if the first was queued
-                // whole. Stopping on short progress keeps that true; without it a
-                // saturated queue would label the second half with an offset that
-                // is too low, which is a corrupted stream rather than a slow one.
-                for part in self.ring.slices_from(client.sent_through) {
-                    if part.is_empty() {
-                        continue;
-                    }
-                    let want = client.sent_through + part.len() as u64;
-                    client.sent_through = client.conn.send_output(client.sent_through, part);
-                    if client.sent_through != want {
-                        break;
-                    }
-                }
+        let Some(client) = self.client.as_mut() else {
+            return;
+        };
+        if !client.greeted {
+            return;
+        }
+        if !client.conn.is_write_saturated() && client.sent_through < end {
+            if client.sent_through < base {
+                // Overflowed while this client was slow or away: the stream is
+                // discontinuous and the client must reset its emulator.
+                client.conn.send_control(&Frame::Gap {
+                    new_base_offset: base,
+                });
+                client.sent_through = base;
+                gapped = true;
             }
 
-            // Last, and only once everything the child wrote has been queued: the
-            // whole point of the linger window (§ 6.5) is that a client arriving
-            // into the race still collects the final output *and* the status, in
-            // that order.
-            if !client.exit_sent
-                && client.sent_through >= end
-                && let Some((status, kind)) = exited
-            {
-                client.conn.send_control(&Frame::Exit { status, kind });
-                client.exit_sent = true;
+            // Both halves of the wrapped deque were addressed in one call, so
+            // the second half's offset is only correct if the first was queued
+            // whole. Stopping on short progress keeps that true; without it a
+            // saturated queue would label the second half with an offset that
+            // is too low, which is a corrupted stream rather than a slow one.
+            for part in self.ring.slices_from(client.sent_through) {
+                if part.is_empty() {
+                    continue;
+                }
+                let want = client.sent_through + part.len() as u64;
+                client.sent_through = client.conn.send_output(client.sent_through, part);
+                if client.sent_through != want {
+                    break;
+                }
             }
         }
-        // Outside the borrow above, because the repaint may write to the PTY queue
-        // rather than to the client. Mid-stream overflow gets the same treatment as
-        // a gap reported at attach time — it is the same discontinuity, and the
-        // client chose how to recover from it.
+
+        // Last, and only once everything the child wrote has been queued: the
+        // whole point of the linger window (§ 6.5) is that a client arriving
+        // into the race still collects the final output *and* the status, in
+        // that order.
+        if !client.exit_sent
+            && client.sent_through >= end
+            && let Some((status, kind)) = exited
+        {
+            client.conn.send_control(&Frame::Exit { status, kind });
+            client.exit_sent = true;
+        }
+        // Outside the borrow above — past the last use of `client`, which is what
+        // ends it — because the repaint may write to the PTY queue rather than to
+        // the client. Mid-stream overflow gets the same treatment as a gap reported
+        // at attach time: it is the same discontinuity, and the client chose how to
+        // recover from it.
         if gapped {
             self.repaint();
         }
@@ -1127,13 +1115,8 @@ impl Daemon {
         // Serving means a client is attached *and* past its `Hello`: a frame sent
         // before `HelloOk` would arrive ahead of the handshake it answers.
         let serving = self.client.as_ref().is_some_and(|client| client.greeted);
-        let Some(agent) = self.agent.as_mut() else {
-            return;
-        };
-        if let Some(chan) = agent.accept(serving)
-            && let Some(client) = self.client.as_mut()
-        {
-            client.conn.send_control(&Frame::AgentOpen { chan });
+        if let Some(chan) = self.agent.as_mut().and_then(|agent| agent.accept(serving)) {
+            self.tell_client(&Frame::AgentOpen { chan });
         }
     }
 
@@ -1180,16 +1163,8 @@ impl Daemon {
     /// the same poll iteration that its socket reports readable, and answering
     /// that with a close for a channel the client has already forgotten is noise.
     fn close_agent_channel(&mut self, chan: u32) {
-        let was_open = self.agent.as_mut().is_some_and(|agent| agent.forget(chan));
-        if was_open && let Some(client) = self.client.as_mut() {
-            client.conn.send_control(&Frame::AgentClose { chan });
-        }
-    }
-
-    /// Drops every channel without notifying anyone, for when the client is gone.
-    fn forget_agent_channels(&mut self) {
-        if let Some(agent) = self.agent.as_mut() {
-            agent.forget_all();
+        if self.agent.as_mut().is_some_and(|agent| agent.forget(chan)) {
+            self.tell_client(&Frame::AgentClose { chan });
         }
     }
 
@@ -1220,24 +1195,20 @@ impl Daemon {
     /// Stamps the session clientless. Everything that belonged to the departing
     /// connection went with it when the `Attached` was dropped.
     ///
-    /// `linger_until` is deliberately left alone. It was armed by `on_child_exit`
-    /// for the five seconds § 6.5 promises, and collapsing it here — on the
-    /// reasoning that there is nobody left to tell — would keep that promise only
-    /// in the ordering where the client leaves *before* the child. A client that
-    /// watched the child exit and then closed would take the window with it, and
-    /// the reconnect the window exists for would find the socket already unlinked.
-    /// The whole point is the client that has not arrived yet.
+    /// The post-exit linger window is untouched, and deliberately so — see
+    /// [`Daemon::exit_deadline`], which derives it from the child's departure rather
+    /// than the client's for exactly that reason.
     fn on_detached(&mut self) {
         self.detached_since = Some(Instant::now());
         // Nothing can answer a signature request with the client gone, so the
         // waiting process should fail now rather than at reattach (§ 6.7).
-        self.forget_agent_channels();
+        if let Some(agent) = self.agent.as_mut() {
+            agent.forget_all();
+        }
     }
 
     fn shutdown(&mut self) {
-        if let Some(mut client) = self.client.take() {
-            drop(client.conn.flush_final());
-        }
+        self.drop_client();
         self.pending = None;
         if let Some(mut pty) = self.pty.take() {
             pty.terminate();

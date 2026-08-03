@@ -54,15 +54,16 @@ fn vectors() -> Vec<Vector> {
 /// same-width neighbours — the failure a round-trip test cannot see — changes the
 /// expected bytes.
 ///
-/// Both handshake frames appear **twice**, because distinct values catch a swap
+/// Both handshake frames appear more than once, because distinct values catch a swap
 /// between two fields and do nothing about a swap *inside* one. A flag bit or an
 /// enumerator exercised at a single value is pinned only against being renumbered
 /// wholesale: give `Hello.flags` both of its bits at once and the two constants can
 /// trade places without moving a byte, and the same holds for `HelloOk`'s `gap` and
-/// `agent` bits, which are only ever set together. So the second vector of each is
-/// chosen to disagree with the first on every bit and every enumerator that has one
+/// `agent` bits, which are only ever set together. So each repeat is chosen to
+/// disagree with the ones before it on every bit and every enumerator that has one
 /// — which is what makes § 2.3 a table this file actually checks, rather than one
-/// the codec merely agrees with itself about.
+/// the codec merely agrees with itself about. `HelloOk` takes three because [`Linger`]
+/// has three values and [`every_linger_state_has_a_vector`] insists on all of them.
 fn handshake_vectors() -> Vec<Vector> {
     vec![
         // 0x01 Hello: u16 proto, u16 flags, u64 out_offset, u64 in_offset,
@@ -138,9 +139,7 @@ fn handshake_vectors() -> Vec<Vector> {
         // 0x02 HelloOk again, disagreeing with the one above on all three of its
         // flag fields: no gap, linger unknown, agent served. `gap` and `agent`
         // differ from each other here, which is what separates bit 0 from bit 3 —
-        // set together as they are above, they can be exchanged for free. Linger
-        // takes a second of its three values for the same reason; 0 and 2 pinned
-        // between the two vectors leaves 1 the only number left for `Disabled`.
+        // set together as they are above, they can be exchanged for free.
         Vector {
             frame: Frame::HelloOk(HelloOk {
                 protocol: 2,
@@ -158,6 +157,31 @@ fn handshake_vectors() -> Vec<Vector> {
                 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, // in_applied
                 0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
                 0x08, // flags: bit 3 agent, gap clear, linger 0 (unknown)
+            ],
+        },
+        // 0x02 HelloOk a third time, for the one linger value the other two leave
+        // out. Reading `Disabled` off the other two — 0 and 2 are pinned, so 1 is
+        // the only number left — is a deduction rather than a test: it says nothing
+        // about which *bits* hold it, and it stops being available the day the field
+        // grows a fourth value. This is also the only vector in the file with bit 3
+        // clear, so `agent` is now pinned in both directions and not just when set.
+        Vector {
+            frame: Frame::HelloOk(HelloOk {
+                protocol: 2,
+                resume_from: 0x6162_6364_6566_6768,
+                in_applied: 0x7172_7374_7576_7778,
+                win: WIN,
+                gap: true,
+                linger: Linger::Disabled,
+                agent: false,
+            }),
+            bytes: &[
+                0x02, 0x00, 0x00, 0x1b, // header: type, u24 len = 27
+                0x00, 0x02, // protocol
+                0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, // resume_from
+                0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, // in_applied
+                0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
+                0x03, // flags: bit 0 gap, linger 1 (disabled), bit 3 clear
             ],
         },
     ]
@@ -379,7 +403,50 @@ fn every_frame_type_has_a_vector() {
     }
 }
 
-/// The five `Error` codes are the numbers § 2.2 gives them.
+/// Every `Exit.kind` has a vector, so both are pinned on bytes rather than one
+/// being inferred from the other.
+///
+/// Swept from [`ExitKind::ALL`] for the reason [`every_frame_type_has_a_vector`]
+/// gives: a hand-written list of the kinds to check is a list that stops covering
+/// the set the moment the set grows, and does it in silence.
+#[test]
+fn every_exit_kind_has_a_vector() {
+    let covered: Vec<ExitKind> = vectors()
+        .iter()
+        .filter_map(|v| match v.frame {
+            Frame::Exit { kind, .. } => Some(kind),
+            _ => None,
+        })
+        .collect();
+    for kind in ExitKind::ALL {
+        assert!(covered.contains(&kind), "{kind:?} has no wire vector");
+    }
+}
+
+/// Every `HelloOk.linger` state has a vector.
+///
+/// The sweep that found something missing: `Linger` is three values in two bits and
+/// this file pinned two of them, leaving `Disabled` justified by a comment that
+/// worked out which number was left over. That is an argument about the other two
+/// vectors rather than a check on this one — it says nothing about *which* bits of
+/// the flags byte carry the field, and any renumbering that leaves 0 and 2 where
+/// they are satisfies it. Swept from [`Linger::ALL`], so the third value has to be
+/// written down in bytes like the other two.
+#[test]
+fn every_linger_state_has_a_vector() {
+    let covered: Vec<Linger> = vectors()
+        .iter()
+        .filter_map(|v| match v.frame {
+            Frame::HelloOk(ok) => Some(ok.linger),
+            _ => None,
+        })
+        .collect();
+    for linger in Linger::ALL {
+        assert!(covered.contains(&linger), "{linger:?} has no wire vector");
+    }
+}
+
+/// The `Error` codes are the numbers § 2.2 gives them.
 ///
 /// A frame carries one code at a time, so the vector above can pin exactly one of
 /// the five and a table is the only way to reach the rest. § 2.2 spells them out
@@ -392,15 +459,22 @@ fn every_frame_type_has_a_vector() {
 /// The two directions are checked separately for the reason the module doc gives:
 /// `from_u16(as_u16(c)) == c` holds under any renumbering that is consistent with
 /// itself, which is precisely the class of bug this file exists to catch.
+///
+/// The numbers are written out by hand because they have to come from the document
+/// rather than from the code under test. *Which* codes the table has to carry does
+/// not: that is swept from [`ErrorCode::ALL`], so a code added to the protocol and
+/// not to this table fails here instead of going quietly unchecked.
 #[test]
 fn error_codes_are_the_numbers_the_table_gives_them() {
-    for (code, number) in [
+    let documented: [(ErrorCode, u16); 5] = [
         (ErrorCode::Protocol, 1),
         (ErrorCode::Takeover, 2),
         (ErrorCode::Version, 3),
         (ErrorCode::InputGap, 4),
         (ErrorCode::Internal, 5),
-    ] {
+    ];
+
+    for (code, number) in documented {
         assert_eq!(
             code.as_u16(),
             number,
@@ -410,6 +484,13 @@ fn error_codes_are_the_numbers_the_table_gives_them() {
             ErrorCode::from_u16(number),
             Some(code),
             "{number} does not decode to the code IMPLEMENTATION.md § 2.2 gives it"
+        );
+    }
+
+    for code in ErrorCode::ALL {
+        assert!(
+            documented.iter().any(|&(listed, _)| listed == code),
+            "{code:?} is on no line of the table IMPLEMENTATION.md § 2.2 gives"
         );
     }
 }

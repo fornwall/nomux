@@ -55,8 +55,7 @@ options:
 fn main() -> ExitCode {
     let mut args = env::args_os().skip(1);
     let Some(mode) = args.next() else {
-        eprint!("{USAGE}");
-        return ExitCode::from(EXIT_USAGE);
+        return usage_error(None);
     };
 
     match mode.to_str() {
@@ -80,11 +79,20 @@ fn main() -> ExitCode {
         Some("daemon") => run_session_mode(Mode::Daemon, args),
         Some("attach") => run_session_mode(Mode::Attach, args),
         Some("kill") => run_session_mode(Mode::Kill, args),
-        _ => {
-            eprint!("{USAGE}");
-            ExitCode::from(EXIT_USAGE)
-        }
+        _ => usage_error(None),
     }
+}
+
+/// Prints `message` where there is one, then the usage, and reports `EX_USAGE`.
+///
+/// The four ways to misuse the command line all end here, so what a usage error
+/// consists of — the message, the usage, and 64 — is decided once.
+fn usage_error(message: Option<&str>) -> ExitCode {
+    if let Some(message) = message {
+        eprintln!("nomux: {message}\n");
+    }
+    eprint!("{USAGE}");
+    ExitCode::from(EXIT_USAGE)
 }
 
 /// The three modes that take a session id.
@@ -116,16 +124,10 @@ impl Mode {
 fn run_session_mode(mode: Mode, args: impl Iterator<Item = OsString>) -> ExitCode {
     let (session, label) = match parse_session_args(args) {
         Ok(parsed) => parsed,
-        Err(message) => {
-            eprintln!("nomux: {message}\n");
-            eprint!("{USAGE}");
-            return ExitCode::from(EXIT_USAGE);
-        }
+        Err(message) => return usage_error(Some(&message)),
     };
     let Some(session) = session else {
-        eprintln!("nomux: `{}` requires a session id\n", mode.name());
-        eprint!("{USAGE}");
-        return ExitCode::from(EXIT_USAGE);
+        return usage_error(Some(&format!("`{}` requires a session id", mode.name())));
     };
 
     match mode {
@@ -155,11 +157,10 @@ fn run_session_mode(mode: Mode, args: impl Iterator<Item = OsString>) -> ExitCod
 /// Deliberately minimal — no argument parser, no abbreviations, no `--` handling.
 /// The only caller is the client, which builds this command line itself.
 fn parse_session_args(
-    args: impl Iterator<Item = OsString>,
+    mut args: impl Iterator<Item = OsString>,
 ) -> Result<(Option<String>, Option<String>), String> {
     let mut session = None;
     let mut label = None;
-    let mut args = args;
 
     while let Some(arg) = args.next() {
         let text = arg

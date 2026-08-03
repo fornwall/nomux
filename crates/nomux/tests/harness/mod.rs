@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use nomux_proto::{
-    Frame, FrameType, HEADER_LEN, Hello, PROTOCOL_VERSION, RESUME_FROM_START, WinSize,
+    ErrorCode, Frame, FrameType, HEADER_LEN, Hello, PROTOCOL_VERSION, RESUME_FROM_START, WinSize,
     decode_header,
 };
 
@@ -130,6 +130,14 @@ pub(crate) struct Session {
     pub(crate) root: PathBuf,
     pub(crate) socket: PathBuf,
     pub(crate) id: String,
+    /// The name the test knows this session by.
+    ///
+    /// Carried only so that a failure can say it: [`Session::id`] and every path
+    /// under [`Session::root`] are built from [`intern`], which is a hash, so
+    /// nothing else a session that will not come up has to offer says which test it
+    /// belonged to — and a test that starts one per row of a table then fails
+    /// identically for every row.
+    name: String,
 }
 
 /// Ring capacity for tests that do not name one.
@@ -158,12 +166,7 @@ impl Session {
     pub(crate) fn start_with_raw_ring(name: &str, value: &str) -> Self {
         let root = run_root(name);
         let id = intern(name);
-        let child = Command::new(env!("CARGO_BIN_EXE_nomux"))
-            .args(["daemon", &id])
-            .env("XDG_RUNTIME_DIR", &root)
-            // A predictable shell keeps assertions independent of the developer's
-            // login environment.
-            .env("SHELL", "/bin/sh")
+        let child = nomux_with_shell(&root, &["daemon", &id])
             .env("PS1", "")
             // The child's working directory, so `pwd` is assertable.
             .env("HOME", &root)
@@ -181,11 +184,17 @@ impl Session {
             root,
             socket,
             id,
+            name: name.to_owned(),
         }
     }
 
     pub(crate) fn connect(&self) -> Client {
-        let stream = UnixStream::connect(&self.socket).expect("connect to session");
+        // Named rather than `expect`ed: the socket is bound before the ring is
+        // built, so a daemon that died on the way up is refused here rather than
+        // missed by `wait_for`, and this is where a test that starts a session per
+        // case learns which of them it was.
+        let stream = UnixStream::connect(&self.socket)
+            .unwrap_or_else(|err| panic!("connect to session {:?}: {err}", self.name));
         stream
             .set_read_timeout(Some(SOCKET_POLL))
             .expect("set read timeout");
@@ -250,7 +259,8 @@ impl Session {
 
     /// Opens a connection to the agent socket, the way a child process would.
     pub(crate) fn connect_agent(&self) -> UnixStream {
-        let stream = UnixStream::connect(self.agent_socket()).expect("connect to agent socket");
+        let stream = UnixStream::connect(self.agent_socket())
+            .unwrap_or_else(|err| panic!("connect to the agent socket of {:?}: {err}", self.name));
         stream
             .set_read_timeout(Some(PATIENCE))
             .expect("set read timeout");
@@ -360,6 +370,38 @@ fn intern(name: &str) -> String {
     interned
 }
 
+/// A `nomux` invocation against the run directory under `root`, ready for whatever
+/// stdio and tuning the caller wants on top.
+///
+/// Every mode the suite starts is started this way, so the one thing no test may
+/// forget is said once rather than at each site: the run directory, which is the
+/// whole of what the frozen control surface is told (§ 6.6). Nothing else is added
+/// here, because that is a claim about the surface rather than a convenience — an
+/// invocation handed more than the run directory is no longer the thing § 6.6
+/// describes, and [`control`] beneath would be documenting something it does not do.
+pub(crate) fn nomux(root: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_nomux"));
+    command.args(args).env("XDG_RUNTIME_DIR", root);
+    command
+}
+
+/// [`nomux`] with a `SHELL` the developer's login environment cannot vary.
+///
+/// For every invocation that could put a shell behind a PTY — including the ones
+/// where doing so would *be* the failure, since a refusal that regressed should
+/// leave a predictable `/bin/sh` to be found rather than whatever the developer
+/// logs in with. One caller runs `list` and `kill` through here as well, because
+/// the `attach` it shares the call with is the one under test.
+///
+/// What is left on [`nomux`] alone is what could not start a shell under any
+/// regression: `list` and `kill`, and a relay onto a socket the test bound itself,
+/// which finds a session already there and so never spawns a daemon.
+pub(crate) fn nomux_with_shell(root: &Path, args: &[&str]) -> Command {
+    let mut command = nomux(root, args);
+    command.env("SHELL", "/bin/sh");
+    command
+}
+
 /// Runs `nomux` against the run directory under `root`, and waits for it to finish.
 ///
 /// `list` and `kill` reach a session only through the files on disk (§ 6.6), so
@@ -368,11 +410,32 @@ fn intern(name: &str) -> String {
 /// anything. A mode that would go on to serve must not come through here: waiting
 /// for it is waiting for ever.
 pub(crate) fn control(root: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_nomux"))
-        .args(args)
-        .env("XDG_RUNTIME_DIR", root)
-        .output()
-        .expect("run nomux")
+    nomux(root, args).output().expect("run nomux")
+}
+
+/// Fails with `what` unless the process exited successfully, quoting whatever it
+/// complained about on the way out.
+///
+/// The sentence stays at the call site because it is the only part of these
+/// assertions that was ever its own. The stderr behind it is not optional: an exit
+/// status alone says that something was refused and nothing about what.
+pub(crate) fn succeeded(out: &Output, what: &str) {
+    assert!(
+        out.status.success(),
+        "{what} ({}): {:?}",
+        out.status,
+        stderr(out)
+    );
+}
+
+/// What the process wrote to standard error.
+pub(crate) fn stderr(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// What the process wrote to standard output.
+pub(crate) fn stdout(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 /// Waits for a file the daemon publishes on its way up.
@@ -413,6 +476,14 @@ const READY_MARKER: &str = "NOMUX-42-READY";
 impl Client {
     pub(crate) fn send(&mut self, frame: &Frame<'_>) {
         write_frame(&mut self.stream, frame);
+    }
+
+    /// Sends keystrokes at `offset`.
+    ///
+    /// The most-sent frame in the suite by a wide margin, and the only one whose
+    /// struct literal outweighs its content.
+    pub(crate) fn input(&mut self, offset: u64, data: &[u8]) {
+        self.send(&Frame::Input { offset, data });
     }
 
     pub(crate) fn hello(&mut self, out_offset: u64, in_offset: u64) -> nomux_proto::HelloOk {
@@ -463,10 +534,7 @@ impl Client {
             line.push_str(then);
         }
         line.push('\n');
-        self.send(&Frame::Input {
-            offset: 0,
-            data: line.as_bytes(),
-        });
+        self.input(0, line.as_bytes());
         let (_, offset) = self.read_until(READY_MARKER, from);
         Ready {
             in_offset: line.len() as u64,
@@ -544,6 +612,25 @@ impl Client {
                 "unexpected {ty:?} while waiting for {want:?}"
             );
         }
+    }
+
+    /// Asserts that the very next frame is a refusal carrying `code`, failing with
+    /// `what` and the daemon's own words when it is not.
+    ///
+    /// The *next* frame rather than the next `Error`, because when a refusal arrives
+    /// is half of what these tests are about: a `Hello` the daemon cannot answer must
+    /// be refused before it takes the session over, and a client handed the right
+    /// code after its replacement has already evicted it was given the wrong answer.
+    pub(crate) fn expect_error(&mut self, code: ErrorCode, what: &str) {
+        let (ty, payload) = self.next_frame();
+        assert_refusal(ty, &payload, code, what);
+    }
+
+    /// [`Client::expect_error`] for a connection the session is also writing output
+    /// to, where the refusal is not the only thing that can be in flight.
+    pub(crate) fn expect_error_among_output(&mut self, code: ErrorCode, what: &str) {
+        let payload = self.next_of(FrameType::Error);
+        assert_refusal(FrameType::Error, &payload, code, what);
     }
 
     /// Waits for the daemon to close the connection after `after`, without
@@ -655,6 +742,28 @@ impl Client {
     /// Collects output until `needle` appears, returning everything consumed and
     /// the offset one past the last output byte.
     pub(crate) fn read_until(&mut self, needle: &str, from: u64) -> (String, u64) {
+        self.read_until_inner(needle, from, false)
+    }
+
+    /// Collects the child's output until `needle` appears, following the ring over any
+    /// overflow it hits on the way.
+    ///
+    /// [`Client::read_until`] refuses a `Gap`, which is right everywhere else in this
+    /// suite: an unannounced discontinuity is most of what these tests exist to catch.
+    /// It is wrong here. The ring is a kilobyte on purpose and the child is still
+    /// echoing tens of kilobytes of filler when the client comes back, so overflow
+    /// *while attached* is the ordinary case rather than a surprise — and waiting for
+    /// the child to fall quiet first is exactly the sleep this was written to be rid of.
+    /// What the caller is looking for survives it either way: the repaint keystroke and
+    /// the fence behind it are the last few bytes the child writes, and the newest
+    /// kilobyte is the one thing the ring never discards.
+    pub(crate) fn read_past_gaps(&mut self, needle: &str, from: u64) -> (String, u64) {
+        self.read_until_inner(needle, from, true)
+    }
+
+    /// The body of both, differing only in whether a `Gap` moves the stream on or
+    /// fails the test.
+    fn read_until_inner(&mut self, needle: &str, from: u64, follow_gaps: bool) -> (String, u64) {
         let mut seen = Vec::new();
         let mut offset = from;
         let awaiting = format!("{needle:?} in the session's output");
@@ -669,6 +778,7 @@ impl Client {
                         return (String::from_utf8_lossy(&seen).into_owned(), offset);
                     }
                 }
+                Frame::Gap { new_base_offset } if follow_gaps => offset = new_base_offset,
                 Frame::InputAck { .. } | Frame::Pong { .. } => {}
                 other => panic!("unexpected frame while awaiting {needle:?}: {other:?}"),
             }
@@ -677,6 +787,24 @@ impl Client {
             "timed out waiting for {needle:?}; saw: {:?}",
             String::from_utf8_lossy(&seen)
         );
+    }
+}
+
+/// Asserts that a frame the daemon sent is an `Error` carrying `code`.
+///
+/// Shared by the two ways of arriving at one, so that what a refusal has to satisfy
+/// is written once and the entry points differ only in how strictly they read.
+fn assert_refusal(ty: FrameType, payload: &[u8], code: ErrorCode, what: &str) {
+    assert_eq!(
+        ty,
+        FrameType::Error,
+        "{what}; the daemon answered with {ty:?} rather than a refusal"
+    );
+    match Frame::decode(ty, payload).expect("decode the refusal") {
+        Frame::Error { code: got, message } => {
+            assert_eq!(got, code, "{what}; the daemon said {message:?}");
+        }
+        other => panic!("{what}; got {other:?}"),
     }
 }
 
@@ -812,6 +940,24 @@ impl Drop for Spawned {
         if let Some(mut child) = self.0.take() {
             drop(child.kill());
             drop(child.wait());
+        }
+    }
+}
+
+/// Kills a pid when it goes out of scope.
+///
+/// The processes these tests background are backgrounded *on purpose*, so nothing
+/// else reaps them: a `sleep 300` left behind by a failing assertion is still there
+/// when the next run starts, and the failure it caused is now accompanied by one it
+/// did not. Read-then-kill-then-assert says the same thing where the ordering is
+/// simple enough to arrange; this covers the case where it is not, and it fires on a
+/// panic from anywhere in between.
+pub(crate) struct Reaper(pub(crate) u32);
+
+impl Drop for Reaper {
+    fn drop(&mut self) {
+        if let Some(pid) = rustix::process::Pid::from_raw(self.0.cast_signed()) {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
         }
     }
 }

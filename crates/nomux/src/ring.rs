@@ -49,24 +49,21 @@ impl Ring {
     /// where that reader had got to, so it is derived per client by comparing its
     /// position against [`Ring::base`] — which stays correct across any number of
     /// overflows, including ones that happened while the client was away.
-    pub(crate) fn push(&mut self, mut data: &[u8]) {
-        // A write larger than the whole ring keeps only its own tail: everything
-        // before it is unreachable anyway. Both the head of *this* write and
-        // everything already retained are gone, and `base` has to account for both
-        // — it is the offset of the oldest surviving byte, not a count of what this
-        // branch trimmed off the input.
-        if let Some(excess) = data.len().checked_sub(self.capacity).filter(|e| *e > 0) {
-            self.base += (self.buf.len() + excess) as u64;
-            self.buf.clear();
-            data = data.get(excess..).unwrap_or(data);
-        }
-
+    pub(crate) fn push(&mut self, data: &[u8]) {
+        // One number for both sides of the eviction. What must fall out of the
+        // window is `retained + new - capacity` however it is split, and `base` —
+        // the offset of the oldest surviving byte — advances by the whole of it,
+        // never by what came off one side. That is what a write larger than the
+        // ring turns on: it keeps only its own tail, because everything before it
+        // is unreachable anyway, so *both* everything already retained and the head
+        // of this very write are gone. Counting only one of the two leaves `base`
+        // too low.
         let overflow = (self.buf.len() + data.len()).saturating_sub(self.capacity);
-        if overflow > 0 {
-            self.buf.drain(..overflow);
-            self.base += overflow as u64;
-        }
-        self.buf.extend(data);
+        let from_buf = overflow.min(self.buf.len());
+        self.base += overflow as u64;
+        self.buf.drain(..from_buf);
+        self.buf
+            .extend(data.get(overflow - from_buf..).unwrap_or_default());
     }
 
     /// Returns the retained bytes at and after `from`, as the two halves of the
@@ -75,16 +72,19 @@ impl Ring {
     /// `from` is clamped to [`Ring::base`], so a caller that has fallen behind
     /// silently resumes at the oldest retained byte — check [`Ring::base`] first if
     /// that needs reporting as a gap.
+    ///
+    /// The two stay in stream order and in place: either may be empty, the *first*
+    /// one included once `from` is past the front half, so a caller walking them
+    /// must skip an empty part rather than stop at one.
     #[must_use]
     pub(crate) fn slices_from(&self, from: u64) -> [&[u8]; 2] {
         let skip = usize::try_from(from.saturating_sub(self.base)).unwrap_or(usize::MAX);
         let (front, back) = self.buf.as_slices();
-        if skip >= front.len() {
-            let back_skip = skip - front.len();
-            [back.get(back_skip..).unwrap_or(&[]), &[]]
-        } else {
-            [front.get(skip..).unwrap_or(&[]), back]
-        }
+        [
+            front.get(skip..).unwrap_or_default(),
+            back.get(skip.saturating_sub(front.len())..)
+                .unwrap_or_default(),
+        ]
     }
 }
 

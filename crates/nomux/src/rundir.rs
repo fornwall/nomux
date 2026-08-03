@@ -621,13 +621,8 @@ impl SpawnLock {
 /// window of whoever ran it. Truncation is at a character boundary, so the result
 /// is always valid UTF-8.
 pub(crate) fn sanitize_label(label: &str) -> String {
-    let mut out = String::new();
-    for ch in label.chars().filter(|ch| !ch.is_control()) {
-        if out.len() + ch.len_utf8() > MAX_LABEL_LEN {
-            break;
-        }
-        out.push(ch);
-    }
+    let mut out: String = label.chars().filter(|ch| !ch.is_control()).collect();
+    out.truncate(out.floor_char_boundary(MAX_LABEL_LEN));
     out.trim().to_owned()
 }
 

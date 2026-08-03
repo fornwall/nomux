@@ -3,7 +3,7 @@
 //! Decoding borrows from the input buffer, so relaying PTY bytes costs no
 //! allocation and no copy beyond the eventual write.
 
-use crate::{FrameType, HEADER_LEN, ProtoError, encode_header};
+use crate::{FrameType, HEADER_LEN, ProtoError, encode_header, wire_enum};
 
 /// Terminal dimensions, applied to the PTY master via `TIOCSWINSZ`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -18,40 +18,20 @@ pub struct WinSize {
     pub ypixel: u16,
 }
 
-/// How the child process terminated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExitKind {
+wire_enum! {
+    /// How the child process terminated.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    ExitKind: u8, as_byte / from_byte,
     /// Returned a status from `main` or `exit`.
-    Exited,
+    Exited = 0,
     /// Killed by a signal.
-    Signalled,
+    Signalled = 1,
 }
 
-impl ExitKind {
-    /// Returns the wire discriminant.
-    #[must_use]
-    pub const fn as_byte(self) -> u8 {
-        match self {
-            Self::Exited => 0,
-            Self::Signalled => 1,
-        }
-    }
-
-    /// Parses a wire discriminant.
-    #[must_use]
-    pub const fn from_byte(byte: u8) -> Option<Self> {
-        match byte {
-            0 => Some(Self::Exited),
-            1 => Some(Self::Signalled),
-            _ => None,
-        }
-    }
-}
-
-/// Reason the daemon is closing a connection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u16)]
-pub enum ErrorCode {
+wire_enum! {
+    /// Reason the daemon is closing a connection.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    ErrorCode: u16, as_u16 / from_u16,
     /// Malformed or out-of-sequence frame.
     Protocol = 1,
     /// Another client attached and took the session over.
@@ -62,27 +42,6 @@ pub enum ErrorCode {
     InputGap = 4,
     /// Daemon-side failure.
     Internal = 5,
-}
-
-impl ErrorCode {
-    /// Returns the wire discriminant.
-    #[must_use]
-    pub const fn as_u16(self) -> u16 {
-        self as u16
-    }
-
-    /// Parses a wire discriminant.
-    #[must_use]
-    pub const fn from_u16(value: u16) -> Option<Self> {
-        match value {
-            1 => Some(Self::Protocol),
-            2 => Some(Self::Takeover),
-            3 => Some(Self::Version),
-            4 => Some(Self::InputGap),
-            5 => Some(Self::Internal),
-            _ => None,
-        }
-    }
 }
 
 /// Sentinel for [`Hello::out_offset`] meaning "I have no state; send everything
@@ -106,6 +65,25 @@ pub const HELLO_REPAINT_CTRL_L: u16 = 1 << 1;
 
 /// Bits defined in [`Hello::flags`]. Anything else set is a protocol error.
 const HELLO_FLAG_BITS: u16 = HELLO_AGENT_FORWARD | HELLO_REPAINT_CTRL_L;
+
+/// Refuses a [`Hello::flags`] word carrying a bit this revision does not define.
+///
+/// Undefined bits are a bug in a peer built from this repository, not a
+/// forward-compatibility case (`DESIGN.md` § 2), so they are refused rather than
+/// masked off — and refused on the way *out* as well as on the way in: without the
+/// encode-side call a caller could build a `Hello` that encodes cleanly and earns an
+/// `Error{Protocol}` from the peer, a bug reported at the wrong end of the
+/// connection, by the process that did nothing wrong.
+///
+/// That encode and decode agree about which bits exist is the whole property, so it
+/// is one function called from both rather than two copies of a mask and a message
+/// that have to be kept in step by hand.
+const fn checked_hello_flags(flags: u16) -> Result<(), ProtoError> {
+    if flags & !HELLO_FLAG_BITS != 0 {
+        return Err(ProtoError::Malformed("undefined Hello flag bits"));
+    }
+    Ok(())
+}
 
 /// Opening frame: what the client already has, and how big its terminal is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,46 +122,30 @@ impl Hello<'_> {
     }
 }
 
-/// Whether the daemon's session outlives the user's last logout.
-///
-/// `systemd-logind` with `KillUserProcesses=yes` kills the daemon at logout unless
-/// the user has lingering enabled, and no amount of double-forking avoids it
-/// (`IMPLEMENTATION.md` § 6.2). The daemon cannot fix this, so it reports it and
-/// the client warns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Linger {
+wire_enum! {
+    /// Whether the daemon's session outlives the user's last logout.
+    ///
+    /// `systemd-logind` with `KillUserProcesses=yes` kills the daemon at logout unless
+    /// the user has lingering enabled, and no amount of double-forking avoids it
+    /// (`IMPLEMENTATION.md` § 6.2). The daemon cannot fix this, so it reports it and
+    /// the client warns.
+    ///
+    /// Unlike the other closed sets on the wire this one is not a field of its own:
+    /// the values below are the two-bit encoding *unshifted*. The pair of helpers
+    /// under the flags-byte masks below — `as_bits` and `from_flags` — put that
+    /// encoding into its place in [`HelloOk`]'s flags byte and take it back out, so
+    /// where in the byte the field sits is written down in exactly one place.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    Linger: u8, as_byte / from_byte,
     /// Not determined: no `systemd`, or its state is unreadable. Do not warn —
     /// on a host without `logind` there is nothing to warn about.
     #[default]
-    Unknown,
+    Unknown = 0,
     /// `logind` is running and lingering is off for this user. The session dies at
     /// logout if the host also sets `KillUserProcesses=yes`.
-    Disabled,
+    Disabled = 1,
     /// Lingering is on; the session survives logout.
-    Enabled,
-}
-
-impl Linger {
-    /// Returns the two-bit wire encoding, already shifted into place.
-    #[must_use]
-    const fn as_bits(self) -> u8 {
-        let value: u8 = match self {
-            Self::Unknown => 0,
-            Self::Disabled => 1,
-            Self::Enabled => 2,
-        };
-        value << HELLOOK_LINGER_SHIFT
-    }
-
-    /// Parses the two-bit wire encoding out of a flags byte.
-    const fn from_flags(flags: u8) -> Option<Self> {
-        match (flags & HELLOOK_LINGER_MASK) >> HELLOOK_LINGER_SHIFT {
-            0 => Some(Self::Unknown),
-            1 => Some(Self::Disabled),
-            2 => Some(Self::Enabled),
-            _ => None,
-        }
-    }
+    Enabled = 2,
 }
 
 /// [`HelloOk`] flags bit: output was dropped before `resume_from`.
@@ -196,6 +158,27 @@ const HELLOOK_LINGER_MASK: u8 = 0b11 << HELLOOK_LINGER_SHIFT;
 const HELLOOK_AGENT: u8 = 1 << 3;
 /// Bits defined in [`HelloOk`]'s flags byte. Anything else set is a protocol error.
 const HELLOOK_FLAG_BITS: u8 = HELLOOK_GAP | HELLOOK_LINGER_MASK | HELLOOK_AGENT;
+
+/// Where in [`HelloOk`]'s flags byte the [`Linger`] field sits, said once.
+///
+/// The enum owns its two-bit encoding — `wire_enum!` generates `as_byte` and
+/// `from_byte` from the discriminants above. These two move that encoding into and
+/// out of its place in the byte, and they are written here, adjacent to each other
+/// and to the masks of the single bits sharing it. Splitting the shift and the mask
+/// between the encode and the decode side, in two types hundreds of lines apart, is
+/// precisely the drift the hand-written wire vectors exist to catch — and vectors
+/// only catch what they happen to pin.
+impl Linger {
+    /// Returns the two-bit wire encoding, already shifted into place.
+    const fn as_bits(self) -> u8 {
+        self.as_byte() << HELLOOK_LINGER_SHIFT
+    }
+
+    /// Parses the two-bit wire encoding out of a flags byte.
+    const fn from_flags(flags: u8) -> Option<Self> {
+        Self::from_byte((flags & HELLOOK_LINGER_MASK) >> HELLOOK_LINGER_SHIFT)
+    }
+}
 
 /// Daemon's answer to [`Hello`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -320,7 +303,7 @@ pub enum Frame<'a> {
     },
 }
 
-impl Frame<'_> {
+impl<'a> Frame<'a> {
     /// Returns this frame's discriminant.
     #[must_use]
     pub const fn frame_type(&self) -> FrameType {
@@ -350,31 +333,19 @@ impl Frame<'_> {
     ///
     /// [`ProtoError::PayloadTooLarge`] if the encoded payload exceeds
     /// [`crate::MAX_PAYLOAD`], or [`ProtoError::Malformed`] for a field too long
-    /// for its own length prefix. `out` is left unchanged in either case.
+    /// for its own length prefix. `out` is rewound to its original length in
+    /// either case.
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), ProtoError> {
-        // Checked before anything is appended, so the caller's buffer is untouched
-        // on the error path. Refused rather than truncated: this returns a
-        // `Result`, so reporting success while putting something other than what
-        // the caller passed on the wire is never the right trade. A `TERM` this
-        // long is a broken caller, and silently shortening it would open the
-        // session under a terminal type nobody chose.
-        if let Self::Hello(hello) = *self {
-            if u16::try_from(hello.term.len()).is_err() {
-                return Err(ProtoError::Malformed("TERM exceeds 65535 bytes"));
-            }
-            // Refused on the way out as well as on the way in. `decode` rejects
-            // undefined bits (§ 2.3), so without this a caller could build a
-            // `Hello` that encodes cleanly and earns an `Error{Protocol}` from the
-            // peer — a bug reported at the wrong end of the connection, by the
-            // process that did nothing wrong.
-            if hello.flags & !HELLO_FLAG_BITS != 0 {
-                return Err(ProtoError::Malformed("undefined Hello flag bits"));
-            }
-        }
-
+        // The payload goes straight into the caller's buffer and the header is
+        // patched in behind it, so every error path rewinds to `start`: a refused
+        // frame leaves the buffer exactly as long as it was found, and a caller
+        // appending frames back to back never ships half of one. Each field's check
+        // is then free to live beside the field in `encode_payload`, rather than
+        // being restated here as a copy of the same conversion.
         let start = out.len();
         out.extend_from_slice(&[0; HEADER_LEN]);
-        self.encode_payload(out);
+        self.encode_payload(out)
+            .inspect_err(|_| out.truncate(start))?;
 
         let header = u32::try_from(out.len() - start - HEADER_LEN)
             .map_err(|_| ProtoError::PayloadTooLarge(u32::MAX))
@@ -386,16 +357,29 @@ impl Frame<'_> {
         Ok(())
     }
 
-    fn encode_payload(&self, out: &mut Vec<u8>) {
+    fn encode_payload(&self, out: &mut Vec<u8>) -> Result<(), ProtoError> {
         match *self {
             Self::Hello(hello) => {
+                // Refused rather than truncated: `encode` returns a `Result`, so
+                // reporting success while putting something other than what the
+                // caller passed on the wire is never the right trade. A `TERM`
+                // longer than its own length prefix is a broken caller, and
+                // silently shortening it would open the session under a terminal
+                // type nobody chose.
+                //
+                // Ahead of the flag check, and both ahead of the first byte: a
+                // `Hello` that is wrong in both ways is two caller bugs at once,
+                // and which of them gets named is a detail nothing should change
+                // by accident. `TERM` has always been the one reported.
+                let term_len = u16::try_from(hello.term.len())
+                    .map_err(|_| ProtoError::Malformed("TERM exceeds 65535 bytes"))?;
+                checked_hello_flags(hello.flags)?;
+
                 out.extend_from_slice(&hello.protocol.to_be_bytes());
                 out.extend_from_slice(&hello.flags.to_be_bytes());
                 out.extend_from_slice(&hello.out_offset.to_be_bytes());
                 out.extend_from_slice(&hello.in_offset.to_be_bytes());
                 put_win(out, hello.win);
-                // `encode` refused anything longer, so this never truncates.
-                let term_len = u16::try_from(hello.term.len()).unwrap_or(u16::MAX);
                 out.extend_from_slice(&term_len.to_be_bytes());
                 out.extend_from_slice(hello.term.as_bytes());
             }
@@ -439,10 +423,9 @@ impl Frame<'_> {
                 out.extend_from_slice(data);
             }
         }
+        Ok(())
     }
-}
 
-impl<'a> Frame<'a> {
     /// Decodes a frame payload, borrowing byte and string fields from it.
     ///
     /// # Errors
@@ -468,9 +451,7 @@ impl<'a> Frame<'a> {
             FrameType::Hello => {
                 let protocol = r.u16()?;
                 let flags = r.u16()?;
-                if flags & !HELLO_FLAG_BITS != 0 {
-                    return Err(ProtoError::Malformed("undefined Hello flag bits"));
-                }
+                checked_hello_flags(flags)?;
                 let out_offset = r.u64()?;
                 let in_offset = r.u64()?;
                 let win = r.win()?;

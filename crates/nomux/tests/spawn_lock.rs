@@ -25,11 +25,14 @@ use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use harness::{Spawned, control, poll_until, run_root, wait_for};
+use harness::{
+    Reaper, Spawned, control, nomux_with_shell, poll_until, run_root, stderr, stdout, succeeded,
+    wait_for,
+};
 
 /// A `list` that finds the spawn lock held leaves the whole entry alone, and
 /// collects it on the next pass once the lock is free.
@@ -39,11 +42,11 @@ fn a_held_spawn_lock_survives_a_concurrent_list() {
     let lock = session.hold_lock();
 
     let listed = session.run(&["list"]);
-    assert!(listed.status.success(), "list failed: {listed:?}");
+    succeeded(&listed, "list failed");
     assert!(
-        !String::from_utf8_lossy(&listed.stdout).contains(&session.id),
+        !stdout(&listed).contains(&session.id),
         "nothing is listening, so the session is not live: {:?}",
-        String::from_utf8_lossy(&listed.stdout)
+        stdout(&listed)
     );
     assert!(
         session.socket().exists(),
@@ -72,8 +75,7 @@ fn a_held_spawn_lock_survives_a_concurrent_list() {
 /// dead stays collectable.
 fn collected_within(session: &StaleSession, within: Duration) {
     let collected = poll_until(within, || {
-        let listed = session.run(&["list"]);
-        assert!(listed.status.success(), "list failed: {listed:?}");
+        succeeded(&session.run(&["list"]), "list failed");
         entries(&session.dir).is_empty()
     });
     assert!(
@@ -98,7 +100,7 @@ fn kill_refuses_to_leave_a_locked_session_behind() {
     assert!(
         !killed.status.success(),
         "kill claimed success for a session it could not remove: {:?}",
-        String::from_utf8_lossy(&killed.stderr)
+        stderr(&killed)
     );
     assert!(
         session.socket().exists() && session.lock_path().exists(),
@@ -106,11 +108,9 @@ fn kill_refuses_to_leave_a_locked_session_behind() {
     );
 
     drop(lock);
-    let killed = session.run(&["kill", "lk2"]);
-    assert!(
-        killed.status.success(),
-        "kill failed with the lock free: {:?}",
-        String::from_utf8_lossy(&killed.stderr)
+    succeeded(
+        &session.run(&["kill", "lk2"]),
+        "kill failed with the lock free",
     );
     assert!(
         !session.socket().exists() && !session.lock_path().exists(),
@@ -146,10 +146,7 @@ fn an_attach_re_takes_a_spawn_lock_that_was_collected() {
     let pinned = File::open(session.lock_path()).expect("pin the orphan inode");
 
     let _relay = Spawned::spawn(
-        Command::new(env!("CARGO_BIN_EXE_nomux"))
-            .args(["attach", &session.id])
-            .env("XDG_RUNTIME_DIR", &session.root)
-            .env("SHELL", "/bin/sh")
+        nomux_with_shell(&session.root, &["attach", &session.id])
             .env("NOMUX_RING_BYTES", "65536")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -191,8 +188,7 @@ fn an_unopenable_spawn_lock_does_not_take_the_control_surface_with_it() {
     fs::set_permissions(session.lock_path(), fs::Permissions::from_mode(0o400))
         .expect("make it unopenable");
 
-    let listed = session.run(&["list"]);
-    assert!(listed.status.success(), "list failed: {listed:?}");
+    succeeded(&session.run(&["list"]), "list failed");
     assert!(
         !session.socket().exists(),
         "a dead session must still be collected when its lock cannot be opened: \
@@ -202,12 +198,7 @@ fn an_unopenable_spawn_lock_does_not_take_the_control_surface_with_it() {
 
     // And the fresh one a later session creates is openable by whoever comes next.
     let session = StaleSession::create("lk5");
-    let killed = session.run(&["kill", "lk5"]);
-    assert!(
-        killed.status.success(),
-        "kill failed: {:?}",
-        String::from_utf8_lossy(&killed.stderr)
-    );
+    succeeded(&session.run(&["kill", "lk5"]), "kill failed");
 }
 
 /// Regression: `kill` waits out a pidfile that exists but is still empty.
@@ -244,10 +235,9 @@ fn kill_waits_out_a_pidfile_that_has_been_created_but_not_yet_written() {
     let killed = session.run.run(&["kill", "lk9"]);
     restore.join().expect("the republishing thread");
 
-    assert!(
-        killed.status.success(),
-        "kill refused a session whose pidfile was merely still being written: {:?}",
-        String::from_utf8_lossy(&killed.stderr)
+    succeeded(
+        &killed,
+        "kill refused a session whose pidfile was merely still being written",
     );
     assert!(
         !session.is_alive(),
@@ -276,9 +266,9 @@ fn kill_leaves_a_live_session_alone_when_its_pidfile_cannot_be_read() {
         "kill claimed to have removed a session it left running"
     );
     assert!(
-        String::from_utf8_lossy(&killed.stderr).contains("is running"),
+        stderr(&killed).contains("is running"),
         "the refusal must say the session is still there: {:?}",
-        String::from_utf8_lossy(&killed.stderr)
+        stderr(&killed)
     );
     assert!(session.is_alive(), "the daemon must still be reachable");
     assert_eq!(
@@ -291,11 +281,9 @@ fn kill_leaves_a_live_session_alone_when_its_pidfile_cannot_be_read() {
     // about the session.
     fs::set_permissions(session.pid_path(), fs::Permissions::from_mode(0o600))
         .expect("restore the pidfile");
-    let killed = session.run.run(&["kill", "lk6"]);
-    assert!(
-        killed.status.success(),
-        "kill failed once the pidfile was readable again: {:?}",
-        String::from_utf8_lossy(&killed.stderr)
+    succeeded(
+        &session.run.run(&["kill", "lk6"]),
+        "kill failed once the pidfile was readable again",
     );
     assert!(
         entries(&session.run.dir).is_empty(),
@@ -318,9 +306,9 @@ fn the_control_surface_refuses_a_run_directory_that_is_not_ours() {
     let attached = planted.run(&["attach", "imp"]);
     assert!(!attached.status.success(), "attach used a planted socket");
     assert!(
-        String::from_utf8_lossy(&attached.stderr).contains("it is a symlink"),
+        stderr(&attached).contains("it is a symlink"),
         "attach must say what it refused: {:?}",
-        String::from_utf8_lossy(&attached.stderr)
+        stderr(&attached)
     );
     assert!(
         planted.nothing_connected(),
@@ -334,14 +322,14 @@ fn the_control_surface_refuses_a_run_directory_that_is_not_ours() {
             "{mode:?} used a planted run directory"
         );
         assert!(
-            String::from_utf8_lossy(&out.stderr).contains("it is a symlink"),
+            stderr(&out).contains("it is a symlink"),
             "{mode:?} must say what it refused: {:?}",
-            String::from_utf8_lossy(&out.stderr)
+            stderr(&out)
         );
         assert!(
             out.stdout.is_empty(),
             "{mode:?} printed a planted entry: {:?}",
-            String::from_utf8_lossy(&out.stdout)
+            stdout(&out)
         );
     }
 }
@@ -360,15 +348,14 @@ fn the_control_surface_neither_creates_nor_complains_about_a_missing_run_directo
 
     for mode in [vec!["list"], vec!["kill", "lk8"]] {
         let out = session.run(&mode);
-        assert!(
-            out.status.success(),
-            "{mode:?} failed on a host with no run directory: {:?}",
-            String::from_utf8_lossy(&out.stderr)
+        succeeded(
+            &out,
+            &format!("{mode:?} failed on a host with no run directory"),
         );
         assert!(
             out.stdout.is_empty(),
             "{mode:?} printed something: {:?}",
-            String::from_utf8_lossy(&out.stdout)
+            stdout(&out)
         );
         assert!(
             !session.dir.exists(),
@@ -450,33 +437,30 @@ impl StaleSession {
 /// of the business of driving a shell.
 struct LiveSession {
     run: StaleSession,
-    pid: i32,
+    /// Whatever the test decided, this daemon is not the next run's business.
+    _reaper: Reaper,
 }
 
 impl LiveSession {
     fn create(id: &str) -> Self {
         let run = StaleSession::empty(id);
-        let started = Command::new(env!("CARGO_BIN_EXE_nomux"))
-            .args(["attach", id])
-            .env("XDG_RUNTIME_DIR", &run.root)
-            .env("SHELL", "/bin/sh")
+        let started = nomux_with_shell(&run.root, &["attach", id])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .output()
             .expect("run attach");
-        assert!(
-            started.status.success(),
-            "attach failed: {:?}",
-            String::from_utf8_lossy(&started.stderr)
-        );
+        succeeded(&started, "attach failed");
         wait_for(&run.pid_path());
         let pid = fs::read_to_string(run.pid_path())
             .expect("read the pidfile")
             .trim()
             .parse()
             .expect("the pidfile holds a pid");
-        Self { run, pid }
+        Self {
+            run,
+            _reaper: Reaper(pid),
+        }
     }
 
     fn pid_path(&self) -> PathBuf {
@@ -488,15 +472,6 @@ impl LiveSession {
     /// only a `connect` can tell.
     fn is_alive(&self) -> bool {
         UnixStream::connect(self.run.socket()).is_ok()
-    }
-}
-
-impl Drop for LiveSession {
-    fn drop(&mut self) {
-        // Whatever the test decided, this daemon is not the next run's business.
-        if let Some(pid) = rustix::process::Pid::from_raw(self.pid) {
-            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
-        }
     }
 }
 
@@ -539,10 +514,11 @@ impl PlantedRunDir {
     /// test run that never ends.
     fn run(&self, args: &[&str]) -> Output {
         let mut child = Spawned::spawn(
-            Command::new(env!("CARGO_BIN_EXE_nomux"))
-                .args(args)
-                .env("XDG_RUNTIME_DIR", self.root.join("xdg"))
-                .env("SHELL", "/bin/sh")
+            // With a shell even for `list` and `kill`, because the `attach` they
+            // share this with is the one that must not reach one — and if it ever
+            // does, it should find a predictable `/bin/sh` rather than whatever the
+            // developer logs in with.
+            nomux_with_shell(&self.root.join("xdg"), args)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped()),

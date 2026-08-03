@@ -96,10 +96,7 @@ fn an_escape_heavy_stream_is_byte_exact_across_random_disconnects() {
     let mut in_offset = ready.in_offset;
 
     let command = emitter_command(EMIT_ROUNDS);
-    client.send(&Frame::Input {
-        offset: in_offset,
-        data: command.as_bytes(),
-    });
+    client.input(in_offset, command.as_bytes());
     in_offset += command.len() as u64;
 
     let mut rng = Rng::new(chaos_seed);
@@ -198,10 +195,7 @@ fn overflow_during_disconnects_is_always_reported() {
 
     // `yes` outruns anything the client can do about it, which is the point.
     let command = b"yes\n";
-    client.send(&Frame::Input {
-        offset: in_offset,
-        data: command,
-    });
+    client.input(in_offset, command);
     in_offset += command.len() as u64;
     // Wait for the first of its output before starting to disconnect. Otherwise
     // the very first drop could discard the command itself — a client that closes
@@ -312,10 +306,7 @@ fn replayed_input_across_random_disconnects_is_applied_once() {
     for round in 0..rounds {
         intended.extend_from_slice(line);
         let from = usize::try_from(applied).expect("offset fits");
-        client.send(&Frame::Input {
-            offset: applied,
-            data: &intended[from..],
-        });
+        client.input(applied, &intended[from..]);
 
         drop(client);
         client = session.connect();
@@ -338,10 +329,7 @@ fn replayed_input_across_random_disconnects_is_applied_once() {
     // A fence proves everything before it has been through the PTY.
     intended.extend_from_slice(b"printf FENCE\n");
     let from = usize::try_from(applied).expect("offset fits");
-    client.send(&Frame::Input {
-        offset: applied,
-        data: &intended[from..],
-    });
+    client.input(applied, &intended[from..]);
     let (seen, _) = client.read_until("FENCE", offset);
     let marks = seen.matches('M').count();
     assert_eq!(
