@@ -525,6 +525,34 @@ fn list_does_not_park_on_a_run_file_that_is_a_fifo() {
     );
 }
 
+/// One line per session, however many of its five files are on disk.
+///
+/// `list` discovers sessions by every run-file name rather than by the socket alone
+/// (`control::session_id_of`), so a live session reaches the loop as several ids and
+/// has to be folded back to one. Nothing else in the suite would notice if it were
+/// not: every other assertion about a listing looks for a line rather than counting
+/// them, and a session printed five times satisfies all of them.
+#[test]
+fn a_session_is_listed_once_however_many_files_it_has() {
+    let session = LiveSession::create("lk16");
+    // The two the daemon does not publish unless it is asked to, so all five names
+    // are present and the fold has the most it will ever have to do.
+    fs::write(session.run.dir.join("lk16.label"), "five files").expect("plant a label");
+    fs::write(session.run.dir.join("lk16.agent"), "").expect("plant an agent socket's name");
+    assert_eq!(entries(&session.run.dir).len(), 5, "all five names on disk");
+
+    let listed = session.run.run(&["list"]);
+    succeeded(&listed, "list failed");
+    let lines = stdout(&listed);
+    succeeded(&session.run.run(&["kill", "lk16"]), "kill failed");
+
+    assert_eq!(
+        lines.lines().collect::<Vec<_>>(),
+        vec![format!("lk16\t{}\tfive files", session.pid)],
+        "five names are one session"
+    );
+}
+
 /// Regression: `nomux list | head` is a listing that ended, not a failure.
 ///
 /// The Rust runtime ignores `SIGPIPE` — § 6.2 depends on that — so the write to a
@@ -535,12 +563,14 @@ fn list_does_not_park_on_a_run_file_that_is_a_fifo() {
 /// printed were left for a `list` nobody may run again.
 ///
 /// The pipe here has no reader at all rather than one that walks away, so the first
-/// write fails and nothing depends on beating a reader to the buffer.
+/// write fails and nothing depends on beating a reader to the buffer. The exit status
+/// is what pins the defect either way: `list` visits the run directory in the order
+/// the directory gives it, so whether the stale entry is reached before the failing
+/// write or after it is the filesystem's business, and only the second of those two
+/// orders also makes the collection below an assertion about the fix.
 #[test]
 fn a_listing_whose_reader_has_gone_ends_cleanly_and_still_collects() {
     let session = LiveSession::create("lk14");
-    // Sorted after the live session, so the collection under test is the one that
-    // comes after the write that fails.
     let stale = session.run.dir.join("lk14x.sock");
     abandon_socket(&stale);
     fs::write(session.run.dir.join("lk14x.pid"), "999999999\n").expect("write a stale pidfile");

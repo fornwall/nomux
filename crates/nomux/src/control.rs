@@ -131,13 +131,23 @@ pub(crate) fn list() -> io::Result<()> {
         Err(err) => return Err(err),
     };
 
-    let mut ids: Vec<String> = entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| session_id_of(&entry.path()))
-        .collect();
-    ids.sort_unstable();
-    // One entry per session, not per file: five names lead to the same id.
-    ids.dedup();
+    // One entry per session, not per file: five names lead to the same id (§ 6.6).
+    //
+    // Folded by a scan of what is already here rather than by sorting and `dedup`ing,
+    // which is a size decision and not a taste one — `sort_unstable` on a `String`
+    // instantiates a quicksort and its insertion-sort fallback, 1.6 KiB of the § 8
+    // budget, and the whole cost of this scan is bounded by five files times the eight
+    // sessions a client mints. Nothing downstream is owed an order: § 6.6 states what
+    // a listing contains and never what sequence it arrives in, and no caller in or
+    // out of this tree reads it by position.
+    let mut ids: Vec<String> = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        if let Some(id) = session_id_of(&entry.path())
+            && !ids.contains(&id)
+        {
+            ids.push(id);
+        }
+    }
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -426,7 +436,7 @@ fn collect(paths: &SessionPaths) {
 /// litter outlives it too.
 ///
 /// A live session contributes several names and is folded back to one entry by the
-/// `dedup` in [`list`]. What decides a session's fate is still the probe under the
+/// scan in [`list`]. What decides a session's fate is still the probe under the
 /// spawn lock in [`collect`], never the name that led us to it.
 fn session_id_of(path: &Path) -> Option<String> {
     const EXTENSIONS: [&str; 5] = ["sock", "pid", "lock", "label", "agent"];
