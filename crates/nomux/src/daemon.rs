@@ -330,10 +330,13 @@ fn start(session_id: &str, label: Option<&str>) -> io::Result<()> {
     // The backlog goes back in with it, since `listen` installs one rather than
     // keeping what is in force and has no way to ask what that was; `SOCKET_BACKLOG`
     // is what makes that a restatement rather than a change. A failure here is
-    // discarded rather than propagated: it leaves the socket exactly as every release
-    // so far has left it, named after the parent, and that is a worse answer to a
-    // question nothing in this tree asks yet — not a reason to refuse a session that
-    // is otherwise ready to serve.
+    // discarded rather than propagated, and costs § 6.6 one of its two witnesses
+    // rather than the session: `control::daemon_of` reads these credentials on every
+    // `kill` and `list`, but the parent has `_exit`ed, so `extant` discards the number
+    // and the pidfile decides alone. Where the kernel has reissued it the two
+    // witnesses disagree, and the tie goes to the file, a stranger wearing that number
+    // not being a `nomux daemon <id>` process. Not a reason to refuse a session that is
+    // otherwise ready to serve.
     //
     // SAFETY: `listen` is passed a descriptor `listener` owns and keeps open across
     // the call, and a backlog. `UnixListener` has no safe spelling of a second
