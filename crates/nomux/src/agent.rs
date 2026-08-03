@@ -15,13 +15,13 @@ use std::path::{Path, PathBuf};
 
 use nomux_proto::MAX_AGENT_CHANNELS;
 
-/// Most a single channel may hold for a local peer that has stopped reading.
+/// Most a single channel may hold for a local peer that has stopped reading
+/// (`IMPLEMENTATION.md` § 6.7).
 ///
-/// Generous by two orders of magnitude for real `ssh-agent` traffic, where an
-/// exchange is a few hundred bytes. The ceiling that matters is the product: eight
-/// channels all at the limit is 2 MiB, which is half the default ring rather than a
-/// rounding error against it — so this is sized to bound a runaway child, not to
-/// disappear beside the session's other memory.
+/// The ceiling that matters is the product: eight channels all at the limit is
+/// 2 MiB, half the default ring rather than a rounding error against it — so this is
+/// sized to bound a runaway child, not to disappear beside the session's other
+/// memory.
 const MAX_CHANNEL_QUEUE: usize = 256 * 1024;
 
 /// Outcome of one attempt to drain a channel's queue.
@@ -119,10 +119,10 @@ impl Agent {
     /// The still-open channel with this id.
     ///
     /// A scan rather than a keyed lookup: the list is capped at
-    /// [`MAX_AGENT_CHANNELS`], and keying it by a `BTreeMap` instead costs 8 KiB
-    /// of monomorphised B-tree in the release binary — measured, `x86_64`, against
-    /// the 400 KiB budget of `IMPLEMENTATION.md` § 8 — to save a linear search
-    /// over at most eight entries.
+    /// [`MAX_AGENT_CHANNELS`], so there are at most eight entries to walk — and a
+    /// `BTreeMap` over them measured 8 KiB of monomorphised B-tree on `x86_64`,
+    /// against the 400 KiB budget of `IMPLEMENTATION.md` § 8. The obvious
+    /// improvement costs more than the search it saves.
     fn channel(&mut self, id: u32) -> Option<&mut Channel> {
         self.channels.iter_mut().find(|chan| chan.id == id)
     }
@@ -130,10 +130,8 @@ impl Agent {
     /// Accepts one connection, returning the id of the channel to announce.
     ///
     /// `serving` is whether a client is attached and greeted. When it is not, the
-    /// connection is accepted and dropped on the spot: a `git push` with nobody
-    /// listening must fail with the same error as a missing agent rather than hang
-    /// until the user happens to reattach. The cap is enforced the same way — the
-    /// daemon closes rather than queueing.
+    /// connection is accepted and dropped on the spot, as is one past the channel
+    /// cap; `IMPLEMENTATION.md` § 6.7 says why closing beats queueing for both.
     ///
     /// Never fails. `EMFILE`, `ECONNABORTED` and friends are transient and belong
     /// to one connection; propagating them would cost the session its agent socket
@@ -165,6 +163,17 @@ impl Agent {
         let Some(chan) = self.channel(id) else {
             return Read::Closed;
         };
+        // A channel the client has closed has had its read half shut down by
+        // `close_from_client`, and a socket in that state reports itself readable on
+        // every pass and answers every read with the end of file we ourselves caused.
+        // Taking that at face value would close the channel with its queue still
+        // unwritten — dropping the very reply `Flush::Finished` exists to deliver —
+        // and would answer the client with an `AgentClose` for a channel it closed
+        // itself and has already forgotten. What is left is the write side, which the
+        // queue keeps asking `poll` about until it drains or the peer refuses it.
+        if chan.closing {
+            return Read::WouldBlock;
+        }
         match crate::nbio::read(chan.stream.as_fd(), buf) {
             Ok(0) => Read::Closed,
             Ok(n) => Read::Data(n),

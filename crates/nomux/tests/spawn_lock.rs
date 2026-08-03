@@ -28,11 +28,11 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use harness::{
-    Reaper, Spawned, collect, control, nomux_with_shell, poll_until, run_root, stderr, stdout,
-    succeeded, wait_for,
+    Reaper, Spawned, collect, control, nomux, nomux_with_shell, poll_until, run_root, stderr,
+    stdout, succeeded, wait_for,
 };
 
 /// A `list` that finds the spawn lock held leaves the whole entry alone, and
@@ -66,14 +66,12 @@ fn a_held_spawn_lock_survives_a_concurrent_list() {
 /// Runs `list` until the run directory is empty, or says so loudly.
 ///
 /// Asserted over a window rather than on one pass, and not because collection is
-/// unreliable. `fork` duplicates every open descriptor, and a duplicate of an
-/// `flock`ed one keeps that lock alive until it is closed — which for a child of
-/// this binary is its `exec`, a moment later. So any other test in this process
-/// that spawns a command while the descriptor above is open holds this lock for as
-/// long as that takes, and a `list` landing in the gap correctly finds it busy and
-/// correctly leaves the entry alone. That is a property of running several tests in
-/// one process, and what § 6.6 promises is what this asserts: an entry that stays
-/// dead stays collectable.
+/// unreliable: `list` gives the spawn lock up rather than waiting for it (§ 6.6), so
+/// anything still holding it leaves the entry correctly alone for that pass. The lock
+/// this test held is given up through the open file description rather than by
+/// closing a descriptor (see [`HeldLock`]), so no `fork` duplicate can be what holds
+/// it — the window stays because what § 6.6 promises is that an entry which stays
+/// dead stays collectable, not that it is collected on any particular pass.
 fn collected_within(session: &StaleSession, within: Duration) {
     let collected = poll_until(within, || {
         succeeded(&session.run(&["list"]), "list failed");
@@ -225,16 +223,29 @@ fn kill_waits_out_a_pidfile_that_has_been_created_but_not_yet_written() {
     let body = fs::read_to_string(session.pid_path()).expect("read the pidfile");
     fs::write(session.pid_path(), b"").expect("empty the pidfile");
 
-    // Refilled well inside the two-second publish grace, so a `kill` that waits
-    // finds the pid and a `kill` that does not has already failed by now.
-    let path = session.pid_path();
-    let restore = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(300));
-        fs::write(path, body.as_bytes()).expect("republish the pid");
-    });
+    // `kill` is started first and the clock runs from there, so both halves of the
+    // window are measured from a point this test can see. Timed from before the fork
+    // instead, a slow `fork` and `exec` under load could republish the pid before
+    // `kill` ever opened the file — and a `kill` that reported the empty one at once
+    // would then pass this — while eating into the two-second publish grace `kill`
+    // measures from its own start, which would fail a healthy one.
+    let mut killing = Spawned::spawn(
+        nomux(&session.run.root, &["kill", "lk9"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
+    thread::sleep(Duration::from_millis(300));
+    fs::write(session.pid_path(), body.as_bytes()).expect("republish the pid");
 
-    let killed = session.run.run(&["kill", "lk9"]);
-    restore.join().expect("the republishing thread");
+    assert!(
+        poll_until(Duration::from_secs(20), || !killing.is_running()),
+        "`nomux kill` never returned from the publish grace it was waiting out"
+    );
+    let killed = killing
+        .into_exited()
+        .wait_with_output()
+        .expect("collect what kill said");
 
     succeeded(
         &killed,
@@ -410,8 +421,8 @@ impl StaleSession {
     }
 
     /// Takes the spawn lock the way `attach` does, and keeps it until the
-    /// returned file is dropped.
-    fn hold_lock(&self) -> File {
+    /// returned guard is dropped.
+    fn hold_lock(&self) -> HeldLock {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -421,11 +432,33 @@ impl StaleSession {
             .expect("open the spawn lock");
         rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
             .expect("take the spawn lock");
-        file
+        HeldLock(file)
     }
 
     fn run(&self, args: &[&str]) -> Output {
         control(&self.root, args)
+    }
+}
+
+/// The spawn lock, released as a property of the open file description rather than
+/// by closing a descriptor.
+///
+/// `fork` duplicates the descriptor into every other test's children, and `flock(2)`
+/// holds the lock until *all* of those duplicates are closed — but releases it on an
+/// explicit `LOCK_UN` through any one of them, because they share one open file
+/// description. So this is the answer `PLAN.md` § P2 prefers, the same shape as
+/// `abandon_socket`'s `shutdown`: no stray copy can undo it.
+struct HeldLock(File);
+
+impl HeldLock {
+    fn metadata(&self) -> std::io::Result<fs::Metadata> {
+        self.0.metadata()
+    }
+}
+
+impl Drop for HeldLock {
+    fn drop(&mut self) {
+        let _ = rustix::fs::flock(&self.0, rustix::fs::FlockOperation::Unlock);
     }
 }
 
@@ -547,21 +580,11 @@ impl PlantedRunDir {
 /// § 6.6: the socket a daemon killed with `SIGKILL` leaves in the run directory,
 /// where only a refused `connect` distinguishes it from a session still in use.
 ///
-/// The `shutdown` is the whole of the difference, and it is not belt and braces.
-/// `fork` copies the descriptor table, so a child any *other* test starts while
-/// this listener is open carries a duplicate of it until its `exec` — and a
-/// listening socket with a descriptor still onto it goes on accepting, however
-/// firmly this one closed its own. What the run directory then holds is a socket
-/// that answers, so `list` and `kill` correctly report a live session where this
-/// promised a dead one, and the tests below fail for the thing they exist to
-/// assert. Measured at 170–270 ms of afterlife on a machine with more runnable
-/// threads than cores, which is several `nomux list` invocations wide.
-///
-/// `PLAN.md` § P2 records both answers to that hazard, and this is the one it
-/// prefers wherever the object allows it: `shutdown` belongs to the socket rather
-/// than to the descriptor, so no duplicate can undo it — where
-/// `harness::while_nothing_forks` would only keep *this* process's forks out of the
-/// window, and would have to be right about every `Command` in the suite for ever.
+/// The `shutdown` is the whole of the difference, and it is not belt and braces: a
+/// listening socket goes on accepting for as long as *any* descriptor onto it
+/// survives, and another test's `fork` in flight is holding one. `shutdown` belongs
+/// to the socket rather than to the descriptor, so no duplicate can undo it
+/// (`PLAN.md` § P2).
 fn abandon_socket(path: &Path) {
     let listener = UnixListener::bind(path).expect("bind a socket to abandon");
     // SAFETY: `shutdown` is passed a descriptor the borrow above keeps open across
@@ -602,8 +625,7 @@ fn entries(dir: &Path) -> Vec<String> {
 /// asserts nothing. `/proc/locks` lists blocked requests alongside granted ones,
 /// marked with `->`, so the wait is on the condition rather than on a guess.
 fn wait_until_blocked_on(dev: u64, ino: u64) {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline {
+    let blocked = poll_until(Duration::from_secs(20), || {
         // A kernel without `/proc/locks` cannot be waited on, and the assertions
         // below would then pass without ever having reached the window they are
         // about. Failing loudly is the point: a guard that quietly stops guarding
@@ -614,12 +636,12 @@ fn wait_until_blocked_on(dev: u64, ino: u64) {
                     the attach ever waited for the spawn lock"
             )
         });
-        if locks.lines().any(|line| is_flock_waiter(line, dev, ino)) {
-            return;
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-    panic!("nothing ever blocked on the spawn lock, inode {ino}");
+        locks.lines().any(|line| is_flock_waiter(line, dev, ino))
+    });
+    assert!(
+        blocked,
+        "nothing ever blocked on the spawn lock, inode {ino}"
+    );
 }
 
 /// Whether one `/proc/locks` line is a request waiting for an `flock` on `dev:ino`:

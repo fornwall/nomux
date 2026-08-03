@@ -8,19 +8,15 @@
 //! bytes to any signal, and treating `EAGAIN` as end of file reports the session as
 //! over every time the kernel has nothing to hand over yet.
 //!
-//! Three callers come through here — the PTY master, the agent listener's channels
-//! and the relay's stdio (`attach`). Only the client socket (`conn`) still keeps a
-//! loop of its own, and on purpose: it queues into a `Vec` with a cursor rather than
-//! a `VecDeque`, so there is nothing for [`drain_to`] to take, and it reads a
-//! zero-length write as `WriteZero` where this module reads it as "not now".
+//! Only the client socket (`conn`) keeps a loop of its own, and on purpose: it
+//! queues into a `Vec` with a cursor rather than a `VecDeque`, so there is nothing
+//! for [`drain_to`] to take, and it reads a zero-length write as `WriteZero` where
+//! this module reads it as "not now".
 //!
 //! What is *not* here is what each outcome means. A closed peer ends the session for
-//! the PTY, ends one channel for the agent, and half-closes one direction for the
-//! relay; `EPIPE` is a dead channel to the agent, and to the relay an ordinary
-//! ending that nonetheless ends only one of its two directions — the stdout one,
-//! since a client that goes away arrives a second time as EOF on the socket's read
-//! side. Folding either decision in would make two of the three callers wrong, so
-//! both come back as they arrived.
+//! the PTY, one channel for the agent and one direction for the relay, and `EPIPE`
+//! divides them the same way. Folding either decision in would make two of the three
+//! callers wrong, so both come back as they arrived.
 
 use std::collections::VecDeque;
 use std::io::IoSlice;
@@ -31,10 +27,9 @@ use rustix::io::Errno;
 /// Reads into `buf`, retrying a call a signal interrupted.
 ///
 /// The retry is the whole of it. `EINTR` says a signal arrived and says nothing
-/// about the descriptor, so it is never news to a caller — but written out at each
-/// site it costs a `loop { return match … }`, which reads like control flow and is
-/// not. Everything else is passed through untouched, including the zero that means
-/// end of file and the `EAGAIN` that emphatically does not.
+/// about the descriptor, so it is never news to a caller. Everything else is passed
+/// through untouched, including the zero that means end of file and the `EAGAIN`
+/// that emphatically does not.
 pub(crate) fn read(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<usize, Errno> {
     loop {
         match rustix::io::read(fd, &mut *buf) {
@@ -59,11 +54,10 @@ pub(crate) fn read(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<usize, Errno> {
 /// wrapped queue costs is the side benefit.
 ///
 /// It also disposes of the empty front. `as_slices` on a non-empty deque is not
-/// documented to put anything in the front slice, and an empty one handed to
-/// `write` comes back `Ok(0)` — the break below — so the queue would stop draining
-/// and every later `POLLOUT` would find it in the same state, a session that
-/// quietly stops accepting keystrokes. As one of two `iovec`s an empty slice
-/// contributes nothing and the call still writes what is beside it.
+/// documented to put anything in the front slice, and an empty one handed to `write`
+/// comes back `Ok(0)` — the break below — so the queue would stop draining for good,
+/// a session that quietly stops accepting keystrokes. As one of two `iovec`s an
+/// empty slice contributes nothing and the call still writes what is beside it.
 pub(crate) fn drain_to(queue: &mut VecDeque<u8>, fd: BorrowedFd<'_>) -> Result<(), Errno> {
     while !queue.is_empty() {
         let written = {

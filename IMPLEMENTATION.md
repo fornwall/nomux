@@ -232,24 +232,20 @@ just made it true.
 
 The client stays in the poll set with an *empty* mask rather than being left out of it.
 `POLLHUP` and `POLLERR` are reported whatever the mask says, and that is the point:
-they are the only way to learn that a held-back peer has died. A read is not always an
-answer to them — a receive buffer at its cap makes filling a no-op, so it never reaches
-the zero-length read that would notice, and the descriptor then reports `POLLHUP` on
-every pass for as long as the child declines to read. So the loop lets the client go on
-the spot, which cannot spin: that descriptor is out of the set on the very next pass.
-It is also what stamps the idle-reaping deadline and fails the agent's waiting callers
-(§6.7) when the peer dies, rather than whenever the child next happens to read. Nothing
-can wedge either, because a non-empty queue is exactly what puts the master in the set
-asking for `POLLOUT`, and draining it re-arms the client on the pass after.
+they are the only way to learn that a held-back peer has died. A read is not an answer
+to them — a receive buffer at its cap makes filling a no-op, so it never reaches the
+zero-length read that would notice. So the loop lets the client go on the spot, which
+cannot spin: that descriptor is out of the set on the very next pass. It is also what
+stamps the idle-reaping deadline and fails the agent's waiting callers (§6.7) when the
+peer dies, rather than whenever the child next happens to read. Nothing can wedge
+either, because a non-empty queue is exactly what puts the master in the set asking for
+`POLLOUT`, and draining it re-arms the client on the pass after.
 
-The receive-buffer cap does less than it looks like, and is worth stating exactly. Its
-job is to make the ceiling on one connection's buffered input the daemon's own number
-rather than the peer's: filling loops until `EAGAIN`, so without it the ceiling is
-whatever the peer set `SO_SNDBUF` to. On a stock Linux the kernel's own 212 KiB unix
-send buffer is the tighter of the two and the cap never binds at all. Against a peer
-that raises `SO_SNDBUF` past a megabyte it does, measurably — removing it doubled the
-daemon's resident set under a blast, 5.2 MB to 12.3 MB — but it converts a peer-chosen
-bound into a fixed one, not an unbounded one into a bound.
+What that receive-buffer cap is *for* is bounding one connection's buffered input by
+the daemon's own number rather than by whatever the peer set `SO_SNDBUF` to. It
+converts a peer-chosen bound into a fixed one, not an unbounded one into a bound, and
+on a stock host it never binds at all — [PLAN.md § P4](PLAN.md#p4--test-depth) has the
+measurements and why no test pins it.
 
 The cost is that a client's own control frames — `Ping`, `Resize`, `Detach` — queue
 behind its own stalled input. That is accepted; it is being held back on input, and
@@ -421,7 +417,7 @@ session and inherits its setup rather than reconstructing it. PAM has run, and
 - **Login shell, dash-prefixed**: `execv(shell, ["-bash", ...])`, not `["bash", ...]`. That leading `-` is what sshd does for an interactive session and what causes `/etc/profile` and `~/.bash_profile` to be sourced. Omitting it yields a stunted environment that users correctly perceive as broken.
 - **Shell selection**: `$SHELL` as inherited, else the password database, else `/bin/sh`. The middle step is `/etc/passwd` parsed directly rather than `getpwuid`: in a static musl binary those are the same thing, since NSS modules cannot be loaded into a static executable, and doing it in Rust keeps the lookup safe and testable. The cost is not seeing LDAP or NIS users, who fall through to `/bin/sh` — as they would with `getpwuid` anyway.
 - **Working directory**: `$HOME`, else the directory the attaching connection was in, else `/`. The daemon itself has already moved to `/` (§6.2), so this has to be set explicitly or the shell would start there.
-- **Environment**: inherited wholesale. Remove nomux scaffolding, set `TERM` from `Hello`, `NOMUX_SESSION=<id>`, and — when agent forwarding is enabled — `SSH_AUTH_SOCK=$RUNDIR/<id>.agent` (§6.7). Change nothing else.
+- **Environment**: inherited wholesale. Remove `NOMUX_BOOTSTRAP`, set `TERM` from `Hello`, `NOMUX_SESSION=<id>`, and — when agent forwarding is enabled — `SSH_AUTH_SOCK=$RUNDIR/<id>.agent` (§6.7). Change nothing else, which leaves `NOMUX_RING_BYTES` (§4) in the child's environment on a daemon that was started with it set.
 - **No PAM.** It already ran for the SSH login, and the daemon is unprivileged.
 - No client-supplied command in v1. A one-shot remote command has no reason to be persistent; it stays on plain SSH.
 
@@ -529,8 +525,9 @@ it.
 
 Detection reads the files `logind` itself reads — `/run/systemd/system` for "is
 this a `logind` host at all", then `/var/lib/systemd/linger/<user>` — rather than
-running `loginctl show-user -p Linger`. Two `stat` calls on the session-start path,
-versus a D-Bus round trip that can block for its full 25-second timeout on a busy
+running `loginctl show-user -p Linger`. Two `stat` calls and a read of `/etc/passwd`
+for the login name, all on the session-start path, versus a D-Bus round trip that can
+block for its full 25-second timeout on a busy
 or broken bus and turn "linger is off" into "the session would not start". Absence
 of the marker is a definite *disabled*; only a lookup that fails for some other
 reason is *unknown*, and the client must not warn on unknown.
@@ -928,12 +925,14 @@ Targets:
 `scripts/build-release.sh` builds all four, writes `SHA256SUMS`, and exits non-zero
 if any binary misses the budget. It also holds each size against the per-target
 baseline recorded in `scripts/size-baseline`, prints the signed delta beside the
-size, and fails a target that has grown more than 3% against it — the cap alone
-passed a commit that grew armv7 46% in one step, since the result still fitted it.
+size, and fails a target that has grown more than 3% against it — the cap alone passed
+a commit that grew armv7 by nearly half in one step, since the result still fitted it.
 Sizes are not repeated here: `scripts/size-baseline` is what a build writes and what
 the gate reads, and every prose copy of those numbers has gone stale at least once.
-`NOMUX_UPDATE_BASELINE=1` rewrites the baseline from that build and skips the growth
-gate, which puts an accepted size change in the diff a reviewer reads.
+armv7 still carries that regression against the other three
+([PLAN.md § P1](PLAN.md#p1--known-gaps)). `NOMUX_UPDATE_BASELINE=1` rewrites the
+baseline from that build and skips the growth gate, which puts an accepted size change
+in the diff a reviewer reads.
 
 **No cross toolchain.** `rust-lld` links all four, including the host target, and
 each `rust-std` component ships the musl CRT objects and `libc.a` beside it in
@@ -963,14 +962,6 @@ Size matters because the cold upload happens over cellular. Release profile:
 
 Every stable figure is over the 400 KiB budget, armv7 included. Re-measure with
 `NOMUX_STABLE_STD=1 sh scripts/build-release.sh` rather than trusting the table.
-
-**The shipping sizes are deliberately not repeated here.** They live in
-`scripts/size-baseline`, which is written by a build; this table is written by hand.
-When it carried them too they went stale twice — armv7 once read 141 KiB here while
-the artifact was 213, and the other three sat two percent low for a release after
-that. One number in two places is one number that will disagree with itself, and the
-copy a reader trusts should be the copy a machine maintains. armv7 carries a live
-regression against the other three; see [PLAN.md](PLAN.md).
 
 The panic machinery — formatting, backtrace symbolisation, `gimli`, `addr2line` —
 is most of that, and it cannot be dropped from a precompiled `std` however the
@@ -1004,7 +995,7 @@ would be taken over.
 | Layer | Approach | Where |
 | --- | --- | --- |
 | Codec | `proptest` round-trip; truncated, oversized and malformed frames must error, never panic. | `crates/nomux-proto/` |
-| Wire format | Hand-written byte vectors for all sixteen frames, taken from the §2.2 table rather than from the encoder, and checked in both directions. Every other codec test compares a frame to a frame, so it checks the codec against itself; these are the only thing that would notice a changed field order, width or endianness — which matters because the client is a separate codebase built from that table. Both handshake frames appear twice so that no flag bit or enumerator is exercised at only one value, and the five `Error` codes are pinned as a table, since a frame carries one at a time. | `crates/nomux-proto/tests/wire.rs` |
+| Wire format | Hand-written byte vectors for all sixteen frames, taken from the §2.2 table rather than from the encoder, and checked in both directions. Every other codec test compares a frame to a frame, so it checks the codec against itself; these are the only thing that would notice a changed field order, width or endianness — which matters because the client is a separate codebase built from that table. Each handshake frame appears three times so that no flag bit or enumerator is exercised at only one value, and the five `Error` codes are pinned as a table, since a frame carries one at a time. | `crates/nomux-proto/tests/wire.rs` |
 | Ring buffer | Model-based against a reference `Vec`, asserting `base_offset` monotonicity and that served ranges are byte-exact, with chunks both under and over capacity. | `src/ring.rs` |
 | Exactly-once input | The §3 scenario, replayed from a randomly chosen earlier offset after every disconnect. | `tests/chaos.rs` |
 | Session | Spawn daemon → write → sever the socket mid-stream → reattach → assert the output resumes exactly where it left off. Plus the handshake's two refusals of a client that has lost track of the streams: an `out_offset` above the end is clamped rather than believed (§4.2), and an `Input` above `in_applied` is `Error{INPUT_GAP}` and a closed connection (§3). | `tests/session.rs` |
@@ -1039,12 +1030,10 @@ more — so the pre-fix ordering lives behind `--cfg nomux_fault_injection`, and
 `const` rather than a `#[cfg]` block so both orderings stay type-checked and the
 shipped binary is unaffected either way.
 
-The script runs the guard twice, because the bug only bites when the input and the
-`Hello` that evicts its sender land in one wakeup, and whether that happens is
-otherwise a matter of microseconds. `--cfg nomux_fault_settle` pauses the daemon
-before each `poll` and forces that interleaving alone: the guard must still pass,
-which is what shows the second run fails because of the ordering rather than the
-delay.
+The bug only bites when the input and the `Hello` that evicts its sender land in one
+wakeup, which is otherwise a matter of microseconds, so `--cfg nomux_fault_settle`
+forces that interleaving alone and the script runs the guard under both. Its header
+says which run must pass and which must fail.
 
 ## 10. Exit codes
 

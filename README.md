@@ -1,8 +1,5 @@
 > [!WARNING]
-> **Experimental.** nomux is AI-generated: written by an AI agent, reviewed but not
-> battle-tested. It has a thorough test suite and no real-world mileage, and the
-> client that drives it does not exist publicly yet — so this is something to read,
-> not something to point at a server you care about.
+> **Experimental.** nomux is AI-generated and has not seen real world usage.
 
 # nomux
 
@@ -56,28 +53,20 @@ Nothing has to be installed by hand: the toolchain is pinned in
 ```sh
 git clone https://github.com/fornwall/nomux && cd nomux
 cargo build     # rustup installs the pinned 1.97.1 on first use
-cargo test      # 112 tests plus 2 doctests, about 10 s
+cargo test      # the whole suite, doctests included, about 10 s
 ```
 
 Both runners are supported, and the line above is the one to start with. The tree is
 developed against `cargo-nextest` — one more tool, for one property: it runs every
-test in its own process. Several of these tests fork, and a forked child inherits
-every open descriptor of whichever other test happens to be mid-flight, so under
-`cargo test`'s single process that is a sharpness the suite absorbs rather than one
-it is spared. What it takes to absorb it is written down in
-[PLAN.md § P2](PLAN.md#p2--structure), and it is a standing obligation on new tests
-rather than a thing that was fixed once.
+test in its own process, which spares the suite the descriptor sharing that
+[PLAN.md § P2](PLAN.md#p2--structure) describes and makes a standing obligation on
+new tests.
 
 ```sh
 cargo install cargo-nextest
 cargo clippy --workspace --all-targets
 cargo nextest run --workspace
 ```
-
-Warnings are errors, configured in `Cargo.toml` via `warnings = { level = "deny",
-priority = 1 }` rather than a command-line flag — so `cargo build`, `cargo clippy`
-and every editor's rust-analyzer all agree, with no cache thrash from differing
-`RUSTFLAGS`.
 
 Commits are gated by [prek](https://github.com/j178/prek) on shellcheck, formatting,
 clippy, tests and doctests:
@@ -122,12 +111,12 @@ sh scripts/build-release.sh     # → target/dist/ plus SHA256SUMS
 It builds every musl target, prints a size table with the change against the
 per-target baseline in `scripts/size-baseline`, and fails if any binary exceeds the
 400 KiB budget or has grown more than 3% since that baseline — the cap on its own
-let a 46% armv7 regression through unremarked. `NOMUX_UPDATE_BASELINE=1` rewrites
-the baseline from that build and skips the growth gate, so an intended size change
-lands in the diff. There is no cross toolchain to install — `rust-lld` links all
-four and each `rust-std` component carries its own musl objects — but the shipping
-configuration rebuilds the standard library with panics compiled out, which needs
-nightly and its sources:
+let a regression through unremarked once ([PLAN.md § P1](PLAN.md#p1--known-gaps)).
+`NOMUX_UPDATE_BASELINE=1` rewrites the baseline from that build and skips the growth
+gate, so an intended size change lands in the diff. There is no cross toolchain to
+install — `rust-lld` links all four and each `rust-std` component carries its own
+musl objects — but the shipping configuration rebuilds the standard library with
+panics compiled out, which needs nightly and its sources:
 
 ```sh
 nightly=$(cat scripts/nightly-version)
@@ -150,6 +139,56 @@ per architecture and a floating compiler moves the bytes that hash is taken over
 Nothing verifies a hash today — `SHA256SUMS` is built and nothing publishes it
 ([PLAN.md § P3](PLAN.md#p3--release-process)). The measurements are in
 [IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build).
+
+## Diagnostics
+
+A daemon has nowhere to write. It redirects its own stdio to `/dev/null` early on
+purpose — under `attach` those descriptors are the SSH channel carrying the client's
+frame stream, and a diagnostic written there would land in the middle of it — so from
+that point on a failure would be silent. Two things answer that.
+
+A session that fails to *start* reports why to the `attach` that tried to start it,
+which is where the reason is wanted:
+
+```
+$ nomux attach work
+nomux: daemon for session work did not start: run directory /run/user/1000/nomux is
+       group-writable
+```
+
+Everything after that goes to syslog, tagged `nomux`, as `user.err` for failures and
+`user.info` for a session beginning or ending. On a systemd host:
+
+```sh
+journalctl -t nomux                  # everything nomux has said
+journalctl -t nomux -f               # follow, while reproducing something
+journalctl -t nomux -p err           # failures only
+journalctl -t nomux --since -1h
+```
+
+Elsewhere it lands in the system log like anything else — `/var/log/syslog` on
+Debian and Ubuntu, `/var/log/messages` on RHEL and Fedora, `logread` under busybox:
+
+```sh
+grep nomux /var/log/syslog
+```
+
+Reading another user's messages needs privilege, so on a shared host expect to be
+root or in `adm`/`systemd-journal`; your own are readable without it. A host with no
+syslog at all — a minimal container, typically — silently gets no logging, which is
+deliberate: a daemon that refused to start because it could not describe itself would
+be worse than one nobody can diagnose.
+
+What is *not* logged is deliberate too. Session ids appear, because they are opaque
+and are what `list` and `kill` take. `--label` does not, and neither does a single
+byte of terminal traffic: syslog is a host-wide sink, and a session whose whole
+footprint is otherwise `0600` files inside a `0700` directory should not announce a
+tab title to everyone who can read the system log.
+
+One case stays silent: the shipping build compiles panics down to a bare trap
+([IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)), so an abort produces no message
+for anything to forward. `SIGQUIT` is left at its default disposition for that reason
+— it still dumps core.
 
 ## Status
 

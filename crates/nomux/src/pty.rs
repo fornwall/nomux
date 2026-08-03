@@ -60,11 +60,10 @@ impl Pty {
     /// Propagates failures from `openpt`, `grantpt`, `unlockpt`, opening the slave,
     /// or spawning the shell.
     pub(crate) fn spawn(config: &Spawn<'_>) -> io::Result<Self> {
-        // `CLOEXEC` on both ends, or every process in the session inherits a
-        // writable handle to its own PTY master: anything that walks
-        // `/proc/self/fd`, or writes to an fd it did not open, could inject output
-        // into the stream or read the user's keystrokes. It does not cost the child
-        // its stdio — `dup2` onto 0/1/2 clears the flag on the copies.
+        // `CLOEXEC` on both ends, or every process in the session inherits a writable
+        // handle to its own PTY master — `IMPLEMENTATION.md` § 6.1 for what that
+        // hands them. It does not cost the child its stdio: `dup2` onto 0/1/2 clears
+        // the flag on the copies.
         let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC)?;
         grantpt(&master)?;
         unlockpt(&master)?;
@@ -164,11 +163,7 @@ impl Pty {
     /// `dtach -r winch`. Most full-screen programs redraw; a bare shell does not.
     ///
     /// A terminal one column wide gets the second resize alone, since there is no
-    /// narrower size to go to and a zero-column terminal is not a thing to hand a
-    /// child. That leaves the repaint weaker than it is everywhere else — one
-    /// `SIGWINCH` where the size did not change, which a program is entitled to
-    /// ignore — and is left as is: the client picks `ctrl_l` where this shape of
-    /// repaint does not suit it (§ 4.3), and nobody drives a one-column terminal.
+    /// narrower size to go to; § 4.3 records why that weaker repaint is accepted.
     ///
     /// # Errors
     ///
@@ -195,32 +190,24 @@ impl Pty {
 
     /// Terminates everything the session started, then the child itself.
     ///
-    /// Two reaches, because neither alone covers the session. The process *group*
-    /// is the cheap one and gets the ordinary case in a single syscall: the child
-    /// is its own group leader — `setsid` in `pre_exec` made it one — so its pgid
-    /// is its pid, and a shell without job control keeps everything it runs in
-    /// that one group.
+    /// Two reaches, because neither alone covers the session. The process *group* is
+    /// the cheap one and gets the ordinary case in a single syscall: the child is its
+    /// own group leader — `setsid` in `pre_exec` made it one — so its pgid is its
+    /// pid, and a shell without job control keeps everything it runs in that group.
     ///
-    /// A shell *with* job control does not. It puts each `&` job in a process
-    /// group of its own, which is the whole point of job control, and
-    /// `kill_process_group(child)` then reaches none of them — nor does the
-    /// `SIGHUP` the kernel sends when the master closes, since that goes to the
-    /// foreground group and a background job is by definition not it. So the
-    /// orphan case this exists to prevent survived the group kill exactly, and only
-    /// for the shells anybody actually uses interactively.
+    /// A shell *with* job control does not. It puts each `&` job in a process group
+    /// of its own, which `kill_process_group(child)` then reaches none of — nor does
+    /// the `SIGHUP` the kernel sends when the master closes, since that goes to the
+    /// foreground group and a background job is by definition not it. So the orphan
+    /// case this exists to prevent survived the group kill exactly, and only for the
+    /// shells anybody actually uses interactively.
     ///
     /// What every one of those jobs *does* share is the session, because nothing a
     /// shell does to a job calls `setsid`. `kill(2)` cannot address a session, so
     /// [`session_members`] walks `/proc` for it. That walk is the reason the two
     /// reaches are ordered rather than merged: it costs a directory scan and a read
-    /// per process, so it runs after the group probe says the common case is
-    /// already over, and on most shutdowns happens once.
-    ///
-    /// `kill_process_group` takes a **positive** pid and negates it itself.
-    /// Handing it a pre-negated one double-negates back to `kill(pid)`, which
-    /// signals the child alone and quietly reintroduces the orphan case; in a debug
-    /// build it does not even get that far, because `Pid::from_raw` asserts its
-    /// argument is non-negative.
+    /// per process, so it runs after the group probe says the common case is already
+    /// over, and on most shutdowns happens once.
     pub(crate) fn terminate(&mut self) {
         let raw = i32::try_from(self.child.id()).unwrap_or(0);
         if let Some(pid) = rustix::process::Pid::from_raw(raw) {
@@ -241,13 +228,9 @@ impl Pty {
                 // zombie is still a member of its own process group, so
                 // `test_kill_process_group` answers `Ok` for it and the `&&` below
                 // short-circuits before `session_members` — which *does* filter
-                // zombies — is ever consulted. Without this the condition cannot go
-                // true on the path that matters: `shutdown` reaches `terminate` with
-                // the child unreaped, because `reap` only runs once the PTY has
-                // reported end of file, which on the `nomux kill` path it has not.
-                // Every teardown then spent the whole 500 ms waiting out a child that
-                // had already gone, inside the two seconds § 6.6 gives the daemon to
-                // shut down.
+                // zombies — is ever consulted. `shutdown` reaches `terminate` with the
+                // child unreaped, because `reap` only runs once the PTY has reported
+                // end of file, which on the `nomux kill` path it has not.
                 let _ = self.child.try_wait();
                 if rustix::process::test_kill_process_group(pid).is_err()
                     && session_members(raw).is_empty()
@@ -289,20 +272,13 @@ fn signal_session(sid: i32, signal: rustix::process::Signal) {
 ///
 /// Signalling by a number read out of `/proc` is the sort of thing that goes very
 /// wrong when it goes wrong, so this is deliberately narrow: `sid` comes from a
-/// child this process forked, and no pid is returned unless its own `stat` line
-/// claims that session. The daemon called `setsid` before spawning anything
-/// (`IMPLEMENTATION.md` § 6.2), so it is in a different session and cannot match —
-/// but it is excluded by pid regardless, because "the reaper signalled itself" is
-/// not a bug worth leaving to a syllogism.
+/// child this process forked, no pid is returned unless its own `stat` line claims
+/// that session, and this process is excluded by pid whatever `/proc` says.
 ///
 /// Zombies are left out. One is a process that has already exited and is waiting
 /// to be collected; signalling it does nothing, and counting it would keep the
 /// caller's grace loop spinning for its whole budget over the child it is itself
 /// about to reap.
-///
-/// A pid that vanishes mid-walk is simply not in the result — the read fails and
-/// the entry is skipped — which is the correct answer to "who is still running",
-/// arrived at by the ordinary race rather than in spite of it.
 fn session_members(sid: i32) -> Vec<i32> {
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return Vec::new();
@@ -349,14 +325,11 @@ const fn to_winsize(win: WinSize) -> Winsize {
 /// Resolves the shell to run and the dash-prefixed `argv[0]` that makes it a login
 /// shell.
 ///
-/// Precedence is `IMPLEMENTATION.md` § 6.1.1: `$SHELL` as inherited from the SSH
-/// login, then the password database, then `/bin/sh`. The middle step matters for
-/// a session started by something that scrubs the environment, where `$SHELL` is
-/// absent and `/bin/sh` would silently downgrade the user's shell.
-///
-/// The leading `-` is what causes `/etc/profile` and `~/.bash_profile` to be
-/// sourced. Without it the user gets a stunted environment and correctly concludes
-/// the tool is broken.
+/// Precedence and the reason for the leading `-` are both `IMPLEMENTATION.md`
+/// § 6.1.1: `$SHELL` as inherited from the SSH login, then the password database,
+/// then `/bin/sh`. The middle step matters for a session started by something that
+/// scrubs the environment, where `$SHELL` is absent and `/bin/sh` would silently
+/// downgrade the user's shell.
 fn login_shell() -> (PathBuf, String) {
     let shell = env::var_os("SHELL")
         .filter(|value| !value.is_empty())

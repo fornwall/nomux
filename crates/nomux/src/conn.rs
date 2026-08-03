@@ -27,23 +27,19 @@ const ABANDON_PENDING_WRITE: usize = 8 << 20;
 /// [`Conn::fill`] loops until `EAGAIN`, and against a peer that keeps writing that
 /// loop has no natural end: every chunk it takes frees exactly that much room in the
 /// kernel's buffer for the peer to refill. The cap turns it back into back pressure,
-/// leaving the bytes where the peer blocks on them.
-///
-/// Load-bearing rather than defensive, because the daemon stops *decoding* once the
-/// PTY queue is full (`IMPLEMENTATION.md` § 4.1). Nothing empties this buffer while
-/// that holds, so without a ceiling on what goes into it the queue would simply have
-/// moved from one `Vec` to another.
+/// leaving the bytes where the peer blocks on them — and it is load-bearing rather
+/// than defensive, because nothing empties this buffer while the daemon has stopped
+/// *decoding* for a full PTY queue (`IMPLEMENTATION.md` § 4.1). Without a ceiling the
+/// queue would simply have moved from one `Vec` to another.
 ///
 /// It has to stay clear of `HEADER_LEN + MAX_PAYLOAD`, which is the one thing it may
 /// not be: a frame that cannot be buffered whole is a frame [`Conn::take_frame`]
 /// never completes, and the connection would then refuse to read the rest of the
-/// frame it is waiting for.
+/// frame it is waiting for. The two sides live in different crates, so that
+/// relationship is pinned below as a compile error rather than left to whoever next
+/// raises `MAX_PAYLOAD`.
 const MAX_PENDING_READ: usize = 1 << 20;
 
-// That last relationship, as a compile error rather than a paragraph. The two sides
-// live in different crates, so raising `MAX_PAYLOAD` is a change nobody editing it
-// would think to check here — and the failure it buys is a connection that wedges on
-// the one frame it can never finish reading.
 const _: () = assert!(
     MAX_PENDING_READ > HEADER_LEN + MAX_PAYLOAD as usize,
     "MAX_PENDING_READ must have room for a whole frame, or take_frame never completes one"
@@ -142,8 +138,7 @@ impl Conn {
     ///
     /// Every caller here chunks to at most [`MAX_PAYLOAD`] and passes flags this
     /// crate defines, so the two encode failures — an oversized payload and an
-    /// undefined flag bit — are both unreachable. Threading a `Result` out to every
-    /// call site would obscure the real error paths for an impossible case.
+    /// undefined flag bit — are both unreachable.
     fn send(&mut self, frame: &Frame<'_>) {
         let _ = frame.encode(&mut self.tx);
     }

@@ -9,10 +9,8 @@ on:
   # means an empty commit.
   workflow_dispatch:
 
-# A pushed fixup makes the run it superseded worthless; don't pay for it. On `main`
-# it is the opposite: each commit there is a distinct set of musl artifacts, so a
-# second push arriving while the first is still building would discard binaries
-# nothing else produces. Cancel branch runs, let `main` finish.
+# Cancel superseded branch runs; let `main` finish, since each commit there is a
+# distinct set of musl artifacts that nothing else produces.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -26,14 +24,12 @@ env:
   # backtrace in the log.
   RUST_BACKTRACE: 1
 
-# Third-party actions are pinned to a commit, not to a tag. A tag is a mutable
-# pointer in someone else's repository, and the release job below builds the four
-# binaries whose SHA-256 the client is designed to pin — so an action that quietly
-# moves there changes bytes users have been told to trust. The version is in the
-# trailing comment because the SHA does not say which one it is; dependabot bumps
-# both. The `actions/*` steps are left on their major tag deliberately: they are
-# GitHub's own, running on GitHub's runner with GitHub's token, so pinning them
-# narrows a trust boundary the job is already entirely inside.
+# Third-party actions are pinned to a commit, not to a tag: the release job below
+# builds the four binaries whose SHA-256 the client is designed to pin, and a tag is a
+# mutable pointer in someone else's repository. The version rides in the trailing
+# comment, since the SHA does not say which one it is. The `actions/*` steps stay on
+# their major tag deliberately — GitHub's own, inside a trust boundary the job is
+# already entirely within.
 jobs:
   # The prek gate, run in the same cheapest-first order. One job, so the workspace
   # and its dependencies are compiled against a single cache.
@@ -59,23 +55,15 @@ jobs:
         with:
           tool: cargo-nextest
 
-      # First, as in the prek config this job mirrors: it is the cheapest check
-      # here and the only one that looks at the shell. Both scripts had defects
-      # that no Rust hook could have seen, and until this step existed the gate
-      # was local-only — so a `--no-verify` commit, or a contributor who had not
-      # run `prek install`, landed unchecked shell. `shellcheck` is preinstalled
-      # on the runner image.
-      #
       # Every tracked `*.sh`, not `scripts/*.sh`: the prek hook matches the path
-      # suffix wherever it lands, and the two sets are equal only for as long as no
-      # shell script lives outside scripts/. The gate that runs on a `--no-verify`
-      # commit is the wrong one to have checking less than the local hook does.
+      # suffix wherever it lands, and the gate that runs on a `--no-verify` commit is
+      # the wrong one to have checking less than the local hook does.
       - run: git ls-files -z '*.sh' | xargs -0 -r shellcheck --shell=sh
 
       - run: cargo fmt --all --check
 
-      # No `-D warnings`: the deny lives in [workspace.lints], so cargo, clippy and
-      # rust-analyzer agree without RUSTFLAGS-induced cache thrash. See README § Build.
+      # No `-D warnings`: the deny lives in [workspace.lints] in Cargo.toml, which is
+      # where the reason is written down.
       - run: cargo clippy --locked --workspace --all-targets
 
       # `--run-ignored all`: the one ignored test sits out a real reaping timeout,
@@ -125,20 +113,13 @@ jobs:
 
       # Read rather than repeated here: scripts/build-release.sh defaults to the same
       # file, so this job and a laptop build use one compiler and their sizes are
-      # comparable against a baseline recorded by it. A literal in this file left the
-      # script free to float, which is how a local run comes to fail on growth nobody
-      # introduced. Dated, never floating: the client is meant to pin a SHA-256 per
-      # architecture, and a compiler that moves moves those bytes underneath it.
-      # Nothing verifies a hash today — see PLAN.md § P3 — but the bytes still have
-      # to be the same ones, or there is nothing to start pinning when it does.
+      # comparable against a baseline recorded by it. A literal here would let the two
+      # drift, which is how a local run comes to fail on growth nobody introduced.
       - name: Read the pinned release nightly
         run: echo "NOMUX_NIGHTLY=$(cat scripts/nightly-version)" >> "$GITHUB_ENV"
 
-      # The shipping build rebuilds std with panics compiled out, which is the only
-      # configuration that meets the size budget (IMPLEMENTATION.md § 8) and needs a
-      # nightly compiler plus its sources. No cross linker to install: rust-lld and
-      # the musl objects that ship with each rust-std component are the whole
-      # toolchain.
+      # The shipping build rebuilds std with panics compiled out, which needs a
+      # nightly compiler plus its sources (IMPLEMENTATION.md § 8).
       - name: Install the release nightly with the musl targets
         run: >
           rustup toolchain install "$NOMUX_NIGHTLY" --profile minimal --no-self-update
@@ -154,11 +135,6 @@ jobs:
 
       # The checksums are the point of this job — the client pins one per
       # architecture — so they have to outlive the log they were printed to.
-      #
-      # v7 rather than v4, which is the last `node20` action in this file: the
-      # runners defaulted to Node 24 in June 2026 and drop Node 20 entirely in the
-      # autumn, and the v4 branch has been frozen since March 2025, so the fix will
-      # not arrive there. The three inputs below are unchanged across the majors.
       - uses: actions/upload-artifact@v7
         with:
           name: musl-binaries

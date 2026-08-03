@@ -50,17 +50,17 @@ pub const RESUME_FROM_START: u64 = u64::MAX;
 
 /// [`Hello::flags`] bit: serve an `ssh-agent` socket for this session.
 ///
-/// Honoured only by the `Hello` that *creates* the session, because the child's
-/// environment is frozen at spawn. Opt-in per host and never set silently: it
-/// bypasses the user's `ForwardAgent` decision (`DESIGN.md` § 5.4).
+/// Honoured only by the `Hello` that *creates* the session (`IMPLEMENTATION.md`
+/// § 2.3), and never set silently: it bypasses the user's `ForwardAgent` decision
+/// (`DESIGN.md` § 5.4).
 pub const HELLO_AGENT_FORWARD: u16 = 1 << 0;
 
 /// [`Hello::flags`] bit: repaint after a gap by writing `Ctrl-L` to the PTY
 /// instead of the `TIOCSWINSZ` dance.
 ///
-/// Honoured on every attach, since it costs nothing to restate. Better for a bare
-/// shell prompt, destructive inside an editor — the client picks, because only the
-/// client knows what it is showing.
+/// Honoured on every attach (`IMPLEMENTATION.md` § 2.3), and chosen by the client
+/// because only the client knows whether a bare shell prompt or an editor is on the
+/// screen.
 pub const HELLO_REPAINT_CTRL_L: u16 = 1 << 1;
 
 /// Bits defined in [`Hello::flags`]. Anything else set is a protocol error.
@@ -68,16 +68,11 @@ const HELLO_FLAG_BITS: u16 = HELLO_AGENT_FORWARD | HELLO_REPAINT_CTRL_L;
 
 /// Refuses a [`Hello::flags`] word carrying a bit this revision does not define.
 ///
-/// Undefined bits are a bug in a peer built from this repository, not a
-/// forward-compatibility case (`DESIGN.md` § 2), so they are refused rather than
-/// masked off — and refused on the way *out* as well as on the way in: without the
-/// encode-side call a caller could build a `Hello` that encodes cleanly and earns an
-/// `Error{Protocol}` from the peer, a bug reported at the wrong end of the
-/// connection, by the process that did nothing wrong.
-///
-/// That encode and decode agree about which bits exist is the whole property, so it
-/// is one function called from both rather than two copies of a mask and a message
-/// that have to be kept in step by hand.
+/// Undefined bits are a protocol error rather than a forward-compatibility case
+/// (`IMPLEMENTATION.md` § 2.3), and are refused on the way *out* as well as on the
+/// way in: without the encode-side call a caller could build a `Hello` that encodes
+/// cleanly and earns an `Error{Protocol}` from the peer, a bug reported at the wrong
+/// end of the connection, by the process that did nothing wrong.
 const fn checked_hello_flags(flags: u16) -> Result<(), ProtoError> {
     if flags & !HELLO_FLAG_BITS != 0 {
         return Err(ProtoError::Malformed("undefined Hello flag bits"));
@@ -96,10 +91,9 @@ pub struct Hello<'a> {
     pub out_offset: u64,
     /// Next input byte the client intends to send.
     ///
-    /// Informational: the daemon does not read it, because `in_applied` in the
-    /// answering [`HelloOk`] is authoritative and the client fast-forwards to that
-    /// (`IMPLEMENTATION.md` § 3). Kept on the wire because the handover sketched in
-    /// `DESIGN.md` § 10 needs a "tell me" sentinel here, mirroring the output side.
+    /// Informational: the daemon never reads it, `in_applied` in the answering
+    /// [`HelloOk`] being the authoritative one. It is on the wire for the handover
+    /// sketched in `DESIGN.md` § 10 (`IMPLEMENTATION.md` § 2.2).
     pub in_offset: u64,
     /// Terminal dimensions.
     pub win: WinSize,
@@ -125,10 +119,8 @@ impl Hello<'_> {
 wire_enum! {
     /// Whether the daemon's session outlives the user's last logout.
     ///
-    /// `systemd-logind` with `KillUserProcesses=yes` kills the daemon at logout unless
-    /// the user has lingering enabled, and no amount of double-forking avoids it
-    /// (`IMPLEMENTATION.md` § 6.2). The daemon cannot fix this, so it reports it and
-    /// the client warns.
+    /// The daemon cannot stop `logind` from killing it at logout, so it reports the
+    /// state and the client warns (`IMPLEMENTATION.md` § 6.2).
     ///
     /// Unlike the other closed sets on the wire this one is not a field of its own:
     /// the values below are the two-bit encoding *unshifted*. The pair of helpers
@@ -159,15 +151,9 @@ const HELLOOK_AGENT: u8 = 1 << 3;
 /// Bits defined in [`HelloOk`]'s flags byte. Anything else set is a protocol error.
 const HELLOOK_FLAG_BITS: u8 = HELLOOK_GAP | HELLOOK_LINGER_MASK | HELLOOK_AGENT;
 
-/// Where in [`HelloOk`]'s flags byte the [`Linger`] field sits, said once.
-///
-/// The enum owns its two-bit encoding — `wire_enum!` generates `as_byte` and
-/// `from_byte` from the discriminants above. These two move that encoding into and
-/// out of its place in the byte, and they are written here, adjacent to each other
-/// and to the masks of the single bits sharing it. Splitting the shift and the mask
-/// between the encode and the decode side, in two types hundreds of lines apart, is
-/// precisely the drift the hand-written wire vectors exist to catch — and vectors
-/// only catch what they happen to pin.
+/// Where in [`HelloOk`]'s flags byte the [`Linger`] field sits, said once — here,
+/// beside the masks of the single bits sharing that byte, rather than split between
+/// the encode and the decode side.
 impl Linger {
     /// Returns the two-bit wire encoding, already shifted into place.
     const fn as_bits(self) -> u8 {
@@ -232,9 +218,8 @@ pub enum Frame<'a> {
     /// Input the daemon has taken ownership of and will never re-apply.
     ///
     /// Sent once the bytes are queued for the PTY master, not once `write(2)` for
-    /// them returns — see `IMPLEMENTATION.md` § 3. Ownership is what the client
-    /// needs to stop replaying them; the write cannot be lost afterwards, because
-    /// the queue outlives the connection.
+    /// them returns: what the client needs in order to stop replaying them is
+    /// ownership rather than durability (`IMPLEMENTATION.md` § 3).
     InputAck {
         /// Exclusive upper bound of applied input.
         applied_through: u64,
@@ -340,8 +325,7 @@ impl<'a> Frame<'a> {
         // patched in behind it, so every error path rewinds to `start`: a refused
         // frame leaves the buffer exactly as long as it was found, and a caller
         // appending frames back to back never ships half of one. Each field's check
-        // is then free to live beside the field in `encode_payload`, rather than
-        // being restated here as a copy of the same conversion.
+        // is then free to live beside the field in `encode_payload`.
         let start = out.len();
         out.extend_from_slice(&[0; HEADER_LEN]);
         self.encode_payload(out)
@@ -360,17 +344,12 @@ impl<'a> Frame<'a> {
     fn encode_payload(&self, out: &mut Vec<u8>) -> Result<(), ProtoError> {
         match *self {
             Self::Hello(hello) => {
-                // Refused rather than truncated: `encode` returns a `Result`, so
-                // reporting success while putting something other than what the
-                // caller passed on the wire is never the right trade. A `TERM`
-                // longer than its own length prefix is a broken caller, and
-                // silently shortening it would open the session under a terminal
-                // type nobody chose.
-                //
-                // Ahead of the flag check, and both ahead of the first byte: a
-                // `Hello` that is wrong in both ways is two caller bugs at once,
-                // and which of them gets named is a detail nothing should change
-                // by accident. `TERM` has always been the one reported.
+                // Refused rather than truncated: silently shortening a `TERM` too
+                // long for its own length prefix would open the session under a
+                // terminal type nobody chose, and the caller has no way to notice.
+                // Ahead of the flag check, so a `Hello` that is wrong in both ways
+                // names this one — `a_hello_wrong_in_two_ways_reports_the_term`
+                // pins that, since the choice should not change by accident.
                 let term_len = u16::try_from(hello.term.len())
                     .map_err(|_| ProtoError::Malformed("TERM exceeds 65535 bytes"))?;
                 checked_hello_flags(hello.flags)?;
@@ -558,7 +537,12 @@ impl<'a> Reader<'a> {
     }
 
     fn array<const N: usize>(&mut self) -> Result<[u8; N], ProtoError> {
-        self.take(N)?.try_into().map_err(|_| ProtoError::Truncated)
+        let (head, tail) = self
+            .rest
+            .split_first_chunk::<N>()
+            .ok_or(ProtoError::Truncated)?;
+        self.rest = tail;
+        Ok(*head)
     }
 
     fn u8(&mut self) -> Result<u8, ProtoError> {
@@ -668,14 +652,14 @@ mod tests {
 
     #[test]
     fn invalid_discriminants_are_rejected() {
-        assert!(matches!(
+        assert_eq!(
             Frame::decode(FrameType::Exit, &[0, 0, 0, 0, 7]),
-            Err(ProtoError::Malformed(_))
-        ));
-        assert!(matches!(
+            Err(ProtoError::Malformed("unknown exit kind"))
+        );
+        assert_eq!(
             Frame::decode(FrameType::Error, &[0xff, 0xff]),
-            Err(ProtoError::Malformed(_))
-        ));
+            Err(ProtoError::Malformed("unknown error code"))
+        );
     }
 
     /// Every flag combination survives, including the ones the daemon never sends
@@ -700,9 +684,8 @@ mod tests {
         }
     }
 
-    /// Undefined bits are a bug in a peer built from this repository, not a
-    /// forward-compatibility case (`DESIGN.md` § 2), so they are refused rather
-    /// than masked off.
+    /// Each reserved encoding earns its own diagnosis, so the two are not
+    /// interchangeable: an undefined bit is one bug, a reserved linger value another.
     #[test]
     fn undefined_flag_bits_are_rejected() {
         let mut hello = Vec::new();
@@ -718,10 +701,10 @@ mod tests {
         .unwrap();
         // `flags` is the second u16 of the payload.
         hello[HEADER_LEN + 3] = 0x80;
-        assert!(matches!(
+        assert_eq!(
             Frame::decode(FrameType::Hello, &hello[HEADER_LEN..]),
-            Err(ProtoError::Malformed(_))
-        ));
+            Err(ProtoError::Malformed("undefined Hello flag bits"))
+        );
 
         let mut ok = Vec::new();
         Frame::HelloOk(HelloOk {
@@ -737,13 +720,14 @@ mod tests {
         .unwrap();
         let flags = ok.len() - 1;
         // Reserved bit 4, then the reserved linger encoding 0b11.
-        for byte in [0b1_0000, 0b110] {
+        for (byte, complaint) in [
+            (0b1_0000, "undefined HelloOk flag bits"),
+            (0b110, "unknown linger state"),
+        ] {
             ok[flags] = byte;
-            assert!(
-                matches!(
-                    Frame::decode(FrameType::HelloOk, &ok[HEADER_LEN..]),
-                    Err(ProtoError::Malformed(_))
-                ),
+            assert_eq!(
+                Frame::decode(FrameType::HelloOk, &ok[HEADER_LEN..]),
+                Err(ProtoError::Malformed(complaint)),
                 "flags byte {byte:#b} should be refused"
             );
         }
@@ -755,10 +739,10 @@ mod tests {
         let mut payload = vec![0; 2 + 2 + 8 + 8 + 8];
         payload.extend_from_slice(&1u16.to_be_bytes());
         payload.push(0x80);
-        assert!(matches!(
+        assert_eq!(
             Frame::decode(FrameType::Hello, &payload),
-            Err(ProtoError::Malformed(_))
-        ));
+            Err(ProtoError::Malformed("TERM is not UTF-8"))
+        );
     }
 
     #[test]
@@ -780,9 +764,6 @@ mod tests {
     }
 
     /// `term` is length-prefixed by a `u16`, so a longer one cannot be represented.
-    /// Refused rather than truncated: `encode` reporting success while sending a
-    /// different `TERM` than it was handed would open the session under a terminal
-    /// type nobody chose, and the caller has no way to notice.
     #[test]
     fn an_unrepresentable_term_is_refused_rather_than_truncated() {
         let long = "x".repeat(usize::from(u16::MAX) + 1);
@@ -798,7 +779,7 @@ mod tests {
         })
         .encode(&mut buf);
 
-        assert!(matches!(err, Err(ProtoError::Malformed(_))), "got {err:?}");
+        assert_eq!(err, Err(ProtoError::Malformed("TERM exceeds 65535 bytes")));
         assert_eq!(buf.len(), before, "the buffer must be left untouched");
 
         // The longest that still fits is accepted, so the boundary is exact.
@@ -814,10 +795,6 @@ mod tests {
     }
 
     /// Encode and decode agree about which flag bits exist.
-    ///
-    /// Without the encode-side check a caller could build a `Hello` that encodes
-    /// cleanly and is then refused by the peer, which reports the protocol error at
-    /// the wrong end of the connection — to the process that did nothing wrong.
     #[test]
     fn undefined_flag_bits_are_refused_by_encode_too() {
         let mut buf = b"previous frame".to_vec();
@@ -832,8 +809,30 @@ mod tests {
         })
         .encode(&mut buf);
 
-        assert!(matches!(err, Err(ProtoError::Malformed(_))), "got {err:?}");
+        assert_eq!(err, Err(ProtoError::Malformed("undefined Hello flag bits")));
         assert_eq!(buf.len(), before, "the buffer must be left untouched");
+    }
+
+    /// A `Hello` wrong in two ways at once names the `TERM`, not the flags.
+    ///
+    /// A `Hello` wrong in both ways is two caller bugs at once, and which of them
+    /// gets named is decided by nothing more than the order of the two checks in
+    /// `encode_payload` — an order an unrelated edit could reverse without noticing.
+    /// `TERM` has always been the one reported, and this is what keeps it so.
+    #[test]
+    fn a_hello_wrong_in_two_ways_reports_the_term() {
+        let long = "x".repeat(usize::from(u16::MAX) + 1);
+        let err = Frame::Hello(Hello {
+            protocol: PROTOCOL_VERSION,
+            flags: HELLO_AGENT_FORWARD | 0x8000,
+            out_offset: 0,
+            in_offset: 0,
+            win: WIN,
+            term: &long,
+        })
+        .encode(&mut Vec::new());
+
+        assert_eq!(err, Err(ProtoError::Malformed("TERM exceeds 65535 bytes")));
     }
 
     /// `decode` is public and usable without `decode_header`, so it applies the

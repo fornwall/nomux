@@ -11,12 +11,7 @@
 //! away the ones whose pid has left.
 //!
 //! Both halves are kept short because these paths carry unix sockets and
-//! `sockaddr_un` truncates at 108 bytes. What the suite adds to
-//! `CARGO_TARGET_TMPDIR` is at most 38 of them — `/<hash>-<pid>/nomux/<hash>.agent`,
-//! with the widest pid Linux will issue — which puts the longest socket a checkout
-//! in a home directory binds at 73 bytes, against 89 for the names this replaces,
-//! and leaves 69 for the checkout itself. That is what makes a worktree under
-//! `.claude/worktrees/` runnable.
+//! `sockaddr_un` truncates at 108 bytes.
 
 #![allow(
     dead_code,
@@ -60,30 +55,20 @@ const PATIENCE: Duration = Duration::from_secs(15);
 /// How long a socket read blocks before the caller's own deadline is looked at
 /// again.
 ///
-/// Deliberately far below [`PATIENCE`]. The socket timeout used to equal it, so a
-/// daemon that went quiet tripped the socket first and the failure read `read from
-/// daemon: Resource temporarily unavailable` — the errno rather than the sentence
-/// naming what was being waited for. Keeping the socket impatient makes the logical
-/// deadline the one that always fires, and it is the only one that knows what the
-/// wait was about.
+/// Deliberately far below [`PATIENCE`], so the logical deadline is the one that
+/// always fires: it is the only one that knows what the wait was about, where a
+/// socket that gave up first could only report an errno.
 const SOCKET_POLL: Duration = Duration::from_millis(100);
 
 /// How long [`poll_until`] waits between attempts.
 ///
-/// The hand-written loops this replaces chose anything from 2 ms to 200 ms. Ten is
-/// short enough that a test measuring how long the daemon took is measuring the
+/// Short enough that a test measuring how long the daemon took is measuring the
 /// daemon rather than the sleep it overshot by — the tightest such bound in the
 /// suite is 400 ms against a 500 ms floor — and long enough that a condition which
 /// shells out to `nomux list` is not run back to back.
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Waits up to `within` for `condition` to hold, and reports whether it ever did.
-///
-/// Every wait in this suite is on something a daemon does on its own schedule, and
-/// each one used to be spelled out: a deadline, a loop, the condition, and a sleep
-/// picked afresh each time. Written once, "bounded" is structural rather than
-/// something the next test has to remember, and what is left at the call site is the
-/// only part that was ever its own — the sentence it fails with.
 pub(crate) fn poll_until(within: Duration, mut condition: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + within;
     loop {
@@ -97,21 +82,30 @@ pub(crate) fn poll_until(within: Duration, mut condition: impl FnMut() -> bool) 
     }
 }
 
+/// Joins `handle`, failing rather than parking if it will not come back.
+///
+/// The relay tests move megabytes on four threads at once, and a relay that stalls in
+/// either direction would otherwise hang the whole run: `JoinHandle::join` has no
+/// deadline, and the guard in `.config/nextest.toml` can only kill the process
+/// without saying which wait never ended.
+pub(crate) fn join_within<T>(handle: thread::JoinHandle<T>, within: Duration, what: &str) -> T {
+    assert!(
+        poll_until(within, || handle.is_finished()),
+        "the {what} thread never finished"
+    );
+    handle
+        .join()
+        .unwrap_or_else(|_| panic!("the {what} thread panicked"))
+}
+
 /// Reads into `buf`, resuming a call a signal ended.
 ///
-/// Every socket this harness hands out carries a receive timeout — [`SOCKET_POLL`] on
-/// a client, [`PATIENCE`] on the agent — and that is precisely the case the kernel
-/// refuses to restart: with `SO_RCVTIMEO` set, a read the kernel finds a pending
-/// signal on comes back `EINTR` whatever `SA_RESTART` the handler asked for
-/// (`signal(7)`). So `EINTR` here is a call that has not happened yet, not news about
-/// the daemon, and a site that reports it fails the test for something that happened
-/// to the test *process* while the session it is asserting on is perfectly healthy.
-/// The daemon carries `nbio::read` for the same sentence on the same syscall; this is
-/// the harness's copy of it.
-///
-/// `pub(crate)` because the tests that hold an agent socket read it themselves, and
-/// that socket carries a timeout like every other. Anything reading one of these by
-/// hand wants this rather than `Read::read`.
+/// Every socket this harness hands out carries a receive timeout, and that is
+/// precisely the case the kernel refuses to restart: with `SO_RCVTIMEO` set, a read
+/// the kernel finds a pending signal on comes back `EINTR` whatever `SA_RESTART` the
+/// handler asked for (`signal(7)`). So `EINTR` here is a call that has not happened
+/// yet, not news about the daemon. Anything reading one of these sockets by hand
+/// wants this rather than `Read::read`.
 ///
 /// Everything else is passed through untouched: the zero that means the daemon closed
 /// the connection, and the `WouldBlock` that is the receive timeout expiring, which is
@@ -271,23 +265,11 @@ impl Session {
     /// kills it on drop, so the caller has to bind it for as long as the client is
     /// used — `let (_session, ..)` where the test never names it again, never `let (_,
     /// ..)`, which would end the session on the spot.
-    ///
-    /// Not for the connections that need the three steps apart: one that asserts on
-    /// the run directory before anything connects, one that resumes from an offset it
-    /// worked out for itself, one that wants a ring other than [`DEFAULT_TEST_RING`],
-    /// or one whose own handshake is the subject. Those spell it out, because there
-    /// the spelling is the test — and it is per *connection* rather than per test,
-    /// since the tests about a refused greeting still open with an ordinary attached
-    /// client and then bring on the connection they are really about.
     pub(crate) fn attached(name: &str) -> (Self, Client, nomux_proto::HelloOk) {
         Self::attached_with(name, 0)
     }
 
     /// [`Session::attached`], with `flags` in the greeting.
-    ///
-    /// Its own function rather than an argument on the common one so that the sessions
-    /// asking for nothing in particular do not all carry a `0` that reads like a
-    /// decision somebody made.
     pub(crate) fn attached_with(name: &str, flags: u16) -> (Self, Client, nomux_proto::HelloOk) {
         let session = Self::start(name);
         let mut client = session.connect();
@@ -509,11 +491,8 @@ pub(crate) fn control(root: &Path, args: &[&str]) -> Output {
 
 /// [`Command::output`] with the `fork` under [`FORKS`] and the wait outside it.
 ///
-/// The gate is the whole difference, and where it is released is the point of not
-/// calling `output`: waiting for the child under it would shut every other test out
-/// of `fork` for as long as this one ran, where all that has to be exclusive is the
-/// `fork` itself. Callers say what they want on the three descriptors, since there is
-/// no asking a `Command` what it has already been told.
+/// Waiting for the child under the gate would shut every other test out of `fork` for
+/// as long as this one ran, where all that has to be exclusive is the `fork` itself.
 pub(crate) fn collect(command: &mut Command) -> Output {
     launch(command)
         .expect("start the process")
@@ -569,23 +548,13 @@ pub(crate) fn wait_for(path: &Path) {
 /// A unix socket enters the filesystem at `bind` and starts answering at `listen`,
 /// and those are two syscalls: in between, the path exists and every `connect` is
 /// refused. So [`wait_for`] on a socket is satisfied one step before the thing every
-/// one of its callers goes on to do, and on a machine with more runnable threads
-/// than cores that step is wide enough to lose — a session start caught here refused
-/// a connection and accepted one 20 µs later, with the daemon running throughout and
-/// `/proc/net/unix` showing its socket bound and not yet listening.
-///
-/// Nothing in production waits on the name either: `nomux attach` retries a refused
-/// connect for five seconds (`IMPLEMENTATION.md` § 6.3), because a refusal from a
-/// daemon it has just spawned means "not yet" rather than "never". This is the
-/// suite's version of the same wait, which is what makes a refusal at
-/// [`Session::connect`] mean something.
+/// one of its callers goes on to do, and that step is wide enough to lose on a
+/// machine with more runnable threads than cores.
 ///
 /// The connection is dropped as soon as it is made, and costs the session nothing:
 /// § 6.4 has the daemon promote a connection on its `Hello` and never on the
 /// `connect`, precisely so that the liveness probe `nomux list` makes cannot evict a
-/// client. So this is not an attach, and does not stop the clock an attach stops —
-/// `a_daemon_nobody_ever_attaches_to_reaps_itself` still runs the full 30 seconds
-/// out with this ahead of it.
+/// client. So this is not an attach, and does not stop the clock an attach stops.
 pub(crate) fn wait_until_answering(path: &Path) {
     let answered = poll_until(Duration::from_secs(10), || {
         UnixStream::connect(path).is_ok()
@@ -658,6 +627,11 @@ impl Client {
     /// marker, then whatever the test wants running — `-echo -onlcr` for a
     /// comparison that must be literal, `raw -echo` with a `sleep` for a child that
     /// holds the terminal without reading it.
+    ///
+    /// `raw` in particular is what makes the line discipline apply back pressure
+    /// rather than quietly dropping an overflow: in canonical mode a line longer than
+    /// the buffer is discarded and the master never stops accepting, so a test about
+    /// a write that cannot complete would measure nothing at all.
     ///
     /// The marker comes *after* the `stty` because that is what makes arriving at it
     /// proof the mode is in effect rather than merely reached: input sent while the

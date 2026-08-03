@@ -14,12 +14,9 @@
 //! below are what `logind` itself reads, so the answer is the same one `loginctl`
 //! prints.
 //!
-//! Two `stat`s and one read of `/etc/passwd`, which `username` does every time
-//! rather than as a fallback: the password database is authoritative where `$USER`
-//! is merely inherited, so it is asked first and the environment is what answers
-//! for an account that has no line in the file. All three are local files that
-//! cannot block on anything but the disk, which is the property that matters here;
-//! the count is not.
+//! Two `stat`s and one read of `/etc/passwd`. All three are local files that cannot
+//! block on anything but the disk, which is the property that matters here; the
+//! count is not — see [`username`] for the order the last two are consulted in.
 
 use std::fs;
 use std::io;

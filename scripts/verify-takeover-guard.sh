@@ -21,12 +21,9 @@
 # guard has stopped guarding anything.
 set -eu
 
-# Both runs below are `cargo nextest`, and cargo reports a missing subcommand the same
-# way it reports a failing test: a non-zero exit. Without this check the first run's
-# failure is announced as "the guard fails on correct code once the interleaving is
-# forced" — the script accusing the code under test of a tool that was never installed.
-# The replayed log does say `no such command: nextest` on its first line, but the
-# headline is the part that gets read, and it is the part that would be wrong.
+# Checked up front: cargo reports a missing subcommand with a non-zero exit, exactly
+# as it reports a failing test, so without this the first run below would be announced
+# as the guard failing on correct code.
 if ! command -v cargo-nextest >/dev/null 2>&1; then
     echo "this script runs the guard under cargo-nextest, which is not installed:" >&2
     echo "  cargo install cargo-nextest --locked" >&2
@@ -35,36 +32,29 @@ fi
 
 test_name=a_takeover_never_discards_input_already_delivered
 
-# nextest's exit code, which is what makes the second run's expectation meaningful:
-# only 100 means "the test ran and failed". A build error (102), a setup error (101)
-# or a filter that matched nothing (4) all mean the guard never executed, and all
-# three are non-zero — so testing for "non-zero" would accept a run that proved
-# nothing, which is exactly the failure this script exists to rule out.
+# Only 100 means "the test ran and failed". A build error (102), a setup error (101)
+# and a filter that matched nothing (4) are all non-zero too, so testing for non-zero
+# would accept a run in which the guard never executed.
 NEXTEST_TEST_FAILURE=100
 
 repo=$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)
-# cargo finds the workspace and reads .cargo/config.toml, and rustup reads
-# rust-toolchain.toml, by walking up from the working directory — so without this,
-# which tree gets tested and which compiler tests it are the caller's business rather
-# than the script's. The cd is what makes the promise above mean what it says.
+# cargo and rustup resolve the workspace and the toolchain by walking up from the
+# working directory, so the cd is what makes the "run from anywhere" promise above
+# mean what it says.
 cd "$repo"
 
-# A separate target directory: RUSTFLAGS changes the fingerprint of every crate,
-# so sharing one would rebuild the whole workspace twice on every switch. Absolute,
-# through $repo rather than a bare `target` that would name the same directory after
-# the cd above: it is exported to cargo, and a CARGO_TARGET_DIR that does not depend
-# on anyone's working directory is one less thing the two runs can disagree about.
+# A separate target directory: RUSTFLAGS changes the fingerprint of every crate, so
+# sharing one would rebuild the whole workspace twice on every switch. Absolute, so it
+# does not depend on anyone's working directory.
 base_target="${CARGO_TARGET_DIR:-$repo/target}"
 
 log=$(mktemp)
 cleanup() { rm -f "$log"; }
 trap cleanup EXIT
-# INT TERM HUP as well as EXIT: each run below rebuilds the whole workspace, which is
-# long enough that Ctrl-C is an ordinary way to end one, and a shell killed by a signal
-# is not guaranteed to run its EXIT trap. Exiting from the handler is also what stops
-# the run rather than letting the interrupted cargo fall into the failure path below
-# and replay a log that has just been deleted. 130 rather than 1, so an interrupted
-# run is not read as the guard reporting a real failure.
+# INT TERM HUP as well as EXIT: each run rebuilds the whole workspace, so Ctrl-C is an
+# ordinary way to end one, and a shell killed by a signal is not guaranteed to run its
+# EXIT trap. Exiting from the handler keeps an interrupted cargo out of the failure
+# path below; 130 rather than 1, so it is not read as the guard reporting a failure.
 trap 'cleanup; exit 130' INT TERM HUP
 
 # The directory names are kept short on purpose: the integration tests bind unix

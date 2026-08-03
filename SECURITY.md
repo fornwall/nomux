@@ -32,12 +32,9 @@ report twice.
   already grant (DESIGN.md § 8).
 
   Note the qualifier: that argument is about the same user, and does not cover a
-  *different* one. The install directory is created by a shell `mkdir -p` that
-  takes whatever the umask leaves and asks nothing about where `$XDG_DATA_HOME`
-  points, so on a lax umask or with that variable aimed at a shared directory,
-  another local user can replace a binary the victim then execs. That is a real
-  gap, it is in scope, and it is recorded in DESIGN.md § 8 — the fix belongs to
-  the client, which is what composes that command line.
+  *different* one. Another local user can replace a binary the victim then execs,
+  which is a real gap and is in scope; it is recorded in
+  [DESIGN.md § 8](DESIGN.md#8-security-model) with the mechanism that opens it.
 - **The wire protocol's lack of authentication.** A session's endpoints are unix
   sockets — `<id>.sock`, plus `<id>.agent` when agent forwarding is enabled — each
   `0600` inside a `0700` run directory. Reaching either already means being the user

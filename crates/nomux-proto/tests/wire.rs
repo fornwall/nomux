@@ -42,14 +42,7 @@ struct Vector {
 ///
 /// Split into groups only to keep each list readable; the tests below and
 /// [`every_frame_type_has_a_vector`] treat them as one table.
-fn vectors() -> Vec<Vector> {
-    let mut all = handshake_vectors();
-    all.extend(stream_vectors());
-    all.extend(control_vectors());
-    all.extend(agent_vectors());
-    all
-}
-
+///
 /// Byte patterns are ascending and distinct per field so that a swap between two
 /// same-width neighbours — the failure a round-trip test cannot see — changes the
 /// expected bytes.
@@ -62,9 +55,21 @@ fn vectors() -> Vec<Vector> {
 /// `agent` bits, which are only ever set together. So each repeat is chosen to
 /// disagree with the ones before it on every bit and every enumerator that has one
 /// — which is what makes § 2.3 a table this file actually checks, rather than one
-/// the codec merely agrees with itself about. `HelloOk` takes three because [`Linger`]
-/// has three values and [`every_linger_state_has_a_vector`] insists on all of them.
-fn handshake_vectors() -> Vec<Vector> {
+/// the codec merely agrees with itself about. Each of the two takes three: [`Linger`]
+/// has three values and [`every_linger_state_has_a_vector`] insists on all of them,
+/// and two `Hello` vectors cannot both show the bits set together and show each of
+/// them clear, which [`every_hello_flag_bit_is_pinned_in_both_states`] insists on.
+fn vectors() -> Vec<Vector> {
+    let mut all = hello_vectors();
+    all.extend(hello_ok_vectors());
+    all.extend(stream_vectors());
+    all.extend(control_vectors());
+    all.extend(agent_vectors());
+    all
+}
+
+/// The client's opening frame, at three different flag words.
+fn hello_vectors() -> Vec<Vector> {
     vec![
         // 0x01 Hello: u16 proto, u16 flags, u64 out_offset, u64 in_offset,
         // winsize, u16 term_len, term bytes.
@@ -113,6 +118,36 @@ fn handshake_vectors() -> Vec<Vector> {
                 b'v', b't', b'1', b'0', b'0',
             ],
         },
+        // 0x01 Hello a third time, with both flag bits clear. Bit 0 is set in both
+        // of the vectors above, so this is the only one that pins it in the clear
+        // state: without it an encoder that always asserted the bit moves no byte
+        // either of the others compares.
+        Vector {
+            frame: Frame::Hello(Hello {
+                protocol: 2,
+                flags: 0,
+                out_offset: 0x8182_8384_8586_8788,
+                in_offset: 0x9192_9394_9596_9798,
+                win: WIN,
+                term: "dumb",
+            }),
+            bytes: &[
+                0x01, 0x00, 0x00, 0x22, // header: type, u24 len = 34
+                0x00, 0x02, // protocol
+                0x00, 0x00, // flags: both bits clear
+                0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, // out_offset
+                0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, // in_offset
+                0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
+                0x00, 0x04, // term_len = 4
+                b'd', b'u', b'm', b'b',
+            ],
+        },
+    ]
+}
+
+/// The daemon's answer, at three different flags bytes.
+fn hello_ok_vectors() -> Vec<Vector> {
+    vec![
         // 0x02 HelloOk: u16 proto, u64 resume_from, u64 in_applied, winsize,
         // u8 flags. Note the flags field is a u8 here and a u16 in Hello — the
         // two handshake frames are deliberately not the same shape. Its 0x0d is
@@ -425,13 +460,10 @@ fn every_exit_kind_has_a_vector() {
 
 /// Every `HelloOk.linger` state has a vector.
 ///
-/// The sweep that found something missing: `Linger` is three values in two bits and
-/// this file pinned two of them, leaving `Disabled` justified by a comment that
-/// worked out which number was left over. That is an argument about the other two
-/// vectors rather than a check on this one — it says nothing about *which* bits of
-/// the flags byte carry the field, and any renumbering that leaves 0 and 2 where
-/// they are satisfies it. Swept from [`Linger::ALL`], so the third value has to be
-/// written down in bytes like the other two.
+/// Swept from [`Linger::ALL`], so all three values are written down in bytes: taking
+/// one of them on faith as the number the other two leave over is an argument about
+/// those vectors rather than a check on this one, since it says nothing about *which*
+/// bits of the flags byte carry the field.
 #[test]
 fn every_linger_state_has_a_vector() {
     let covered: Vec<Linger> = vectors()
@@ -446,24 +478,64 @@ fn every_linger_state_has_a_vector() {
     }
 }
 
+/// Every defined `Hello.flags` bit appears both set and clear across the vectors.
+///
+/// The sweep the other three have, for the one closed set on this wire with no
+/// `ALL` to drive it: a bit exercised at a single value is pinned only against
+/// being renumbered wholesale, so an encoder that always asserted it would move no
+/// byte any other test here compares.
+///
+/// *Which* bits are defined is asked of the encoder rather than listed out, since a
+/// hand-written list stops covering the protocol the moment the protocol grows —
+/// the reason [`every_frame_type_has_a_vector`] is driven from [`FrameType::ALL`].
+#[test]
+fn every_hello_flag_bit_is_pinned_in_both_states() {
+    let flags: Vec<u16> = vectors()
+        .iter()
+        .filter_map(|v| match v.frame {
+            Frame::Hello(hello) => Some(hello.flags),
+            _ => None,
+        })
+        .collect();
+
+    for bit in (0..u16::BITS).map(|shift| 1u16 << shift) {
+        let defined = Frame::Hello(Hello {
+            protocol: 2,
+            flags: bit,
+            out_offset: 0,
+            in_offset: 0,
+            win: WIN,
+            term: "",
+        })
+        .encode(&mut Vec::new())
+        .is_ok();
+        if !defined {
+            continue;
+        }
+        assert!(
+            flags.iter().any(|f| f & bit != 0),
+            "no Hello vector sets flag bit {bit:#06x}"
+        );
+        assert!(
+            flags.iter().any(|f| f & bit == 0),
+            "no Hello vector clears flag bit {bit:#06x}"
+        );
+    }
+}
+
 /// The `Error` codes are the numbers § 2.2 gives them.
 ///
 /// A frame carries one code at a time, so the vector above can pin exactly one of
-/// the five and a table is the only way to reach the rest. § 2.2 spells them out
-/// inline — `1 protocol, 2 takeover, 3 version, 4 input_gap, 5 internal` — and
-/// until this existed, exchanging any two of the four that appear in no vector
-/// changed nothing that anything in this repository compares. The daemon names
-/// them symbolically and so does the suite, so both ends would have agreed on the
-/// wrong number and only the client, built from the table, would have disagreed.
-///
-/// The two directions are checked separately for the reason the module doc gives:
-/// `from_u16(as_u16(c)) == c` holds under any renumbering that is consistent with
-/// itself, which is precisely the class of bug this file exists to catch.
+/// the five and a table is the only way to reach the rest. Without it, the daemon
+/// and the suite would both name them symbolically and so agree on any renumbering,
+/// while only the client — built from § 2.2 — disagreed.
 ///
 /// The numbers are written out by hand because they have to come from the document
 /// rather than from the code under test. *Which* codes the table has to carry does
 /// not: that is swept from [`ErrorCode::ALL`], so a code added to the protocol and
-/// not to this table fails here instead of going quietly unchecked.
+/// not to this table fails here instead of going quietly unchecked. The two
+/// directions are checked separately for the reason the module doc gives:
+/// `from_u16(as_u16(c)) == c` holds under any renumbering consistent with itself.
 #[test]
 fn error_codes_are_the_numbers_the_table_gives_them() {
     let documented: [(ErrorCode, u16); 5] = [

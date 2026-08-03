@@ -7,16 +7,10 @@
 # itself lives in Cargo.toml.
 #
 # `--locked` on every cargo hook, matching .github/workflows/ci.yml: without it a
-# hook may quietly update Cargo.lock to make itself pass, and the first thing to
-# notice is CI failing on the dependency set the commit did not actually build
-# against. `cargo fmt` takes no such flag and reads no lockfile.
+# hook may quietly update Cargo.lock to make itself pass.
 repos:
   - repo: local
     hooks:
-      # The release build and the takeover guard are shell, and both had defects
-      # that no Rust hook could ever have looked at — an unquoted exit status
-      # compared as a boolean, in a script whose whole job is asserting a specific
-      # failure. Cheapest hook here, and it runs first for that reason.
       - id: shellcheck
         name: shellcheck
         entry: shellcheck --shell=sh

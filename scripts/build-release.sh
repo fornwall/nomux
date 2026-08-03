@@ -8,8 +8,8 @@
 # regression in the one number users feel.
 #
 # The cap on its own is not enough, which is what the armv7 regression taught: one
-# commit grew that binary 46% and nothing said a word, because 213 KiB still fits in
-# 400 KiB comfortably. A number is only watched if something compares it to what it
+# commit grew that binary 46% and nothing said a word, because the result still fitted
+# the cap comfortably. A number is only watched if something compares it to what it
 # was. So the script also keeps a per-target baseline in scripts/size-baseline, prints
 # the signed delta against it beside every size, and fails a build that grows a target
 # by more than 3%. A shrink never fails, however large. When the growth is intended,
@@ -17,48 +17,20 @@
 # which puts the new figure in the diff, so accepting a size regression becomes
 # something a reviewer sees rather than something nobody measured.
 #
-# Two things have to be true of the output:
+# Two things have to be true of the output, and IMPLEMENTATION.md § 8 says why: it is
+# byte-identical everywhere, which the --remap-path-prefix flags below are what buy —
+# so the check is a grep of each artifact for the builder's home directory, not a
+# comparison of two builds on one machine — and nothing on the host leaks into it,
+# which .cargo/config.toml and rust-toolchain.toml between them decide.
 #
-#   1. It is byte-identical everywhere. The client is meant to pin a SHA-256 per
-#      architecture and re-check it after upload — nothing does that yet, see
-#      PLAN.md § P3 — so "the same commit" has to mean "the same
-#      bytes" whether it was built in CI or on a laptop. Cargo hands rustc absolute
-#      paths for registry crates and for the standard library, and those paths end
-#      up verbatim in panic-location strings — so an unremapped build embeds the
-#      builder's home directory and is reproducible only on the builder's machine.
-#      The --remap-path-prefix flags below are what make it portable. Two clean
-#      builds of one commit from different checkout paths are byte-identical with
-#      them and were already so without them, which is exactly the trap: the naive
-#      check passes on one machine and tells you nothing about the next one. Grep
-#      the artifact for the builder's home directory instead; that is the real test.
+# Nightly by default because the released standard library does not fit; rebuilding it
+# with -Cpanic=immediate-abort is the only configuration that ships. The compiler is
+# dated rather than floating — scripts/nightly-version names it and this script
+# defaults to it, with NOMUX_NIGHTLY overriding for a one-off — because the SHA-256
+# the client pins would drift under a floating one.
 #
-#   2. Nothing on the host leaks into it. .cargo/config.toml pins rust-lld as the
-#      linker for all four targets, including x86_64, so the host's gcc and binutils
-#      never get a vote. Combined with rust-toolchain.toml the whole toolchain is
-#      version-pinned, and `rustup target add` is the entire cross-compilation setup:
-#      no gcc, no zig, no sysroot. That works because the tree is pure Rust — rustix
-#      is on its linux_raw backend, so nothing links a C object — and each rust-std
-#      component ships the musl CRT and libc.a in `self-contained/`.
-#
-# Why nightly by default: with the released standard library the binary does not fit.
-# The panic machinery — formatting, backtrace symbolisation, gimli, addr2line — is
-# most of it, and it cannot be dropped from a precompiled std no matter how the
-# release profile is tuned. Rebuilding std from source with -Cpanic=immediate-abort
-# turns every panic into a bare trap and cuts each target to roughly a third: the
-# budget is missed on every one of them without it — 440 to 493 KiB against a 400 KiB
-# cap, armv7 included — and cleared with it. So it is not an optimisation, it is the
-# only configuration that ships. The cost is a nightly compiler and panics that abort
-# with no message — acceptable only because the clippy wall in Cargo.toml already
-# denies unwrap, expect, panic and indexing. The compiler is dated rather than
-# floating — scripts/nightly-version names it and this script defaults to it, with
-# NOMUX_NIGHTLY overriding for a one-off — because a floating one is a moving target
-# and the SHA-256 the client pins would drift under it.
-#
-# No shipping figure is written down in this comment. scripts/size-baseline holds
-# them, written by a build rather than by hand, and the copy that used to live on
-# this line had gone stale — which is the whole argument for keeping one of them.
-# The stable-std figures above are the ones NOMUX_STABLE_STD=1 reproduces; see
-# IMPLEMENTATION.md § 8.
+# No shipping figure is written down here: scripts/size-baseline holds them, written
+# by a build rather than by hand.
 #
 # Set NOMUX_STABLE_STD=1 to build against the pinned stable toolchain's released std
 # instead. Expect it to fail the size gate; it is kept to make that cost visible and

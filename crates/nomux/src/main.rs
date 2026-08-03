@@ -19,6 +19,7 @@ mod pty;
 mod ring;
 mod rundir;
 mod startup;
+mod syslog;
 
 use std::env;
 use std::ffi::OsString;
@@ -59,34 +60,52 @@ fn main() -> ExitCode {
     };
 
     match mode.to_str() {
-        Some("probe") => {
+        Some(word @ "probe") => only(args, word, || {
             print_probe();
             ExitCode::SUCCESS
-        }
-        Some("list") => report(control::list()),
-        Some("--version" | "-V") => {
+        }),
+        Some(word @ "list") => only(args, word, || report(control::list())),
+        Some(word @ ("--version" | "-V")) => only(args, word, || {
             println!(
                 "nomux {} (protocol {})",
                 env!("CARGO_PKG_VERSION"),
                 nomux_proto::PROTOCOL_VERSION
             );
             ExitCode::SUCCESS
-        }
-        Some("--help" | "-h") => {
+        }),
+        Some(word @ ("--help" | "-h")) => only(args, word, || {
             print!("{USAGE}");
             ExitCode::SUCCESS
-        }
+        }),
         Some("daemon") => run_session_mode(Mode::Daemon, args),
         Some("attach") => run_session_mode(Mode::Attach, args),
         Some("kill") => run_session_mode(Mode::Kill, args),
-        _ => usage_error(None),
+        _ => usage_error(Some(&format!("unknown mode `{}`", mode.display()))),
     }
+}
+
+/// Runs a mode that takes no arguments, refusing any that were passed.
+///
+/// The caller is the client, which builds these command lines itself, so an
+/// argument dropped on the floor is a bug it has no way to be told about — and the
+/// session modes already reject one they do not understand.
+///
+/// `run` is a plain `fn` pointer rather than a generic so that the four modes share
+/// a single instantiation, which the § 8 size budget cares about and this does not.
+fn only(mut args: impl Iterator<Item = OsString>, word: &str, run: fn() -> ExitCode) -> ExitCode {
+    if let Some(extra) = args.next() {
+        return usage_error(Some(&format!(
+            "`{word}` takes no arguments, got `{}`",
+            extra.display()
+        )));
+    }
+    run()
 }
 
 /// Prints `message` where there is one, then the usage, and reports `EX_USAGE`.
 ///
-/// The four ways to misuse the command line all end here, so what a usage error
-/// consists of — the message, the usage, and 64 — is decided once.
+/// Every way to misuse the command line ends here, so what a usage error consists
+/// of — the message, the usage, and 64 — is decided once.
 fn usage_error(message: Option<&str>) -> ExitCode {
     if let Some(message) = message {
         eprintln!("nomux: {message}\n");
@@ -98,10 +117,7 @@ fn usage_error(message: Option<&str>) -> ExitCode {
 /// The three modes that take a session id.
 ///
 /// An enum rather than the `&str` `main` matched on, so that the dispatch below is
-/// exhaustive. Spelled as a string it needed a catch-all arm, which `kill` was
-/// reached through — and a fourth mode added to `main` would then have become
-/// `kill` silently, since the lint wall denies the `unreachable!` that would
-/// otherwise have caught it.
+/// exhaustive and a fourth mode cannot silently fall into a catch-all arm.
 #[derive(Clone, Copy)]
 enum Mode {
     Daemon,
@@ -186,25 +202,34 @@ fn parse_session_args(
 }
 
 /// Maps a fallible operation onto an exit code, reporting failure on stderr.
+///
+/// `InvalidInput` is `EX_USAGE` here for the reason the `attach` arm above gives:
+/// [`rundir::SessionPaths::new`] is the crate's only source of it, so it always means
+/// a session id that could never have named a session — a malformed command line
+/// rather than an operation that failed. Answering that with 1 from `kill` and 64
+/// from `attach` made one mistake look like two different things.
 fn report(result: std::io::Result<()>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("nomux: {err}");
-            ExitCode::FAILURE
+            ExitCode::from(if err.kind() == std::io::ErrorKind::InvalidInput {
+                EXIT_USAGE
+            } else {
+                1
+            })
         }
     }
 }
 
 /// Emits the bootstrap line the client parses in `IMPLEMENTATION.md` § 5.1.
 ///
-/// The architecture reported is this binary's own compile-time target, which is
-/// what the client actually needs to confirm: that the uploaded artifact runs here.
-///
-/// So the vocabulary is Rust's and *not* `uname`'s — lowercase `linux`, and `arm`
-/// where `uname -m` says `armv7l`. The shell probe in § 5.1 runs before any binary
-/// exists and necessarily uses `uname`; this one describes the artifact rather than
-/// the host. Same prefix, two vocabularies, on purpose.
+/// The architecture is this binary's own compile-time target, so the vocabulary is
+/// Rust's and *not* `uname`'s — lowercase `linux`, and `arm` where `uname -m` says
+/// `armv7l`. That is what the client needs to confirm: not what the host calls
+/// itself, but that the artifact it uploaded runs here. The shell probe in § 5.1
+/// runs before any binary exists and necessarily uses `uname`. Same prefix, two
+/// vocabularies, on purpose.
 fn print_probe() {
     println!(
         "NOMUX-BOOTSTRAP {} {} {}",

@@ -3,10 +3,8 @@
 //! Spoken end-to-end between the client and the session daemon; the `attach` relay
 //! is transparent to it. See `IMPLEMENTATION.md` § 2 for the frame tables.
 //!
-//! Client and daemon ship as one unit and are versioned in lockstep, so this is a
-//! private protocol with no stability guarantee. [`PROTOCOL_VERSION`] exists to
-//! *fail fast* on the one mismatch that can genuinely occur — a live session held
-//! by a daemon from an older client — not to negotiate.
+//! A private protocol with no stability guarantee: [`PROTOCOL_VERSION`] exists to
+//! fail fast on a mismatched peer rather than to negotiate (`IMPLEMENTATION.md` § 2).
 
 #![forbid(unsafe_code)]
 
@@ -29,27 +27,15 @@ pub const HEADER_LEN: usize = 4;
 /// Largest permitted payload. Bounds the peer's ability to force an allocation.
 pub const MAX_PAYLOAD: u32 = 256 * 1024;
 
-// The discriminant list below is the one thing in this crate that several
-// unrelated places have to agree on, and the compiler only notices some of the
-// ways they can drift apart. `Frame::decode` matches on `FrameType` exhaustively,
-// so adding a variant here stops the build until the payload side has learnt to
-// read one. A hand-written `from_byte` stops nothing: it ends in a catch-all
-// `_ => None`, which quietly absorbs a variant nobody taught it about. That
-// combination compiles, passes the suite, and is broken in the field — this end
-// can *send* the new frame but never *receives* one, because every header carrying
-// it comes back as an unknown type, and the symptom points at the peer rather than
-// at the arm that was never written. The two test suites had a hole of the same
-// shape: both swept a hand-written `[FrameType; 16]`, so a variant missing from
-// those arrays was simply never exercised, and nothing said so.
+// A discriminant list is written down once, and everything mechanically derived
+// from it — the enum, both directions of the conversion, and the `ALL` the suites
+// sweep — is generated from it, so the four cannot drift apart. `Frame::decode`
+// matches on `FrameType` exhaustively, so a variant added to the list stops the
+// build until the payload side has learnt to read one; a hand-written `from_byte`
+// ending in a catch-all `_ => None` stops nothing, and leaves an end that can
+// *send* the new frame but never *receives* one.
 //
-// So the list is written once, here, and everything mechanically derived from it —
-// the enum, both directions of the conversion, and the `ALL` the suites sweep — is
-// generated from it. This is a plain `macro_rules!` expanding to the same items
-// that used to be typed out by hand, so it costs nothing at runtime and nothing
-// against the size budget `Cargo.toml` sets out.
-//
-// `FrameType` is the list this crate is built around but not the only closed set on
-// the wire: `IMPLEMENTATION.md` § 2.3 applies the same rule to `Error.code`,
+// `IMPLEMENTATION.md` § 2.3 applies the same closed-set rule to `Error.code`,
 // `Exit.kind` and the linger field, so those go through this macro too rather than
 // through three more hand-written matches — see `frame.rs`. Hence the parameters:
 // the sets differ in their repr and in what the two accessors are called. The
@@ -71,12 +57,9 @@ macro_rules! wire_enum {
         impl $name {
             /// Every variant, in wire order.
             ///
-            /// Public because the crate's integration tests sweep it — offering every
-            /// payload to every frame type, checking every discriminant round-trips,
-            /// and generating every value of every closed set — and a test that has to
-            /// be told about a new variant is a test that will eventually not be.
-            /// Nothing outside the test suites has a use for it, but this protocol is
-            /// private to this repository, so exposing it commits to nothing.
+            /// Public because the crate's integration tests sweep it, and a test that
+            /// has to be told about a new variant is a test that will eventually not
+            /// be told about one.
             pub const ALL: [Self; [$(Self::$variant),+].len()] = [$(Self::$variant),+];
 
             /// Returns the wire discriminant.
@@ -150,14 +133,12 @@ pub const MAX_AGENT_CHANNELS: u32 = 8;
 
 /// Returns whether `id` is usable as a session id.
 ///
-/// Ids are minted by the client and used directly as filename components in the run
-/// directory, so the accepted set is deliberately narrow: 1..=64 bytes of
-/// `[A-Za-z0-9_-]`. This rejects `.`, `..`, `/`, NUL, empty and all non-ASCII, which
-/// makes path traversal impossible by construction rather than by escaping.
-///
-/// Both ends validate — the client before minting, the daemon before use. An invalid
-/// id is always a hard error; sanitising one into a valid id would silently attach
-/// the user to the wrong session.
+/// Ids are minted by the client and used directly as filename components, so the
+/// accepted set is deliberately narrow — 1..=64 bytes of `[A-Za-z0-9_-]`
+/// (`IMPLEMENTATION.md` § 6.3) — which makes path traversal impossible by
+/// construction rather than by escaping. An invalid id is a hard error at both ends
+/// and is never sanitised: rewriting one into a valid id would silently attach the
+/// user to the wrong session.
 ///
 /// # Examples
 ///

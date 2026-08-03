@@ -26,13 +26,13 @@ use rustix::pipe::PipeFlags;
 /// process group and unlinks the run files, where the default disposition leaves
 /// both behind.
 ///
-/// It is not what protects the window before § 6.2 has finished detaching, and no
-/// longer claims to be. Nothing is armed that early — the handlers go up right after
-/// that detachment, which is the earliest point at which a byte written here cannot
-/// be inherited by a child that never received the signal. What closes that window
-/// instead is § 6.2 itself: once the daemon holds no controlling terminal, no
-/// keystroke can reach it, and before that point it has no PTY, no child and no run
-/// files, so dying there is indistinguishable from never having started.
+/// None of this protects the window before § 6.2 has finished detaching, and nothing
+/// is armed that early: the handlers go up right after that detachment, which is the
+/// earliest point at which a byte written here cannot be inherited by a child that
+/// never received the signal. What closes that window instead is § 6.2 itself: once
+/// the daemon holds no controlling terminal, no keystroke can reach it, and before
+/// that point it has no PTY, no child and no run files, so dying there is
+/// indistinguishable from never having started.
 ///
 /// `SIGQUIT` is deliberately left alone. Its default action is a core dump, which
 /// is the only way left to get a snapshot out of a daemon that has wedged, and
@@ -124,11 +124,11 @@ pub(crate) fn arm_stop_signals() -> io::Result<OwnedFd> {
 /// exactly there: `ssh -t host 'nomux daemon <id>'` produces it, because `bash -c`
 /// with a single command `exec`s in place instead of forking. The daemon is then the
 /// terminal's foreground process group for the session's whole life, so Ctrl-C kills
-/// it and `Ctrl-\` dumps its core — `SIGHUP` was covered, terminal-generated signals
-/// were not.
+/// it and `Ctrl-\` dumps its core: covering `SIGHUP` alone leaves every
+/// terminal-generated signal still able to reach it.
 ///
-/// Hence both halves in the early return. Everything after it is unchanged and still
-/// carries the weight: `setsid` leaves the caller a session leader with no
+/// Hence both halves in the early return. What follows it carries the weight:
+/// `setsid` leaves the caller a session leader with no
 /// controlling terminal, which is the whole property, and it refuses with `EPERM`
 /// for a process-group leader — a session leader being one by definition, so on the
 /// ordinary path, where `attach::spawn_daemon` already called `setsid` between fork
@@ -149,8 +149,7 @@ pub(crate) fn arm_stop_signals() -> io::Result<OwnedFd> {
 /// terminal up and delivers `SIGHUP` to its foreground process group — which the
 /// forked child is still in for the few instructions before its own `setsid`. With
 /// the disposition inherited as ignored the race cannot be lost; without it the
-/// daemon dies during the very manoeuvre that was meant to save it, which is exactly
-/// what it did the first time this was written.
+/// daemon dies during the very manoeuvre that was meant to save it.
 ///
 /// `TIOCNOTTY` would drop the terminal without a fork and is deliberately not used.
 /// Issued by a session leader it sends `SIGHUP` and `SIGCONT` to the foreground

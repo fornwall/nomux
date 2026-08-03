@@ -30,9 +30,10 @@ use nomux_proto::{
 };
 
 use harness::{
-    Reaper, Rng, Session, Spawned, accept_within, collect, control, hello_frame, nomux,
-    nomux_with_shell, poll_until, push_until_refused, read_uninterrupted, reconnect_until_gap,
-    run_root, stderr, stdout, succeeded, wait_for, while_nothing_forks, write_frame,
+    Reaper, Rng, Session, Spawned, accept_within, collect, control, hello_frame, join_within,
+    nomux, nomux_with_shell, poll_until, push_until_refused, read_uninterrupted,
+    reconnect_until_gap, run_root, stderr, stdout, succeeded, wait_for, while_nothing_forks,
+    write_frame,
 };
 
 #[test]
@@ -100,10 +101,14 @@ fn an_out_offset_past_the_end_of_the_stream_is_clamped_rather_than_believed() {
         !resumed.gap,
         "nothing was dropped, so nothing may be reported as a gap"
     );
+    // Pinned from below as well as from above. Clamping to the ring's *base* rather
+    // than to its end also satisfies an upper bound, also reports no gap, and also
+    // leaves the read at the end of this test finding its marker — in a stream it
+    // simply receives again from the start.
     assert!(
-        resumed.resume_from < end + FAR,
-        "an out_offset past the end of the stream must be clamped to it: \
-         resumed from {} against the {} claimed",
+        (end..end + FAR).contains(&resumed.resume_from),
+        "an out_offset past the end of the stream must be clamped to the end of it: \
+         resumed from {} against the {end} already received and the {} claimed",
         resumed.resume_from,
         end + FAR
     );
@@ -512,6 +517,7 @@ fn a_detach_ends_the_connection_but_not_the_session() {
 #[test]
 fn the_exit_status_arrives_after_the_final_output() {
     let (session, mut client, _) = Session::attached("exit_order");
+    let shell = shell_of(&session);
 
     let command = b"printf NOMUX-LAST-WORD; exit 3\n";
     client.input(0, command);
@@ -519,7 +525,15 @@ fn the_exit_status_arrives_after_the_final_output() {
     // takes it with them.
     client.wait_for_input_ack(command.len() as u64);
     drop(client);
-    thread::sleep(Duration::from_millis(500));
+
+    // The reattach has to land after the child is gone, or the ordering below is
+    // satisfied by a live stream rather than by the replay this is about — which is
+    // all a fixed sleep here could hope for, and silently miss on a loaded machine.
+    assert!(
+        poll_until(Duration::from_secs(10), || !process_alive(shell)),
+        "the child never exited, so the reattach below is not the race the linger \
+         window exists for"
+    );
 
     // Reattach inside the linger window, exactly the race the window is for.
     let mut client = session.connect();
@@ -547,6 +561,75 @@ fn the_exit_status_arrives_after_the_final_output() {
     );
 }
 
+/// Regression: the status is turned into a frame on the pass that collects it, not
+/// on whatever pass happens to wake up next.
+///
+/// `pump_output` is the only place the `Exit` frame is built, and `collect_status`
+/// used to run at the top of `event_loop` — one whole iteration earlier.
+/// `poll_timeout` clamps the sleep to `STATUS_RETRY` only while the status is still
+/// outstanding, so the pass that finally collected one no longer qualified for the
+/// clamp, and by then the master had already left the poll set with the child. There
+/// was nothing left that could wake the daemon: it slept out the rest of `EXIT_LINGER`
+/// and only then built the frame the user was waiting for.
+///
+/// Driven down the `STATUS_GRACE` path rather than through an ordinary `exit`, which
+/// reaches the same bug only when `waitpid` is not ready at PTY end of file — about
+/// one exit in three, which is a coin toss rather than a test. A child that closes
+/// the terminal *without* exiting reaches it every time: the master reports end of
+/// file at once, and `waitpid` has nothing to give up because the process is still
+/// there. So the status can only ever come from the two-second synthesis in
+/// `collect_status`, and when the frame carrying it arrives is the whole measurement
+/// — 2 s where the collecting pass pumps, 5 s where it sleeps first.
+///
+/// `exec <command>` rather than bare redirections, because redirecting 0, 1 and 2
+/// away from the slave does not take the last descriptor onto it: an interactive
+/// shell keeps one more for job control — `/dev/tty` on fd 10, under the `dash` this
+/// suite pins as `SHELL` — and the master goes on waiting. Replacing the process is
+/// what closes that one, since it is close-on-exec, and it leaves `sleep` holding
+/// nothing but `/dev/null`.
+#[test]
+fn a_synthesised_exit_status_is_sent_when_it_is_collected_rather_than_when_the_linger_ends() {
+    /// Between `STATUS_GRACE` and `EXIT_LINGER`, and not near either: 1.5 s of slack
+    /// for a shell to run one `exec` builtin on a loaded machine, against the 1.5 s
+    /// that still separates it from the regression.
+    const BOUND: Duration = Duration::from_millis(3500);
+
+    let (_session, mut client, ok) = Session::attached("exit_synthesised");
+
+    // The marker is the last thing the child writes, and the `exec` on its heels is
+    // what closes the terminal — so the clock below starts within one shell statement
+    // of the end of file the daemon reacts to. The process it leaves behind is alive
+    // for far longer than this test runs, which is what leaves `waitpid` with nothing
+    // to report and forces the synthesis.
+    client.make_ready(
+        "-echo",
+        Some("exec sleep 300 0</dev/null 1>/dev/null 2>/dev/null"),
+        ok.resume_from,
+    );
+    let began = Instant::now();
+
+    let (elapsed, status, kind) = loop {
+        let (ty, payload) = client.next_frame();
+        match Frame::decode(ty, &payload).expect("decode") {
+            Frame::Exit { status, kind } => break (began.elapsed(), status, kind),
+            Frame::Output { .. } | Frame::InputAck { .. } | Frame::Pong { .. } => {}
+            other => panic!("unexpected {other:?} while waiting for the exit"),
+        }
+    };
+
+    assert_eq!(
+        status, 0,
+        "a child that closed the terminal without exiting has no status of its own"
+    );
+    assert_eq!(kind, nomux_proto::ExitKind::Exited);
+    assert!(
+        elapsed < BOUND,
+        "the Exit frame took {elapsed:?}: the status was collected at the two-second \
+         grace and then held until the five-second linger window expired, which is a \
+         terminal that hangs on every exit `waitpid` is not ready for"
+    );
+}
+
 /// The child must not inherit a handle to its own PTY master.
 ///
 /// Everything the user runs in the session would otherwise hold a writable
@@ -560,7 +643,7 @@ fn the_child_inherits_only_its_stdio() {
     client.input(0, b"echo NOMUX-SPAWNED\n");
     client.read_until("NOMUX-SPAWNED", ok.resume_from);
 
-    let shell = child_of(session.child.id()).expect("find the session shell");
+    let shell = shell_of(&session);
     let mut terminals = Vec::new();
     for entry in fs::read_dir(format!("/proc/{shell}/fd")).expect("read the shell's fds") {
         let entry = entry.expect("fd entry");
@@ -581,6 +664,24 @@ fn the_child_inherits_only_its_stdio() {
         ["0", "1", "2"],
         "the child should hold the slave exactly three times, as its stdio"
     );
+}
+
+/// The pid of the shell `session` is running.
+///
+/// Waited for rather than looked up once: a session is up when its daemon answers,
+/// which is one fork before the shell exists, so a single walk of `/proc` is a race
+/// every caller here would lose occasionally and blame on something else.
+fn shell_of(session: &Session) -> u32 {
+    let daemon = session.child.id();
+    let mut shell = None;
+    assert!(
+        poll_until(Duration::from_secs(10), || {
+            shell = child_of(daemon);
+            shell.is_some()
+        }),
+        "the daemon never started a shell"
+    );
+    shell.expect("the shell the wait above returned for")
 }
 
 /// The pid of `parent`'s first child, from `/proc`.
@@ -814,10 +915,8 @@ fn attach_spawns_the_daemon_and_relays_transparently() {
 fn a_child_that_stops_reading_input_does_not_wedge_the_daemon() {
     let (_session, mut client, ok) = Session::attached("wedge");
 
-    // Raw mode is what makes the line discipline apply back pressure instead of
-    // quietly dropping the overflow: in canonical mode a line longer than the
-    // buffer is discarded, and the master write never blocks at all. `sleep` then
-    // holds the terminal without reading it, so everything below piles up.
+    // `raw` for the back pressure it keeps (see [`Client::make_ready`]); `sleep`
+    // then holds the terminal without reading it, so everything below piles up.
     let ready = client.make_ready("raw -echo", Some("sleep 30"), ok.resume_from);
 
     let chunk = vec![b'x'; 16 * 1024];
@@ -827,11 +926,13 @@ fn a_child_that_stops_reading_input_does_not_wedge_the_daemon() {
         offset += chunk.len() as u64;
     }
 
-    // Long enough for the daemon to have tried the write and, with a blocking
-    // master, to still be parked inside it. Sending the ping in the same batch as
-    // the input would prove nothing: it would be answered from the same read,
-    // before the write was ever attempted.
-    thread::sleep(Duration::from_millis(500));
+    // The ping has to reach the daemon in a *later* read than the input, or it is
+    // answered before the write to the master was ever attempted and proves nothing.
+    // The ack for the last input byte is the daemon saying it has consumed all of
+    // them, which is that condition rather than a guess at how long it takes — and
+    // with a blocking master the daemon is parked in the write instead, so the ack
+    // never comes and this fails here rather than below.
+    client.wait_for_input_ack(offset);
 
     // The daemon must still be answering: with a blocking master this does not
     // return until the sleep does.
@@ -871,12 +972,10 @@ fn input_the_child_never_reads_is_back_pressured_rather_than_buffered() {
 
     let (session, mut client, ok) = Session::attached("input_cap");
 
-    // Raw mode is what makes the line discipline apply back pressure instead of
-    // quietly dropping the overflow: in canonical mode a line longer than the buffer
-    // is discarded and the master never stops accepting. `sleep` then holds the
-    // terminal without reading a byte of it. No settling sleep is needed once the
-    // marker is back: the whole line is parsed before any of it runs, so the shell
-    // reads nothing more until `sleep 30` returns.
+    // `raw` for the back pressure it keeps (see [`Client::make_ready`]); `sleep`
+    // then holds the terminal without reading a byte of it. No settling sleep is
+    // needed once the marker is back: the whole line is parsed before any of it
+    // runs, so the shell reads nothing more until `sleep 30` returns.
     let ready = client.make_ready("raw -echo", Some("sleep 30"), ok.resume_from);
     drop(client);
 
@@ -913,11 +1012,9 @@ fn input_the_child_never_reads_is_back_pressured_rather_than_buffered() {
 /// drives, and that is not where the queue grows. The takeover path of § 6.4.1 reaches
 /// the decode loop twice without passing through the poll set at all — once to drain
 /// the outgoing connection, once for the input pipelined behind the arriving `Hello` —
-/// and a connection promoted with a megabyte already buffered decoded every byte of
-/// it. Each reconnect injected another queue's worth and nothing bounds reconnects:
-/// measured, 60 takeovers carried `in_applied` from 1.3 MB to 20.8 MB and the daemon's
-/// resident set from 4.6 MB to 23.8 MB, linearly. So the cap is enforced between
-/// frames in the decode loop, and this is the test that says so.
+/// and nothing bounds reconnects, so each one injected another queue's worth. The cap
+/// is therefore enforced between frames in the decode loop, and this is the test that
+/// says so.
 ///
 /// `in_applied` is what is asserted on because it is exactly what the daemon has taken
 /// ownership of (§ 3): every byte queued for the PTY is below it, so a ceiling on it is
@@ -1065,28 +1162,17 @@ fn the_daemon_mode_detaches_itself() {
     // waiting for it is not barrier enough.
     // No assertion on the outcome: the reads below are what judge the daemon, and
     // this only keeps them from judging it before it has finished detaching.
-    poll_until(Duration::from_secs(10), || {
-        stat_field(pid, StatField::Session) == Some(pid) && stdio_is_silenced(&stdio_targets(pid))
-    });
+    poll_until(Duration::from_secs(10), || has_detached(pid));
 
     // Everything read before the child is killed, so a failing assertion cannot
     // leave the daemon behind.
-    let leads_session = stat_field(pid, StatField::Session);
-    let stdio = stdio_targets(pid);
+    let detachment = detachment_of(pid);
     let recorded = fs::read_to_string(root.join("nomux").join("detached.pid"))
         .ok()
         .and_then(|text| text.trim().parse::<u32>().ok());
     drop(child);
 
-    assert_eq!(
-        leads_session,
-        Some(pid),
-        "the daemon stayed in the session it was started in, so a hangup reaches it"
-    );
-    assert!(
-        stdio_is_silenced(&stdio),
-        "the daemon still holds the descriptors it was handed: {stdio:?}"
-    );
+    assert_detached(&detachment, Some(pid), "the daemon");
     assert_eq!(
         recorded,
         Some(pid),
@@ -1145,16 +1231,12 @@ fn a_daemon_that_leads_a_process_group_detaches_by_forking() {
         recorded = fs::read_to_string(&pid_file)
             .ok()
             .and_then(|text| text.trim().parse::<u32>().ok());
-        recorded.is_some_and(|pid| {
-            stat_field(pid, StatField::Session) == Some(pid)
-                && stdio_is_silenced(&stdio_targets(pid))
-        })
+        recorded.is_some_and(has_detached)
     });
 
     // Everything read before anything is collected, so a failing assertion cannot
     // leave a session behind.
-    let leads_session = recorded.and_then(|pid| stat_field(pid, StatField::Session));
-    let stdio = recorded.map(stdio_targets).unwrap_or_default();
+    let detachment = recorded.map(detachment_of).unwrap_or_default();
     let alive = recorded.is_some_and(process_alive);
     drop(control(&root, &["kill", "grouped"]));
     drop(starter);
@@ -1173,13 +1255,36 @@ fn a_daemon_that_leads_a_process_group_detaches_by_forking() {
         alive,
         "no live daemon behind the pidfile: it names {recorded:?}"
     );
+    assert_detached(&detachment, recorded, "the forked child");
+}
+
+/// Whether `pid` has finished detaching itself (§ 6.2): a session of its own, and
+/// nothing left of the stdio it was handed.
+fn has_detached(pid: u32) -> bool {
+    stat_field(pid, StatField::Session) == Some(pid) && stdio_is_silenced(&stdio_targets(pid))
+}
+
+/// What `/proc` says about `pid`'s detachment, as the session it leads and the three
+/// descriptors it holds.
+///
+/// Read out and handed back rather than asserted on the spot, because both halves
+/// have to be in hand *before* the caller collects the daemon: `/proc` has nothing to
+/// say about a process that is gone, and a failing assertion must not be the thing
+/// that leaves a session behind.
+fn detachment_of(pid: u32) -> (Option<u32>, Vec<PathBuf>) {
+    (stat_field(pid, StatField::Session), stdio_targets(pid))
+}
+
+/// The two halves of § 6.2, as [`detachment_of`] found them for `whose`.
+fn assert_detached(found: &(Option<u32>, Vec<PathBuf>), pid: Option<u32>, whose: &str) {
+    let (leads_session, stdio) = found;
     assert_eq!(
-        leads_session, recorded,
-        "the forked child must lead a session of its own"
+        *leads_session, pid,
+        "{whose} stayed in the session it was started in, so a hangup reaches it"
     );
     assert!(
-        stdio_is_silenced(&stdio),
-        "the forked child still holds the descriptors it was handed: {stdio:?}"
+        stdio_is_silenced(stdio),
+        "{whose} still holds the descriptors it was handed: {stdio:?}"
     );
 }
 
@@ -1428,9 +1533,10 @@ fn a_daemon_that_reaps_itself_removes_its_run_files() {
     );
 
     // The child exits and the client leaves. The linger window is deliberately *not*
-    // collapsed by the departure — `on_detached` leaves `linger_until` alone, because
-    // the client the window exists for is the one that has not arrived yet (§ 6.5) —
-    // so what ends the daemon here is the five-second `EXIT_LINGER` expiring, and
+    // collapsed by the departure — it is derived from `child_gone` alone, which
+    // `on_detached` never touches, because the client the window exists for is the
+    // one that has not arrived yet (§ 6.5) — so what ends the daemon here is the
+    // five-second `EXIT_LINGER` measured from that moment expiring, and
     // `shutdown` then unlinks the run files. Hence the generous deadline below.
     client.input(0, b"exit 3\n");
     client.drain_available();
@@ -1482,7 +1588,7 @@ fn a_signalled_daemon_collects_a_process_that_ignores_sighup() {
         process_alive(orphan),
         "the backgrounded process was gone before the session ended"
     );
-    let shell = child_of(session.child.id()).expect("find the session shell");
+    let shell = shell_of(&session);
     assert_eq!(
         stat_field(orphan, StatField::ProcessGroup),
         Some(shell),
@@ -1740,69 +1846,29 @@ fn an_abrupt_client_disconnect_does_not_kill_the_session() {
 /// protocol.
 #[test]
 fn the_relay_moves_bulk_traffic_both_ways_without_losing_a_byte() {
-    use std::net::Shutdown;
-    use std::sync::Arc;
-
     const BULK: usize = 2 * 1024 * 1024;
 
     let (mut child, peer, _listener) = relay_onto_a_socket("relay_bulk", Stdio::piped());
-    let peer = Arc::new(peer);
     let mut stdin = child.stdin.take().expect("stdin");
     let mut stdout = child.stdout.take().expect("stdout");
-    let mut stderr = child.stderr.take().expect("stderr");
 
-    let upstream = Rng::new(0x5eed_1234).bytes(BULK);
-    let downstream = Rng::new(0xfeed_9876).bytes(BULK);
-
-    // Four threads because all four flows must run at once: with any one of them
-    // parked the relay's back pressure would deadlock the other three.
-    let feed = {
-        let data = upstream.clone();
-        thread::spawn(move || {
-            stdin.write_all(&data).expect("write to relay stdin");
+    assert_relay_moves_bulk(
+        child,
+        peer,
+        BULK,
+        (0x5eed_1234, 0xfeed_9876),
+        move |data| {
+            stdin.write_all(data).expect("write to relay stdin");
             // Half-close, which the relay must turn into shutdown(SHUT_WR) on the
             // socket while still draining the other direction.
             drop(stdin);
-        })
-    };
-    let push = {
-        let data = downstream.clone();
-        let peer = Arc::clone(&peer);
-        thread::spawn(move || {
-            let mut peer = &*peer;
-            peer.write_all(&data).expect("write to relay socket");
-        })
-    };
-    let uplink = {
-        let peer = Arc::clone(&peer);
-        thread::spawn(move || {
-            let mut peer = &*peer;
+        },
+        move || {
             let mut got = Vec::new();
-            peer.read_to_end(&mut got).expect("read from relay socket");
+            stdout.read_to_end(&mut got).expect("read relay stdout");
             got
-        })
-    };
-    let downlink = thread::spawn(move || {
-        let mut got = Vec::new();
-        stdout.read_to_end(&mut got).expect("read relay stdout");
-        got
-    });
-
-    feed.join().expect("feeder thread");
-    let uplink = uplink.join().expect("socket reader thread");
-    push.join().expect("pusher thread");
-    // Only now: the relay ends the moment the socket reports EOF, so closing this
-    // any earlier would truncate the direction under test rather than test it.
-    peer.shutdown(Shutdown::Write)
-        .expect("half-close the socket");
-    let downlink = downlink.join().expect("stdout reader thread");
-
-    let mut complaints = String::new();
-    drop(stderr.read_to_string(&mut complaints));
-    drop(child);
-
-    assert_same(&upstream, &uplink, "stdin -> socket", &complaints);
-    assert_same(&downstream, &downlink, "socket -> stdout", &complaints);
+        },
+    );
 }
 
 /// The same traffic again, over stdio no kernel will splice — which is the only way
@@ -1810,27 +1876,20 @@ fn the_relay_moves_bulk_traffic_both_ways_without_losing_a_byte() {
 ///
 /// `Pump::transfer` reaches for `splice` first and copies through a 16 KiB buffer
 /// only once the kernel has refused the pair, latching that refusal for the life of
-/// the direction. On a developer's machine and on CI the kernel never refuses,
-/// because `Stdio::piped()` hands it the pipe it wants, so the fallback — the path
-/// whose own comment says it "handles every case correctly anyway" — was asserted
-/// about by nothing. A byte quietly dropped in `copy_in` passed the whole suite.
+/// the direction. Stdio on a `socketpair` is what takes the pipe away, and is the
+/// case `splice_once` names in so many words: sshd handing the client socket-backed
+/// stdio instead of pipes. Socket to socket is `EINVAL`, which is neither `EINTR`
+/// nor `EAGAIN` and so arrives as `Spliced::Unusable`, so from the first wakeup in
+/// each direction every byte below crosses through `copy_in` and `drain_to` and none
+/// through the kernel.
 ///
-/// Stdio on a `socketpair` is what takes the pipe away. Not a contrivance for the
-/// test: it is the case `splice_once` names in so many words, sshd handing the
-/// client socket-backed stdio instead of pipes, and it is why the fallback exists at
-/// all. Socket to socket is `EINVAL`, which is neither `EINTR` nor `EAGAIN` and so
-/// arrives as `Spliced::Unusable`, so from the first wakeup in each direction every
-/// byte below crosses through `copy_in` and `drain_to` and none through the kernel.
-///
-/// Both endings are the fallback's too, and both are asserted here rather than in
-/// tests of their own: the half-close on stdin and the one on the socket each reach
-/// the relay as `copy_in` reading zero, and getting either wrong truncates or hangs
-/// one of the two comparisons below.
+/// Both endings are the fallback's too: the half-close on stdin and the one on the
+/// socket each reach the relay as `copy_in` reading zero, and getting either wrong
+/// truncates or hangs one of the two comparisons below.
 #[test]
 fn the_relay_moves_the_same_traffic_by_copying_when_the_kernel_will_not_splice_it() {
     use std::net::Shutdown;
     use std::os::fd::OwnedFd;
-    use std::sync::Arc;
 
     // A quarter of what the splice test moves, and still 32 buffers per direction:
     // what a mis-slice or a swallowed short read does at one 16 KiB boundary it does
@@ -1842,32 +1901,76 @@ fn the_relay_moves_the_same_traffic_by_copying_when_the_kernel_will_not_splice_i
     let (mut feed, relay_stdin) = UnixStream::pair().expect("a socketpair for the relay's stdin");
     let (mut drain, relay_stdout) =
         UnixStream::pair().expect("a socketpair for the relay's stdout");
-    let (mut child, peer, _listener) = relay_onto_a_socket_over(
+    let (child, peer, _listener) = relay_onto_a_socket_over(
         "relay_copy",
         Stdio::from(OwnedFd::from(relay_stdin)),
         Stdio::from(OwnedFd::from(relay_stdout)),
         Stdio::piped(),
     );
-    let peer = Arc::new(peer);
-    let mut stderr = child.stderr.take().expect("stderr");
 
-    let upstream = Rng::new(0x0c07_9114).bytes(BULK);
-    let downstream = Rng::new(0xc0de_5a1e).bytes(BULK);
-
-    // Four threads for the same reason as above: all four flows have to run at once
-    // or the relay's back pressure parks the other three. More sharply here, in fact
-    // — the copying path writes to a *blocking* stdout, so a reader that stops
-    // reading stops the relay rather than filling a buffer.
-    let feeder = {
-        let data = upstream.clone();
-        thread::spawn(move || {
-            feed.write_all(&data).expect("write to relay stdin");
+    assert_relay_moves_bulk(
+        child,
+        peer,
+        BULK,
+        (0x0c07_9114, 0xc0de_5a1e),
+        move |data| {
+            feed.write_all(data).expect("write to relay stdin");
             // The half-close the relay must turn into shutdown(SHUT_WR) on the
             // socket while it goes on draining the other direction. A socket's, not
             // a pipe's, but `copy_in` reads the same zero from either.
             feed.shutdown(Shutdown::Write)
                 .expect("half-close the relay's stdin");
-        })
+        },
+        move || {
+            let mut got = Vec::new();
+            drain.read_to_end(&mut got).expect("read relay stdout");
+            got
+        },
+    );
+}
+
+/// How long one direction of a relay has to finish before the wait on it is called a
+/// hang rather than slowness.
+///
+/// Far above the second or so the transfers really take, and far below the
+/// termination in `.config/nextest.toml`, so a stalled relay fails here — naming the
+/// direction that stopped — rather than being killed there with nothing to point at.
+const RELAY_PATIENCE: Duration = Duration::from_secs(30);
+
+/// Moves `bulk` bytes each way through a relay and compares both directions.
+///
+/// Shared by the two tests above, which differ only in the stdio the relay is handed
+/// — and therefore in whether the kernel will splice it — and in how the feeding side
+/// half-closes. Everything else was written twice: the same four threads, the same
+/// order of joins, and the same pair of comparisons.
+///
+/// `feed` writes the upstream bytes and then half-closes; `drain` reads the
+/// downstream ones to end of file. Both own their descriptor, so the choice of pipe
+/// or `socketpair` stays with the caller that made it.
+fn assert_relay_moves_bulk(
+    mut child: Spawned,
+    peer: UnixStream,
+    bulk: usize,
+    seeds: (u64, u64),
+    feed: impl FnOnce(&[u8]) + Send + 'static,
+    drain: impl FnOnce() -> Vec<u8> + Send + 'static,
+) {
+    use std::net::Shutdown;
+    use std::sync::Arc;
+
+    let peer = Arc::new(peer);
+    let mut stderr = child.stderr.take().expect("stderr");
+
+    let upstream = Rng::new(seeds.0).bytes(bulk);
+    let downstream = Rng::new(seeds.1).bytes(bulk);
+
+    // Four threads because all four flows must run at once: with any one of them
+    // parked the relay's back pressure would deadlock the other three. More sharply
+    // on the copying path, which writes to a *blocking* stdout — there a reader that
+    // stops reading stops the relay rather than filling a buffer.
+    let feeder = {
+        let data = upstream.clone();
+        thread::spawn(move || feed(&data))
     };
     let push = {
         let data = downstream.clone();
@@ -1886,20 +1989,16 @@ fn the_relay_moves_the_same_traffic_by_copying_when_the_kernel_will_not_splice_i
             got
         })
     };
-    let downlink = thread::spawn(move || {
-        let mut got = Vec::new();
-        drain.read_to_end(&mut got).expect("read relay stdout");
-        got
-    });
+    let downlink = thread::spawn(drain);
 
-    feeder.join().expect("feeder thread");
-    let uplink = uplink.join().expect("socket reader thread");
-    push.join().expect("pusher thread");
-    // Only now, as above: the relay ends on the socket's EOF, so an earlier
-    // half-close would truncate the direction under test rather than test it.
+    join_within(feeder, RELAY_PATIENCE, "feeder");
+    let uplink = join_within(uplink, RELAY_PATIENCE, "socket reader");
+    join_within(push, RELAY_PATIENCE, "pusher");
+    // Only now: the relay ends the moment the socket reports EOF, so closing this
+    // any earlier would truncate the direction under test rather than test it.
     peer.shutdown(Shutdown::Write)
         .expect("half-close the socket");
-    let downlink = downlink.join().expect("stdout reader thread");
+    let downlink = join_within(downlink, RELAY_PATIENCE, "stdout reader");
 
     let mut complaints = String::new();
     drop(stderr.read_to_string(&mut complaints));
@@ -1916,18 +2015,17 @@ fn the_relay_moves_the_same_traffic_by_copying_when_the_kernel_will_not_splice_i
 /// off on reading the source. If the destination's peer then dies, `poll` reports
 /// `POLLERR` — never `POLLOUT`, because a pipe nobody is reading never becomes
 /// writable — and the drain that would clear the latch was guarded on `POLLOUT`
-/// alone. Nothing in the iteration could act, nothing could change, and the loop
-/// went round at the speed of the scheduler: a `nomux attach` pinned at 100% CPU
-/// on somebody's server for as long as the socket stayed open.
-///
-/// The shape is the ordinary one for this project rather than a corner: output
-/// backed up in the pipe is exactly the state a connection is in when the network
-/// drops under load.
+/// alone, so nothing in the iteration could act and the loop spun at the speed of
+/// the scheduler.
 ///
 /// A bare socket for a peer, as in the bulk test above — the relay parses nothing,
 /// so a daemon here would only add a protocol conversation the bug does not need.
 #[test]
 fn the_relay_exits_when_its_stdout_dies_with_the_destination_latched_full() {
+    /// Far more than the ~264 KiB the socket buffer and the stdout pipe hold between
+    /// them, so the push below cannot end by simply running out of bytes.
+    const PUSH: usize = 8 << 20;
+
     let (mut child, mut peer, _listener) = relay_onto_a_socket("relay_spin", Stdio::null());
     // Stdin stays open and idle throughout. It is in the poll set the whole time,
     // which is the point: the wakeups being spun on come from stdout, so a relay
@@ -1939,16 +2037,17 @@ fn the_relay_exits_when_its_stdout_dies_with_the_destination_latched_full() {
     // stdout pipe both full, which is what leaves the relay's last `splice` sitting
     // on `EAGAIN` with `dest_full` latched and its buffer empty.
     peer.set_nonblocking(true).expect("nonblocking peer");
-    let chunk = vec![b'x'; 64 * 1024];
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        match peer.write(&chunk) {
-            Ok(0) => break,
-            Ok(_) => thread::sleep(Duration::from_millis(5)),
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(err) => panic!("writing to the relay's socket failed: {err}"),
-        }
-    }
+    let sent = push_until_refused(&mut peer, &vec![b'x'; PUSH], Duration::from_secs(1));
+    // Asserted rather than assumed: every other way out of that push leaves the
+    // destination unlatched, and stdout is then not in the relay's poll set at all —
+    // which is the state the *next* test is about, and this one would pass while
+    // proving it a second time.
+    assert!(
+        sent < PUSH,
+        "the relay's socket and stdout pipe took all {PUSH} bytes, so nothing was \
+         ever latched full"
+    );
+
     // Nothing has read a byte of stdout, so the pipe is full and the relay is
     // waiting for it to become writable. Now take away the reader.
     drop(stdout);
@@ -1962,29 +2061,33 @@ fn the_relay_exits_when_its_stdout_dies_with_the_destination_latched_full() {
 /// Regression: the relay must leave when its stdout dies while nothing is owed to
 /// it, which is the state it is in almost all of the time.
 ///
-/// The test above reaches the one state in which the dead descriptor is still
-/// watched: `dest_full` latched keeps stdout in the poll set, so `POLLERR` arrives
-/// and is acted on. An *idle* direction — empty buffer, no latch — wants nothing
-/// from `poll`, so stdout is not in the set at all and that `POLLERR` is never
-/// delivered. The only thing that can discover the reader has gone is writing to
-/// it, and the `EPIPE` that comes back used to be answered by dropping the buffer
-/// and carrying on: every byte the session produced was then read off the socket
-/// and discarded over a dead pipe, for as long as the session kept producing, with
-/// the relay holding the session's one client slot throughout.
+/// The regression is what the relay used to do about it: answer the `EPIPE` by
+/// dropping the buffer and carrying on, so every byte the session produced was read
+/// off the socket and discarded over a dead pipe, for as long as the session kept
+/// producing, with the relay holding its one client slot throughout.
+///
+/// Which of the two discoveries arrives first depends on what stdout is. An idle
+/// direction is out of the poll set altogether — an empty buffer wants nothing — so
+/// nothing is noticed until the session produces something, and that first chunk is
+/// buffered rather than written, the relay writing only to a descriptor `poll` has
+/// just called writable. Buffering it is what puts stdout into the set. A pipe whose
+/// read end is gone answers `POLLOUT | POLLERR`, so here the `ERR` branch wins and
+/// the relay leaves without ever attempting the write. A socket whose peer has shut
+/// down its read half answers `POLLOUT` alone, the write is made, and the `EPIPE` it
+/// returns is the only thing that ever reports the death — which is
+/// [`the_relay_exits_when_a_stdout_it_can_only_copy_to_stops_reading`], the sibling
+/// that keeps that arm under test.
 ///
 /// Asserted as the relay exiting rather than as bytes not moving, because that is
 /// the only thing that distinguishes the two: a discard loop accepts everything it
 /// is handed — 42 MB of it, when this was measured — and from the socket end looks
 /// exactly like a relay doing its job.
 ///
-/// The pipe is built here rather than by `Stdio::piped()`, and its read end is closed
-/// before there is a relay at all, because a pipe is broken exactly when the last
-/// descriptor onto its read end goes — and under `cargo test`, where the whole suite
-/// shares one process, "the last" is not this test's to decide. Any other test's
-/// `fork` in flight holds a copy of everything open here (see [`while_nothing_forks`]),
-/// so a read end left open across the spawn and the connect is a read end another
-/// test's child can be holding when the relay writes. The relay is idle from birth
-/// either way: it does not touch stdout until it has something for it.
+/// The pipe is built and half-closed inside [`while_nothing_forks`], because a pipe
+/// is broken only when the *last* descriptor onto its read end goes and another
+/// test's `fork` in flight holds a copy of everything open here (`PLAN.md` § P2). The
+/// relay is idle from birth either way: it does not touch stdout until it has
+/// something for it.
 #[test]
 fn the_relay_exits_when_its_stdout_dies_with_nothing_owed_to_it() {
     // Before a single byte has crossed, so the direction is idle rather than
@@ -2050,13 +2153,9 @@ fn the_relay_exits_when_a_stdout_it_can_only_copy_to_stops_reading() {
     );
 
     // Shut down rather than closed, and left open afterwards to make that the point:
-    // closing says "gone" only if this process holds the last descriptor onto it, and
-    // under `cargo test` any other test's `fork` in flight holds a copy of it (see
-    // `while_nothing_forks`) — for as long as that copy lives the peer is still a
-    // reader and the relay's `writev` is still accepted. `SHUT_RD` is a property of
-    // the socket rather than of any descriptor onto it, so a stray duplicate cannot
-    // undo it: the kernel marks this end as reading no more and the peer's end as
-    // sending no more, and the relay gets the same `EPIPE` either way.
+    // `SHUT_RD` is a property of the socket rather than of any descriptor onto it, so
+    // the copy another test's `fork` in flight is holding cannot undo it where a close
+    // could (`PLAN.md` § P2).
     //
     // Before a byte has crossed, so nothing is owed to it and nothing is latched: the
     // relay is not watching this descriptor and cannot be told about it.
@@ -2127,6 +2226,11 @@ fn relay_onto_a_socket_over(
         Duration::from_secs(10),
         "`nomux attach` to connect to the session socket",
     );
+    // `accept` hands back a socket with no deadline of its own, and the bulk tests
+    // read it to end of file — so a relay that stalled would park a test thread for
+    // ever. The timeout turns that into the named failure `join_within` reports.
+    peer.set_read_timeout(Some(RELAY_PATIENCE))
+        .expect("a peer the test must not park on");
     (child, peer, listener)
 }
 

@@ -104,11 +104,7 @@ pub(crate) fn run_dir() -> io::Result<PathBuf> {
 /// nothing about *what* exists: `$XDG_RUNTIME_DIR/nomux` may be a symlink into a
 /// directory another user owns, in which case every file the caller is about to
 /// make there — a socket that carries the session, the pidfile, the spawn lock — is
-/// made somewhere that user chose and can replace. The version this supersedes made
-/// that worse rather than better, since it answered an existing directory with an
-/// unconditional `fs::set_permissions`, which resolves the path and therefore
-/// follows the symlink: it tightened a stranger's directory to [`DIR_MODE`] on
-/// their behalf and then filled it with sockets.
+/// made somewhere that user chose and can replace.
 ///
 /// The check runs before the creation, so the ordinary case costs one `open` and
 /// one `fstat`, and so a plain file sitting at the path is reported as what it is
@@ -126,11 +122,10 @@ fn ensure_dir_at(dir: &Path) -> io::Result<()> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         settled => return settled,
     }
-    // `mkdir(2)` subtracts the umask from the mode it is given, so a login with
-    // `umask 0500` would create a run directory its owner cannot open — and the
-    // check below would then refuse what this line had just made. Suppressing the
-    // umask is what makes `DIR_MODE` a request rather than a ceiling, for the
-    // parents this creates along the way as much as for the directory itself.
+    // Suppressed for the parents `recursive` creates along the way as much as for
+    // the directory itself — [`with_umask`] says why every mode here has to be
+    // exact. Left to a `umask 0500` this line would make a run directory its owner
+    // cannot open, and the check below would then refuse what it had just made.
     with_umask(DIR_MODE, || {
         fs::DirBuilder::new()
             .recursive(true)
@@ -154,23 +149,15 @@ fn ensure_dir_at(dir: &Path) -> io::Result<()> {
 /// descriptor it is meant to describe is worse than no check.
 ///
 /// The descriptor is dropped at the end and the run files go on being opened by
-/// path, which is a decision rather than an oversight. There is no `bindat(2)`, so
-/// the session socket and the agent socket — the two files that decide who a
-/// session is talking to — must be resolved by name whatever this function returns;
-/// a descriptor would cover the pidfile, the label and the lock, and a layout in
-/// which the three cheap files are addressed race-free while the two that matter
-/// are not would read as though the race were closed. What closes it is the
-/// property established here instead: in a directory this user owns and nobody else
-/// can write to, this user's own processes are the only ones that can put a name in
-/// it, which is what makes every path built on it safe to resolve. Keeping the
-/// descriptor for the session's lifetime would also pin the filesystem the daemon
-/// deliberately lets go of in `IMPLEMENTATION.md` § 6.2.
-///
-/// What that leaves open is a *parent* somebody else can write to — an
-/// `XDG_RUNTIME_DIR` pointed at a shared directory, say — where the whole run
-/// directory can be renamed away and replaced between this call and the next
-/// `bind`. No descriptor obtainable here would close that, because the `bind` needs
-/// the path either way.
+/// path, which is a decision rather than an oversight: there is no `bindat(2)`, so
+/// the two sockets that decide who a session is talking to must be resolved by name
+/// whatever this function returns. `IMPLEMENTATION.md` § 6.3 gives the rest of that
+/// argument, and the *parent* it leaves open. What closes the part that can be
+/// closed is the property established here: in a directory this user owns and
+/// nobody else can write to, this user's own processes are the only ones that can
+/// put a name in it, which is what makes every path built on it safe to resolve.
+/// Keeping the descriptor for the session's lifetime would also pin the filesystem
+/// the daemon deliberately lets go of in § 6.2.
 ///
 /// # Errors
 ///
@@ -239,15 +226,10 @@ pub(crate) fn check_run_dir(dir: &Path) -> io::Result<()> {
     // of anything any more.
     //
     // Every other mode is repaired to exactly [`DIR_MODE`], through the descriptor
-    // already checked above. Group and other read or execute disclose the session
-    // ids and the labels and no more, the sockets being `SOCKET_MODE` in their own
-    // right; an owner bit that is missing rather than spare — `0400`, `0500`,
-    // `0600`, which an odd umask under an older version left behind — makes a run
-    // directory this user cannot fill, which is no more usable than one that is too
-    // open; and `setgid` or `sticky` are harmless in themselves but make the layout
-    // depend on how the directory happened to be created, where § 6.3 states the
-    // mode as exact. The one mode not reached here is one the owner cannot open at
-    // all, which failed above with nothing to repair through.
+    // already checked above — spare bits, owner bits that are missing rather than
+    // spare, and `setgid` or `sticky` alike, since § 6.3 states the mode as exact
+    // and says what each of them costs. The one mode not reached here is one the
+    // owner cannot open at all, which failed above with nothing to repair through.
     let mode = Mode::from_raw_mode(stat.st_mode);
     if mode.intersects(Mode::WGRP | Mode::WOTH) {
         return Err(refuse(
@@ -395,24 +377,38 @@ impl SessionPaths {
         // `fs::write` creates at `0666 & ~umask`, which under the ordinary umask
         // publishes the label at `0644` and under `umask 0400` leaves it unreadable
         // to the `list` that is its only consumer. [`FILE_MODE`] either way.
-        with_umask(FILE_MODE, || fs::write(self.label(), label.as_bytes()))
+        //
+        // Removed first because a mode argument applies only to a file this call
+        // creates: `O_TRUNC` onto one already at the path keeps whatever mode it
+        // arrived with, so the suppression above would silently do nothing for the
+        // leftover of a previous incarnation. Only the socket is cleared when a
+        // daemon rebinds an id, so such a leftover is ordinary rather than exotic.
+        let path = self.label();
+        drop(fs::remove_file(&path));
+        with_umask(FILE_MODE, || fs::write(&path, label.as_bytes()))
     }
 
     /// Records the pid `nomux kill` will signal, at a mode its owner can read back.
     ///
-    /// `File::create` asks for `0666`, so without the umask suppressed it is the
-    /// umask alone that decides what this ends up as: `0644` under an ordinary one,
-    /// and `0266` under `umask 0400` — a pidfile its own owner cannot read. `kill`
-    /// refuses to unlink a live session whose pid it cannot read, correctly, so the
-    /// session would be unkillable until somebody noticed and `chmod`ed it. The
-    /// directory is `0700` either way; this is about the file staying legible to the
-    /// process that has to act on it.
+    /// Left to the umask this file is whatever `0666` minus it comes to, which under
+    /// `umask 0400` is `0266` — a pidfile its own owner cannot read. `kill` refuses
+    /// to unlink a live session whose pid it cannot read, correctly, so the session
+    /// would be unkillable until somebody noticed and `chmod`ed it. The directory is
+    /// `0700` either way; this is about the file staying legible to the process that
+    /// has to act on it.
     ///
     /// The file is created and filled a syscall apart, which `control::kill` knows
     /// about: it waits out a zero-length pidfile rather than reporting the corrupt
     /// one it would otherwise see.
     pub(crate) fn write_pid(&self) -> io::Result<()> {
-        let mut file = with_umask(FILE_MODE, || fs::File::create(self.pid()))?;
+        // Removed first: `File::create` is `O_CREAT|O_TRUNC`, and its mode argument
+        // applies only on creation, so a pidfile left at a wrong mode by an older
+        // version keeps it and the suppression below buys nothing. That is the
+        // unkillable session this function exists to prevent, reached by the one
+        // route it did not cover — rebinding an id clears the socket and nothing else.
+        let path = self.pid();
+        drop(fs::remove_file(&path));
+        let mut file = with_umask(FILE_MODE, || fs::File::create(&path))?;
         writeln!(file, "{}", std::process::id())
     }
 
@@ -459,12 +455,11 @@ impl SessionPaths {
     fn acquire(&self, operation: FlockOperation) -> Option<SpawnLock> {
         let path = self.lock();
         for _ in 0..LOCK_ATTEMPTS {
-            // Created at exactly [`FILE_MODE`] like the other two plain files.
-            // `open(2)` subtracts the umask as `mkdir` and `bind` do, and this is
-            // the file where that does damage: a lock created `0400` under `umask
-            // 0200` is one no later `open(O_RDWR)` can have, so the mutex is lost
-            // to every process that comes after — including the `list` and `kill`
-            // that are supposed to be able to clean up after anything.
+            // Created at exactly [`FILE_MODE`] like the other two plain files, and
+            // this is the one that constant is documented around: a lock left at
+            // `0400` is one no later `open(O_RDWR)` can have, so the mutex the
+            // `list` and `kill` that clean up after anything rest on is lost to
+            // every process that comes after.
             let opened = with_umask(FILE_MODE, || {
                 rustix::fs::open(
                     &path,
@@ -478,10 +473,7 @@ impl SessionPaths {
             loop {
                 match rustix::fs::flock(&fd, operation) {
                     // A signal landing on a blocking `flock` is not an answer about
-                    // the lock; ask again. Spelled as the one arm that continues
-                    // rather than as an `Ok` arm followed by a trailing `break`,
-                    // which is the same control flow reading as though the ordinary
-                    // path were the exception. `nbio::read` takes the same shape.
+                    // the lock; ask again.
                     Err(rustix::io::Errno::INTR) => {}
                     Ok(()) => break,
                     Err(rustix::io::Errno::WOULDBLOCK) => return None,
@@ -516,10 +508,8 @@ impl SessionPaths {
 
     /// The five paths, in the order [`Self::unlink_all_locked`] removes them.
     ///
-    /// Split out so that order can be asserted for what it is. Reproducing it
-    /// against a live preemption would mean a test that has to win a race to see
-    /// anything, and one that therefore passes for timing reasons at least as often
-    /// as for the right one.
+    /// Split out so that the order can be asserted directly, rather than through a
+    /// test that has to win a race against a live preemption to see anything.
     fn removal_order(&self) -> [PathBuf; 5] {
         // `<id>.lock` last, and the ordering is load-bearing rather than tidy.
         // `flock` holds an *inode*: the instant that name is gone the caller's lock
@@ -570,17 +560,12 @@ impl SessionPaths {
 ///
 /// It also stands for the *absence* of a lock, on a host that has none to give —
 /// `<id>.lock` cannot be opened, or the filesystem does not implement `flock`, or
-/// the run directory is read-only or over quota. That degradation is deliberate.
-/// The reason to take a mutex is that somebody else might be holding it, and a lock
-/// this process cannot obtain by any means is one no other process here can be
-/// holding either: every one of them reaches it through [`SessionPaths::acquire`],
-/// on the same file, under the same uid. What refusing instead would buy is
-/// nothing, and what it would cost is the frozen control surface — `list` and
-/// `kill` would stop being able to collect a session that is genuinely dead, which
-/// is the one thing § 6.6 exists to guarantee. What is given up is serialisation
-/// against a *concurrent* attach, which is what this layout had before the lock
-/// existed, and which `daemon::bind_socket` still backstops by refusing an id whose
-/// socket already answers.
+/// the run directory is read-only or over quota. Proceeding without one there is
+/// deliberate, and § 6.3 gives the argument: a lock this process cannot obtain by
+/// any means is one no other process here can be holding either, since every one of
+/// them reaches it through [`SessionPaths::acquire`], on the same file, under the
+/// same uid — so refusing would buy nothing and would cost the § 6.6 escape hatch
+/// its ability to collect a session that is genuinely dead.
 #[derive(Debug)]
 pub(crate) struct SpawnLock {
     /// The locked descriptor: `close(2)` on it is what releases the lock, so it is
@@ -667,9 +652,9 @@ mod tests {
     }
 
     /// Neither a symlink nor a plain file is a run directory, and the symlink is the
-    /// one that mattered: `fs::set_permissions` resolves the path, so the version
-    /// before this one answered it by tightening whatever it pointed at — another
-    /// user's directory — and then filling that with the session's sockets.
+    /// one that mattered: anything that answers it by mode rather than by refusal
+    /// resolves the path, and so tightens whatever it points at — another user's
+    /// directory — before filling that with the session's sockets.
     #[test]
     fn a_symlink_or_a_file_in_place_of_the_run_directory_is_refused() {
         let root = scratch("rundir-symlink");
@@ -703,14 +688,10 @@ mod tests {
         drop(fs::remove_dir_all(&root));
     }
 
-    /// Three answers for one field, and what separates them is what can still be
-    /// done about the mode. Anything the owner can open is repaired to exactly
-    /// [`DIR_MODE`] through the descriptor that was just checked — spare bits and
-    /// missing bits alike, and `setgid` and `sticky` with them, since § 6.3 states
-    /// the mode as exact. Write for group or other is refused instead: whoever had
-    /// it could already have left a socket of their own at a session id, which no
-    /// later `chmod` undoes. And a mode the owner cannot open is refused too, for
-    /// the plainer reason that there is no descriptor left to repair it through.
+    /// Three answers for one field, separated by what can still be done about the
+    /// mode: repaired wherever the owner can open the directory, refused where group
+    /// or other can write to it, and refused where nobody can open it at all. The
+    /// three loops below are those three answers; [`check_run_dir`] argues them.
     #[test]
     fn a_run_directory_mode_is_repaired_where_it_can_be_and_refused_where_it_cannot() {
         let root = scratch("rundir-mode");
@@ -757,11 +738,10 @@ mod tests {
         drop(fs::remove_dir_all(&root));
     }
 
-    /// The branch the version of this test that preceded it called untestable
-    /// without a second uid. It needs no second uid and no mock: every Linux host
-    /// has readable directories belonging to root, and the owner check returns
-    /// before anything is created or any mode changed — which is what makes the
-    /// target being untouched an assertion here rather than a hope.
+    /// The owner check needs no second uid and no mock: every Linux host has
+    /// readable directories belonging to root, and the check returns before anything
+    /// is created or any mode changed — which is what makes the target being
+    /// untouched an assertion here rather than a hope.
     #[test]
     fn a_run_directory_owned_by_another_uid_is_refused() {
         let us = rustix::process::getuid();
@@ -790,10 +770,8 @@ mod tests {
     }
 
     /// `<id>.lock` is removed last, which is a correctness property rather than a
-    /// tidy one: `flock` holds an inode, so from the moment that name is gone the
-    /// caller's lock guards nothing and the next acquirer creates and locks a fresh
-    /// file there — while the unlinks still to come go on removing by name, out of
-    /// a session somebody else has just brought up.
+    /// tidy one — [`SessionPaths::removal_order`] says why, and this is the
+    /// assertion that keeps it true.
     #[test]
     fn the_spawn_lock_is_the_last_file_removed() {
         let paths = SessionPaths::new("tab_7").unwrap();

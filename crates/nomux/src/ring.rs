@@ -45,19 +45,14 @@ impl Ring {
 
     /// Appends output, discarding from the front if it no longer fits.
     ///
-    /// Discarding is not reported here. Whether a *reader* lost anything depends on
-    /// where that reader had got to, so it is derived per client by comparing its
-    /// position against [`Ring::base`] — which stays correct across any number of
-    /// overflows, including ones that happened while the client was away.
+    /// Discarding is not reported here; whether a *reader* lost anything is derived
+    /// per client from [`Ring::base`], for the reason `IMPLEMENTATION.md` § 4 gives.
     pub(crate) fn push(&mut self, data: &[u8]) {
         // One number for both sides of the eviction. What must fall out of the
-        // window is `retained + new - capacity` however it is split, and `base` —
-        // the offset of the oldest surviving byte — advances by the whole of it,
-        // never by what came off one side. That is what a write larger than the
-        // ring turns on: it keeps only its own tail, because everything before it
-        // is unreachable anyway, so *both* everything already retained and the head
-        // of this very write are gone. Counting only one of the two leaves `base`
-        // too low.
+        // window is `retained + new - capacity` however it splits between the head of
+        // the buffer and the head of this write, and `base` — the offset of the
+        // oldest surviving byte — advances by the whole of it, never by what came off
+        // one side. Counting only one of the two leaves `base` too low.
         let overflow = (self.buf.len() + data.len()).saturating_sub(self.capacity);
         let from_buf = overflow.min(self.buf.len());
         self.base += overflow as u64;
@@ -114,11 +109,11 @@ mod tests {
 
     /// An oversized write discards what was retained *as well as* its own head.
     ///
-    /// Counting only its own head leaves `base` too low, and a caught-up client
-    /// then sits above it — so the overflow is invisible, no `Gap` is sent, and the
-    /// client splices a stream with a hole in it onto its scrollback believing it
-    /// contiguous. That is the one failure this whole design exists to make
-    /// impossible, so it is pinned at the arithmetic rather than end to end.
+    /// A `base` left too low puts a caught-up client above it, so the overflow is
+    /// invisible, no `Gap` is sent, and the client splices a stream with a hole in it
+    /// onto its scrollback believing it contiguous. That is the one failure the whole
+    /// design exists to prevent, so it is pinned at the arithmetic rather than end to
+    /// end.
     #[test]
     fn an_oversized_write_accounts_for_what_it_evicts() {
         let mut ring = Ring::new(4);

@@ -1,10 +1,5 @@
-# No `msrv` key: clippy reads `rust-version` from Cargo.toml, and stating it twice
-# is one more place for the pin to drift.
-
-# No `allow-dbg-in-tests`: the four keys below are here because the test suite does
-# unwrap, expect, panic and index, and would not compile under the workspace lint wall
-# without them. `dbg!` appears nowhere in the tree, so that key allowed something
-# nothing did — and left in a committed test it is debris either way.
+# The test suite unwraps, expects, panics and indexes, and would not compile under
+# the workspace lint wall without these.
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true

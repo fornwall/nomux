@@ -35,8 +35,7 @@ protocol it speaks. Mechanics: [IMPLEMENTATION.md](IMPLEMENTATION.md).
 - **Release** — all four musl targets build reproducibly, inside the 400 KiB budget
   and against a per-target growth gate, from `scripts/build-release.sh`. armv7 has by
   far the least headroom, for the reason in P1. The sizes live in
-  `scripts/size-baseline`, which a build writes — and not in prose here, which is
-  where every stale copy of them has been found so far.
+  `scripts/size-baseline`, which a build writes.
 - **Not started** — the release process of P3, and the client, which is a separate
   repository and whose server-side contract is the last section of this file.
 
@@ -52,9 +51,11 @@ recorded with what it was measured against.
   and publishes the pidfile a few syscalls later, so a `kill` landing in between
   sees a live session it cannot identify. It refuses rather than unlinking, and
   waits the window out, so the outcome is an honest non-zero exit rather than a
-  destroyed session — but the window is still there. Only the hand-started case:
-  a session `attach` spawned is never visible without its pidfile, and a pidfile
-  caught between creation and its first write is waited out like a missing one.
+  destroyed session — but the window is still there. `attach` narrows it rather than
+  closing it: the lock goes as soon as the path exists, and the pidfile is created a
+  syscall before it is filled, so the ordinary spawn can be caught holding an empty
+  one. Both halves — no file, and a file with nothing in it — are waited out, so only
+  a daemon that stays unpublished past that grace is reported.
 - **The run-directory check costs armv7 66 KiB.** Bisected to `4d5d465`, the commit
   that introduced it, and the jump is that architecture alone: 148,292 → 215,884
   bytes, a 46% step against roughly 6 KiB for the whole branch on each of the other
@@ -66,6 +67,24 @@ recorded with what it was measured against.
   least likely to be on a fast link. It went unnoticed because the release script
   enforced the cap and not the delta; the 3% gate that now exists would fail the
   same commit.
+
+- **An abort still says nothing, and cannot.** The daemon now reports startup failures
+  to the `attach` that spawned it and everything afterwards to syslog, which covers
+  every failure it can see coming. An *abort* is not one of those: the shipping build
+  is `-Cpanic=immediate-abort` with `strip = "symbols"`, so allocation failure and any
+  surviving panic produce no message, no location and no symbol to forward. What is
+  left is the `SIGQUIT` core § 6.5 preserves — and nothing publishes unstripped
+  binaries for it to be read against, so today that core names no functions. Publishing
+  them beside `SHA256SUMS`, keyed by the same hash, is the cheap half of the answer and
+  belongs with the P3 release work.
+- **Nothing bounds how many sessions one host will run.** The cap of eight is enforced
+  client-side ([DESIGN.md § 5.1](DESIGN.md#51-bootstrap)) and the daemon knows nothing
+  of its siblings, so two devices on one account give sixteen and a client bug gives no
+  limit at all. Each session is a daemon, a login shell and whatever that shell started,
+  held for seven days. On a shared build host the only bound in the system is on the far
+  side of a boundary this repository cannot see. The daemon already reads the run
+  directory in `list`; counting entries at startup and refusing past a generous ceiling
+  would put a floor under it without the client's cooperation.
 
 ## P2 — structure
 
@@ -104,21 +123,13 @@ recorded with what it was measured against.
   decide. `the_relay_exits_when_its_stdout_dies_with_nothing_owed_to_it` and
   `the_relay_exits_when_a_stdout_it_can_only_copy_to_stops_reading` provoke the relay
   with a single write, so a duplicate alive for the microseconds of that one write
-  costs the whole test — measured at 4 and 5 failures in 25 whole-suite runs, with the
-  reader end outliving its close by between 0.5 ms and 50 ms, and `/proc` naming the
-  holders as forks of the test binary still carrying the forking test's thread name.
-  Nothing clears on its own afterwards, because a relay that has handed over its one
-  chunk never writes again and so never learns.
-
-  It reaches a *listening* socket in the same shape, and there what lies is the run
-  directory itself: `StaleSession::create` binds `<id>.sock` and closes it to make the
-  dead session [IMPLEMENTATION.md § 6.6](IMPLEMENTATION.md#66-frozen-control-surface)
-  defines, and a duplicate keeps that socket accepting — so `list` and `kill`
-  correctly report a session alive that the test had promised was a corpse. Measured
-  at 170–270 ms of afterlife on a machine with several times as many runnable threads
-  as cores, with `/proc/net/unix` showing the socket still carrying `SO_ACCEPTCON` and
-  a reference the closing test no longer held, against 5 failures in 400 whole-binary
-  runs, shared between two of the three tests that start from one.
+  costs the whole test, and nothing clears on its own afterwards: a relay that has
+  handed over its one chunk never writes again and so never learns. It reaches a
+  *listening* socket in the same shape, where what lies is the run directory itself —
+  `StaleSession::create` binds `<id>.sock` and closes it to make the dead session
+  [IMPLEMENTATION.md § 6.6](IMPLEMENTATION.md#66-frozen-control-surface) defines, and a
+  duplicate keeps that socket accepting, so `list` and `kill` correctly report a
+  session alive that the test had promised was a corpse.
 
   Two answers, and the choice between them is whether the condition can be made a
   property of the object rather than of the descriptor. Where it can, it should be:
@@ -136,14 +147,23 @@ recorded with what it was measured against.
   on returns `EINTR` whatever `SA_RESTART` asked for. It costs a test either way —
   reported, it fails the test for something that happened to the process rather than
   to the daemon; swallowed, it ends a drain or a back-pressure measurement early and
-  says nothing. Both were observed:
-  `a_child_that_stops_reading_input_does_not_wedge_the_daemon` failed 1 loaded
-  `cargo test --locked --workspace` run in 25 on `EINTR` in its setup, and the same
-  run swallowed one in `drain_available`. Nothing in the suite sends the signal, which
+  says nothing — and both were observed, in
+  `a_child_that_stops_reading_input_does_not_wedge_the_daemon` and in
+  `drain_available`. Nothing in the suite sends the signal, which
   is why the answer is a retry rather than a culprit: `harness::read_uninterrupted`
   and `harness::write_uninterrupted` are what every socket call in the harness goes
   through, for the same reason `nbio::read` is the only raw read in the daemon, and a
   bare `stream.read` added later is what would bring this back.
+
+- **"Frozen" is promised for a layout that has already grown once.**
+  [IMPLEMENTATION.md § 6.6](IMPLEMENTATION.md#66-frozen-control-surface) says filenames
+  and permissions may never change, and the set is five files having gained
+  `<id>.agent`. Nothing says what an *older* binary's `kill` does with a name it does
+  not know, and the answer today is that it leaves it behind — one leaked file per
+  collected session, for as long as the two versions coexist. The promise holds for what
+  it needs to cover if it is stated as the five existing names, their permissions and
+  the pidfile format, with collection removing `<id>.*` rather than an enumerated list.
+  That is a small change now and an impossible one once a sixth file exists in the wild.
 
 ## P3 — release process
 
@@ -157,6 +177,15 @@ The four musl targets build, land under the 400 KiB budget, and are byte-reprodu
 
 - A `cargo-fuzz` target for `decode_header` and `Frame::decode`. The parser's fuzzing lives in `proptest` today: arbitrary bytes for every frame type, plus single-byte mutations of real encodings, which is what actually reaches past length prefixes and enum discriminants. It runs on stable in the normal suite. A nightly `cargo-fuzz` target would explore longer, and has not yet earned the nightly dependency.
 - Chaos against a real full-screen program. The suite emits sixel and CSI sequences from `sh`, which keeps it deterministic and dependency-free; driving an actual `vim` would test `vim`. Worth revisiting only if a bug turns up that this shape misses.
+- **The wire vectors cannot be run by the implementation that most needs them.**
+  `crates/nomux-proto/tests/wire.rs` is written from the § 2.2 table rather than from
+  the encoder, which is exactly what makes it able to catch a changed field order — and
+  it is locked inside a Rust integration test. [IMPLEMENTATION.md § 1](IMPLEMENTATION.md#1-architecture)
+  allows the client to reimplement the codec, which a mobile client in Swift or Kotlin
+  will, and it cannot run any of this. Emitting the same table as a language-neutral
+  fixture from the same test — hex per frame, checked in — would let an independent
+  implementation be verified against the identical bytes. Until something does, the
+  protocol has never met a second implementation.
 - **`MAX_PENDING_READ` has no test and cannot easily have one.** The kernel's unix
   send buffer is roughly 212 KiB, five times tighter than the 1 MiB cap, so on a
   stock host the cap never binds and no socket-level test can pin it. Raising the
@@ -173,9 +202,9 @@ Not backlog — recorded so they are not rediscovered as gaps.
 | Read-only mirrors | Out of scope, [DESIGN.md § 2](DESIGN.md#2-scope) |
 | Cross-device handover | [DESIGN.md § 10](DESIGN.md#10-open-questions), with its three prerequisites |
 | `libvterm` overflow snapshot | [DESIGN.md § 10](DESIGN.md#10-open-questions) |
-| Ring capacity default | [DESIGN.md § 10](DESIGN.md#10-open-questions); `NOMUX_RING_BYTES` makes it tunable, but the default is unchosen |
+| Ring capacity default | [DESIGN.md § 10](DESIGN.md#10-open-questions); `NOMUX_RING_BYTES` makes it tunable, but the default is unchosen. Revisit knowing the memory figure that argues for keeping it small is an overestimate: a ring that size is one allocation large enough to be `mmap`ed and faulted lazily, so a session holds `min(output produced, capacity)` resident, not `capacity`. Eight idle sessions cost eight small rings. What argues for a larger default is the case § 10 does not name — an ordinary twenty-minute disconnect across a build, which overruns 4 MiB and loses the output the reconnect was for |
 | `daemon::run` taking the spawn lock | `attach` holds it across the whole spawn, so a daemon taking it would block on its own parent until that attach times out. Closed from the attach side instead ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)) |
-| Addressing the run files through a validated directory descriptor | There is no `bindat(2)`, so both sockets must resolve by name whatever the check returns; four files race-free and two not would read as if the race were closed. The check refuses a directory anyone else can write to, which is what makes the path-based calls safe ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)) |
+| Addressing the run files through a validated directory descriptor | There is no `bindat(2)`, so the sockets must resolve by name whatever the check returns ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)) |
 
 ## Client-side, not this repo
 
@@ -184,7 +213,21 @@ server-side contract already fixed here.
 
 - `direct-streamlocal` warm path; the exec relay is the fallback.
 - Bootstrap orchestration: probe, arch selection, upload, negative caching per host.
-- N-1 codec retention and the "never auto-reconnect after `TAKEOVER`" rule.
+- Codec retention and the "never auto-reconnect after `TAKEOVER`" rule. N-1 is stated in
+  [DESIGN.md § 6.4](DESIGN.md#64-versioning), and its safety argument — that the client
+  offers a restart while the session is *still reachable* — assumes the client runs under
+  every release. App stores batch updates in the background, so a user who does not open
+  the app for a month goes from release 5 to release 8 without ever running 6 or 7, and
+  any session created under 5 is unreachable before the window opens. Keying retention to
+  protocol revision instead, and keeping every revision ever shipped, removes the failure
+  rather than bounding it: revisions are append-only integers and a codec is a few hundred
+  lines, which costs an app nothing.
+- Collecting binaries it has uploaded. `install_dir()` is referenced only by `probe`, and
+  nothing in this repository ever unlinks one — so every release leaves another artifact
+  in every user's home on every host they have touched, in a directory
+  [DESIGN.md § 8](DESIGN.md#8-security-model) already expects file-integrity tooling to
+  notice. The client knows the version each session is running, so it has what it needs
+  to remove any `nomux-*` that is neither current nor holding a live session.
 - Emulator reset on `gap`, and the 8-sessions-per-host cap.
 - The child's exit status. It arrives in the `Exit` frame; the relay cannot read it without parsing frames, which is exactly what keeps the relay version-independent ([IMPLEMENTATION.md § 10](IMPLEMENTATION.md#10-exit-codes)).
 - Answering agent channels from the key store, and the per-host opt-in that sets `HELLO_AGENT_FORWARD`. The daemon never enables forwarding on its own.

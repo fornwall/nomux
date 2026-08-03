@@ -35,17 +35,16 @@ const SPAWN_LOCK_GRACE: Duration = Duration::from_secs(2);
 
 /// How long `kill` waits for a live daemon to publish `<id>.pid`.
 ///
-/// The daemon binds its socket — which is what makes it answer as alive — before
-/// it writes the pidfile (§ 6.2), so a `kill` that lands inside that window finds a
+/// The daemon binds its socket — which is what makes it answer as alive — before it
+/// writes the pidfile (§ 6.2), so a `kill` that lands inside that window finds a
 /// session that is unmistakably there and no pid to signal. `attach` holds the spawn
-/// lock until the pidfile exists, which covers most of it — but only most: the file
-/// is created empty and filled a syscall later, and `attach` lets go at the first
-/// half. So the window is reachable from the ordinary spawn as well as from a daemon
-/// somebody started by hand, and both halves of it — no file, and a file with nothing
-/// in it — are waited out here. Waiting turns a spurious failure into the ordinary
-/// answer;
-/// bounded, because a socket that answers with no pidfile behind it may equally be
-/// a daemon that died mid-publish, and this is the escape hatch — it does not hang.
+/// lock only until the path *exists*, which the empty file left by the first half of
+/// publishing already satisfies, so the ordinary spawn reaches that window as well as
+/// a daemon somebody started by hand. Both halves of it — no file, and a file with
+/// nothing in it — are waited out here, which turns a spurious failure into the
+/// ordinary answer. Bounded, because a socket that answers with no pidfile behind it
+/// may equally be a daemon that died mid-publish, and this is the escape hatch — it
+/// does not hang.
 const PUBLISH_GRACE: Duration = Duration::from_secs(2);
 
 /// State of one session as seen from the run directory alone.
@@ -57,20 +56,12 @@ enum Liveness {
     Stale,
 }
 
-/// Prints one line per live session: id, pid and label.
-///
-/// # Errors
-///
-/// Fails if the run directory cannot be read. A missing directory is not an
-/// error — it simply means no session has ever been created.
 /// Turns the § 6.3 run-directory check into "is there one?" rather than an error to
 /// be matched.
 ///
 /// Both modes have to make that check before they trust any name inside the
 /// directory, and both treat its absence as the question already answered: `list`
-/// prints nothing, `kill` finds its postcondition already holding. Written out at
-/// each site it was a five-line `match` per call — and `list` made two of them, for
-/// two different reasons, which left a reader unable to tell which was load-bearing.
+/// prints nothing, `kill` finds its postcondition already holding.
 fn present(checked: io::Result<()>) -> io::Result<bool> {
     match checked {
         Ok(()) => Ok(true),
@@ -79,6 +70,12 @@ fn present(checked: io::Result<()>) -> io::Result<bool> {
     }
 }
 
+/// Prints one line per live session: id, pid and label.
+///
+/// # Errors
+///
+/// Fails if the run directory cannot be read. A missing directory is not an
+/// error — it simply means no session has ever been created.
 pub(crate) fn list() -> io::Result<()> {
     let dir = run_dir()?;
     // The same check every other path makes before it trusts this directory
@@ -107,6 +104,8 @@ pub(crate) fn list() -> io::Result<()> {
         .filter_map(|entry| session_id_of(&entry.path()))
         .collect();
     ids.sort_unstable();
+    // One entry per session, not per file: five names lead to the same id.
+    ids.dedup();
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -236,12 +235,9 @@ enum Target {
 /// kill` ends up terminating an unrelated process of the user's. The socket is the
 /// authority on whether the daemon is still there.
 ///
-/// The other direction is the one that had to be repaired: a socket that answers
-/// and a pid that cannot be read is an **error**, never a "no such session". The
-/// version this supersedes unlinked all five files there and exited 0, which took
-/// the socket away from a daemon still holding the user's shell — the session then
-/// answered nothing, appeared in no listing, and the next attach bound a second
-/// daemon over the same id. There is exactly one benign reason for that state,
+/// The other direction is § 6.6's rule that a live session's files are never
+/// unlinked: a socket that answers and a pid that cannot be read is an **error**,
+/// never a "no such session". There is exactly one benign reason for that state,
 /// which is the daemon's own bind-to-publish window, so a *missing* pidfile is
 /// waited out for [`PUBLISH_GRACE`] and anything else — a mode that hides it, a
 /// body that is not a pid — is reported at once, since waiting cannot change it.
@@ -262,15 +258,11 @@ fn resolve(paths: &SessionPaths) -> io::Result<Target> {
                     .map(Target::Daemon)
                     .ok_or_else(|| unreadable(paths, &format!("it holds {body:?}")));
             }
-            // Present but empty is the same window one syscall later, and is
-            // therefore waited out rather than reported. `SessionPaths::write_pid`
-            // publishes in
-            // two steps — `File::create`, which leaves a zero-length file, then the
-            // `writeln!` that fills it — so a reader can land between them. Nor is
-            // this only the hand-started case: `attach` releases the spawn lock as
-            // soon as the path *exists*, which the empty file already satisfies, so
-            // the ordinary spawn reaches it too. Reported as an error it refused to
-            // kill a session that was in perfect health and about to finish starting.
+            // Present but empty is the same window one syscall later, and is therefore
+            // waited out rather than reported: `SessionPaths::write_pid` publishes in
+            // two steps — a `File::create` that leaves a zero-length file, then the
+            // `writeln!` that fills it — so a reader can land between them. Reported
+            // as an error it refused to kill a session in perfect health.
             Ok(_) => "it was created but never written",
             Err(err) if err.kind() == io::ErrorKind::NotFound => "it never appeared",
             Err(err) => return Err(unreadable(paths, &err.to_string())),
@@ -301,23 +293,19 @@ fn unreadable(paths: &SessionPaths, problem: &str) -> io::Error {
 
 /// Removes a dead session's files, or leaves them to whoever comes next.
 ///
-/// The probe that got us here is a hint rather than a verdict. `<id>.lock` is the
-/// mutex an attach holds across creating a session (§ 6.3) and is itself one of
-/// the files removed below, so an entry that looked stale a moment ago may be one
-/// an attach is in the middle of bringing up — and taking that mutex out from
-/// under it is how two attaches end up each holding a lock of their own. So
-/// collection takes the same lock, and gives up rather than waits: a session
-/// somebody is starting is not garbage, `list` is a snapshot either way, and the
-/// entry is collectable for as long as it stays dead.
+/// The probe that got us here is a hint rather than a verdict, so collection takes
+/// `<id>.lock` and decides liveness again under it — the only place the answer cannot
+/// change between being read and being acted on (§ 6.6). It gives up rather than
+/// waits, because that lock is also the mutex an attach holds across creating a
+/// session (§ 6.3) and is itself one of the files removed below: taking it out from
+/// under an attach is how two of them end up each holding a lock of their own, and
+/// the entry stays collectable for as long as it stays dead.
 ///
-/// Liveness is then decided again under the lock, which is the only place the
-/// answer cannot change between being read and being acted on.
-///
-/// `None` from [`SessionPaths::try_lock_spawn`] means that and nothing else —
-/// somebody holds it. A host that cannot lock at all hands back a claim anyway and
-/// collection goes ahead, which is the point: an entry that stopped being
-/// collectable because of the mutex protecting it would be a garbage collector that
-/// leaks under exactly the conditions it exists for.
+/// `None` from [`SessionPaths::try_lock_spawn`] means somebody holds it and nothing
+/// else. A host that cannot lock at all hands back a claim anyway and collection goes
+/// ahead, per § 6.3: an entry that stopped being collectable because of the mutex
+/// protecting it would be a garbage collector that leaks under exactly the conditions
+/// it exists for.
 fn collect(paths: &SessionPaths) {
     let Some(lock) = paths.try_lock_spawn() else {
         return;
@@ -327,9 +315,23 @@ fn collect(paths: &SessionPaths) {
     }
 }
 
-/// Extracts a session id from a `*.sock` path, ignoring anything else.
+/// Extracts a session id from any of the five run-file names (§ 6.6).
+///
+/// Every name, not just `<id>.sock`: the socket is the first file
+/// [`SessionPaths::unlink_all_locked`] removes, so a collection interrupted partway
+/// through leaves the other four behind — and keying discovery on the socket alone
+/// makes exactly that wreckage invisible. It would never be listed, so its id could
+/// never be learned, so the `kill` that would clear it could never be typed. Under
+/// the `$XDG_STATE_HOME` fallback, which exists so sessions outlive a logout, the
+/// litter outlives it too.
+///
+/// A live session contributes several names and is folded back to one entry by the
+/// `dedup` in [`list`]. What decides a session's fate is still the probe under the
+/// spawn lock in [`collect`], never the name that led us to it.
 fn session_id_of(path: &Path) -> Option<String> {
-    if path.extension()? != "sock" {
+    const EXTENSIONS: [&str; 5] = ["sock", "pid", "lock", "label", "agent"];
+    let extension = path.extension()?.to_str()?;
+    if !EXTENSIONS.contains(&extension) {
         return None;
     }
     Some(path.file_stem()?.to_str()?.to_owned())

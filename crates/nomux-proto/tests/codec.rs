@@ -11,14 +11,16 @@
 //! This is the fuzzing story for the parser, run on stable as part of the normal
 //! suite rather than as a `cargo-fuzz` target: the input space that matters is a
 //! 4-byte header and a length-prefixed payload, which proptest reaches by
-//! construction. A nightly `cargo-fuzz` target would buy coverage-guided search
-//! over longer inputs and remains worth adding, but nothing here depends on it.
+//! construction.
 
 use nomux_proto::{
     ErrorCode, ExitKind, Frame, FrameType, HEADER_LEN, HELLO_AGENT_FORWARD, HELLO_REPAINT_CTRL_L,
     Hello, HelloOk, Linger, MAX_PAYLOAD, ProtoError, WinSize, decode_header,
 };
 use proptest::prelude::*;
+use proptest::strategy::ValueTree;
+use proptest::test_runner::TestRunner;
+use std::collections::HashSet;
 
 /// Cap on generated `data` and `term` lengths.
 ///
@@ -35,8 +37,7 @@ const MAX_GENERATED_LEN: usize = 24;
 /// them — `Hello.term`, `Input.data`, `Output.data`, `Error.message` and
 /// `AgentData.data`: the frame travels with an empty placeholder in the borrowed
 /// field and [`OwnedFrame::frame`] hands back a copy pointing at the owned value
-/// instead. A mirror enum would restate those five variants the compiler already
-/// knows about, and would need a sixth the day a frame grows a borrowed field.
+/// instead.
 #[derive(Debug, Clone)]
 struct OwnedFrame {
     /// The frame, with a placeholder wherever it borrows.
@@ -142,8 +143,8 @@ fn any_hello_flags() -> impl Strategy<Value = u16> {
 fn any_frame() -> impl Strategy<Value = OwnedFrame> {
     // Driven from the `ALL` the discriminant lists generate, not from a hand-written
     // list of `Just`s: a value missing from such a list is simply never generated,
-    // and nothing says so — the same hole on the generating side that `from_byte`
-    // ending in `_ => None` used to leave on the parsing side.
+    // and nothing says so. The arms below are the one hand-written list left, which
+    // is why [`every_frame_type_is_generated`] checks them against `FrameType::ALL`.
     let linger = prop::sample::select(Linger::ALL.to_vec());
     let error_code = prop::sample::select(ErrorCode::ALL.to_vec());
     let exit_kind = prop::sample::select(ExitKind::ALL.to_vec());
@@ -260,6 +261,33 @@ fn encode_and_split(frame: Frame<'_>) -> Result<Vec<u8>, TestCaseError> {
     Ok(payload)
 }
 
+/// [`any_frame`] generates every frame type.
+///
+/// Its `prop_oneof!` arms are the one list in this file still written out by hand,
+/// and a variant missing from them is simply never round-tripped — the hole
+/// [`FrameType::ALL`] closes one level up, reopened here. The sweeps below take
+/// arbitrary payloads to every type and so would still reach a new variant's
+/// decoder, but never its field domain, which is what [`every_frame_round_trips`]
+/// is for.
+///
+/// Deterministic rather than a `proptest!` case, because this asserts coverage of
+/// the generator rather than a property of the codec, and a coverage check that
+/// passes by luck is worse than none.
+#[test]
+fn every_frame_type_is_generated() {
+    let mut runner = TestRunner::deterministic();
+    let strategy = any_frame();
+    let mut seen = HashSet::new();
+    for _ in 0..4096 {
+        let owned = strategy.new_tree(&mut runner).unwrap().current();
+        seen.insert(owned.frame().frame_type());
+    }
+
+    for ty in FrameType::ALL {
+        assert!(seen.contains(&ty), "any_frame never generates {ty:?}");
+    }
+}
+
 /// Offers `payload` to every frame type and checks the invariant that must hold
 /// for bytes from a hostile peer: not panicking, and — when the bytes are accepted
 /// — being the *only* encoding of what they decoded to.
@@ -271,7 +299,7 @@ fn decode_as_every_type(payload: &[u8]) -> Result<(), TestCaseError> {
     // Every type rather than a sampled few: a decode apiece is far cheaper than the
     // shrinking proptest would otherwise need to find the one type that mishandles a
     // given payload. [`FrameType::ALL`] is generated from the discriminant list, so a
-    // new frame type joins this sweep without anyone having to remember it.
+    // new frame type joins this sweep by itself.
     for ty in FrameType::ALL {
         let Ok(frame) = Frame::decode(ty, payload) else {
             continue;
@@ -295,8 +323,8 @@ fn decode_as_every_type(payload: &[u8]) -> Result<(), TestCaseError> {
 proptest! {
     // Eight times proptest's default. The codec is a few hundred branches over
     // buffers this suite keeps tiny, so the whole file still runs in well under a
-    // second — and a rejection sampler looking for, say, a valid `ErrorCode` in two
-    // random bytes needs the cases far more than it needs the time back.
+    // second, and a rejection sampler looking for a valid `ErrorCode` in two random
+    // bytes needs the cases far more than it needs the time back.
     #![proptest_config(ProptestConfig { cases: 2048, ..ProptestConfig::default() })]
 
     /// Encoding then decoding is the identity, for every variant over its whole

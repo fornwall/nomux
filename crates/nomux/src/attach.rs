@@ -7,12 +7,12 @@
 
 use std::collections::VecDeque;
 use std::env;
-use std::io::{self, Write};
+use std::io;
 use std::net::Shutdown;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
+use std::process::{ChildStderr, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use rustix::event::PollFlags;
@@ -87,7 +87,7 @@ fn connect_or_spawn(paths: &SessionPaths, label: Option<&str>) -> io::Result<Uni
         Err(err) => return Err(err),
     }
 
-    spawn_daemon(paths.id(), label)?;
+    let complaint = spawn_daemon(paths.id(), label)?;
 
     let deadline = Instant::now() + SPAWN_TIMEOUT;
     loop {
@@ -98,9 +98,13 @@ fn connect_or_spawn(paths: &SessionPaths, label: Option<&str>) -> io::Result<Uni
             }
             Err(err) if is_absent(&err) => {
                 if Instant::now() >= deadline {
+                    let id = paths.id();
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
-                        format!("daemon for session {} did not start", paths.id()),
+                        daemon_complaint(complaint).map_or_else(
+                            || format!("daemon for session {id} did not start"),
+                            |said| format!("daemon for session {id} did not start: {said}"),
+                        ),
                     ));
                 }
                 std::thread::sleep(SPAWN_POLL_INTERVAL);
@@ -118,9 +122,7 @@ fn connect_or_spawn(paths: &SessionPaths, label: Option<&str>) -> io::Result<Uni
 /// that succeeds says the id is claimed — not that anything on disk says so yet.
 /// Returning here the instant it succeeded would drop the lock inside that window,
 /// and "the lock is free" would not imply "the id is unclaimed": a `kill` taking it
-/// there finds a live daemon and no pid, and the version of `kill` that answered
-/// that by unlinking all five files left a daemon holding the user's shell with no
-/// socket to reach it by, and the id free for a second daemon to bind.
+/// there finds a live daemon and no pid, which § 6.6 forbids it to unlink over.
 ///
 /// Bounded by the caller's own deadline and never fatal. The pidfile belongs to
 /// `kill`, not to the relay, so a daemon that never writes one still gets its
@@ -143,15 +145,11 @@ fn is_absent(err: &io::Error) -> bool {
 
 /// Starts the daemon detached from this process's session.
 ///
-/// Both halves of that are the daemon's own job as of `IMPLEMENTATION.md` § 6.2,
-/// and both are still done here, because the daemon cannot do either of them soon
-/// enough. Between this `exec` and its own `setsid` there is a window where a
-/// hangup would take the session with it; and until it redirects its own stdio it
-/// holds *this relay's* descriptors, so anything it writes — a session that already
-/// exists, a backtrace — lands in the middle of the client's frame stream. Both
-/// windows close before the daemon exists, and cost it nothing: it finds itself
-/// already a session leader and does nothing more.
-fn spawn_daemon(session_id: &str, label: Option<&str>) -> io::Result<()> {
+/// Both halves — `setsid` and `/dev/null` stdio — are the daemon's own job as of
+/// `IMPLEMENTATION.md` § 6.2, and both are still done here because it cannot reach
+/// either soon enough; that section has the two windows this closes. They cost it
+/// nothing: it finds itself already a session leader and does nothing more.
+fn spawn_daemon(session_id: &str, label: Option<&str>) -> io::Result<Option<ChildStderr>> {
     let exe = env::current_exe()?;
     let mut command = Command::new(exe);
     command
@@ -159,7 +157,13 @@ fn spawn_daemon(session_id: &str, label: Option<&str>) -> io::Result<()> {
         .arg(session_id)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        // A pipe rather than `/dev/null`, which is the only reason a failure to start
+        // has a reason attached to it. The daemon writes its diagnostics to stderr up
+        // until `release_startup_state` points the descriptor at `/dev/null` — so
+        // everything that can go wrong before a session exists arrives here, and the
+        // pipe reaching end of file is itself the daemon reporting it got past that
+        // point. Afterwards it has syslog and this end has nothing left to read.
+        .stderr(Stdio::piped());
     if let Some(label) = label {
         // As two arguments, never `--label=<text>`: the label is free-form text
         // from a tab title and this way nothing has to be escaped.
@@ -174,7 +178,26 @@ fn spawn_daemon(session_id: &str, label: Option<&str>) -> io::Result<()> {
             Ok(())
         });
     }
-    command.spawn().map(drop)
+    command.spawn().map(|mut child| child.stderr.take())
+}
+
+/// Whatever the daemon managed to say before it stopped saying anything.
+///
+/// Read without waiting. This is only ever called once the daemon has already missed
+/// its deadline, and one that is wedged with its stderr still open must not take the
+/// relay down with it — a blocking read here would turn a five-second timeout into a
+/// hang. Anything it did write is sitting in the pipe by now.
+fn daemon_complaint(stderr: Option<ChildStderr>) -> Option<String> {
+    let stderr = stderr?;
+    let fd = stderr.as_fd();
+    rustix::fs::fcntl_setfl(fd, rustix::fs::OFlags::NONBLOCK).ok()?;
+    let mut buf = [0u8; 512];
+    let read = rustix::io::read(fd, &mut buf).ok()?;
+    let text = String::from_utf8_lossy(buf.get(..read)?).into_owned();
+    let line = text.lines().find(|line| !line.trim().is_empty())?.trim();
+    // The daemon reached this through `main`'s reporter, which prefixes the binary's
+    // own name. Keeping it would render as `nomux: ... : nomux: ...`.
+    Some(line.strip_prefix("nomux: ").unwrap_or(line).to_owned())
 }
 
 /// Moves bytes between stdio and the socket until either side closes.
@@ -196,10 +219,9 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
     let mut to_stdout = Pump::default();
     let mut stdin_open = true;
     let mut socket_open = true;
-    // The third of the three, and the only one about a *destination*. The relay
-    // exists to put the session's output somewhere; once that somewhere has no
-    // reader left, there is nothing for it to go on doing, so it ends the loop the
-    // way the two above do rather than carrying on with nowhere to deliver.
+    // The third of the three, and the only one about a *destination*: the relay
+    // exists to put the session's output somewhere, so once that somewhere has no
+    // reader left it ends the loop the way the two above do.
     let mut stdout_open = true;
 
     while stdout_open && (socket_open || to_stdout.has_data()) {
@@ -208,10 +230,6 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
         if want_stdin {
             fds.push(rustix::event::PollFd::new(&stdin_fd, PollFlags::IN));
         }
-        // Built up the way `daemon::watches` builds the same mask, rather than
-        // through a helper enumerating four combinations of two booleans: one
-        // spelling for one idea, and the conditions stay next to the flag each one
-        // asks for.
         let mut socket_flags = PollFlags::empty();
         if socket_open && to_stdout.wants_source() {
             socket_flags |= PollFlags::IN;
@@ -237,13 +255,10 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
             Err(rustix::io::Errno::INTR) => continue,
             Err(err) => return Err(err.into()),
         }
-        // Read back by position, which `daemon::watches` deliberately does not do —
-        // it tags each entry, because a poll set whose size depends on how many agent
-        // channels are live is one an index slip silently misreads. Safe here for the
-        // reason that does not hold there: the set is three fixed entries, and the
-        // same three conditions that decided whether each was pushed are reused
-        // below rather than recomputed, so a `Pump` that changed state during the
-        // `poll` cannot shift the mapping under it.
+        // Read back by position, which `daemon::watches` deliberately does not do:
+        // its set is variable-length. Safe here because the three conditions that
+        // decided whether each entry was pushed are reused below rather than
+        // recomputed, so a `Pump` that changed state during `poll` cannot shift it.
         let mut events = fds.iter().map(rustix::event::PollFd::revents);
         let mut revents = |registered: bool| {
             if registered {
@@ -258,8 +273,7 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
 
         // `ERR` alongside `HUP`, as the socket direction below and
         // `daemon::poll_once` both have it: a source reporting only `ERR` would
-        // otherwise never be read and never be closed, and stdin stays in the poll
-        // set, so the relay would spin on it exactly as stdout used to.
+        // otherwise never be read, never be closed, and spin in the poll set.
         if stdin_events.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
             && !to_socket.transfer(stdin_fd, sock_fd)?
         {
@@ -275,41 +289,49 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
         }
         // Deliberately not read back into an ending. An `EPIPE` towards the socket
         // is a client that has gone, and the relay already ends on that: the same
-        // departure arrives as EOF from the socket's *read* side above, where
-        // `socket_open` is cleared. Anything still queued for it is dropped there
-        // and then, which is all that is owed to a peer that has stopped listening.
+        // departure arrives as EOF from the socket's *read* side above.
+        //
+        // Speculative on a non-empty buffer as well as on `POLLOUT`, which stdout
+        // below deliberately is not: this descriptor was switched to non-blocking at
+        // the top, so an optimistic write here either saves a wakeup or costs one
+        // `EAGAIN`.
         if socket_events.contains(PollFlags::OUT) || to_socket.has_data() {
             let _client_still_reading = to_socket.drain_to(sock_fd)?;
         }
-        // Before the drain, and one of the two ways the same fact arrives.
-        // `POLLOUT` is the only thing that clears `Pump::dest_full`, and a
-        // destination whose reader has gone never reports it — a full pipe with no
-        // reader is not writable, it is broken. So the relay would poll a
-        // descriptor that answers `ERR` forever, match neither this condition nor
-        // the one below (the buffer is empty: `splice` moved those bytes inside the
-        // kernel), change nothing, and come straight back round — a busy loop at
-        // the speed of the scheduler, for as long as the socket stayed open.
+        // One of the two ways a dead stdout arrives. `POLLOUT` is the only thing
+        // that clears `Pump::dest_full`, and a destination whose reader has gone
+        // never reports it — a full pipe with no reader is not writable, it is
+        // broken — so without this the relay would poll a descriptor that answers
+        // `ERR` forever and never act on it.
         if stdout_events.intersects(PollFlags::ERR | PollFlags::HUP) {
             stdout_open = false;
-        } else if stdout_events.contains(PollFlags::OUT) || to_stdout.has_data() {
-            // The other way, and the only one available while this direction is
-            // idle: an empty buffer wants nothing from `poll`, so stdout is not in
-            // the set and `ERR` above is never delivered. A reader that dies then
-            // is discovered by writing to it and by nothing else — which is why an
-            // `EPIPE` here has to be the ending rather than a cleared buffer.
-            // Swallowing it left the relay reading the socket into a buffer it
-            // emptied over a dead pipe, for as long as the session went on
-            // producing output, while holding the session's one client slot.
+        } else if stdout_events.contains(PollFlags::OUT) {
+            // On `POLLOUT` alone, and never speculatively on a non-empty buffer the
+            // way the socket above is drained. Stdout is left in the blocking mode it
+            // was inherited in, and cannot safely be taken out of it: it may be a
+            // terminal whose open file description the user's shell shares, where
+            // `O_NONBLOCK` is not this process's to set. A write it is not ready for
+            // therefore parks the whole relay inside the kernel with the other
+            // direction unserved — exactly what the socket was switched over to
+            // avoid. Nothing is lost by waiting, because a non-empty buffer is what
+            // puts stdout in the poll set asking for `POLLOUT` in the first place, so
+            // the wait is one wakeup and never a byte.
+            //
+            // `EPIPE` from that write is still an ending rather than a cleared
+            // buffer, and is the other of the two ways. A unix socket whose peer has
+            // stopped reading reports itself writable and then refuses the write, so
+            // for that shape of destination this is the only place the death can be
+            // discovered: `ERR` above is what a pipe gives, and this is what a socket
+            // gives.
             stdout_open = to_stdout.drain_to(stdout_fd)?;
         }
     }
 
-    // The loop can exit still owing the last batch — the socket reaches EOF with
-    // the buffer non-empty — but only a destination that is still there is owed
-    // anything.
-    if stdout_open && to_stdout.drain_to(stdout_fd)? {
-        stdout.lock().flush()?;
-    }
+    // Nothing is owed here. Every exit from the loop leaves `to_stdout` empty
+    // whenever stdout is still open: the `while` condition keeps going round while
+    // it has data, and the `fds.is_empty()` break needs `wants_dest()` to be false,
+    // which is that same emptiness. The last batch is handed over inside the loop,
+    // on the `POLLOUT` that a non-empty buffer is what asks for.
     Ok(())
 }
 
@@ -344,13 +366,10 @@ enum Spliced {
 /// Moves up to [`SPLICE_CHUNK`] bytes from `src` to `dst` without them ever
 /// entering this process.
 ///
-/// `splice` demands that one end be a pipe, and whether that holds is a property
-/// of the host rather than of this code: under sshd our stdio is a pipe on some
-/// builds and a socketpair on others, while the peer is always a unix socket. So
-/// it is discovered by trying, and every failure that is not "try again" collapses
-/// into [`Spliced::Unusable`]. Deliberately blunt: the copying path below handles
-/// every case correctly anyway, so there is nothing to be won by telling `EINVAL`
-/// from `ENOSYS` from a socket that just died.
+/// Whether `splice` works for a pair is a property of the host rather than of this
+/// code (`IMPLEMENTATION.md` § 7), so it is discovered by trying: every failure that
+/// is not "try again" collapses into [`Spliced::Unusable`]. Deliberately blunt,
+/// because the copying path below handles all of them correctly anyway.
 fn splice_once(src: BorrowedFd<'_>, dst: BorrowedFd<'_>) -> Spliced {
     let flags = SpliceFlags::MOVE | SpliceFlags::NONBLOCK;
     loop {
@@ -367,11 +386,9 @@ fn splice_once(src: BorrowedFd<'_>, dst: BorrowedFd<'_>) -> Spliced {
 
 /// One direction of the relay.
 ///
-/// Two paths through the single component that must never break, which is worth
-/// being uneasy about — so they are kept from ever interleaving: `splice` is
-/// attempted only when the buffer is empty, and a `splice` never leaves anything
-/// behind in it. Bytes therefore leave in the order they arrived under either
-/// path, and the choice between them cannot reorder anything.
+/// The two paths through it are kept from ever interleaving (`IMPLEMENTATION.md`
+/// § 7): `splice` is attempted only when the buffer is empty, and a `splice` never
+/// leaves anything behind in it, so the choice between them cannot reorder bytes.
 #[derive(Debug, Default)]
 struct Pump {
     /// Bytes the destination would not take yet. Only ever filled by the copying
@@ -380,11 +397,6 @@ struct Pump {
     /// Set for good the first time `splice` refuses this pair. Never reconsidered:
     /// the reason it refuses — neither end is a pipe — cannot change while the
     /// relay runs, and retrying would buy a wasted syscall per wakeup forever.
-    ///
-    /// Named for the refusal rather than for the capability so that the default is
-    /// the optimistic one, which is the behaviour wanted: one refused syscall is
-    /// the entire cost of finding out whether this host can splice, and it is paid
-    /// once per direction.
     splice_refused: bool,
     /// `splice` reported the destination full. Distinct from a non-empty buffer in
     /// that nothing is held here; it only records that the source must be left
@@ -396,14 +408,6 @@ struct Pump {
 impl Pump {
     /// Whether the source is worth polling: only with the destination caught up,
     /// so nothing can overtake bytes that are already owed to it.
-    ///
-    /// Written as the negation rather than as `!has_data && !dest_full`, which is
-    /// the same predicate by De Morgan and says nothing about being the same. The
-    /// two are exclusive and exhaustive, which is exactly what the type's own doc
-    /// claims — `splice` is attempted only when the buffer is empty, so the choice
-    /// between the two directions cannot reorder anything — and stating it this way
-    /// makes it a fact about the code rather than a coincidence each reader has to
-    /// re-derive.
     fn wants_source(&self) -> bool {
         !self.wants_dest()
     }
@@ -439,25 +443,22 @@ impl Pump {
     /// Hands the destination whatever is owed it, and forgets that it was full.
     /// `false` means the destination has stopped reading.
     ///
-    /// Called on `POLLOUT`, and also speculatively whenever something is buffered —
-    /// an optimistic write that either saves a wakeup or costs one `EAGAIN`.
-    /// Clearing [`Pump::dest_full`] is sound either way: it only ever gates
-    /// re-reading the source, and the write below is what establishes whether the
-    /// destination has room.
+    /// Called on `POLLOUT`, and towards the socket also speculatively whenever
+    /// something is buffered — which is safe only there, because only that
+    /// descriptor is non-blocking. Clearing [`Pump::dest_full`] is sound either way:
+    /// it only ever gates re-reading the source, and the write below is what
+    /// establishes whether the destination has room.
     fn drain_to(&mut self, fd: BorrowedFd<'_>) -> io::Result<bool> {
         self.dest_full = false;
         match crate::nbio::drain_to(&mut self.buf, fd) {
             // `EPIPE` is `nbio`'s to report and each caller's to interpret: to an
             // agent channel it is a dead socket, and here it is the destination's
-            // reader having gone, which is an ordinary ending rather than a
-            // failure — so what was owed it is dropped and the answer comes back as
-            // `false` rather than as an error nobody could act on.
-            //
-            // Which direction that ends is `relay`'s to say and not this method's,
-            // because the two do not agree: towards the socket it is a client that
-            // has left, which the socket's own read side reports again as EOF, and
-            // towards stdout it is the relay's entire purpose gone. Both arrive
-            // here identically, and only one of them stops the loop.
+            // reader having gone — an ordinary ending rather than a failure, so what
+            // was owed it is dropped and the answer comes back as `false`. Which
+            // direction that ends is `relay`'s to say and not this method's: towards
+            // the socket it is a client that has left, which the socket's own read
+            // side reports again as EOF, and towards stdout it is the relay's entire
+            // purpose gone. Both arrive here identically, and only one stops the loop.
             Err(rustix::io::Errno::PIPE) => {
                 self.buf.clear();
                 Ok(false)
