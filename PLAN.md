@@ -126,10 +126,21 @@ than by guessing, and is recorded with what it was measured against.
   and a bind mount, a symlinked `XDG_RUNTIME_DIR` or a file repaired by hand all reach
   it. The argument in § 6.3 for refusing early — that refusing at the `bind` would
   leave a `<id>.lock` behind from the command whose job is to collect it — is one-sided
-  while the alternative leaves everything already there for good. What closes it is
-  `list` reporting an id it cannot build paths for instead of skipping it, and `kill`
-  collecting by name in the case where no socket address can be formed, which is
-  exactly the case where there is no live session to protect.
+  while the alternative leaves everything already there for good.
+
+  The `list` half closes cheaply: report the id it cannot build paths for instead of
+  skipping it, since reporting is not collecting and puts nothing at risk. The `kill`
+  half has no such answer, and the obvious one is a trap. "No socket address can be
+  formed" is not "no live session": it is "liveness cannot be *probed*", and two names
+  for one run directory separate them. With a symlink at a 6-byte path pointing at a
+  47-byte one, a session created through the short name — `attach` exits 0, `list`
+  through that name shows it, `<id>.sock` is one inode under both names — is a session
+  whose `connect` through the long name cannot even be attempted. A `kill` that
+  collected by name there would unlink the socket, pidfile and lock of a daemon still
+  holding the user's shell, which is the one thing § 6.6 promises never happens. So
+  whatever closes this half has to establish liveness some other way — the id is
+  reachable by a shorter path, and finding it is the work — or leave `kill` refusing
+  and say so.
 
 ## P2 — structure
 
@@ -204,13 +215,15 @@ than by guessing, and is recorded with what it was measured against.
   [IMPLEMENTATION.md § 6.6](IMPLEMENTATION.md#66-frozen-control-surface) now promises
   the five existing names, their permissions and the pidfile format rather than the
   layout as a whole, and says what growth costs. The code half is untouched.
-  `SessionPaths::removal_order` is five paths and `control::session_id_of` matches five
-  extensions, so a `kill` older than a name neither discovers a session by it nor
-  removes it — one file per collected session, for as long as the two versions share a
-  host, which is what `<id>.agent` would have cost had it arrived after a release.
-  Removing and discovering `<id>.*` instead covers every future name at once, and the
-  window for it is closing rather than open: cheap while five names are all there have
-  ever been, impossible once a binary in the wild depends on the enumeration.
+  `SessionPaths::removal_order` is five paths and `control::session_id_of` — whose one
+  caller is `list` — matches five extensions, so a *binary* older than a name neither
+  discovers a session by it nor removes it: one file per collected session for as long
+  as the two versions share a host, and an id that is invisible for good where that
+  file is the last one left. It is what `<id>.agent` would have cost had it arrived
+  after a release. Removing and discovering `<id>.*` instead covers every future name
+  at once, and the window for it is closing rather than open: cheap while five names
+  are all there have ever been, impossible once a binary in the wild depends on the
+  enumeration.
 
 ## P3 — release process
 

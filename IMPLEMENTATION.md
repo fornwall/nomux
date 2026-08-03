@@ -495,10 +495,12 @@ What the fork costs is the socket's account of who owns it. `SO_PEERCRED` on a
 listening socket is stamped at `listen(2)`, from the process performing it, so from
 the fork until the survivor listens for itself the credentials §6.6 reads off a
 connection are the parent's — and that is a number the kernel is free to reissue the
-moment the parent `_exit`s. So the survivor listens again on the descriptor it
-inherited, which re-stamps it; both halves of that were measured on this kernel, that
-the stamp moves and that a connection queued in between survives the call. Restating
-the backlog is part of the same call and is §6.3's. A failure is discarded rather than
+moment the parent `_exit`s. So the survivor calls `listen` again on the descriptor it
+inherited — which works, and that is the non-obvious part: `unix_listen` accepts a
+socket already in `TCP_LISTEN` rather than refusing it, and re-runs `init_peercred` on
+it. Both halves of that were measured on this kernel, that the stamp moves to the
+caller and that a connection queued in between survives the call. Restating the
+backlog is part of the same call and is §6.3's. A failure is discarded rather than
 propagated: it leaves the socket named after the half that left, which costs §6.6 one
 of its two witnesses and leaves it the pidfile — not a reason to refuse a session that
 is otherwise ready to serve.
@@ -687,12 +689,12 @@ loser blocks there, then finds the socket the winner bound and connects to it. O
 a process that spawns its own daemon polls, and only for its own. A stale socket is one where `connect`
 returns `ECONNREFUSED` — unlink and respawn. `EACCES` is not staleness.
 
-The daemon takes that same lock on its own account, and never blocks for it.
-Everything between its bind and its pidfile decides on the evidence `list` and `kill`
-decide on — a refused `connect` means a dead daemon whose socket and pidfile are
-removed, which is exactly what a collection does one `connect` earlier — so without it
-a sweep that probed a stale socket and was then descheduled unlinks what this daemon
-has bound in the meantime. `attach` never reached that state, because it holds this
+The daemon takes that same lock on its own account, and never blocks for it. It takes
+it *before* it probes for a stale socket, because everything from that probe to its
+pidfile decides on the evidence `list` and `kill` decide on — a refused `connect`
+means a dead daemon whose socket and pidfile are removed, which is exactly what a
+collection does one `connect` earlier — so without it a sweep that probed a stale
+socket and was then descheduled unlinks what this daemon has bound in the meantime. `attach` never reached that state, because it holds this
 lock across the whole spawn; a `nomux daemon <id>` started by hand, which §6.2 is
 written for, held nothing. It is a `try_lock` rather than a wait because on the
 ordinary path the holder *is* the attach that spawned this process, and waiting would
@@ -848,18 +850,21 @@ neither is taken on trust. The group `SIGKILL` is conditional where the walk's i
 and the reason is that the two conditions come apart: the case this whole path exists
 for, a backgrounded job in a process group of its own, outlives the grace while the
 *child's* group has already gone, so the walk still has a member to signal exactly
-where a group `SIGKILL` would be aimed at a pgid nothing holds. The probe that decides
-it is taken again after the grace rather than carried across it, because the `waitpid`
-inside the grace is what reaps the child, and reaping is what frees its number.
+where a group `SIGKILL` would be aimed at a pgid nothing holds. That probe runs once
+before the hangup and again on every pass of the grace, and the value the kill reads
+is the last one it took — so nothing is signalled at a group this has already watched
+go, and no fresh probe is taken afterwards to unsay it.
 
-What that probe cannot ask is whether what it found is *ours*: `kill(-pgid, 0)`
-answers for whoever holds the number now, and the daemon reaps the child on every
-pass, so from the reaping onwards that number is the kernel's to hand out again. That
-is the second guard's question, and the two are one guard in two halves: the probe
-says something is there, the start time says the number is still the child's. Field 22
-of `/proc/<pid>/stat` is that start time, read when the child is spawned and compared
-again before the hangup and before the kill; a change skips **both** reaches, since
-pids are reissued and start times are not reissued with them. A *missing*
+What the probe cannot ask is whether what it found is *ours*: `kill(-pgid, 0)` answers
+for whoever holds the number now, and the daemon reaps the child on every pass, so
+from the reaping onwards that number is the kernel's to hand out again. That is the
+second guard's question, and the two are one guard in two halves — the probe says
+something is there, the start time says the number is still the child's. Field 22 of
+`/proc/<pid>/stat` is that start time, read when the child is spawned, and it is the
+one asked **twice**: before the hangup and again before the kill, because the grace is
+what can change the answer, its `waitpid` being what reaps the child and reaping being
+what frees the number. A change skips both reaches, since pids are reissued and start
+times are not reissued with them. A *missing*
 `/proc/<pid>` is deliberately not a reissue, and that is the case the guard turns on
 rather than an oversight: no task holds the number, so it cannot have been given away,
 and the kernel keeps a pid reserved for as long as anything still names it as a session
@@ -971,12 +976,14 @@ is not sealed against *growth* — it was four names until `<id>.agent` arrived 
 promise is stated over the existing five rather than over the layout as a whole because
 that is the part anything can be built against.
 
-Growth is not free, and the bill goes to whoever is older. Collection removes an
-enumerated list, so a `kill` that predates a name collects the four it knows and leaves
-the fifth: one file per collected session, for as long as the two versions share a
-host. A sixth name would do the same again, and collecting `<id>.*` instead is what
-would close it — cheap now, impossible once a binary in the wild depends on the
-enumeration.
+Growth is not free, and the bill goes to whoever is older. Both discovery and
+collection name the extensions they know: a binary that predates a name collects the
+four it knows and leaves the fifth — one file per collected session, for as long as
+the two versions share a host — and its `list`, scanning a directory whose only
+remaining name is the one it has never heard of, never learns that id at all, so the
+`kill` that would clear it can never be typed. A sixth name would do both again, and
+matching `<id>.*` in each place is what would close it — cheap now, impossible once a
+binary in the wild depends on the enumeration.
 
 Corollary: a *new* binary can reap an *old* daemon, so recovery does not depend on
 the old binary still being present on the host.
