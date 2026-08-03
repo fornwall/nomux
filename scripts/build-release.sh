@@ -394,6 +394,10 @@ if [ "$update_baseline" = 1 ]; then
 # \`nightly\` floats: two builds a day apart can both call themselves that and disagree
 # about every figure below. These are toolchain-dependent — a compiler bump moves them
 # all — so a refresh belongs in the commit that moved the bytes, and nowhere else.
+#
+# Which is also why the toolchain is pinned in \`scripts/nightly-version\` rather than
+# named at each site: that file and this one move together, and a commit that changes
+# one without the other is the mistake both exist to make visible.
 EOF
             printf '%s' "$measured"
         } > "$baseline_file"

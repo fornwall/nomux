@@ -5,8 +5,8 @@
 # accepting a size change is a commit someone signs rather than a number nobody
 # looked at.
 #
-# Measured on 2026-08-02 by:
-#   rustc 1.99.0-nightly (ad3d0bc14 2026-07-31)
+# Measured on 2026-08-03 by:
+#   rustc 1.99.0-nightly (8ab9fdff5 2026-07-30)
 # The resolved compiler rather than the toolchain name it was asked for, because
 # `nightly` floats: two builds a day apart can both call themselves that and disagree
 # about every figure below. These are toolchain-dependent — a compiler bump moves them
@@ -15,7 +15,7 @@
 # Which is also why the toolchain is pinned in `scripts/nightly-version` rather than
 # named at each site: that file and this one move together, and a commit that changes
 # one without the other is the mistake both exist to make visible.
-x86_64-unknown-linux-musl             160136
-aarch64-unknown-linux-musl            151064
-armv7-unknown-linux-musleabihf        220772
-riscv64gc-unknown-linux-musl          131552
+x86_64-unknown-linux-musl             159432
+aarch64-unknown-linux-musl            150128
+armv7-unknown-linux-musleabihf        219828
+riscv64gc-unknown-linux-musl          130832
