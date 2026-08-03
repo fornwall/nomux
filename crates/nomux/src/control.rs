@@ -210,8 +210,7 @@ pub(crate) fn kill(session_id: &str) -> io::Result<()> {
     // one that had to be killed all leave the same nothing behind. Every other exit
     // is a `?` or a `return` above, and none of them unlinks anything — § 6.6 keeps
     // all five files whenever `kill` cannot establish that the session is dead.
-    paths.unlink_all_locked(&lock);
-    Ok(())
+    paths.unlink_all_locked(&lock)
 }
 
 /// Takes the spawn lock for the whole of a `kill`, waiting briefly for it.
@@ -347,7 +346,9 @@ fn collect(paths: &SessionPaths) {
         return;
     };
     if liveness(paths) == Liveness::Stale {
-        paths.unlink_all_locked(&lock);
+        // Ignored, unlike `kill`: this is opportunistic tidying behind a `list`,
+        // with no caller waiting on an answer and nothing lost by trying again.
+        drop(paths.unlink_all_locked(&lock));
     }
 }
 
@@ -380,15 +381,7 @@ fn liveness(paths: &SessionPaths) -> Liveness {
         Err(err)
             if matches!(
                 err.kind(),
-                io::ErrorKind::ConnectionRefused
-                    | io::ErrorKind::NotFound
-                    // Not a guess, and not the `EACCES` case below: `InvalidInput`
-                    // here is std refusing to build the address at all, because the
-                    // path does not fit `sun_path`. Nothing can be listening on an
-                    // address that cannot be formed, so reading it as alive would
-                    // make the wreckage of such a session permanent — `list` would
-                    // show it for ever and `kill` would decline to collect it.
-                    | io::ErrorKind::InvalidInput
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
             ) =>
         {
             Liveness::Stale

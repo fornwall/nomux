@@ -90,28 +90,19 @@ pub(crate) fn arm_stop_signals() -> io::Result<OwnedFd> {
     // `sighandler_t` is an integer wide enough for a pointer, and a function item
     // has to be laundered through one to reach it.
     let handler = note_stop_signal as *const () as libc::sighandler_t;
-    for (armed, signum) in STOP_SIGNALS.into_iter().enumerate() {
+    for signum in STOP_SIGNALS {
         // SAFETY: `signal` on a single-threaded process with an async-signal-safe
         // handler, installed before any thread or child exists. `exec` resets
         // handled dispositions, so the session's child is unaffected.
-        if unsafe { libc::signal(signum, handler) } == libc::SIG_ERR {
-            let err = io::Error::last_os_error();
-            // Unwound rather than left half-installed. `run` answers this failure by
-            // carrying on with no self-pipe, and the read end goes out of scope with
-            // it — so a handler surviving here would write into a pipe nobody holds,
-            // discard the `EPIPE` as "a byte is already waiting", and swallow the
-            // signal. That is a daemon permanently deaf to `SIGTERM`, which is worse
-            // than the default disposition this exists to improve on: the default at
-            // least closes the master and hangs up the foreground group.
-            for prior in STOP_SIGNALS.into_iter().take(armed) {
-                // SAFETY: the same call, putting back the disposition the loop above
-                // replaced.
-                unsafe {
-                    libc::signal(prior, libc::SIG_DFL);
-                }
-            }
-            return Err(err);
-        }
+        //
+        // The result is not checked because there is nothing it can report:
+        // `signal(2)` fails only on an invalid signum or on `SIGKILL`/`SIGSTOP`, and
+        // [`STOP_SIGNALS`] is a compile-time constant that is neither. What stood
+        // here was an unwind restoring `SIG_DFL` to the signals already armed — for
+        // a branch nothing can take, and wrong on its own terms besides, since a
+        // daemon that inherited `SIGTERM` as `SIG_IGN` would have come out of it
+        // less protected than it went in.
+        unsafe { libc::signal(signum, handler) };
     }
     Ok(read)
 }

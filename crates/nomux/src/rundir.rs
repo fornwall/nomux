@@ -5,7 +5,7 @@
 //! build can manage a daemon of any version. Filenames and permissions here may
 //! never change.
 
-use std::io::{self, Write};
+use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixListener;
@@ -56,6 +56,24 @@ fn with_umask<T>(mode: u32, f: impl FnOnce() -> T) -> T {
     let result = f();
     rustix::process::umask(previous);
     result
+}
+
+/// Replaces `path` with `body`, at exactly [`FILE_MODE`], in one `write`.
+///
+/// Removed first because a mode argument applies only to a file the call creates:
+/// `O_TRUNC` onto one already at the path keeps whatever mode it arrived with, so
+/// the suppression below would silently do nothing for the leftover of a previous
+/// incarnation. Only the socket is cleared when a daemon rebinds an id, so such a
+/// leftover is ordinary rather than exotic — and for `<id>.pid` the mode it keeps
+/// can be one its own owner cannot read, which is a session `kill` will not touch.
+///
+/// One `write` rather than a `File` and a `writeln!`: `File` is unbuffered and
+/// `format_args!` hands its pieces over one at a time, so a formatted pidfile is
+/// published three syscalls wide instead of the two `control::resolve` is written
+/// against.
+fn write_private(path: &Path, body: &[u8]) -> io::Result<()> {
+    drop(fs::remove_file(path));
+    with_umask(FILE_MODE, || fs::write(path, body))
 }
 
 /// Binds a unix socket that is never, even briefly, more permissive than
@@ -219,6 +237,19 @@ pub(crate) fn check_run_dir(dir: &Path) -> io::Result<()> {
         // falls back where it is a searchless parent rather than this directory
         // that answered `EACCES`.
         rustix::io::Errno::ACCESS => match fs::symlink_metadata(dir) {
+            // Somebody else's, at a mode that keeps us out. The uid is the whole
+            // sentence — this is the § 8 threat, reachable with `XDG_RUNTIME_DIR`
+            // pointed into a shared parent — and naming the mode instead would
+            // report `0700`, the expected one, as the fault. The `fstat` route
+            // below says it the same way, and only ever reaches directories this
+            // user can already open.
+            Ok(meta) if meta.is_dir() && meta.uid() != rustix::process::getuid().as_raw() => {
+                refuse(
+                    dir,
+                    io::ErrorKind::PermissionDenied,
+                    &format!("it belongs to uid {}", meta.uid()),
+                )
+            }
             Ok(meta) if meta.is_dir() => refuse(
                 dir,
                 io::ErrorKind::PermissionDenied,
@@ -326,6 +357,13 @@ impl SessionPaths {
         // read the unbindable address as a *live* session whose files they must not
         // unlink. That leaves a `<id>.lock` behind on every attempt, from the very
         // command whose job is to collect it.
+        //
+        // Bounded against `.label`, the longest of the five, so a `.sock` path is a
+        // byte shorter still — which is what lets `control::liveness` read every
+        // `connect` failure it is not told about as a live session rather than as an
+        // address that can never be formed. Both `list` and `kill` reach that code
+        // only through this constructor, so no `SessionPaths` that exists can fail
+        // to build its own socket address.
         let longest = dir.as_os_str().len() + "/".len() + id.len() + ".label".len();
         if longest > SUN_PATH_MAX {
             return Err(io::Error::new(
@@ -418,18 +456,10 @@ impl SessionPaths {
         if label.is_empty() {
             return Ok(());
         }
-        // `fs::write` creates at `0666 & ~umask`, which under the ordinary umask
-        // publishes the label at `0644` and under `umask 0400` leaves it unreadable
-        // to the `list` that is its only consumer. [`FILE_MODE`] either way.
-        //
-        // Removed first because a mode argument applies only to a file this call
-        // creates: `O_TRUNC` onto one already at the path keeps whatever mode it
-        // arrived with, so the suppression above would silently do nothing for the
-        // leftover of a previous incarnation. Only the socket is cleared when a
-        // daemon rebinds an id, so such a leftover is ordinary rather than exotic.
-        let path = self.label();
-        drop(fs::remove_file(&path));
-        with_umask(FILE_MODE, || fs::write(&path, label.as_bytes()))
+        // Left to the umask this would be `0666` minus it, which under the ordinary
+        // one publishes the label at `0644` and under `umask 0400` leaves it
+        // unreadable to the `list` that is its only consumer.
+        write_private(&self.label(), label.as_bytes())
     }
 
     /// Records the pid `nomux kill` will signal, at a mode its owner can read back.
@@ -445,15 +475,17 @@ impl SessionPaths {
     /// about: it waits out a zero-length pidfile rather than reporting the corrupt
     /// one it would otherwise see.
     pub(crate) fn write_pid(&self) -> io::Result<()> {
-        // Removed first: `File::create` is `O_CREAT|O_TRUNC`, and its mode argument
-        // applies only on creation, so a pidfile left at a wrong mode by an older
-        // version keeps it and the suppression below buys nothing. That is the
-        // unkillable session this function exists to prevent, reached by the one
-        // route it did not cover — rebinding an id clears the socket and nothing else.
-        let path = self.pid();
-        drop(fs::remove_file(&path));
-        let mut file = with_umask(FILE_MODE, || fs::File::create(&path))?;
-        writeln!(file, "{}", std::process::id())
+        write_private(&self.pid(), format!("{}\n", std::process::id()).as_bytes())
+    }
+
+    /// Removes the pidfile a previous incarnation of this id left behind.
+    ///
+    /// For the daemon, at the point where it has established that no live one is on
+    /// the socket — `daemon::bind_socket` says why that is the moment. Absent is a
+    /// state `control::resolve` already waits out; stale is the one it cannot tell
+    /// from current.
+    pub(crate) fn clear_pid(&self) {
+        drop(fs::remove_file(self.pid()));
     }
 
     /// `ssh-agent` socket, served for a session created with
@@ -494,8 +526,13 @@ impl SessionPaths {
 
     /// Locks `<id>.lock` and confirms that what got locked is still that file.
     ///
-    /// `None` is "somebody else has it", and nothing else: every other way this
-    /// can fail to produce a lock hands back [`SpawnLock::unavailable`] instead.
+    /// `None` is "not this time": either somebody else is holding the lock, or the
+    /// file at the path was replaced under this call more often than
+    /// [`LOCK_ATTEMPTS`] allows for. Every other way this can fail to produce a lock
+    /// hands back [`SpawnLock::unavailable`] instead. The two readings need not be
+    /// told apart, because every caller answers them the same way — wait, skip, or
+    /// refuse — and `lock_spawn` uses the blocking operation, so *its* `None` can
+    /// only ever be the second.
     fn acquire(&self, operation: FlockOperation) -> Option<SpawnLock> {
         let path = self.lock();
         for _ in 0..LOCK_ATTEMPTS {
@@ -544,10 +581,31 @@ impl SessionPaths {
     /// mutex out from under an attach that is using it (`IMPLEMENTATION.md`
     /// § 6.3), and could unlink the socket of a session that came up while the
     /// decision to collect was being made.
-    pub(crate) fn unlink_all_locked(&self, _lock: &SpawnLock) {
+    ///
+    /// # Errors
+    ///
+    /// The first failure that is not an absence, once every path has been tried.
+    /// Absence is success — the five go in one order, and a collection is often
+    /// finishing one that was interrupted — but anything else has to reach `kill`,
+    /// whose exit status is the caller's only account of whether the session went.
+    /// Reporting nothing here is how a read-only run directory, an `EIO` or an
+    /// immutable `<id>.lock` becomes a `kill` that exits 0 having removed nothing,
+    /// and a `<id>.lock` left behind is a session `list` rediscovers and tries to
+    /// collect on every run from then on.
+    pub(crate) fn unlink_all_locked(&self, _lock: &SpawnLock) -> io::Result<()> {
+        // Every path is attempted before the first failure is returned: they are
+        // independent, and stopping at one would leave the rest of a session behind
+        // over a file that was already the exception.
+        let mut failure = Ok(());
         for path in self.removal_order() {
-            drop(fs::remove_file(path));
+            if let Err(err) = fs::remove_file(path)
+                && err.kind() != io::ErrorKind::NotFound
+                && failure.is_ok()
+            {
+                failure = Err(err);
+            }
         }
+        failure
     }
 
     /// The five paths, in the order [`Self::unlink_all_locked`] removes them.
@@ -585,7 +643,7 @@ impl SessionPaths {
     /// daemon's exit behind that attach's spawn timeout.
     pub(crate) fn unlink_all(&self) {
         if let Some(lock) = self.try_lock_spawn() {
-            self.unlink_all_locked(&lock);
+            drop(self.unlink_all_locked(&lock));
         }
     }
 }

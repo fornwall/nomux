@@ -16,14 +16,17 @@ pub(crate) struct Ring {
 }
 
 impl Ring {
-    /// Creates a ring retaining at most `capacity` bytes.
+    /// Creates a ring retaining at most `capacity` bytes, and never fewer than one.
     ///
-    /// # Panics
-    ///
-    /// Panics if `capacity` is zero, which would make every write a gap.
+    /// The clamp rather than an assertion, in a binary built `panic = "abort"` whose
+    /// whole purpose is not to lose the user's session to a process that stopped.
+    /// `daemon::ring_capacity` already filters zero — and must keep doing so, since
+    /// it falls back to the 4 MiB default where this would clamp to a one-byte ring
+    /// that makes every write a gap — so this is the unreachable case answered
+    /// without an abort site rather than with one.
     #[must_use]
     pub(crate) fn new(capacity: usize) -> Self {
-        assert!(capacity > 0, "ring capacity must be non-zero");
+        let capacity = capacity.max(1);
         Self {
             buf: VecDeque::with_capacity(capacity),
             capacity,

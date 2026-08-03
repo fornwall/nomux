@@ -137,8 +137,8 @@ impl Conn {
     /// Queues a frame, discarding the encode result.
     ///
     /// Every caller here chunks to at most [`MAX_PAYLOAD`] and passes flags this
-    /// crate defines, so the two encode failures — an oversized payload and an
-    /// undefined flag bit — are both unreachable.
+    /// crate defines, so the encode failures — an oversized payload, an undefined
+    /// flag bit, a `TERM` this side would not accept back — are all unreachable.
     fn send(&mut self, frame: &Frame<'_>) {
         let _ = frame.encode(&mut self.tx);
     }

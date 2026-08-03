@@ -26,11 +26,15 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-/// `EX_USAGE`: malformed invocation.
+/// `EX_USAGE`: malformed invocation. The one code borrowed from `sysexits.h`, and
+/// the only one shared by every mode — `IMPLEMENTATION.md` § 10 has both tables and
+/// says why the rest of that range is left alone.
 const EXIT_USAGE: u8 = 64;
-/// Session exists but is unattachable.
+/// Session exists but is unattachable. The shell's "found but not executable",
+/// applied to a session, since `attach` is what a client runs over an exec channel.
 const EXIT_UNATTACHABLE: u8 = 126;
-/// No such session, and it could not be started.
+/// No such session, and it could not be started. The shell's "not found", for the
+/// reason above.
 const EXIT_NO_SESSION: u8 = 127;
 
 const USAGE: &str = "\
@@ -202,6 +206,13 @@ fn parse_session_args(
 }
 
 /// Maps a fallible operation onto an exit code, reporting failure on stderr.
+///
+/// The whole of the `daemon`, `list` and `kill` table in `IMPLEMENTATION.md` § 10:
+/// zero where the postcondition holds, 64 for a command line that could not have
+/// named a session, and 1 for everything else. The coarseness of that last one is
+/// deliberate and § 10 argues it — the states behind it want different responses
+/// from a caller, but the one worth acting on is "is the session still alive", and
+/// `list` answers that better than a status byte can.
 ///
 /// `InvalidInput` is `EX_USAGE` here for the reason the `attach` arm above gives:
 /// [`rundir::SessionPaths::new`] is the crate's only source of it, so it always means

@@ -193,7 +193,12 @@ fn spawn_daemon(session_id: &str, label: Option<&str>) -> io::Result<Option<Chil
 fn daemon_complaint(stderr: Option<ChildStderr>) -> Option<String> {
     let stderr = stderr?;
     let fd = stderr.as_fd();
-    rustix::fs::fcntl_setfl(fd, rustix::fs::OFlags::NONBLOCK).ok()?;
+    // Added to what is there rather than assigned over it. This descriptor is a
+    // freshly created pipe read end with nothing else set, so the two are the same
+    // today — but `fcntl_setfl` replaces the whole status word, and every other
+    // site in the tree does the `getfl`-then-or for a reason.
+    let flags = rustix::fs::fcntl_getfl(fd).ok()?;
+    rustix::fs::fcntl_setfl(fd, flags | rustix::fs::OFlags::NONBLOCK).ok()?;
     let mut buf = [0u8; 512];
     // Through `nbio`, like every other read in the tree: a signal landing on this
     // one would discard the only account of the failure anybody is going to get,

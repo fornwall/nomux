@@ -54,8 +54,8 @@ const MAX_RING_CAPACITY: usize = 1 << 30;
 ///
 /// An unparseable, zero or unservable value falls back rather than failing: a mistyped
 /// tuning variable should not stop a session from starting. Zero in particular has to
-/// be filtered here rather than passed on, since `Ring::new` asserts a non-zero
-/// capacity — a ring that makes every write a gap is not a tuning choice.
+/// be filtered here rather than passed on: `Ring::new` clamps it to one byte, and a
+/// ring that makes every write a gap is not a tuning choice — the default is.
 fn ring_capacity() -> usize {
     std::env::var(RING_BYTES_ENV)
         .ok()
@@ -208,8 +208,15 @@ struct Daemon {
     child_gone: Option<Instant>,
     /// The child's status, `None` until `waitpid` hands it over.
     exited: Option<(i32, ExitKind)>,
-    /// When the session became clientless, for idle reaping.
-    detached_since: Option<Instant>,
+    /// When the session last lost its client, for idle reaping.
+    ///
+    /// The timestamp alone. *Whether* that deadline is armed is `client.is_none()`,
+    /// so the two cannot disagree — this used to be an `Option` carrying both, and
+    /// keeping the arming half in step with the client was done by hand, including
+    /// one assignment whose whole job was to undo a stamp made two lines earlier.
+    /// A stamp left standing under a live client reaps the session out from under
+    /// it at [`IDLE_TIMEOUT`], a week later and with nothing to point at.
+    last_detach: Instant,
 }
 
 /// Runs the daemon for `session_id` until the child exits or the session is reaped.
@@ -288,14 +295,17 @@ fn start(session_id: &str, label: Option<&str>) -> io::Result<()> {
         win: WinSize::default(),
         child_gone: None,
         exited: None,
-        detached_since: Some(Instant::now()),
+        last_detach: Instant::now(),
     };
 
     // The first thing said from the far side of `release_startup_state`, and the only
     // record that this session ever existed once its run files are gone.
     crate::syslog::info(session_id, "started");
     let result = daemon.event_loop();
-    crate::syslog::info(session_id, &format!("exiting: {}", daemon.stop_reason()));
+    // `None` where the loop ended for a reason that is not one of its stop
+    // conditions, which is `event_loop` returning on a failed `poll`.
+    let reason = daemon.stop_reason().unwrap_or("the event loop ended");
+    crate::syslog::info(session_id, &format!("exiting: {reason}"));
     daemon.shutdown();
     result
 }
@@ -320,6 +330,22 @@ fn bind_socket(paths: &SessionPaths) -> io::Result<UnixListener> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => return Err(err),
     }
+
+    // Only the socket is replaced when an id is rebound, and a `<id>.pid` outliving
+    // it is what lets `attach`'s wait for that path to *exist* be satisfied by the
+    // dead daemon's number — the spawn lock is then released before this daemon has
+    // published anything, and a `kill` taking it in the window finds a live socket
+    // and a stale pid at once. Since pids are reused, that is `control::resolve`
+    // signalling an unrelated process of the user's, which checking liveness first
+    // cannot catch: the session really is live, and it is the pidfile that belongs
+    // to the previous one.
+    //
+    // Here rather than after the `bind`, so there is no window at all: past the
+    // match above, either nothing was at the socket or what was there refused a
+    // connection, so any pidfile beside it is a dead daemon's by the same evidence
+    // that licensed removing the socket. A live session took the early return and
+    // reaches none of this.
+    paths.clear_pid();
 
     let listener = crate::rundir::bind_socket_private(&path)?;
     listener.set_nonblocking(true)?;
@@ -392,7 +418,9 @@ impl Daemon {
     /// than stored, for the reason [`Daemon::detach_limit`] gives: `should_stop` needs
     /// the rule as a predicate and `poll_timeout` needs it as a duration.
     fn detach_deadline(&self) -> Option<Instant> {
-        self.detached_since.map(|since| since + self.detach_limit())
+        self.client
+            .is_none()
+            .then(|| self.last_detach + self.detach_limit())
     }
 
     /// The soonest a deadline could stop the daemon, if either is armed.
@@ -403,7 +431,7 @@ impl Daemon {
             .min()
     }
 
-    /// Whether the PTY queue has grown past [`MAX_PENDING_INPUT`].
+    /// Whether the PTY queue has reached [`MAX_PENDING_INPUT`].
     fn input_is_saturated(&self) -> bool {
         self.pending_input.len() >= MAX_PENDING_INPUT
     }
@@ -418,31 +446,32 @@ impl Daemon {
         }
     }
 
-    fn should_stop(&self) -> bool {
-        self.stopping || self.stop_deadline().is_some_and(|at| Instant::now() >= at)
-    }
-
-    /// Which of [`Self::should_stop`]'s answers it was, for the log.
+    /// Why the daemon should stop, if it should — `None` is "keep going".
     ///
-    /// The same three conditions in the same order, so the sentence in syslog names
-    /// the rule that actually fired rather than the one a reader would guess. The
-    /// last arm is not reachable through `should_stop` — `event_loop` also returns on
-    /// a failed `poll` — and says so rather than claiming a deadline.
-    fn stop_reason(&self) -> &'static str {
+    /// One function rather than a predicate beside a matching list of reasons: the
+    /// two were the same three conditions in the same order, held that way by a
+    /// comment saying so, which is a drift hazard written down rather than removed.
+    /// The sentence in syslog now names the rule that actually fired because it is
+    /// the rule that fired.
+    fn stop_reason(&self) -> Option<&'static str> {
         let now = Instant::now();
         if self.stopping {
-            "signalled"
+            Some("signalled")
         } else if self.exit_deadline().is_some_and(|at| now >= at) {
-            "the child exited"
+            Some("the child exited")
         } else if self.detach_deadline().is_some_and(|at| now >= at) {
-            if self.pty.is_none() {
+            Some(if self.pty.is_none() {
                 "no client ever attached"
             } else {
                 "idle with no client"
-            }
+            })
         } else {
-            "the event loop ended"
+            None
         }
+    }
+
+    fn should_stop(&self) -> bool {
+        self.stop_reason().is_some()
     }
 
     /// Everything the poll set watches, in the order it is registered.
@@ -594,7 +623,7 @@ impl Daemon {
         let pty_events = revents(Source::Pty);
         let client_events = revents(Source::Client);
         if pty_events.intersects(PollFlags::OUT) {
-            self.write_pty()?;
+            self.write_pty();
         }
         if pty_events.intersects(readable) {
             self.read_pty(read_buf)?;
@@ -775,12 +804,10 @@ impl Daemon {
         // daemon has not yet noticed is dead (`IMPLEMENTATION.md` § 6.4). It leaves
         // by the same door as any other refusal, which also drops its agent channels
         // — the arriving client knows nothing of them, and their ids are never
-        // reissued. That departure stamps the session clientless, which this one is
-        // not, so the stamp is undone on the next line: it must stay next to the
-        // `reject` that sets it, since a stamp left standing under a live client
-        // reaps the session out from under it at `IDLE_TIMEOUT`.
+        // reissued. That departure stamps `last_detach`, which is harmless here and
+        // used to need undoing: the idle deadline is armed by `client.is_none()`
+        // rather than by the stamp, and the next line installs the replacement.
         self.reject(ErrorCode::Takeover, "another client attached");
-        self.detached_since = None;
         self.client = self.pending.take().map(Attached::new);
         self.on_hello(&hello)?;
         // Clients pipeline: input riding behind the `Hello` in the same read is
@@ -814,35 +841,34 @@ impl Daemon {
         Ok(())
     }
 
-    fn write_pty(&mut self) -> io::Result<()> {
+    fn write_pty(&mut self) {
         let Some(pty) = self.pty.as_ref() else {
-            return Ok(());
+            return;
         };
-        match crate::nbio::drain_to(&mut self.pending_input, pty.master()) {
-            Ok(()) => Ok(()),
-            // Belt and braces for an error Linux does not appear to produce: a write
-            // to a master whose slave has gone *succeeds* here, and the departure is
-            // reported on the read side alone, as the `EIO` that `pty::read_pty`
-            // turns into end of file. Measured, not assumed — including against a
-            // session leader holding the slave as its controlling terminal, which is
-            // the shape this daemon makes. So this arm is kept for the kernel that
-            // answers differently rather than for one that does.
-            //
-            // If it ever does fire, the child is gone: not a failure of the daemon,
-            // so the attached client still receives `Exit`, and the queue goes with
-            // it because there is no longer anything to apply it to. What it must not
-            // do is record the exit. `child_gone` is what drops the master from the
-            // poll set, and the read side can still be holding everything the child
-            // wrote on its way out — the line discipline hands it over 4 KiB at a
-            // time — so stamping it here would end the session on output that was
-            // still readable, which is the one thing § 9 says never happens without
-            // a `Gap`. Left to `read_pty`, which reaches `Read::Eof` only once the
-            // master is dry.
-            Err(rustix::io::Errno::IO) => {
-                self.pending_input.clear();
-                Ok(())
-            }
-            Err(err) => Err(err.into()),
+        // No write error ends the session. Linux does not appear to produce one at
+        // all — a write to a master whose slave has gone *succeeds*, and the
+        // departure is reported on the read side alone, as the `EIO` that
+        // `pty::read_pty` turns into end of file. Measured, not assumed, including
+        // against a session leader holding the slave as its controlling terminal,
+        // which is the shape this daemon makes. So this is for the kernel that
+        // answers differently rather than for one that does, and it covers the whole
+        // class rather than the one errno that was foreseen: § 6.4.1 already says a
+        // failing *client* socket is never propagated out of the event loop, and
+        // there is no reason the input half of a PTY should be the one place a
+        // stray errno destroys the session this daemon exists to keep.
+        //
+        // Whatever the errno, the child is gone or unreachable, so the queue goes
+        // with it — there is no longer anything to apply it to, and clearing it is
+        // also what drops `PollFlags::OUT` from the master's mask in `watches`, so
+        // no spin follows. What this must not do is record the exit. `child_gone` is
+        // what drops the master from the poll set, and the read side can still be
+        // holding everything the child wrote on its way out — the line discipline
+        // hands it over 4 KiB at a time — so stamping it here would end the session
+        // on output that was still readable, which is the one thing § 9 says never
+        // happens without a `Gap`. Left to `read_pty`, which reaches `Read::Eof`
+        // only once the master is dry.
+        if crate::nbio::drain_to(&mut self.pending_input, pty.master()).is_err() {
+            self.pending_input.clear();
         }
     }
 
@@ -1236,12 +1262,28 @@ impl Daemon {
         }
     }
 
+    /// Pushes out what is queued, letting the connection go if it cannot be served.
+    ///
+    /// Neither condition here goes through [`Daemon::drop_client`], and neither
+    /// wants its final flush: the socket has already failed, or the peer is past
+    /// `ABANDON_PENDING_WRITE` and so is not reading *by definition* (§ 4.1).
+    /// `flush_final` puts the socket back into blocking mode and writes against a
+    /// 500 ms deadline, so on the second branch it would park the whole daemon —
+    /// no PTY drained, no agent channel served, no reaping — for half a second, to
+    /// deliver eight megabytes to a peer that has stopped reading. What is in that
+    /// queue is `Pong`s and `InputAck`s besides, which a reattaching client
+    /// re-derives from `in_applied`.
+    ///
+    /// `drop_client` keeps the flush for the departures that have somewhere to go:
+    /// an explicit `Detach`, and the half-close the attach relay makes with
+    /// `shutdown(SHUT_WR)` while still reading.
     fn write_client(&mut self) {
         let Some(client) = self.client.as_mut() else {
             return;
         };
         if client.conn.flush_some().is_err() || client.conn.is_write_hopeless() {
-            self.drop_client();
+            self.client = None;
+            self.on_detached();
         }
     }
 
@@ -1267,7 +1309,7 @@ impl Daemon {
     /// [`Daemon::exit_deadline`], which derives it from the child's departure rather
     /// than the client's for exactly that reason.
     fn on_detached(&mut self) {
-        self.detached_since = Some(Instant::now());
+        self.last_detach = Instant::now();
         // Nothing can answer a signature request with the client gone, so the
         // waiting process should fail now rather than at reattach (§ 6.7).
         if let Some(agent) = self.agent.as_mut() {

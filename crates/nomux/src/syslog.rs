@@ -36,7 +36,7 @@ const FACILITY_USER: u8 = 1;
 
 /// Severities, from RFC 5424 § 6.2.1. Only the two the daemon has a use for.
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum Severity {
+enum Severity {
     /// Something failed. The session may not exist, or may not have survived.
     Error = 3,
     /// A session began or ended in the ordinary way.
@@ -55,7 +55,7 @@ pub(crate) enum Severity {
 /// that is real weight against the § 8 budget to restate something the collector
 /// stamps anyway from the moment it receives the datagram. `journald`, `rsyslog` and
 /// `busybox syslogd` all fill both in for a message that carries neither.
-pub(crate) fn send(severity: Severity, message: &str) {
+fn send(severity: Severity, message: &str) {
     let priority = FACILITY_USER * 8 + severity as u8;
     let line = format!(
         "<{priority}>nomux[{pid}]: {message}",
