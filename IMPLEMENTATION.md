@@ -694,8 +694,9 @@ it *before* it probes for a stale socket, because everything from that probe to 
 pidfile decides on the evidence `list` and `kill` decide on — a refused `connect`
 means a dead daemon whose socket and pidfile are removed, which is exactly what a
 collection does one `connect` earlier — so without it a sweep that probed a stale
-socket and was then descheduled unlinks what this daemon has bound in the meantime. `attach` never reached that state, because it holds this
-lock across the whole spawn; a `nomux daemon <id>` started by hand, which §6.2 is
+socket and was then descheduled unlinks what this daemon has bound in the meantime.
+`attach` never reached that state, because it holds this lock across the whole
+spawn; a `nomux daemon <id>` started by hand, which §6.2 is
 written for, held nothing. It is a `try_lock` rather than a wait because on the
 ordinary path the holder *is* the attach that spawned this process, and waiting would
 park the session's own creation until that attach gave up — so what closes is every
