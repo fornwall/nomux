@@ -130,6 +130,20 @@ recorded with what it was measured against.
   side of, so no `fork` can be in flight to copy it. That is sound only as long as
   every process the suite starts goes through `harness::launch`; a `Command::spawn`
   called directly is what would quietly bring this back.
+- **A raw read in the harness has to resume what a signal ended.** Every socket the
+  harness reads carries a receive timeout, and that is the one case `signal(7)` says
+  is never restarted: with `SO_RCVTIMEO` set, a call the kernel finds a pending signal
+  on returns `EINTR` whatever `SA_RESTART` asked for. It costs a test either way —
+  reported, it fails the test for something that happened to the process rather than
+  to the daemon; swallowed, it ends a drain or a back-pressure measurement early and
+  says nothing. Both were observed:
+  `a_child_that_stops_reading_input_does_not_wedge_the_daemon` failed 1 loaded
+  `cargo test --locked --workspace` run in 25 on `EINTR` in its setup, and the same
+  run swallowed one in `drain_available`. Nothing in the suite sends the signal, which
+  is why the answer is a retry rather than a culprit: `harness::read_uninterrupted`
+  and `harness::write_uninterrupted` are what every socket call in the harness goes
+  through, for the same reason `nbio::read` is the only raw read in the daemon, and a
+  bare `stream.read` added later is what would bring this back.
 
 ## P3 — release process
 

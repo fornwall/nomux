@@ -31,8 +31,8 @@ use nomux_proto::{
 
 use harness::{
     Reaper, Rng, Session, Spawned, accept_within, collect, control, hello_frame, nomux,
-    nomux_with_shell, poll_until, push_until_refused, reconnect_until_gap, run_root, stderr,
-    stdout, succeeded, wait_for, while_nothing_forks, write_frame,
+    nomux_with_shell, poll_until, push_until_refused, read_uninterrupted, reconnect_until_gap,
+    run_root, stderr, stdout, succeeded, wait_for, while_nothing_forks, write_frame,
 };
 
 #[test]
@@ -1273,18 +1273,19 @@ fn agent_connections_fail_fast_while_detached() {
     let _chan = client.next_chan(FrameType::AgentOpen);
     drop(client);
 
+    // Through the harness rather than `Read::read`: these sockets carry a receive
+    // timeout, so a signal ends the call with `EINTR` rather than the kernel
+    // restarting it, and a raw read would report that as the channel having failed.
     let mut buf = [0u8; 1];
     assert_eq!(
-        mid_flight
-            .read(&mut buf)
-            .expect("read from the open channel"),
+        read_uninterrupted(&mut mid_flight, &mut buf).expect("read from the open channel"),
         0,
         "a channel that was open when the client left must be closed, not held"
     );
 
     let mut arriving = session.connect_agent();
     assert_eq!(
-        arriving.read(&mut buf).expect("read from agent socket"),
+        read_uninterrupted(&mut arriving, &mut buf).expect("read from agent socket"),
         0,
         "a detached session must close agent connections immediately"
     );
@@ -1309,7 +1310,7 @@ fn agent_channels_are_capped() {
     let mut extra = session.connect_agent();
     let mut buf = [0u8; 1];
     assert_eq!(
-        extra.read(&mut buf).expect("read from agent socket"),
+        read_uninterrupted(&mut extra, &mut buf).expect("read from agent socket"),
         0,
         "the connection past the cap must be closed, not queued"
     );

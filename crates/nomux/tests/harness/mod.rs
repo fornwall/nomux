@@ -97,6 +97,54 @@ pub(crate) fn poll_until(within: Duration, mut condition: impl FnMut() -> bool) 
     }
 }
 
+/// Reads into `buf`, resuming a call a signal ended.
+///
+/// Every socket this harness hands out carries a receive timeout — [`SOCKET_POLL`] on
+/// a client, [`PATIENCE`] on the agent — and that is precisely the case the kernel
+/// refuses to restart: with `SO_RCVTIMEO` set, a read the kernel finds a pending
+/// signal on comes back `EINTR` whatever `SA_RESTART` the handler asked for
+/// (`signal(7)`). So `EINTR` here is a call that has not happened yet, not news about
+/// the daemon, and a site that reports it fails the test for something that happened
+/// to the test *process* while the session it is asserting on is perfectly healthy.
+/// The daemon carries `nbio::read` for the same sentence on the same syscall; this is
+/// the harness's copy of it.
+///
+/// `pub(crate)` because the tests that hold an agent socket read it themselves, and
+/// that socket carries a timeout like every other. Anything reading one of these by
+/// hand wants this rather than `Read::read`.
+///
+/// Everything else is passed through untouched: the zero that means the daemon closed
+/// the connection, and the `WouldBlock` that is the receive timeout expiring, which is
+/// each caller's cue to look at its own deadline.
+pub(crate) fn read_uninterrupted(
+    socket: &mut UnixStream,
+    buf: &mut [u8],
+) -> std::io::Result<usize> {
+    loop {
+        match socket.read(buf) {
+            Err(err) if err.kind() == ErrorKind::Interrupted => {}
+            outcome => return outcome,
+        }
+    }
+}
+
+/// Writes what `socket` will take of `buf`, resuming a call a signal ended.
+///
+/// [`read_uninterrupted`] in the other direction, and needed on its own account
+/// rather than for symmetry: the only caller is measuring how much the daemon will
+/// accept before it stops accepting, and an interruption counted as a refusal ends
+/// that measurement early — understating the answer, in the direction that makes the
+/// assertion pass. A call a signal reaches after it has transferred anything reports
+/// the short count instead, so nothing here can put a byte on the wire twice.
+fn write_uninterrupted(socket: &mut UnixStream, buf: &[u8]) -> std::io::Result<usize> {
+    loop {
+        match socket.write(buf) {
+            Err(err) if err.kind() == ErrorKind::Interrupted => {}
+            outcome => return outcome,
+        }
+    }
+}
+
 /// Accepts one connection, or fails saying what never arrived.
 ///
 /// A blocking `accept` on a listener nothing connects to parks the thread for ever,
@@ -118,7 +166,10 @@ pub(crate) fn accept_within(
             accepted = Some(stream);
             true
         }
-        Err(err) if err.kind() == ErrorKind::WouldBlock => false,
+        // Two ways of saying "ask again on the next pass": `WouldBlock` is the
+        // non-blocking listener reporting that nobody has arrived, and `Interrupted`
+        // is a signal having ended the call before it could report anything at all.
+        Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => false,
         Err(err) => panic!("accepting {awaiting} failed: {err}"),
     });
     assert!(arrived, "timed out waiting for {awaiting}");
@@ -658,7 +709,7 @@ impl Client {
                 return None;
             }
             let mut chunk = [0u8; 8192];
-            match self.stream.read(&mut chunk) {
+            match read_uninterrupted(&mut self.stream, &mut chunk) {
                 Ok(0) => panic!("the daemon closed the connection while awaiting {awaiting}"),
                 Ok(n) => self.pending.extend_from_slice(&chunk[..n]),
                 // What a read timeout is reported as; the deadline above is the one
@@ -744,7 +795,7 @@ impl Client {
                     "the daemon refused {after} rather than acting on it"
                 );
             }
-            match self.stream.read(&mut chunk) {
+            match read_uninterrupted(&mut self.stream, &mut chunk) {
                 Ok(0) => return,
                 Ok(n) => self.pending.extend_from_slice(&chunk[..n]),
                 Err(err) if err.kind() == ErrorKind::WouldBlock => {}
@@ -799,7 +850,7 @@ impl Client {
     /// long in the first place.
     pub(crate) fn drain_available(&mut self) {
         let mut chunk = [0u8; 8192];
-        while let Ok(n) = self.stream.read(&mut chunk) {
+        while let Ok(n) = read_uninterrupted(&mut self.stream, &mut chunk) {
             if n == 0 {
                 break;
             }
@@ -916,18 +967,30 @@ fn has_unread_bytes(stream: &UnixStream) -> bool {
     use std::os::fd::AsRawFd;
 
     let mut byte = 0u8;
-    // SAFETY: `recv` is given a valid one-byte buffer with the length that matches
-    // it, on a descriptor the borrow above keeps open for the call. `MSG_DONTWAIT`
-    // keeps it from blocking regardless of the socket's own timeout.
-    let peeked = unsafe {
-        libc::recv(
-            stream.as_raw_fd(),
-            std::ptr::from_mut(&mut byte).cast::<libc::c_void>(),
-            1,
-            libc::MSG_PEEK | libc::MSG_DONTWAIT,
-        )
-    };
-    peeked > 0
+    loop {
+        // SAFETY: `recv` is given a valid one-byte buffer with the length that
+        // matches it, on a descriptor the borrow above keeps open for the call.
+        // `MSG_DONTWAIT` keeps it from blocking regardless of the socket's own
+        // timeout.
+        let peeked = unsafe {
+            libc::recv(
+                stream.as_raw_fd(),
+                std::ptr::from_mut(&mut byte).cast::<libc::c_void>(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        // `MSG_DONTWAIT` makes an interruption unlikely rather than impossible, and
+        // the answer it would otherwise produce is the wrong one: "nothing queued" is
+        // exactly what the caller is asking about, and it would report it of a socket
+        // that has bytes waiting. Retried for the same reason as
+        // [`read_uninterrupted`], which cannot be used here because peeking is the
+        // whole point and `Read` has no way to ask for it.
+        if peeked < 0 && std::io::Error::last_os_error().kind() == ErrorKind::Interrupted {
+            continue;
+        }
+        return peeked > 0;
+    }
 }
 
 /// The greeting the tests send: the current protocol, [`WIN`], and a terminal type
@@ -951,6 +1014,10 @@ pub(crate) const fn hello_frame(flags: u16, out_offset: u64, in_offset: u64) -> 
 /// For the tests that hold a socket or a relay's stdin rather than a [`Client`],
 /// because what they measure is what the far end does with the bytes rather than
 /// the conversation that follows.
+///
+/// The one call here that needs nothing added for [`read_uninterrupted`]'s sake:
+/// `write_all` already treats `Interrupted` as "go round again", so a signal costs it
+/// a loop iteration rather than a frame.
 pub(crate) fn write_frame(sink: &mut impl Write, frame: &Frame<'_>) {
     let mut buf = Vec::new();
     frame.encode(&mut buf).expect("encode");
@@ -973,7 +1040,7 @@ pub(crate) fn push_until_refused(
     let mut sent = 0;
     let mut progressed = Instant::now();
     while sent < bytes.len() && progressed.elapsed() < patience {
-        match socket.write(&bytes[sent..]) {
+        match write_uninterrupted(socket, &bytes[sent..]) {
             Ok(0) => break,
             Ok(n) => {
                 sent += n;
