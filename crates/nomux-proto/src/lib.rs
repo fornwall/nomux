@@ -19,7 +19,12 @@ pub use frame::{
 ///
 /// Revision 2 gave both flag fields meaning: agent forwarding and repaint policy
 /// in `Hello`, linger state and agent status in `HelloOk`. Revision 3 took
-/// `Hello.in_offset` back out, the daemon never having read it.
+/// `Hello.in_offset` back out, the daemon never having read it — `DESIGN.md` § 10
+/// owns why it was there and is where it comes back.
+///
+/// The number itself is pinned against `IMPLEMENTATION.md` § 2.2 by
+/// `the_protocol_revision_is_the_number_the_document_gives`, since the vectors that
+/// would otherwise notice a change spell it out as a literal.
 pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Fixed frame header size, so reads are a two-stage `read_exact`.

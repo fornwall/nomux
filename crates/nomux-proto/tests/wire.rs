@@ -20,7 +20,7 @@
 
 use nomux_proto::{
     ErrorCode, ExitKind, Frame, FrameType, HEADER_LEN, HELLO_AGENT_FORWARD, HELLO_REPAINT_CTRL_L,
-    Hello, HelloOk, Linger, MAX_PAYLOAD, RESUME_FROM_START, WinSize,
+    Hello, HelloOk, Linger, MAX_PAYLOAD, PROTOCOL_VERSION, RESUME_FROM_START, WinSize,
 };
 
 /// Distinct in all four fields on purpose: `cols`, `rows`, `xpixel` and `ypixel`
@@ -566,6 +566,50 @@ fn every_hello_ok_flag_is_pinned_in_both_states() {
         assert!(
             states.iter().any(|set| !*set),
             "no HelloOk vector clears the {name} flag"
+        );
+    }
+}
+
+/// The protocol revision is the number § 2.2 gives, and it is the one the
+/// handshake vectors carry.
+///
+/// [`PROTOCOL_VERSION`] was the last wire constant nothing here compared against
+/// the document, and this file is why: the six handshake vectors write the revision
+/// out as a literal, the way everything else in them is written out, so the
+/// constant could be moved to any number at all and every test in the workspace
+/// stayed green — measured at 4, which passed 132 of 132. Every other use compares
+/// it to itself, `session.rs` asserting a `HelloOk` carries what this crate put
+/// there and `spawn_lock.rs` formatting it into the string it then looks for.
+///
+/// The failure that hides behind that is the one the daemon is built to make loud:
+/// it refuses a `Hello` whose `protocol` is not this number, so a client written
+/// from § 2.2 would be turned away at the handshake, and the table it was written
+/// from would be right.
+///
+/// Beside the handshake rather than beside the § 2.1 limits, which is where
+/// [`the_length_field_is_a_u24_past_its_low_byte`] keeps `MAX_PAYLOAD`'s pin: the
+/// revision is not a bound on anything, it is the first field of two frames, and
+/// the vectors are where it is spent. The second assertion is what that placement
+/// buys — the literals stay hand-written from the document, and are now checked to
+/// be the number the code will accept rather than merely a number.
+#[test]
+fn the_protocol_revision_is_the_number_the_document_gives() {
+    assert_eq!(
+        PROTOCOL_VERSION, 3,
+        "IMPLEMENTATION.md § 2.2 puts the current revision at 3"
+    );
+
+    for vector in vectors() {
+        let carried = match vector.frame {
+            Frame::Hello(hello) => hello.protocol,
+            Frame::HelloOk(ok) => ok.protocol,
+            _ => continue,
+        };
+        assert_eq!(
+            carried, PROTOCOL_VERSION,
+            "a handshake vector is written at a revision the daemon would refuse: \
+             {:?}",
+            vector.frame
         );
     }
 }
