@@ -20,7 +20,7 @@
 
 use nomux_proto::{
     ErrorCode, ExitKind, Frame, FrameType, HEADER_LEN, HELLO_AGENT_FORWARD, HELLO_REPAINT_CTRL_L,
-    Hello, HelloOk, Linger, RESUME_FROM_START, WinSize,
+    Hello, HelloOk, Linger, MAX_PAYLOAD, RESUME_FROM_START, WinSize,
 };
 
 /// Distinct in all four fields on purpose: `cols`, `rows`, `xpixel` and `ypixel`
@@ -523,6 +523,55 @@ fn every_hello_flag_bit_is_pinned_in_both_states() {
     }
 }
 
+/// Both `HelloOk` flag bits appear set and clear across the vectors.
+///
+/// [`every_hello_flag_bit_is_pinned_in_both_states`] for the other flags field.
+/// The three vectors above do cover all four states today, and say so in their
+/// comments — one of them notes it is "the only vector in the file with bit 3
+/// clear" — but prose is not what fails when an edit drops that vector, and a bit
+/// left set in every vector is pinned only against being renumbered wholesale.
+///
+/// Swept over the two booleans rather than over bit positions, because unlike
+/// `Hello.flags` the field is typed: [`HelloOk`] carries `gap` and `agent` as
+/// `bool`, and `Linger` — which shares the byte and has an `ALL` — is covered by
+/// [`every_linger_state_has_a_vector`].
+#[test]
+fn every_hello_ok_flag_is_pinned_in_both_states() {
+    let mut gap = Vec::new();
+    let mut agent = Vec::new();
+
+    for vector in vectors() {
+        // Destructured exhaustively rather than read field by field, which is what
+        // gives this sweep the property the `ALL`-driven ones have for free: a
+        // third bool added to the flags byte stops this file compiling until it is
+        // swept here too, instead of going quietly unpinned.
+        if let Frame::HelloOk(HelloOk {
+            protocol: _,
+            resume_from: _,
+            in_applied: _,
+            win: _,
+            gap: this_gap,
+            linger: _,
+            agent: this_agent,
+        }) = vector.frame
+        {
+            gap.push(this_gap);
+            agent.push(this_agent);
+        }
+    }
+
+    for (name, states) in [("gap", gap), ("agent", agent)] {
+        assert!(
+            states.iter().any(|set| *set),
+            "no HelloOk vector sets the {name} flag"
+        );
+        assert!(
+            states.iter().any(|set| !*set),
+            "no HelloOk vector clears the {name} flag"
+        );
+    }
+}
+
 /// The `Error` codes are the numbers § 2.2 gives them.
 ///
 /// A frame carries one code at a time, so the vector above can pin exactly one of
@@ -563,6 +612,60 @@ fn error_codes_are_the_numbers_the_table_gives_them() {
         assert!(
             documented.iter().any(|&(listed, _)| listed == code),
             "{code:?} is on no line of the table IMPLEMENTATION.md § 2.2 gives"
+        );
+    }
+}
+
+/// The `len` field is a big-endian `u24`, checked past its low byte and at the cap.
+///
+/// Every vector above carries a payload shorter than 256 bytes, so the top two
+/// bytes of its length are always zero — and an encoder that computed `len`
+/// correctly and then wrote only its low byte would satisfy all sixteen of them.
+/// The § 2.1 cap is the other half of the same gap: `MAX_PAYLOAD` is the one wire
+/// constant nothing here compares against the document, and `oversized_payload_is_
+/// rejected` in the crate holds at whatever value it happens to have. A client
+/// built from § 2.1 sending a legal 256 KiB frame would collect `Error{Protocol}`,
+/// and nothing in the tree would have said so.
+///
+/// These payloads are built rather than written out, which is why they sit here
+/// instead of in the table above. The bytes being asserted are still only the
+/// header, and still hand-written from the document.
+#[test]
+fn the_length_field_is_a_u24_past_its_low_byte() {
+    assert_eq!(
+        MAX_PAYLOAD, 262_144,
+        "IMPLEMENTATION.md § 2.1 caps a payload at 256 KiB"
+    );
+
+    // `Output` is a u64 offset followed by the bytes, so the payload runs 8 longer
+    // than the data: 308 == 0x00_01_34 reaches the middle byte, and the largest
+    // legal payload is 0x04_00_00, which is the only value that reaches the top one.
+    for (data_len, header) in [
+        (300_usize, [0x05, 0x00, 0x01, 0x34]),
+        (MAX_PAYLOAD as usize - 8, [0x05, 0x04, 0x00, 0x00]),
+    ] {
+        let data = vec![0xa5; data_len];
+        let frame = Frame::Output {
+            offset: 0,
+            data: &data,
+        };
+
+        let mut buf = Vec::new();
+        frame
+            .encode(&mut buf)
+            .expect("a payload at the cap encodes");
+        assert_eq!(
+            buf[..HEADER_LEN],
+            header,
+            "a {}-byte payload does not encode the length § 2.1 gives it",
+            data_len + 8
+        );
+
+        assert_eq!(
+            Frame::decode(FrameType::Output, &buf[HEADER_LEN..]),
+            Ok(frame),
+            "a {}-byte payload does not decode back",
+            data_len + 8
         );
     }
 }

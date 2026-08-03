@@ -80,6 +80,23 @@ const fn checked_hello_flags(flags: u16) -> Result<(), ProtoError> {
     Ok(())
 }
 
+/// Refuses a [`Hello::term`] carrying an interior NUL.
+///
+/// U+0000 is valid UTF-8, so the `from_utf8` on the decode side lets it through —
+/// and the daemon puts `term` straight into the child's environment
+/// (`IMPLEMENTATION.md` § 6.1.1), where `execve` takes NUL-terminated strings and
+/// refuses it. That makes a NUL the one field value this crate can call
+/// well-formed and the daemon then cannot use: the spawn fails, the client is told
+/// `Error{Internal}`, and a failure that belongs to the frame is reported as one
+/// belonging to the host. Refused at the boundary instead, on the way *out* as
+/// well as in, for the reason [`checked_hello_flags`] gives.
+fn checked_term(term: &str) -> Result<(), ProtoError> {
+    if term.as_bytes().contains(&0) {
+        return Err(ProtoError::Malformed("TERM contains a NUL byte"));
+    }
+    Ok(())
+}
+
 /// Opening frame: what the client already has, and how big its terminal is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Hello<'a> {
@@ -352,6 +369,7 @@ impl<'a> Frame<'a> {
                 // pins that, since the choice should not change by accident.
                 let term_len = u16::try_from(hello.term.len())
                     .map_err(|_| ProtoError::Malformed("TERM exceeds 65535 bytes"))?;
+                checked_term(hello.term)?;
                 checked_hello_flags(hello.flags)?;
 
                 out.extend_from_slice(&hello.protocol.to_be_bytes());
@@ -437,6 +455,7 @@ impl<'a> Frame<'a> {
                 let term_len = usize::from(r.u16()?);
                 let term = core::str::from_utf8(r.take(term_len)?)
                     .map_err(|_| ProtoError::Malformed("TERM is not UTF-8"))?;
+                checked_term(term)?;
                 Self::Hello(Hello {
                     protocol,
                     flags,
@@ -841,6 +860,53 @@ mod tests {
         .encode(&mut Vec::new());
 
         assert_eq!(err, Err(ProtoError::Malformed("TERM exceeds 65535 bytes")));
+    }
+
+    /// A NUL in `TERM` is valid UTF-8, and refused anyway at both ends.
+    ///
+    /// The decode direction is the one that matters: the daemon hands `term`
+    /// straight to the child's environment, where `execve` refuses it, so a frame
+    /// this crate called well-formed would take the daemon down at `spawn` rather
+    /// than be answered as the protocol error it is.
+    #[test]
+    fn a_nul_in_term_is_refused_at_both_ends() {
+        let mut buf = b"previous frame".to_vec();
+        let before = buf.len();
+        let err = Frame::Hello(Hello {
+            protocol: PROTOCOL_VERSION,
+            flags: 0,
+            out_offset: 0,
+            in_offset: 0,
+            win: WIN,
+            term: "xt\0rm",
+        })
+        .encode(&mut buf);
+
+        assert_eq!(err, Err(ProtoError::Malformed("TERM contains a NUL byte")));
+        assert_eq!(buf.len(), before, "the buffer must be left untouched");
+
+        // Built by encoding a well-formed `Hello` and overwriting one byte of its
+        // `TERM`, so this does not restate the field layout it is not testing —
+        // `wire.rs` is where that is pinned.
+        let mut wire = Vec::new();
+        Frame::Hello(Hello {
+            protocol: PROTOCOL_VERSION,
+            flags: 0,
+            out_offset: 0,
+            in_offset: 0,
+            win: WIN,
+            term: "xt_rm",
+        })
+        .encode(&mut wire)
+        .unwrap();
+        let marker = wire.iter().position(|&b| b == b'_').unwrap();
+        wire[marker] = 0;
+
+        assert_eq!(
+            Frame::decode(FrameType::Hello, &wire[HEADER_LEN..]),
+            Err(ProtoError::Malformed("TERM contains a NUL byte")),
+            "a NUL that arrived on the socket is a protocol error, not a spawn failure"
+        );
     }
 
     /// `decode` is public and usable without `decode_header`, so it applies the

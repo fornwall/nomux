@@ -124,6 +124,25 @@ fn any_text() -> impl Strategy<Value = String> {
     prop::collection::vec(any::<char>(), 0..=MAX_GENERATED_LEN).prop_map(String::from_iter)
 }
 
+/// Strategy for `Hello.term`.
+///
+/// [`any_text`] minus U+0000, which the codec refuses there by design: it is valid
+/// UTF-8 that `execve` will not take, so it is not a well-formed frame. Same
+/// reasoning as [`any_hello_flags`] — this generator's job is the frames that
+/// encode, and the refusal is covered by the mutation property below and by a unit
+/// test beside the check.
+///
+/// Mapped rather than filtered because `any::<char>()` deliberately samples the
+/// special values, U+0000 among them, so a filter would spend proptest's local
+/// reject budget on a case that is trivially rewritten.
+fn any_term() -> impl Strategy<Value = String> {
+    prop::collection::vec(
+        any::<char>().prop_map(|c| if c == '\0' { '\u{fffd}' } else { c }),
+        0..=MAX_GENERATED_LEN,
+    )
+    .prop_map(String::from_iter)
+}
+
 /// Strategy for a bounded opaque payload.
 fn any_bytes() -> impl Strategy<Value = Vec<u8>> {
     prop::collection::vec(any::<u8>(), 0..=MAX_GENERATED_LEN)
@@ -195,7 +214,7 @@ fn any_frame() -> impl Strategy<Value = OwnedFrame> {
             any::<u64>(),
             any::<u64>(),
             any_win(),
-            any_text(),
+            any_term(),
         )
             .prop_map(|(protocol, flags, out_offset, in_offset, win, term)| {
                 OwnedFrame::with_text(
