@@ -195,20 +195,27 @@ The four musl targets build, land under the 400 KiB budget, and are byte-reprodu
   fixture from the same test — hex per frame, checked in — would let an independent
   implementation be verified against the identical bytes. Until something does, the
   protocol has never met a second implementation.
-- **Three documented numbers and arms still have nothing behind them.** Each was found
+- **Four documented numbers and arms still have nothing behind them.** Each was found
   by reading § 9 against the suite rather than by a failure, and each is cheap except
   where noted. `MAX_CHANNEL_QUEUE` — an agent channel whose local peer stops reading
   is closed once its queue passes 256 KiB; `agent_channels_are_capped` covers the
-  count cap, not the byte cap. The `frame is not valid from a client` arm — a
-  server-only frame arriving *after* a successful greeting, which is a different
-  function from the ungreeted refusal that is tested, and a different claim: that the
-  session survives a client which misbehaves once attached. And exit codes 126 and
-  127, which are deliberately left: both are `attach`'s mapping of what it met, so
-  reaching either honestly means a real relay — a mode that goes on to serve and so
-  cannot be run to completion by a test that waits for it. What an argument-parsing
-  test could reach is only the `io::ErrorKind`-to-number mapping, and asserting on
-  that pins which kind a refusal happens to carry rather than anything a client
-  depends on.
+  count cap, not the byte cap. The 1 GiB ring ceiling — `ring_huge` in
+  `a_ring_capacity_the_daemon_cannot_use_falls_back_to_the_default` pins that the
+  daemon does not abort on a `NOMUX_RING_BYTES` mistyped upwards, which is what
+  `MAX_RING_CAPACITY` exists for, but nothing separates the clamp
+  [IMPLEMENTATION.md § 4](IMPLEMENTATION.md#4-ring-buffer) documents from the fallback
+  the test is named after. The distinction is already on the wire: a
+  `RESUME_FROM_START` greeting is answered with the ring's base, so writing a few MiB
+  past the default and reading `resume_from` back says which capacity was built. The
+  `frame is not valid from a client` arm — a server-only frame arriving *after* a
+  successful greeting, which is a different function from the ungreeted refusal that
+  is tested, and a different claim: that the session survives a client which
+  misbehaves once attached. And exit codes 126 and 127, which are deliberately left:
+  both are `attach`'s mapping of what it met, so reaching either honestly means a real
+  relay — a mode that goes on to serve and so cannot be run to completion by a test
+  that waits for it. What an argument-parsing test could reach is only the
+  `io::ErrorKind`-to-number mapping, and asserting on that pins which kind a refusal
+  happens to carry rather than anything a client depends on.
 - **`MAX_PENDING_READ` has no test and cannot easily have one.** The kernel's unix
   send buffer is roughly 212 KiB, five times tighter than the 1 MiB cap, so on a
   stock host the cap never binds and no socket-level test can pin it. Raising the

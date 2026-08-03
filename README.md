@@ -175,10 +175,11 @@ sh scripts/build-release.sh     # → target/dist/ plus SHA256SUMS
 
 It builds every musl target, prints a size table with the change against the
 per-target baseline in `scripts/size-baseline`, and fails a binary that misses either
-the size budget or the growth gate. There is no cross toolchain to install —
-`rust-lld` links all four and each `rust-std` component carries its own musl
-objects — but the shipping configuration rebuilds the standard library with panics
-compiled out, which needs nightly and its sources:
+the size budget or the growth gate — both numbers are in
+[IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build). There is no cross toolchain to
+install — `rust-lld` links all four and each `rust-std` component carries its own
+musl objects — but the shipping configuration rebuilds the standard library with
+panics compiled out, which needs nightly and its sources:
 
 ```sh
 nightly=$(cat scripts/nightly-version)
@@ -190,13 +191,11 @@ rustup target add --toolchain "$nightly" \
   riscv64gc-unknown-linux-musl
 ```
 
-That nightly is dated rather than floating, and `scripts/nightly-version` is the
-one place it is named — the build script and CI read it from there too. Why the
-standard library is rebuilt at all, why the pin has to be dated, what
-`NOMUX_STABLE_STD=1`, `NOMUX_NIGHTLY` and `NOMUX_UPDATE_BASELINE=1` are for, and
-the two numbers the script gates on are
-[IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)'s; when the pin moves, and what
-becomes of `SHA256SUMS` after the script writes it, are
+Why the standard library is rebuilt at all, why `scripts/nightly-version` pins a
+dated nightly rather than a floating one, and what `NOMUX_STABLE_STD=1`,
+`NOMUX_NIGHTLY` and `NOMUX_UPDATE_BASELINE=1` are for are
+[IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)'s; when that pin moves, and what
+becomes of `SHA256SUMS` after the build writes it, are
 [PLAN.md § P3](PLAN.md#p3--release-process)'s.
 
 ## Diagnostics

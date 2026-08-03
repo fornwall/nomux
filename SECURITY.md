@@ -19,8 +19,8 @@ nomux has no released version and none receives security updates; fixes land on
 `main`. See [DESIGN.md § 8](DESIGN.md#8-security-model) for the threat model and
 [PLAN.md](PLAN.md) for known gaps — notably
 [§ P3](PLAN.md#p3--release-process)'s: the per-architecture checksums a client would
-verify an uploaded binary against go no further than a CI artifact that expires and
-sits behind a login, so there is nothing for a client to read them from.
+verify an uploaded binary against are published only as a CI artifact, which expires
+and sits behind a login, so no client can reach them.
 
 ## Not in scope
 
