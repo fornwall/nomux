@@ -175,7 +175,9 @@ Capacity defaults to 4 MiB and is overridable per daemon with `NOMUX_RING_BYTES`
 The right value is host-dependent — a machine running the DESIGN.md §5.1 cap of eight sessions
 pays it eight times over — and an unparseable or zero value falls back to the
 default rather than refusing to start, since a mistyped tuning variable should never
-cost someone their session.
+cost someone their session. One that parses and is positive but larger than the daemon
+can serve is clamped to 1 GiB instead, since nothing on that path rejects it and
+`VecDeque::with_capacity` answers a request it cannot serve by aborting the process.
 
 ```
         base_offset                              end_offset
@@ -267,7 +269,7 @@ signal (§6.5).
 ```mermaid
 flowchart TD
   A["Hello{out_offset}"] --> B{"out_offset == u64::MAX?"}
-  B -- yes --> C["resume_from = base_offset"]
+  B -- yes --> C["resume_from = base_offset<br/>gap = false"]
   B -- no --> D{"out_offset < base_offset?"}
   D -- no --> E["resume_from = min(out_offset, end_offset)<br/>gap = false"]
   D -- yes --> F["resume_from = base_offset<br/>gap = true"]
@@ -988,10 +990,14 @@ builder's home directory 56 times over.
 
 Reproducibility is the producing half of a check whose consuming half does not exist
 yet. **The client is meant to pin a SHA-256 per architecture and verify it after
-upload; nothing does that today** — `SHA256SUMS` is built here and nothing publishes
-it ([PLAN.md § P3](PLAN.md#p3--release-process)). Release builds must pin a **dated**
-nightly (`NOMUX_NIGHTLY`) regardless, since a floating one moves the bytes that hash
-would be taken over.
+upload; nothing does that today** — where `SHA256SUMS` goes once
+`scripts/build-release.sh` has written it, and what is missing before a client could
+read one, is [PLAN.md § P3](PLAN.md#p3--release-process)'s. Release builds must pin a
+**dated** nightly regardless, since a floating one moves the bytes that hash would be
+taken over. `scripts/nightly-version` holds the dated name, and `NOMUX_NIGHTLY` in the
+environment overrides that file for a build that is not a release — a one-off against
+a newer compiler, say. A release may not take the override, for the same reason the
+pin is dated at all.
 
 ## 9. Testing
 

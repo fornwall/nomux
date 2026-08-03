@@ -18,8 +18,9 @@ There is no SLA — this is a personal project — but reports are read.
 nomux has no released version and none receives security updates; fixes land on
 `main`. See [DESIGN.md § 8](DESIGN.md#8-security-model) for the threat model and
 [PLAN.md](PLAN.md) for known gaps — notably
-[§ P3](PLAN.md#p3--release-process)'s: nothing publishes the per-architecture
-checksums a client would verify an uploaded binary against.
+[§ P3](PLAN.md#p3--release-process)'s: the per-architecture checksums a client would
+verify an uploaded binary against are published only as a CI artifact, which expires
+and sits behind a login, so no client can reach them.
 
 ## Not in scope
 

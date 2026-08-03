@@ -27,6 +27,7 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
@@ -192,6 +193,124 @@ fn an_attach_re_takes_a_spawn_lock_that_was_collected() {
         "the file at the path must be a new one, not the inode that was unlinked"
     );
     drop(pinned);
+}
+
+/// Regression: a daemon holds `<id>.lock` across claiming its id, so nothing can
+/// collect the session it is in the middle of publishing.
+///
+/// `attach` holds that lock from before the fork until `<id>.pid` exists (§ 6.3), and
+/// `list` and `kill` take it before they unlink anything (§ 6.6) — so the mutual
+/// exclusion the frozen control surface rests on existed only where an attach
+/// happened to be the spawner. A `nomux daemon <id>` started by hand, which the usage
+/// text documents and § 6.2 is written for, took nothing at all: a `list` that had
+/// already probed the stale socket and found it refused went on to unlink the socket
+/// and the pidfile this daemon had bound in between, which is the one thing § 6.6
+/// promises never happens. Through `kill` the same interleaving exits 0 reporting no
+/// such session while a daemon holds the user's shell.
+///
+/// The window is three syscalls wide, so it is held open here rather than waited for.
+/// A unix `connect` blocks for as long as the listener's backlog is full, and
+/// `bind_socket` probes the socket before it touches anything — so a listener with a
+/// backlog of nothing and one connection already queued parks the daemon inside the
+/// region under test for as long as this test likes.
+#[test]
+fn a_daemon_holds_the_spawn_lock_while_it_claims_the_id() {
+    let session = StaleSession::empty("lka");
+    // Created here so the wait below has an inode to name; the daemon opens this same
+    // path, and `SpawnLock` checks that what it locked is still the file at it.
+    let lock = File::create(session.lock_path()).expect("create the spawn lock");
+    let lock = lock.metadata().expect("stat the spawn lock");
+
+    let blocker = UnixListener::bind(session.socket()).expect("plant a listening socket");
+    // SAFETY: `listen` is passed a descriptor the borrow above keeps open across the
+    // call, and a backlog. `UnixListener` has no safe spelling of a second `listen` —
+    // `bind` chose the backlog and nothing revisits it — and rustix's would mean
+    // adding its `net` feature to the whole crate for one line of one test.
+    let shrunk = unsafe { libc::listen(blocker.as_raw_fd(), 0) };
+    assert_eq!(
+        shrunk,
+        0,
+        "shrink the backlog: {}",
+        std::io::Error::last_os_error()
+    );
+    // A backlog of zero still takes one connection — the kernel refuses at *more*
+    // than the backlog, not at it — so the queue is filled here, and every `connect`
+    // after this one waits for an `accept` that is never coming.
+    let _queued = UnixStream::connect(session.socket()).expect("fill the backlog");
+
+    let _daemon = Spawned::spawn(
+        nomux_with_shell(&session.root, &["daemon", &session.id])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    );
+
+    wait_until_flock(
+        Flock::Granted,
+        lock.dev(),
+        lock.ino(),
+        "the daemon took the spawn lock before it went near the socket",
+    );
+}
+
+/// Regression: a `nomux daemon <id>` that never bound its socket exits non-zero,
+/// including on the path where § 6.2 has to fork.
+///
+/// The refusal an id already in use earns is not the only one that has to survive the
+/// fork. Everything else the bind can answer — a read-only run directory, no space
+/// for the node, a path component that stopped resolving, a name that appeared
+/// between the probe and the bind — reaches the caller through the same exit status,
+/// and past the fork there is no caller left to reach: the process somebody waited on
+/// has already gone through `_exit(0)`. `ssh -t host 'nomux daemon <id>'` is exactly
+/// the shape that forks, per § 6.2, so this is not a corner.
+///
+/// A dangling symlink is the deterministic way in. `connect` follows it, finds
+/// nothing and answers `ENOENT`, which the probe reads as an id nobody is serving;
+/// `bind` does not follow it, finds the name taken and answers `EADDRINUSE`. No race,
+/// no timing, and the errno arrives strictly between the two.
+///
+/// `setpgid` in the child is what forces the fork, and it is the same device
+/// `a_daemon_that_leads_a_process_group_detaches_by_forking` uses: `Command` never
+/// makes a process group leader, so without it `setsid` succeeds outright and this
+/// test would pass against the ordering it exists to catch.
+#[test]
+fn a_daemon_that_cannot_bind_says_so_even_when_it_has_to_fork() {
+    let session = StaleSession::empty("lkc");
+    std::os::unix::fs::symlink(session.dir.join("nowhere"), session.socket())
+        .expect("plant a dangling symlink at the socket");
+
+    let mut command = nomux_with_shell(&session.root, &["daemon", "lkc"]);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: the closure runs in the forked child before exec, so it must be
+    // async-signal-safe. `setpgid` is, and nothing here allocates or takes a lock.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    let started = collect(&mut command);
+
+    assert!(
+        !started.status.success(),
+        "a daemon that never bound its socket reported success: {:?}",
+        stderr(&started)
+    );
+    assert!(
+        stderr(&started).contains("Address already in use"),
+        "and it must say what stopped it: {:?}",
+        stderr(&started)
+    );
+    assert!(
+        !session.pid_path().exists(),
+        "nothing may be published for a session that does not exist"
+    );
 }
 
 /// The lock a `kill` creates is one the *next* process must be able to open, so it

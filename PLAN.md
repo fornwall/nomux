@@ -199,12 +199,15 @@ The four musl targets build, land under the 400 KiB budget, and are byte-reprodu
   by reading § 9 against the suite rather than by a failure, and each is cheap except
   where noted. `MAX_CHANNEL_QUEUE` — an agent channel whose local peer stops reading
   is closed once its queue passes 256 KiB; `agent_channels_are_capped` covers the
-  count cap, not the byte cap. `MAX_RING_CAPACITY` — the ceiling exists because
-  `VecDeque::with_capacity` aborts the process on a request it cannot serve, so the
-  promise holds for a `NOMUX_RING_BYTES` that is mistyped downwards and is untested
-  for one mistyped upwards; it needs its own test rather than a row in the existing
-  table, since a huge value clamps to 1 GiB rather than falling back to the default.
-  The `frame is not valid from a client` arm — a server-only frame arriving *after* a
+  count cap, not the byte cap. The 1 GiB ring ceiling — `ring_huge` in
+  `a_ring_capacity_the_daemon_cannot_use_falls_back_to_the_default` pins that the
+  daemon does not abort on a `NOMUX_RING_BYTES` mistyped upwards, which is what
+  `MAX_RING_CAPACITY` exists for, but nothing separates the clamp
+  [IMPLEMENTATION.md § 4](IMPLEMENTATION.md#4-ring-buffer) documents from the fallback
+  the test is named after. The distinction is already on the wire: a
+  `RESUME_FROM_START` greeting is answered with the ring's base, so writing a few MiB
+  past the default and reading `resume_from` back says which capacity was built. The
+  `frame is not valid from a client` arm — a server-only frame arriving *after* a
   successful greeting, which is a different function from the ungreeted refusal that
   is tested, and a different claim: that the session survives a client which
   misbehaves once attached. And exit codes 126 and 127, which are deliberately left:
@@ -229,7 +232,7 @@ Not backlog — recorded so they are not rediscovered as gaps.
 | Read-only mirrors | Out of scope, [DESIGN.md § 2](DESIGN.md#2-scope) |
 | Cross-device handover | [DESIGN.md § 10](DESIGN.md#10-open-questions), with its three prerequisites |
 | `libvterm` overflow snapshot | [DESIGN.md § 10](DESIGN.md#10-open-questions) |
-| Ring capacity default | [DESIGN.md § 10](DESIGN.md#10-open-questions); `NOMUX_RING_BYTES` makes it tunable, but the default is unchosen. Revisit knowing the memory figure that argues for keeping it small is an overestimate: a ring that size is one allocation large enough to be `mmap`ed and faulted lazily, so a session holds `min(output produced, capacity)` resident, not `capacity`. Eight idle sessions cost eight small rings. What argues for a larger default is the case § 10 does not name — an ordinary twenty-minute disconnect across a build, which overruns 4 MiB and loses the output the reconnect was for |
+| Ring capacity default | [DESIGN.md § 10](DESIGN.md#10-open-questions); `NOMUX_RING_BYTES` makes it tunable, but the default is unchosen. § 10 has why the memory figure that argues for keeping it small overstates what a session holds; what argues for a larger default is the case § 10 does not name — an ordinary twenty-minute disconnect across a build, which overruns 4 MiB and loses the output the reconnect was for |
 | `daemon::run` taking the spawn lock | `attach` holds it across the whole spawn, so a daemon taking it would block on its own parent until that attach times out. Closed from the attach side instead ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)) |
 | Addressing the run files through a validated directory descriptor | There is no `bindat(2)`, so the sockets must resolve by name whatever the check returns ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)) |
 

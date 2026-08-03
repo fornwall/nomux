@@ -783,6 +783,64 @@ fn a_synthesised_exit_status_is_sent_when_it_is_collected_rather_than_when_the_l
     );
 }
 
+/// Regression: the session's own child is collected as soon as `waitpid` will give
+/// it up, whether or not the terminal has been let go of.
+///
+/// A shell that exits behind a job still holding the slave — `sleep 300 &` and then
+/// `exit`, which is what a `nohup ... &` leaves — never brings the master to end of
+/// file, so nothing stamps `child_gone` and a collection gated on it never runs.
+/// Nothing else reaps: `Pty::try_wait` has no other caller until `terminate`. The
+/// shell was therefore left a zombie for the whole life of the session, which is up
+/// to the seven-day idle timeout.
+///
+/// Collecting is not reporting, and the two are asserted together: `next_of` refuses
+/// anything but the session's own chatter, so an `Exit` frame arriving here would
+/// fail this test. It must not, because the transcript is plainly not finished —
+/// the job that outlived the shell still has the terminal.
+///
+/// The reap happens on an event-loop pass, and with the client idle there are none:
+/// nothing wakes a daemon whose child exits behind a held slave, `SIGCHLD` being at
+/// its default disposition and so discarded. The `Ping` is what supplies one, on a
+/// condition rather than a sleep — the `Pong` answering it is queued by the same
+/// pass that collects.
+#[test]
+fn a_shell_that_exits_behind_a_background_job_is_still_reaped() {
+    let (session, mut client, ok) = Session::attached("zombie_shell");
+    let shell = shell_of(&session);
+    let ready = client.make_ready("-echo", None, ok.resume_from);
+
+    // The job outlives the shell and keeps the slave open, so the master never
+    // reports end of file and the daemon is never told the child has gone.
+    client.input(ready.in_offset, b"sleep 300 & exit\n");
+    assert!(
+        poll_until(Duration::from_secs(10), || !process_alive(shell)),
+        "the shell never exited"
+    );
+
+    client.send(&Frame::Ping { nonce: 0x2031 });
+    drop(client.next_of(FrameType::Pong));
+
+    assert_ne!(
+        process_state(shell),
+        Some('Z'),
+        "the shell exited behind a job that still holds the slave and was left a \
+         zombie as pid {shell}"
+    );
+
+    // The job still has the terminal, and `Session` drops its daemon with `SIGKILL`,
+    // which runs none of § 6.5's collection — so the `sleep` would outlive this test
+    // by five minutes. Asking the daemon to stop is what collects it.
+    let raw = session.child.id();
+    let daemon = rustix::process::Pid::from_raw(raw.cast_signed()).expect("the daemon's own pid");
+    rustix::process::kill_process(daemon, rustix::process::Signal::TERM)
+        .expect("signal the daemon");
+    assert!(
+        poll_until(Duration::from_secs(10), || !process_alive(raw)),
+        "the signalled daemon never exited, so the job it was collecting is still \
+         running"
+    );
+}
+
 /// The child must not inherit a handle to its own PTY master.
 ///
 /// Everything the user runs in the session would otherwise hold a writable
@@ -2121,6 +2179,152 @@ fn a_closed_agent_channel_whose_peer_stopped_reading_leaves_the_daemon_asleep() 
         b"echo NOMUX-STILL-SERVING\n",
     );
     client.read_until("NOMUX-STILL-SERVING", offset);
+}
+
+/// Regression: an `accept` the daemon has no descriptor for is waited out rather
+/// than retried without pause.
+///
+/// `EMFILE` and `ENFILE` fail the call *without* consuming the queued connection, so
+/// the listener goes on reporting itself readable and `poll` returns instantly on
+/// every pass for as long as the shortage lasts. The peer closing does not clear it
+/// either: an aborted connection sits in the backlog until something accepts it.
+/// § 6.4.1 is right that such an error must not end the session, but returning to
+/// retry it on the next pass is retrying it immediately and for ever — and under a
+/// system-wide `ENFILE` every nomux daemon on the host burns a core, which is what
+/// whoever is trying to recover the machine has to compete with.
+///
+/// The shortage is imposed from outside rather than provoked from within: lowering
+/// another process's soft `RLIMIT_NOFILE` needs no privilege beyond sharing its uid,
+/// costs the daemon none of the descriptors it already holds — `alloc_fd` refuses a
+/// *number* at or above the limit and says nothing about the table below it — and is
+/// exactly the state a host out of descriptors puts it in. Measured as processor
+/// time for the reason
+/// [`a_closed_agent_channel_whose_peer_stopped_reading_leaves_the_daemon_asleep`]
+/// gives, against the same window and the same tolerance.
+#[test]
+fn a_daemon_that_cannot_accept_stands_back_rather_than_spinning() {
+    /// Long enough that the bug shows up as tens of ticks, short enough to keep the
+    /// suite where it is.
+    ///
+    /// Half a second rather than the 300 ms the agent-channel test above uses,
+    /// because that is what separates the two answers well enough for a threshold to
+    /// sit between them under load. No figure is quoted for the spin: it is whatever
+    /// share of a core the scheduler hands the daemon, and three measurements of it
+    /// spread from the twenties to the forties. What the threshold rests on is the
+    /// other answer, which is not a share of anything — the fixed daemon sleeps
+    /// 100 ms at a time and wakes five times to fail one `accept`, so it measures
+    /// zero, and no amount of load moves zero.
+    const WINDOW: Duration = Duration::from_millis(500);
+    /// Five ticks is 50 ms of processor time against half a second of wall clock: a
+    /// tenth of one core, well under the lowest spin figure seen and unreachable by a
+    /// daemon that is asleep.
+    const TOLERATED: u32 = 5;
+
+    let session = Session::start("emfile");
+    let daemon = session.child.id();
+    // Not merely answering. `Session::start` waits for the socket, and the daemon
+    // binds that before it writes its pidfile, opens `/dev/null` over its stdio and
+    // asks `logind` about lingering — all of which need a descriptor, and the first
+    // of which is a `?` that ends the process. Starving it there is starving a
+    // *startup*, which is a different thing from the event loop this measures and
+    // fails it about one run in four on a loaded machine. The pidfile is the last of
+    // those that can refuse to start, so waiting for it is waiting for the state the
+    // test is about.
+    wait_for(&session.pid_file());
+    let restore = open_file_limit(daemon);
+    // Below the three the daemon cannot be without, so the next descriptor it asks
+    // for is refused however few it is holding.
+    set_open_file_limit(daemon, 3);
+
+    // The knock it cannot answer. `connect` succeeds regardless — the connection is
+    // queued by the listener, and the `accept` that is refused is what leaves it
+    // there.
+    let starved = UnixStream::connect(&session.socket).expect("knock on the door");
+    let began = cpu_ticks(daemon);
+    thread::sleep(WINDOW);
+    let burned = cpu_ticks(daemon).saturating_sub(began);
+    assert!(
+        burned <= TOLERATED,
+        "the daemon burned {burned} clock ticks in {WINDOW:?} failing to accept one \
+         connection, with no client attached and no child running"
+    );
+
+    // And the listener came back rather than being stood down for good: a backoff
+    // that never expires is the same session lost by a quieter route.
+    set_open_file_limit(daemon, restore);
+    drop(starved);
+    let mut client = session.connect();
+    let ok = client.hello(RESUME_FROM_START, 0);
+    client.input(0, b"echo NOMUX-AFTER-EMFILE\n");
+    client.read_until("NOMUX-AFTER-EMFILE", ok.resume_from);
+}
+
+/// The soft limit on open descriptors that `pid` is running under.
+fn open_file_limit(pid: u32) -> u64 {
+    let mut current = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `prlimit` is passed a pid, the resource it is being asked about, a null
+    // pointer for the limit that is not being set, and a pointer to a `rlimit` this
+    // frame owns for the answer. Reading a limit needs no privilege at all.
+    let read = unsafe {
+        libc::prlimit(
+            i32::try_from(pid).expect("a pid fits a pid_t"),
+            libc::RLIMIT_NOFILE,
+            std::ptr::null(),
+            &raw mut current,
+        )
+    };
+    assert_eq!(
+        read,
+        0,
+        "read the daemon's open-file limit: {}",
+        std::io::Error::last_os_error()
+    );
+    current.rlim_cur
+}
+
+/// Puts `pid` under a soft limit of `soft` open descriptors.
+///
+/// The hard limit is read back and passed through untouched, which is what keeps
+/// this within what one uid may do to its own processes: raising a hard limit is
+/// privileged, leaving it alone is not.
+fn set_open_file_limit(pid: u32, soft: u64) {
+    let mut hard = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: as [`open_file_limit`], which is the same call for the same reason.
+    let read = unsafe {
+        libc::prlimit(
+            i32::try_from(pid).expect("a pid fits a pid_t"),
+            libc::RLIMIT_NOFILE,
+            std::ptr::null(),
+            &raw mut hard,
+        )
+    };
+    assert_eq!(read, 0, "read the daemon's open-file limit");
+    let wanted = libc::rlimit {
+        rlim_cur: soft,
+        rlim_max: hard.rlim_max,
+    };
+    // SAFETY: as above, with the two pointers the other way round: `wanted` is owned
+    // by this frame and the answer is not asked for.
+    let set = unsafe {
+        libc::prlimit(
+            i32::try_from(pid).expect("a pid fits a pid_t"),
+            libc::RLIMIT_NOFILE,
+            &raw const wanted,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(
+        set,
+        0,
+        "hold the daemon to {soft} open descriptors: {}",
+        std::io::Error::last_os_error()
+    );
 }
 
 /// Drives a session to an overflow gap and returns what the child saw afterwards.

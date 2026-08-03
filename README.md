@@ -45,6 +45,71 @@ stability guarantee.
 - [IMPLEMENTATION.md](IMPLEMENTATION.md) — wire protocol, ring buffer, PTY handling, bootstrap, build.
 - [PLAN.md](PLAN.md) — backlog: known gaps, unbuilt features, deferred decisions.
 
+## How it works
+
+One session's whole life, in the calls that make it. The daemon leaves the login
+session before it publishes its pid, so no hangup and no keystroke can reach it, and
+it opens every terminal `O_NOCTTY` so it never acquires one: the only controlling
+terminal here is the child's, taken on the PTY slave in a session of its own. That
+detachment and the stop pipe are both best-effort. Topology and states are
+[DESIGN.md § 4](DESIGN.md#4-architecture) and [§ 5](DESIGN.md#5-session-lifecycle);
+the poll set, and the reasoning behind every call, is
+[IMPLEMENTATION.md § 6](IMPLEMENTATION.md#6-daemon).
+
+```mermaid
+sequenceDiagram
+  participant C as client over ssh
+  participant D as nomux daemon
+  participant T as PTY
+  participant S as shell
+
+  Note over C,D: sshd opens direct-streamlocal to id.sock where it can
+  Note over C,D: elsewhere nomux attach relays, on every connection
+  C->>D: nothing answers, so spawn one under id.lock
+  D->>D: bind id.sock, then SIGHUP to SIG_IGN
+  D->>D: getsid, then /dev/tty if it already leads one
+  D->>D: setsid, or fork, _exit the parent, then setsid
+  Note over D: session leader, no ctty, all ttys O_NOCTTY
+  D->>D: stop self-pipe, id.pid, chdir /, detach stdio
+  C->>D: connect, which only makes it pending
+  C->>D: Hello with TERM and winsize, which attaches
+  D->>T: openpt, grantpt, unlockpt, ptsname
+  D->>T: master O_NONBLOCK, then open the slave
+  D->>T: TIOCSWINSZ before the child can look
+  D->>S: fork, with the slave as 0 1 2
+  S->>S: setsid, own session and group
+  S->>T: TIOCSCTTY on the slave
+  S->>S: SIGHUP to SIG_DFL, execve, dashed argv0
+  Note over S: session and group leader, ctty is the slave
+  D->>D: close its own slave fds, or no EIO comes
+  D->>C: HelloOk with resume_from
+  loop the poll loop, until a stop condition fires
+    C->>D: Input frames
+    D->>T: write the master
+    T-->>D: read the master into the ring
+    D->>C: Output frames and InputAck
+    opt a client may leave, and another arrive
+      C--xD: HUP or a half-close
+      C->>D: a later connect, pending again
+      C->>D: its Hello takes the session over
+    end
+    opt once, when the child lets go
+      S->>S: exits
+      T-->>D: EIO on the master, taken as end of file
+      D->>S: waitpid, retried each pass, invented past 2 s
+      D->>C: the rest of the output, then one Exit
+      Note over D: 5 s of linger, still in the loop
+    end
+  end
+  Note over C,D: a stop signal or a week idle reach here with no Exit
+  D->>S: SIGHUP to the group, then each /proc session member
+  D->>S: 500 ms grace, then SIGKILL if still standing
+  D->>S: kill and reap the child either way
+  opt if id.lock is free
+    D->>D: unlink the five run files, id.lock last
+  end
+```
+
 ## Build
 
 Nothing has to be installed by hand: the toolchain is pinned in
@@ -110,8 +175,7 @@ sh scripts/build-release.sh     # → target/dist/ plus SHA256SUMS
 
 It builds every musl target, prints a size table with the change against the
 per-target baseline in `scripts/size-baseline`, and fails a binary that misses either
-the size budget or the growth gate — both numbers, and the variable that rewrites the
-baseline for an intended change, are in
+the size budget or the growth gate — both numbers are in
 [IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build). There is no cross toolchain to
 install — `rust-lld` links all four and each `rust-std` component carries its own
 musl objects — but the shipping configuration rebuilds the standard library with
@@ -127,17 +191,12 @@ rustup target add --toolchain "$nightly" \
   riscv64gc-unknown-linux-musl
 ```
 
-That is not an optimisation: with the released standard library, every target
-misses the size budget. `NOMUX_STABLE_STD=1` builds against the pinned stable
-toolchain and is expected to fail the gate. The nightly is dated rather than
-floating, and `scripts/nightly-version` is where it is named: the script and CI both
-read it from there, so a local build and the runner measure the same bytes against a
-baseline recorded by the same compiler. `NOMUX_NIGHTLY` overrides it for a build that
-is not a release; a release must pin, because the client is meant to pin a SHA-256
-per architecture and a floating compiler moves the bytes that hash is taken over.
-Nothing verifies a hash today — `SHA256SUMS` is built and nothing publishes it
-([PLAN.md § P3](PLAN.md#p3--release-process)). The measurements are in
-[IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build).
+Why the standard library is rebuilt at all, why `scripts/nightly-version` pins a
+dated nightly rather than a floating one, and what `NOMUX_STABLE_STD=1`,
+`NOMUX_NIGHTLY` and `NOMUX_UPDATE_BASELINE=1` are for are
+[IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)'s; when that pin moves, and what
+becomes of `SHA256SUMS` after the build writes it, are
+[PLAN.md § P3](PLAN.md#p3--release-process)'s.
 
 ## Diagnostics
 
