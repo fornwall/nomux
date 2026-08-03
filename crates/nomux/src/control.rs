@@ -71,13 +71,18 @@ const MAX_PID_LEN: usize = 32;
 
 /// Longest `/proc/<pid>/cmdline` prefix [`is_daemon_for`] reads.
 ///
-/// Sized so that no legitimate invocation can reach it, because a command line this
-/// cannot see the end of is one whose daemon it cannot recognise. `argv[0]` is
-/// `env::current_exe()` resolved, so its bound is the kernel's `PATH_MAX` rather than
-/// anything this program picks — § 5.2 installs under a directory the *client* names,
-/// which is not a length that can be assumed small — and behind it come the mode and
-/// an id of at most [`MAX_SESSION_ID_LEN`], with a NUL after each. Stack rather than
-/// text, on a path that runs at most twice per `kill`.
+/// Sized to hold the three arguments that identify a daemon and no more of the command
+/// line than that: `argv[0]`, whose bound is the kernel's `PATH_MAX` rather than
+/// anything this program picks — `attach` starts the daemon from `env::current_exe()`
+/// resolved, and § 5.2 installs under a directory the *client* names — then the mode,
+/// then an id of at most [`MAX_SESSION_ID_LEN`], with a NUL after each.
+///
+/// It is deliberately *not* sized for the whole command line, because the whole
+/// command line has no bound: `--label <text>` follows the id and reaches `attach`
+/// verbatim, so a caller can make it any length it likes. Nothing past the id is read
+/// as anything but padding — [`is_daemon_for`] decides on the arguments it saw the end
+/// of — which is what keeps a label out of the question rather than in front of it.
+/// Stack rather than text, on a path that runs at most twice per `kill`.
 const MAX_CMDLINE_LEN: usize = PATH_MAX + 1 + "daemon".len() + 1 + MAX_SESSION_ID_LEN + 1;
 
 /// The kernel's longest path, which is what bounds a resolved `argv[0]`.
@@ -580,19 +585,35 @@ fn serving(
 /// last argument cannot equal both `daemon` and the id — but a false *negative* is
 /// how a healthy daemon becomes invisible, and an invisible daemon is a session
 /// [`serving`] refuses to identify for as long as it runs. So a read that cannot see
-/// the end of the command line says so, exactly as [`parse_pid`] does of a pidfile
-/// that runs past its own bound.
+/// what it needs says so, exactly as [`parse_pid`] does of a pidfile that runs past
+/// its own bound.
+///
+/// What it needs is the two words, not the whole command line, and the difference is
+/// the reason a session with a long `--label` is still killable: the label follows the
+/// id and arrives at `attach` verbatim, so a command line has no length this could be
+/// sized against. Finding the pair is therefore an answer whether or not the read
+/// reached the end, and only *failing* to find it leaves the truncation to decide.
 fn is_daemon_for(pid: rustix::process::Pid, id: &str) -> Option<bool> {
     let mut buf = [0u8; MAX_CMDLINE_LEN];
     let cmdline = PathBuf::from(format!("/proc/{}/cmdline", pid.as_raw_nonzero()));
     let body = read_prefix(&cmdline, &mut buf).ok()?;
-    if body.len() >= MAX_CMDLINE_LEN {
-        return None;
+    // Every argv element is NUL-*terminated*, so everything up to the last NUL is
+    // arguments this read saw the end of and whatever follows it is a tail. Comparing
+    // the tail would be comparing half a word.
+    let whole = body
+        .iter()
+        .rposition(|byte| *byte == 0)
+        .and_then(|end| body.get(..end))
+        .unwrap_or(&[]);
+    // Compared as whole arguments, so an id that is a prefix of another session's is a
+    // different session — and the id is looked for *after* the mode, which is the order
+    // `<exe> daemon <id>` puts them in.
+    let mut args = whole.split(|byte| *byte == 0);
+    if args.any(|arg| arg == b"daemon") && args.any(|arg| arg == id.as_bytes()) {
+        return Some(true);
     }
-    // NUL-separated argv, so the arguments are compared whole: an id that is a prefix
-    // of another session's is a different session.
-    let mut args = body.split(|byte| *byte == 0);
-    Some(args.any(|arg| arg == b"daemon") && args.any(|arg| arg == id.as_bytes()))
+    // Not there — which is only news if the read saw everything there was.
+    (body.len() < MAX_CMDLINE_LEN).then_some(false)
 }
 
 /// The refusal to act when neither live candidate is this session's daemon.

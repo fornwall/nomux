@@ -583,11 +583,12 @@ fn a_daemon_started_from_a_long_path_is_still_told_from_a_stranger() {
     fs::copy(env!("CARGO_BIN_EXE_nomux"), &exe).expect("install the binary deep");
     // What the daemon's `/proc/<pid>/cmdline` will hold: the three arguments and the
     // NUL after each. Asserted rather than assumed, since the whole test is about
-    // where that length falls.
+    // where that length falls — this is the lower bound `MAX_CMDLINE_LEN` has to clear
+    // for a deep install to be identified at all, and 512 is the size it once was.
     let cmdline = exe.as_os_str().len() + 1 + "daemon".len() + 1 + "lk19".len() + 1;
     assert!(
         cmdline > 512,
-        "the command line must overrun a fixed 512-byte read to test anything: \
+        "the command line must be longer than the buffer once was to test anything: \
          {cmdline} bytes"
     );
 
@@ -635,6 +636,74 @@ fn a_daemon_started_from_a_long_path_is_still_told_from_a_stranger() {
     succeeded(
         &killed,
         "a daemon started from a long path was not recognised as one",
+    );
+    assert_eq!(
+        listed.trim_end().split('\t').nth(1),
+        Some(daemon.to_string().as_str()),
+        "list must name the daemon it identified, not the planted pid: {listed:?}"
+    );
+    assert!(
+        poll_until(Duration::from_secs(10), || !process_alive(daemon)),
+        "kill reported success with the daemon still running as pid {daemon}"
+    );
+}
+
+/// Regression: a daemon is still recognised when its command line is long *behind*
+/// the id.
+///
+/// The path in the test above is bounded — the kernel resolves `argv[0]` and will not
+/// hand back more than `PATH_MAX` — but `--label` is not: `attach` passes what it was
+/// given straight through (`attach::spawn_daemon`), and the 256-byte cap in
+/// `sanitize_label` applies to the file the daemon *writes*, not to its own `argv`. So
+/// a command line has no length a buffer can be sized against, and a rule that needed
+/// to see the end of one would strand a session over a label.
+///
+/// Nothing behind the id is read as anything but padding: the pair is looked for among
+/// the arguments the read saw the end of, and finding it is an answer whether or not
+/// the rest arrived. The label here is an order of magnitude past what the layout
+/// stores and past the whole buffer.
+#[test]
+fn a_daemon_started_with_an_over_long_label_is_still_told_from_a_stranger() {
+    let root = run_root("lk20");
+    let label = "L".repeat(8192);
+    let started = collect(
+        nomux_with_shell(&root, &["attach", "lk20", "--label", &label])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+    );
+    succeeded(&started, "a session with a very long label failed to start");
+    let pid_path = root.join("nomux").join("lk20.pid");
+    wait_for(&pid_path);
+    let daemon: u32 = fs::read_to_string(&pid_path)
+        .expect("read the pidfile")
+        .trim()
+        .parse()
+        .expect("the pidfile holds a pid");
+    let _reaper = Reaper(daemon);
+
+    let mut bystander = Spawned::spawn(
+        Command::new("sleep")
+            .arg("300")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    );
+    fs::write(&pid_path, format!("{}\n", bystander.id())).expect("plant a stranger's pid");
+
+    let listed = stdout(&control(&root, &["list"]));
+    let killed = control(&root, &["kill", "lk20"]);
+    let survived = bystander.is_running();
+    drop(bystander);
+
+    assert!(
+        survived,
+        "a `sleep` was taken for the session's daemon: {:?}",
+        stderr(&killed)
+    );
+    succeeded(
+        &killed,
+        "a daemon whose label ran past the command-line buffer was not recognised",
     );
     assert_eq!(
         listed.trim_end().split('\t').nth(1),
