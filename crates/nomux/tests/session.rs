@@ -2194,13 +2194,18 @@ fn a_closed_agent_channel_whose_peer_stopped_reading_leaves_the_daemon_asleep() 
 #[test]
 fn a_daemon_that_cannot_accept_stands_back_rather_than_spinning() {
     /// Long enough that the bug shows up as tens of ticks, short enough to keep the
-    /// suite where it is. Half a second rather than the 300 ms above, because the
-    /// two answers are further apart there: measured at 25 ticks with the spin and 0
-    /// without it, against 15 and 0 over 300 ms.
+    /// suite where it is.
+    ///
+    /// Half a second rather than the 300 ms the agent-channel test above uses,
+    /// because that is what separates the two answers well enough for a threshold to
+    /// sit between them under load. The spin measures in the twenties to forties over
+    /// this window — 28 and 38 on two machines — and what it is *not* is the other
+    /// answer, which is exactly zero and cannot be moved by scheduling: the fixed
+    /// daemon sleeps 100 ms at a time and wakes five times to fail one `accept`.
     const WINDOW: Duration = Duration::from_millis(500);
     /// Five ticks is 50 ms of processor time against half a second of wall clock: a
-    /// tenth of one core, where the bug is half of one and the fix is a wakeup every
-    /// 100 ms that finds nothing to do.
+    /// tenth of one core, well under the lowest spin figure seen and unreachable by a
+    /// daemon that is asleep.
     const TOLERATED: u32 = 5;
 
     let session = Session::start("emfile");

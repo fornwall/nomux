@@ -12,7 +12,7 @@
 use std::collections::VecDeque;
 use std::fs;
 use std::io;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -112,6 +112,14 @@ const FIRST_ATTACH_TIMEOUT: Duration = Duration::from_secs(30);
 /// of a shortage that has just cleared does not notice, and long enough that a host
 /// under `ENFILE` is not being made worse by every nomux daemon on it burning a core.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Backlog for the session socket.
+///
+/// The figure `UnixListener::bind` uses, restated because [`start`] calls `listen`
+/// a second time to move the socket's `SO_PEERCRED` onto the process that survives
+/// § 6.2's fork, and `listen` takes a backlog rather than keeping the one in force.
+/// Passing anything smaller would quietly shrink the queue a `list` sweep fills.
+const SOCKET_BACKLOG: libc::c_int = 128;
 
 /// Fault injection: restores the pre-fix event ordering of § 6.4.1, where the
 /// takeover was serviced before the client it was replacing.
@@ -267,8 +275,8 @@ fn start(session_id: &str, label: Option<&str>) -> io::Result<()> {
 
     // Held across the whole of claiming the id, because everything below decides on
     // the same evidence `list` and `kill` decide on and must not interleave with
-    // them (§ 6.3): `clear_stale_socket` reads a refused `connect` as a dead daemon
-    // and removes its socket and pidfile, which is exactly what a collection does one
+    // them (§ 6.3): `bind_socket` reads a refused `connect` as a dead daemon and
+    // removes its socket and pidfile, which is exactly what a collection does one
     // `connect` earlier. Without this, a `list` that probed the stale socket and was
     // then descheduled unlinks what this daemon has bound in the meantime — the live
     // session's socket and pidfile, which § 6.6 promises never happens — and a `kill`
@@ -287,17 +295,37 @@ fn start(session_id: &str, label: Option<&str>) -> io::Result<()> {
     // already held, and there this is no worse than taking nothing at all.
     let publishing = paths.try_lock_spawn();
 
-    // Before the fork, so a session that is already running is still refused to
-    // whoever asked with an exit status they can see. The bind is on the other side
-    // of it; `clear_stale_socket` argues both halves.
-    clear_stale_socket(&paths)?;
+    // The whole of it before the fork, and not only the refusal an id already in use
+    // earns. Every other way binding can fail — a read-only run directory, no space
+    // for the node, a path component that stopped resolving, a name that appeared
+    // between the probe and the bind — has to be reported from *this* process, because
+    // past § 6.2's fork the one a caller is waiting on has already `_exit`ed with a
+    // status of its own and every errno after it reads as success. `ssh -t host
+    // 'nomux daemon <id>'` is exactly the shape that forks, so a session that never
+    // started would be a session reported as started.
+    let listener = bind_socket(&paths)?;
     // Before the pidfile, so the pid `nomux kill` reads belongs to the process that
     // survives.
     leave_login_session();
-    // After the fork, so that the process `SO_PEERCRED` reports as the socket's
-    // creator is the one that is still there to be signalled.
-    let listener = crate::rundir::bind_socket_private(&paths.socket())?;
-    listener.set_nonblocking(true)?;
+    // The surviving process claims the socket it inherited. `SO_PEERCRED` on a
+    // listening socket is stamped by `listen(2)` rather than by `bind`, and stamped
+    // again by every later `listen` — `unix_listen` accepts a socket already in
+    // `TCP_LISTEN` and re-runs `init_peercred` on it — so without this the credentials
+    // a control surface reads off the socket are the forked parent's, and that number
+    // is one the kernel is free to reissue the moment it exits. Measured on this
+    // kernel, both that the stamp moves and that a connection queued in between
+    // survives the call.
+    //
+    // The backlog is the one `UnixListener::bind` chose, restated because `listen` has
+    // no way to ask. A failure here is discarded rather than propagated: it leaves the
+    // socket exactly as every release so far has left it, named after the parent, and
+    // that is a worse answer to a question nothing in this tree asks yet — not a
+    // reason to refuse a session that is otherwise ready to serve.
+    //
+    // SAFETY: `listen` is passed a descriptor `listener` owns and keeps open across
+    // the call, and a backlog. `UnixListener` has no safe spelling of a second
+    // `listen`, and rustix's would mean adding its `net` feature to the whole crate.
+    let _ = unsafe { libc::listen(listener.as_raw_fd(), SOCKET_BACKLOG) };
 
     // Before the pidfile, because that file is what `nomux kill` (§ 6.6) reads to
     // find this process: arming after writing it would leave a window, however
@@ -364,27 +392,12 @@ fn start(session_id: &str, label: Option<&str>) -> io::Result<()> {
     result
 }
 
-/// Establishes that the id is free, and removes what a dead daemon left at it.
+/// Binds the session socket, replacing a stale one.
 ///
 /// A socket whose `connect` is refused belongs to a dead daemon; anything else —
 /// including `EACCES` — is left alone, since removing it could destroy a live
 /// session belonging to someone else's run.
-///
-/// Separate from the `bind` that follows it in [`start`] because § 6.2's fork goes
-/// between them, and the two halves want opposite sides of it. The refusal has to
-/// come *before*: past the fork the process a caller is waiting on has already
-/// `_exit`ed with a status of its own, so an id that is already running would be
-/// reported as success. And the bind has to come *after*: `kill` identifies the
-/// daemon from the socket's `SO_PEERCRED`, which names whichever process called
-/// `listen`, so binding first hands the frozen control surface the number of the
-/// parent that is about to vanish — a number the kernel is then free to reissue,
-/// which is the whole hazard reading the socket exists to close.
-///
-/// What that costs is one `fork` of extra width in the window where the id is
-/// claimed but nothing is bound. The spawn lock `start` holds spans it — a `fork`
-/// duplicates the descriptor rather than the lock, so the surviving child holds the
-/// one the parent took — and that is what keeps a collection out of it.
-fn clear_stale_socket(paths: &SessionPaths) -> io::Result<()> {
+fn bind_socket(paths: &SessionPaths) -> io::Result<UnixListener> {
     let path = paths.socket();
     match UnixStream::connect(&path) {
         Ok(_) => {
@@ -433,7 +446,10 @@ fn clear_stale_socket(paths: &SessionPaths) -> io::Result<()> {
     // that licensed removing the socket. A live session took the early return and
     // reaches none of this.
     paths.clear_pid();
-    Ok(())
+
+    let listener = crate::rundir::bind_socket_private(&path)?;
+    listener.set_nonblocking(true)?;
+    Ok(listener)
 }
 
 /// What one entry of the poll set belongs to.
@@ -456,14 +472,44 @@ enum Source {
     AgentChannel(u32),
 }
 
+/// How many slots one [`Source`] can occupy in the poll set at once.
+///
+/// A `match` rather than a count, because `Source` has no count and the number this
+/// feeds is a fixed array's length: a seventh singleton added without widening that
+/// array would be a wakeup silently dropped, which is the one failure the named
+/// lookup below cannot catch. This is what a new variant cannot be added past — the
+/// match stops compiling until it is classified, and [`POLL_SLOTS`] is the sum over
+/// every arm.
+const fn slots_for(source: Source) -> usize {
+    match source {
+        Source::Listener
+        | Source::Signal
+        | Source::Pty
+        | Source::Client
+        | Source::Pending
+        | Source::AgentListener => 1,
+        // `Agent::accept` refuses a ninth, so the table cannot be longer than this.
+        Source::AgentChannel(_) => MAX_AGENT_CHANNELS as usize,
+    }
+}
+
 /// Slots the poll set can ever need at once: the six sources that exist at most once
 /// each — the listener, the signal pipe, the PTY master, the client, the connection
-/// that has not greeted, the agent listener — plus one per agent channel, which
-/// `Agent::accept` caps at [`MAX_AGENT_CHANNELS`].
-///
-/// Derived from that cap rather than counted out, so raising it cannot leave a number
-/// here behind.
-const POLL_SLOTS: usize = 6 + MAX_AGENT_CHANNELS as usize;
+/// that has not greeted, the agent listener — plus one per agent channel.
+const POLL_SLOTS: usize = slots_for(Source::Listener)
+    + slots_for(Source::Signal)
+    + slots_for(Source::Pty)
+    + slots_for(Source::Client)
+    + slots_for(Source::Pending)
+    + slots_for(Source::AgentListener)
+    + slots_for(Source::AgentChannel(0));
+
+const _: () = assert!(
+    POLL_SLOTS >= 6 + MAX_AGENT_CHANNELS as usize,
+    "the poll set must hold every source that exists at most once and a full agent \
+     table at the same time, or `watches` drops the entries past the end and the loop \
+     never hears from the descriptors they belonged to"
+);
 
 /// What one `poll` came back with: the readiness of each source in the order
 /// [`Daemon::watches`] registered them, and how many of the slots it used.
@@ -482,9 +528,16 @@ impl Daemon {
             // Given back at the end of the pass that grew it. `take_frame` copies each
             // payload in here, so a single large `Input` leaves one `MAX_PAYLOAD` —
             // 256 KiB — held for the rest of the session, which can be a week, over a
-            // frame nothing will look at again. It costs the steady state nothing: a
-            // pass that decoded no frame leaves the capacity where the last shrink put
-            // it, and `shrink_to` below its own argument makes no call at all.
+            // frame nothing will look at again.
+            //
+            // A pass that decoded no frame pays nothing: the capacity is where the
+            // last shrink left it, and `shrink_to` below its own argument makes no
+            // call. A pass that decoded one pays an allocation and a free — and where
+            // the payload is large, on musl's allocator that is an `mmap` and a
+            // `munmap`, so a client streaming full-sized `Input` frames trades two
+            // syscalls a pass for not holding a quarter of a megabyte until the
+            // session ends. The output direction, which is where the volume is, comes
+            // through here without decoding anything.
             //
             // `read_buf` is left alone deliberately. It is a fixed 64 KiB that every
             // pass reads into, so giving it back would be one allocation per pass
@@ -892,6 +945,15 @@ impl Daemon {
                     return;
                 }
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                // Named rather than folded in with the rest, the way every other
+                // non-blocking call site in this tree names it: the listener is
+                // non-blocking, so an empty backlog is an ordinary answer and not
+                // something to stand back from. Reachable or not on `AF_UNIX` — a
+                // `poll` that reported `POLLIN` and an `accept` that finds nothing
+                // needs two processes racing for one connection, and there is only
+                // ever one here — a descriptor shortage and an empty queue are not
+                // the same event and must not share an arm.
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return,
                 Err(_) => {
                     self.accept_retry = Some(Instant::now() + ACCEPT_BACKOFF);
                     return;
@@ -1036,12 +1098,16 @@ impl Daemon {
         // `MAX_PENDING_INPUT` plus a frame, 1.25 MiB, kept for up to seven days.
         //
         // Here rather than anywhere the queue merely shrinks, and only where it has
-        // gone empty, which is what keeps it off the steady state: the master is in
-        // the poll set asking for `POLLOUT` exactly while this queue is non-empty, so
-        // the pass that empties it is the last one to call this until the client
-        // sends again. What that costs is one allocation per burst of typing, against
-        // a relay loop that goes round once per 64 KiB of *output* and never comes
-        // through here at all.
+        // gone empty: the master is in the poll set asking for `POLLOUT` exactly while
+        // this queue is non-empty, so the pass that empties it is the last one to call
+        // this until the client sends again.
+        //
+        // What it costs is one allocation and one free per keystroke, not per burst:
+        // `write_pty` runs on the pass *after* the one that queued the bytes, so an
+        // interactive key is queued in one pass and drained — and the queue freed — in
+        // the next. That is a few dozen a second against a human, and the loop this
+        // sits in goes round once per 64 KiB of *output* without coming through here
+        // at all. The alternative is holding 1.25 MiB for a week over one paste.
         if self.pending_input.is_empty() {
             self.pending_input.shrink_to(0);
         }
@@ -1541,10 +1607,10 @@ mod tests {
     /// Regression: losing the race to remove a stale socket must not turn a session
     /// that is perfectly startable into one that refuses to start.
     ///
-    /// A `list` collects a dead session on exactly the evidence `clear_stale_socket`
+    /// A `list` collects a dead session on exactly the evidence `bind_socket`
     /// acts on — a `connect` that was refused — so the two reach for the same file
     /// and the collection can get there first. What is left then is the state
-    /// `clear_stale_socket` was trying to reach, and it used to answer it with the
+    /// `bind_socket` was trying to reach, and it used to answer it with the
     /// `ENOENT` from its own `remove_file`, which `daemon::start` propagates: no
     /// session, because somebody else had already tidied up.
     #[test]
@@ -1563,12 +1629,12 @@ mod tests {
         fs::write(paths.socket(), b"").expect("plant a stale socket");
         COLLECT_ONCE.set(true);
 
-        let cleared = clear_stale_socket(&paths);
+        let bound = bind_socket(&paths);
         assert!(
             !COLLECT_ONCE.get(),
             "the socket was never probed, so nothing was raced"
         );
         drop(fs::remove_file(paths.socket()));
-        cleared.expect("a stale socket somebody else removed first is not a failure");
+        drop(bound.expect("a stale socket somebody else removed first is not a failure"));
     }
 }

@@ -56,18 +56,22 @@ const _: () = assert!(
 /// The condition is a *ratio* rather than a number of bytes, because what a
 /// compaction costs is the remainder — the part that stays — and a threshold on the
 /// prefix says nothing about that. Draining a queue of n bytes in c-byte writes at a
-/// fixed 64 KiB threshold moves about n²/2c, so the cost per byte delivered rises
-/// with the queue rather than staying put. It bites precisely where the queue is
-/// largest, which is the replay path: `pump_output` tops the queue back up to
-/// [`MAX_PENDING_WRITE`] after every write, so the remainder never shrinks. Simulated
-/// against that pattern with a full 1 MiB queue, delivering one megabyte moves
-/// 7.50 MiB at the 64 KiB floor a socket buffer can be shrunk to and 1.97 MiB at the
-/// `AF_UNIX` default of some 208 KiB a wakeup; halving moves 0.94 MiB and 0.58 MiB.
+/// fixed 64 KiB threshold moves about n²/2c: every write past the first 64 KiB
+/// memmoves almost the whole queue, so the cost per byte delivered rises with the
+/// queue instead of staying put. It bites precisely where the queue is largest, which
+/// is the replay path — `pump_output` tops the queue back up to
+/// [`MAX_PENDING_WRITE`] after every write, so the remainder never shrinks. Halving
+/// moves at most as many bytes as the compaction retires, the remainder being no
+/// larger than the prefix by the test itself, so each byte pays for one move and is
+/// then gone: O(1) amortised per byte however the writes fall.
 ///
-/// Halving moves at most as many bytes as the compaction retires — the remainder is
-/// no larger than the prefix, by the test itself — so each byte pays for one move and
-/// is then gone, which is O(1) amortised per byte however the writes fall, and never
-/// more than the fixed threshold would have moved.
+/// It is not free everywhere, and the receive direction is where it is not. There
+/// `fill` reads a chunk and `take_frame` decodes straight through it, so the cursor
+/// reaches the end and the fixed threshold was never met at all — the free `clear`
+/// above took every compaction. Halving instead memmoves each buffer roughly once
+/// before it empties. That is bounded by what a client sends, which is keystrokes
+/// and acknowledgements against a megabyte cap, where the send direction carries the
+/// session's whole output: the trade is deliberate and it is in the right direction.
 fn compact(buf: &mut Vec<u8>, pos: &mut usize) {
     if *pos == buf.len() {
         buf.clear();

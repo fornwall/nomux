@@ -26,6 +26,7 @@ use std::fs::{self, File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 use std::time::Duration;
@@ -248,6 +249,66 @@ fn a_daemon_holds_the_spawn_lock_while_it_claims_the_id() {
         lock.dev(),
         lock.ino(),
         "the daemon took the spawn lock before it went near the socket",
+    );
+}
+
+/// Regression: a `nomux daemon <id>` that never bound its socket exits non-zero,
+/// including on the path where § 6.2 has to fork.
+///
+/// The refusal an id already in use earns is not the only one that has to survive the
+/// fork. Everything else the bind can answer — a read-only run directory, no space
+/// for the node, a path component that stopped resolving, a name that appeared
+/// between the probe and the bind — reaches the caller through the same exit status,
+/// and past the fork there is no caller left to reach: the process somebody waited on
+/// has already gone through `_exit(0)`. `ssh -t host 'nomux daemon <id>'` is exactly
+/// the shape that forks, per § 6.2, so this is not a corner.
+///
+/// A dangling symlink is the deterministic way in. `connect` follows it, finds
+/// nothing and answers `ENOENT`, which the probe reads as an id nobody is serving;
+/// `bind` does not follow it, finds the name taken and answers `EADDRINUSE`. No race,
+/// no timing, and the errno arrives strictly between the two.
+///
+/// `setpgid` in the child is what forces the fork, and it is the same device
+/// `a_daemon_that_leads_a_process_group_detaches_by_forking` uses: `Command` never
+/// makes a process group leader, so without it `setsid` succeeds outright and this
+/// test would pass against the ordering it exists to catch.
+#[test]
+fn a_daemon_that_cannot_bind_says_so_even_when_it_has_to_fork() {
+    let session = StaleSession::empty("lkc");
+    std::os::unix::fs::symlink(session.dir.join("nowhere"), session.socket())
+        .expect("plant a dangling symlink at the socket");
+
+    let mut command = nomux_with_shell(&session.root, &["daemon", "lkc"]);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: the closure runs in the forked child before exec, so it must be
+    // async-signal-safe. `setpgid` is, and nothing here allocates or takes a lock.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    let started = collect(&mut command);
+
+    assert!(
+        !started.status.success(),
+        "a daemon that never bound its socket reported success: {:?}",
+        stderr(&started)
+    );
+    assert!(
+        stderr(&started).contains("Address already in use"),
+        "and it must say what stopped it: {:?}",
+        stderr(&started)
+    );
+    assert!(
+        !session.pid_path().exists(),
+        "nothing may be published for a session that does not exist"
     );
 }
 
