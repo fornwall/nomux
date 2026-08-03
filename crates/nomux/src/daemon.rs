@@ -52,10 +52,13 @@ const MAX_RING_CAPACITY: usize = 1 << 30;
 
 /// Resolves the ring capacity, honouring [`RING_BYTES_ENV`].
 ///
-/// An unparseable, zero or unservable value falls back rather than failing: a mistyped
-/// tuning variable should not stop a session from starting. Zero in particular has to
-/// be filtered here rather than passed on: `Ring::new` clamps it to one byte, and a
-/// ring that makes every write a gap is not a tuning choice — the default is.
+/// Nothing here refuses: a mistyped tuning variable should not stop a session from
+/// starting. An unparseable or zero value falls back to the default, and one that is
+/// merely too large is clamped to [`MAX_RING_CAPACITY`] — which is a different answer
+/// from the default, and the right one, since a caller asking for more than the
+/// ceiling is asking for as much as it can have. Zero in particular has to be filtered
+/// here rather than passed on: `Ring::new` clamps it to one byte, and a ring that
+/// makes every write a gap is not a tuning choice — the default is.
 fn ring_capacity() -> usize {
     std::env::var(RING_BYTES_ENV)
         .ok()
@@ -96,6 +99,19 @@ const IDLE_TICK: Duration = Duration::from_secs(60 * 60);
 /// How long to wait for the very first client before giving up. Without this a
 /// daemon spawned by a connection that died mid-handshake would live forever.
 const FIRST_ATTACH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the listener stays out of the poll set after an `accept` that failed for
+/// something other than a signal.
+///
+/// A descriptor shortage — `EMFILE` for this process, `ENFILE` for the host — leaves
+/// the connection queued, so the listener goes on reporting `POLLIN` and every pass
+/// answers it with the same failure, for as long as the shortage lasts. Clamping the
+/// sleep is not enough on its own and neither is any timeout: a readable descriptor
+/// in the set is what makes `poll` return immediately. So the listener leaves the set
+/// for this long instead, which is short enough that a client waiting on the far side
+/// of a shortage that has just cleared does not notice, and long enough that a host
+/// under `ENFILE` is not being made worse by every nomux daemon on it burning a core.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Fault injection: restores the pre-fix event ordering of § 6.4.1, where the
 /// takeover was serviced before the client it was replacing.
@@ -208,6 +224,10 @@ struct Daemon {
     child_gone: Option<Instant>,
     /// The child's status, `None` until `waitpid` hands it over.
     exited: Option<(i32, ExitKind)>,
+    /// When the listener may be polled again, after an `accept` that failed for a
+    /// reason that will still be there on the next pass. `None` is the ordinary
+    /// state, where the listener is in the set.
+    accept_retry: Option<Instant>,
     /// When the session last lost its client, for idle reaping.
     ///
     /// The timestamp alone. *Whether* that deadline is armed is `client.is_none()`,
@@ -245,11 +265,39 @@ fn start(session_id: &str, label: Option<&str>) -> io::Result<()> {
     let paths = SessionPaths::new(session_id)?;
     paths.ensure_dir()?;
 
-    let listener = bind_socket(&paths)?;
-    // After the socket, so a session that is already running is still reported to
-    // whoever asked with an exit status they can see; before the pidfile, so the
-    // pid `nomux kill` reads belongs to the process that survives.
+    // Held across the whole of claiming the id, because everything below decides on
+    // the same evidence `list` and `kill` decide on and must not interleave with
+    // them (§ 6.3): `clear_stale_socket` reads a refused `connect` as a dead daemon
+    // and removes its socket and pidfile, which is exactly what a collection does one
+    // `connect` earlier. Without this, a `list` that probed the stale socket and was
+    // then descheduled unlinks what this daemon has bound in the meantime — the live
+    // session's socket and pidfile, which § 6.6 promises never happens — and a `kill`
+    // landing in the same window exits 0 reporting no such session while a daemon
+    // holds the user's shell, invisible to `list` and unkillable by it. `attach`
+    // never reached that state because it holds this lock across the spawn; a
+    // `nomux daemon <id>` started by hand, which § 6.2 is written for, held nothing.
+    //
+    // Never blocking, and it goes ahead without the lock rather than refusing. On the
+    // ordinary path the attach that spawned this process is holding this very lock on
+    // its behalf until `<id>.pid` exists, so waiting would park the session's own
+    // creation until that attach gave up at its spawn timeout — and nothing here can
+    // tell that holder from a `kill`'s. So what closes is every interleaving where
+    // the lock was free to be taken, which is every one that does not start inside
+    // somebody else's locked region; what remains open is the case where it was
+    // already held, and there this is no worse than taking nothing at all.
+    let publishing = paths.try_lock_spawn();
+
+    // Before the fork, so a session that is already running is still refused to
+    // whoever asked with an exit status they can see. The bind is on the other side
+    // of it; `clear_stale_socket` argues both halves.
+    clear_stale_socket(&paths)?;
+    // Before the pidfile, so the pid `nomux kill` reads belongs to the process that
+    // survives.
     leave_login_session();
+    // After the fork, so that the process `SO_PEERCRED` reports as the socket's
+    // creator is the one that is still there to be signalled.
+    let listener = crate::rundir::bind_socket_private(&paths.socket())?;
+    listener.set_nonblocking(true)?;
 
     // Before the pidfile, because that file is what `nomux kill` (§ 6.6) reads to
     // find this process: arming after writing it would leave a window, however
@@ -268,6 +316,11 @@ fn start(session_id: &str, label: Option<&str>) -> io::Result<()> {
         // Advisory: a session is worth more than its name in a listing.
         drop(paths.write_label(label));
     }
+    // Released the instant the id is published, and never carried into the event
+    // loop: `kill` waits two seconds for this lock and then reports a session it
+    // could not remove (§ 6.6), so a daemon still holding it would be one nothing
+    // could stop.
+    drop(publishing);
 
     // Everything above resolved its paths already, so the daemon can let go of the
     // directory it inherited from the attaching connection. Holding it would keep
@@ -295,6 +348,7 @@ fn start(session_id: &str, label: Option<&str>) -> io::Result<()> {
         win: WinSize::default(),
         child_gone: None,
         exited: None,
+        accept_retry: None,
         last_detach: Instant::now(),
     };
 
@@ -310,12 +364,27 @@ fn start(session_id: &str, label: Option<&str>) -> io::Result<()> {
     result
 }
 
-/// Binds the session socket, replacing a stale one.
+/// Establishes that the id is free, and removes what a dead daemon left at it.
 ///
 /// A socket whose `connect` is refused belongs to a dead daemon; anything else —
 /// including `EACCES` — is left alone, since removing it could destroy a live
 /// session belonging to someone else's run.
-fn bind_socket(paths: &SessionPaths) -> io::Result<UnixListener> {
+///
+/// Separate from the `bind` that follows it in [`start`] because § 6.2's fork goes
+/// between them, and the two halves want opposite sides of it. The refusal has to
+/// come *before*: past the fork the process a caller is waiting on has already
+/// `_exit`ed with a status of its own, so an id that is already running would be
+/// reported as success. And the bind has to come *after*: `kill` identifies the
+/// daemon from the socket's `SO_PEERCRED`, which names whichever process called
+/// `listen`, so binding first hands the frozen control surface the number of the
+/// parent that is about to vanish — a number the kernel is then free to reissue,
+/// which is the whole hazard reading the socket exists to close.
+///
+/// What that costs is one `fork` of extra width in the window where the id is
+/// claimed but nothing is bound. The spawn lock `start` holds spans it — a `fork`
+/// duplicates the descriptor rather than the lock, so the surviving child holds the
+/// one the parent took — and that is what keeps a collection out of it.
+fn clear_stale_socket(paths: &SessionPaths) -> io::Result<()> {
     let path = paths.socket();
     match UnixStream::connect(&path) {
         Ok(_) => {
@@ -325,7 +394,25 @@ fn bind_socket(paths: &SessionPaths) -> io::Result<UnixListener> {
             ));
         }
         Err(err) if err.kind() == io::ErrorKind::ConnectionRefused => {
-            fs::remove_file(&path)?;
+            // Forced here because there is nowhere else it can be forced from: the
+            // probe above and the removal below are two syscalls on one name, with
+            // nothing in between for another process to be scheduled into, so the
+            // test for losing that race has to be inside the window. Compiled out of
+            // every build but this crate's own unit tests.
+            #[cfg(test)]
+            tests::collect_the_stale_socket(&path);
+            // A collection decides on the same evidence one `connect` earlier
+            // (§ 6.6), so losing the race to remove this file is ordinary rather than
+            // exceptional — and the file being gone is the state this call exists to
+            // reach. Propagating that `ENOENT` turns a session that is perfectly
+            // startable into one that refuses to start, over a socket that is gone
+            // either way. Absence is success here for the same reason it is in the
+            // arm below.
+            if let Err(err) = fs::remove_file(&path)
+                && err.kind() != io::ErrorKind::NotFound
+            {
+                return Err(err);
+            }
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => return Err(err),
@@ -335,10 +422,10 @@ fn bind_socket(paths: &SessionPaths) -> io::Result<UnixListener> {
     // it is what lets `attach`'s wait for that path to *exist* be satisfied by the
     // dead daemon's number — the spawn lock is then released before this daemon has
     // published anything, and a `kill` taking it in the window finds a live socket
-    // and a stale pid at once. Since pids are reused, that is `control::resolve`
-    // signalling an unrelated process of the user's, which checking liveness first
-    // cannot catch: the session really is live, and it is the pidfile that belongs
-    // to the previous one.
+    // and a stale pid at once. Since pids are reused, that is `kill` signalling an
+    // unrelated process of the user's, which checking liveness first cannot catch:
+    // the session really is live, and it is the pidfile that belongs to the previous
+    // one.
     //
     // Here rather than after the `bind`, so there is no window at all: past the
     // match above, either nothing was at the socket or what was there refused a
@@ -346,10 +433,7 @@ fn bind_socket(paths: &SessionPaths) -> io::Result<UnixListener> {
     // that licensed removing the socket. A live session took the early return and
     // reaches none of this.
     paths.clear_pid();
-
-    let listener = crate::rundir::bind_socket_private(&path)?;
-    listener.set_nonblocking(true)?;
-    Ok(listener)
+    Ok(())
 }
 
 /// What one entry of the poll set belongs to.
@@ -481,7 +565,13 @@ impl Daemon {
     /// arithmetic bug there would silently apply one fd's readiness to another.
     fn watches(&self) -> Vec<(Source, BorrowedFd<'_>, PollFlags)> {
         let mut watches = Vec::with_capacity(5);
-        watches.push((Source::Listener, self.listener.as_fd(), PollFlags::IN));
+        // Out of the set while an `accept` that failed is being waited out, which is
+        // the only way to stand back from it: the queued connection that failure left
+        // behind keeps the descriptor readable, so a `poll` that still asks about it
+        // returns immediately however long the timeout says.
+        if self.accept_retry.is_none() {
+            watches.push((Source::Listener, self.listener.as_fd(), PollFlags::IN));
+        }
         if let Some(stop) = self.stop_pipe.as_ref() {
             watches.push((Source::Signal, stop.as_fd(), PollFlags::IN));
         }
@@ -600,6 +690,12 @@ impl Daemon {
         if SETTLE_BEFORE_POLL {
             std::thread::sleep(FAULT_SETTLE);
         }
+        // Cleared here rather than tested at each of the two places it is read, so
+        // that "the listener is back in the set" and "there is no longer a wakeup to
+        // arrange for it" cannot disagree.
+        if self.accept_retry.is_some_and(|at| Instant::now() >= at) {
+            self.accept_retry = None;
+        }
         let Some(events) = self.wait()? else {
             return Ok(());
         };
@@ -706,6 +802,11 @@ impl Daemon {
         if self.child_gone.is_some() && self.exited.is_none() {
             remaining = remaining.min(STATUS_RETRY);
         }
+        // The listener is out of the poll set until this passes (`Daemon::accept`),
+        // so nothing else is left to wake the loop up and put it back.
+        if let Some(at) = self.accept_retry {
+            remaining = remaining.min(at.saturating_duration_since(Instant::now()));
+        }
         Timespec {
             tv_sec: i64::try_from(remaining.as_secs()).unwrap_or(i64::MAX),
             tv_nsec: i64::from(remaining.subsec_nanos()),
@@ -725,6 +826,12 @@ impl Daemon {
     /// to one connection and are transient, and losing a live session to a descriptor
     /// shortage is the worse answer. `Agent::accept` does the same for the other
     /// listener.
+    ///
+    /// Transient is not the same as *gone*, though, which is what
+    /// [`ACCEPT_BACKOFF`] is for. A descriptor shortage leaves the connection queued,
+    /// so returning to retry on the next pass is retrying immediately and for ever —
+    /// and the peer closing does not clear it, since an aborted connection sits in
+    /// the backlog until something accepts it.
     fn accept(&mut self) {
         loop {
             match self.listener.accept() {
@@ -735,7 +842,10 @@ impl Daemon {
                     return;
                 }
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => return,
+                Err(_) => {
+                    self.accept_retry = Some(Instant::now() + ACCEPT_BACKOFF);
+                    return;
+                }
             }
         }
     }
@@ -875,16 +985,16 @@ impl Daemon {
     /// Records that the child has let go of the terminal, and starts the linger
     /// window.
     ///
-    /// No status is *invented* here. The master reports end of file while `waitpid`
-    /// still answers "not yet" — on this kernel for about a third of exits (§ 6.5) —
-    /// so committing a status at this moment makes one up, and `exit 3` is reported
-    /// to the client as `exit 0`. The call below takes a real status where `waitpid`
-    /// already has one, saving those the [`STATUS_RETRY`] round trip; the rest wait.
+    /// No status is *invented* here, and none is collected either. The master reports
+    /// end of file while `waitpid` still answers "not yet" — on this kernel for about
+    /// a third of exits (§ 6.5) — so committing a status at this moment makes one up,
+    /// and `exit 3` is reported to the client as `exit 0`. [`Daemon::collect_status`]
+    /// runs later in this very pass and every pass after it, so an exit `waitpid` is
+    /// already ready for costs nothing and the rest wait out [`STATUS_RETRY`].
     fn on_child_exit(&mut self) {
         if self.child_gone.is_none() {
             self.child_gone = Some(Instant::now());
         }
-        self.collect_status();
         // The frame itself is left to `pump_output`, which sends it once the last
         // of the child's output has gone out. Announcing the exit ahead of the
         // words that caused it is how a client ends up closing the tab on a
@@ -893,12 +1003,18 @@ impl Daemon {
 
     /// Collects the child's status once `waitpid` will give it up.
     ///
-    /// Called every pass while the status is outstanding, so the wait costs a few
-    /// milliseconds rather than a wrong answer.
+    /// Called every pass, and not only while the terminal has been let go of. The
+    /// child can exit while something it started still holds the slave — `sleep 3600 &`
+    /// and then `exit` is the whole of it — and then the master never reaches end of
+    /// file, so a collection gated on that leaves the session's own child a zombie
+    /// for as long as the session lasts, which is up to [`IDLE_TIMEOUT`]. Nothing
+    /// else reaps it: `Pty::try_wait` has no other caller until `terminate`.
+    ///
+    /// Collecting is not reporting. Whether the client is *told* is
+    /// [`Daemon::pump_output`]'s decision and is gated on `child_gone` there, because
+    /// an `Exit` frame is a promise that the session's output is finished — and while
+    /// the slave is still held it plainly is not.
     fn collect_status(&mut self) {
-        let Some(gone_at) = self.child_gone else {
-            return;
-        };
         if self.exited.is_some() {
             return;
         }
@@ -908,7 +1024,10 @@ impl Daemon {
             .and_then(|pty| pty.try_wait().ok().flatten())
         {
             self.exited = Some(pty::exit_parts(status));
-        } else if gone_at.elapsed() >= STATUS_GRACE {
+        } else if self
+            .child_gone
+            .is_some_and(|gone_at| gone_at.elapsed() >= STATUS_GRACE)
+        {
             // The child closed the terminal without exiting — a program that
             // daemonises itself does exactly this — so there is no status to
             // report and never will be. The client is still owed an `Exit` rather
@@ -1148,7 +1267,12 @@ impl Daemon {
     fn pump_output(&mut self) {
         let base = self.ring.base();
         let end = self.ring.end();
-        let exited = self.exited;
+        // Both, because a status is collected as soon as `waitpid` has one
+        // (`Daemon::collect_status`) and that can be long before the terminal is
+        // free: a backgrounded job holding the slave keeps the session's output
+        // coming after its own shell has gone. The `Exit` frame says the transcript
+        // is complete, so end of file on the master is what licenses it.
+        let exited = self.child_gone.and(self.exited);
         let mut gapped = false;
         let Some(client) = self.client.as_mut() else {
             return;
@@ -1324,5 +1448,62 @@ impl Daemon {
             pty.terminate();
         }
         self.paths.unlink_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::path::Path;
+
+    use super::*;
+
+    thread_local! {
+        /// Whether the next stale socket [`bind_socket`] proves dead is to be removed
+        /// out from under it. Per thread, because `cargo test` runs this crate's unit
+        /// tests as threads of one process and nothing else may see the fault.
+        static COLLECT_ONCE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// A § 6.6 collection, forced into the window it cannot otherwise be scheduled
+    /// into. Called from [`bind_socket`], which says why it has to be.
+    pub(super) fn collect_the_stale_socket(path: &Path) {
+        if COLLECT_ONCE.replace(false) {
+            drop(fs::remove_file(path));
+        }
+    }
+
+    /// Regression: losing the race to remove a stale socket must not turn a session
+    /// that is perfectly startable into one that refuses to start.
+    ///
+    /// A `list` collects a dead session on exactly the evidence `clear_stale_socket`
+    /// acts on — a `connect` that was refused — so the two reach for the same file
+    /// and the collection can get there first. What is left then is the state
+    /// `clear_stale_socket` was trying to reach, and it used to answer it with the
+    /// `ENOENT` from its own `remove_file`, which `daemon::start` propagates: no
+    /// session, because somebody else had already tidied up.
+    #[test]
+    fn a_stale_socket_collected_from_under_the_bind_still_starts_the_session() {
+        // The real run directory of whoever is running the suite, since `run_dir` is
+        // resolved from the environment and this process must not rewrite that out
+        // from under the tests it shares a process with. The id is this process's
+        // own, so nothing but this test can be looking at these two names.
+        let paths = SessionPaths::new(&format!("bindrace_{}", std::process::id()))
+            .expect("resolve the run directory");
+        paths.ensure_dir().expect("create the run directory");
+        // A name whose `connect` is refused, which is the whole of what § 6.6 means by
+        // stale. A plain file earns that answer from the kernel — it is not a socket —
+        // and needs no listener of this process's own, which under `cargo test` a
+        // concurrent `fork` elsewhere in the suite would keep alive past its drop.
+        fs::write(paths.socket(), b"").expect("plant a stale socket");
+        COLLECT_ONCE.set(true);
+
+        let cleared = clear_stale_socket(&paths);
+        assert!(
+            !COLLECT_ONCE.get(),
+            "the socket was never probed, so nothing was raced"
+        );
+        drop(fs::remove_file(paths.socket()));
+        cleared.expect("a stale socket somebody else removed first is not a failure");
     }
 }
