@@ -60,7 +60,7 @@ it appears.
 
 | Type | Dir | Name | Payload |
 | --- | --- | --- | --- |
-| `0x01` | C→D | `Hello` | `u16` protocol, `u16` flags, `u64` out_offset, `u64` in_offset, winsize, `u16` term_len, UTF-8 term bytes |
+| `0x01` | C→D | `Hello` | `u16` protocol, `u16` flags, `u64` out_offset, winsize, `u16` term_len, UTF-8 term bytes |
 | `0x02` | D→C | `HelloOk` | `u16` protocol, `u64` resume_from, `u64` in_applied, winsize, `u8` flags |
 | `0x03` | C→D | `Input` | `u64` offset, bytes |
 | `0x04` | D→C | `InputAck` | `u64` applied_through |
@@ -77,18 +77,20 @@ it appears.
 | `0x0f` | ↔ | `AgentData` | `u32` chan, opaque `ssh-agent` bytes |
 | `0x10` | ↔ | `AgentClose` | `u32` chan |
 
+Both handshake frames carry the current revision, **3** — `PROTOCOL_VERSION` in
+`nomux-proto`. It is bumped on any wire change, compatible ones included: a change
+that leaves the number alone is one `Hello.protocol` cannot catch, and a client
+built from an older copy of this table then misparses rather than being refused.
+
 The session id is **not** in `Hello` — it is already fixed by the socket path
 (warm) or the `attach <id>` argument (cold).
 
 `Hello.out_offset` of `u64::MAX` means *"I have no state, send me whatever you have"*
 — used on a fresh app launch to recover scrollback.
 
-`Hello.in_offset` is **informational and the daemon never reads it.** `HelloOk`'s
-`in_applied` is authoritative and the client fast-forwards to that (§3), so a client
-built from this table alone would otherwise implement a field with no effect. It is
-on the wire because the cross-device handover of
-[DESIGN.md § 10](DESIGN.md#10-open-questions) needs a "tell me" sentinel here,
-mirroring the output side.
+Nothing in `Hello` says where the client's *input* stream stands. `HelloOk`'s
+`in_applied` is authoritative and the client fast-forwards to it (§3), so a claim
+from the client would be one the daemon has no use for.
 
 ### 2.3 Flags
 
@@ -133,7 +135,7 @@ sequenceDiagram
   D->>D: queue for the PTY → in_applied = 106
   D--xC: InputAck{106} lost with the connection
   Note over C: still believes in_applied = 100
-  C->>D: Hello{in_offset: 100}
+  C->>D: Hello{out_offset} on a fresh connection
   D-->>C: HelloOk{in_applied: 106}
   Note over C: fast-forwards, discards 100..106
   C->>D: Input{offset: 106, ...}

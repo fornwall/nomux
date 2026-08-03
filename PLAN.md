@@ -11,7 +11,9 @@ deferred, or client-side work recorded because its server-side contract is fixed
 here. This section is the standing state; the deltas that produced it are what
 `git log` is for.
 
-Complete and under test on Linux, protocol revision 2, and not usable on its own:
+Complete and under test on Linux, at the protocol revision
+[IMPLEMENTATION.md § 2.2](IMPLEMENTATION.md#22-messages) states — the number lives
+there, next to the bytes that carry it — and not usable on its own:
 the client that speaks this protocol is a separate, unreleased project, so a clone
 of this repository gives you `probe`, `list`, `kill` and a daemon nothing can hold a
 conversation with. What is complete is the whole server half. The daemon owns a PTY,
