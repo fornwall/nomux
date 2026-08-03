@@ -307,13 +307,18 @@ impl Pty {
             // *and* the session is empty, so there is nothing left for these to
             // reach.
             //
-            // The two reaches are separately conditional because the two conditions
+            // Asked a second time because the loop above can be what makes the
+            // answer change: its `try_wait` is what reaps the child, and reaping is
+            // what frees the number. Half a second is not long enough for the pid
+            // allocator to come round again, so this is the same check standing
+            // where the reasoning puts it rather than a hazard anybody has met.
+            //
+            // The two reaches are separately conditional because their conditions
             // come apart: a backgrounded job in a group of its own — the case this
             // whole function exists for — outlives the grace while the *child's*
-            // group is already gone. A `SIGKILL` at that group would be aimed at a
-            // pgid nothing holds, which is the one number in here that can be given
-            // away while the loop above runs.
-            if !settled {
+            // group is already gone, and a `SIGKILL` at that group would be aimed
+            // at a pgid nothing holds.
+            if !settled && !self.pid_reissued(raw) {
                 if group_alive {
                     let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
                 }
@@ -346,6 +351,18 @@ impl Pty {
     /// either. That leaves the hazard open on a host where nothing here can work
     /// anyway, and the alternative is a daemon that stops collecting its own child's
     /// group on it, which is the only reach left when the walk cannot run.
+    ///
+    /// The identity is coarse in two ways, and both are safe for reasons worth
+    /// writing down rather than rediscovering. The start time is in `USER_HZ` ticks,
+    /// so two processes that start inside the same 10 ms compare equal — but the
+    /// stranger this is looking for would have to have started within 10 ms of the
+    /// child it replaced, which means the allocator coming the whole way round the
+    /// pid space in that time. And the read cannot tell an absent `/proc/<raw>` from
+    /// an unreadable one, `ENOENT` and `EACCES` arriving alike as `None`. Under
+    /// `hidepid` that only hides a stranger of *another* uid, and one of those the
+    /// liveness probe has already refused: `kill(-pgid, 0)` at a group this user may
+    /// not signal answers `EPERM`, which reads as gone. A stranger of our own uid is
+    /// never hidden from us.
     ///
     /// What remains is the microseconds between this read and the signal, against
     /// the whole life of a session before it.
@@ -770,6 +787,16 @@ mod tests {
             SIGNALLED_A_FREED_PID.swap(false, Relaxed),
             "the ordinary case sent no SIGHUP, so the two assertions below are \
              about an instrument that measures nothing"
+        );
+        // Pinned rather than discarded, so that a panic from anywhere else in
+        // `terminate` is not swallowed by this one being expected: the trap is what
+        // takes rustix's assertion with it, and that assertion is compiled in for
+        // exactly as long as this crate's own are.
+        assert_eq!(
+            unwound.is_err(),
+            cfg!(debug_assertions),
+            "the only panic wanted here is rustix's own, on the return value of the \
+             syscall the filter has just rolled back"
         );
         // What `terminate` may not have got round to, having possibly left through
         // the trapped syscall rather than through its own end.
