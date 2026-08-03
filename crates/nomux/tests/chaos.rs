@@ -201,7 +201,17 @@ fn overflow_during_disconnects_is_always_reported() {
     // the very first drop could discard the command itself — a client that closes
     // with output queued makes the kernel send RST, taking unread input with it —
     // and the test would sit waiting for a firehose that was never started.
-    let (_, started) = client.read_until("y", offset);
+    //
+    // Past a gap rather than refusing one, which `read_until` would: the daemon
+    // takes 64 KiB off the PTY in a single pass against the 32 KiB ring above, so
+    // `yes` can overrun this client between the input frame and the first output
+    // frame — and § 9 then *obliges* the daemon to report a `Gap`. Refusing it here
+    // would fail the test for the behaviour it exists to demand. The gap is not
+    // counted: `gaps` below is what the disconnect loop observed, and a setup that
+    // could satisfy the closing assertion on its own would leave that loop proving
+    // nothing. What this waits for is unchanged — a byte the firehose actually
+    // wrote — and the contiguity of everything between gaps is still asserted.
+    let (_, started) = client.read_past_gaps("y", offset);
     offset = started;
 
     let mut rng = Rng::new(chaos_seed);

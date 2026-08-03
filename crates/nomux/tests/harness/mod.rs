@@ -806,13 +806,20 @@ impl Client {
     ///
     /// [`Client::read_until`] refuses a `Gap`, which is right everywhere else in this
     /// suite: an unannounced discontinuity is most of what these tests exist to catch.
-    /// It is wrong here. The ring is a kilobyte on purpose and the child is still
-    /// echoing tens of kilobytes of filler when the client comes back, so overflow
-    /// *while attached* is the ordinary case rather than a surprise — and waiting for
-    /// the child to fall quiet first is exactly the sleep this was written to be rid of.
-    /// What the caller is looking for survives it either way: the repaint keystroke and
-    /// the fence behind it are the last few bytes the child writes, and the newest
-    /// kilobyte is the one thing the ring never discards.
+    /// It is wrong for the two callers that have deliberately sized the ring below what
+    /// the child is producing — a kilobyte against tens of kilobytes of echoed filler,
+    /// and 32 against the 64 KiB the daemon takes off the PTY in one pass. There
+    /// overflow *while attached* is the ordinary case rather than a surprise, § 9
+    /// obliges the daemon to announce it, and refusing the announcement would fail the
+    /// test for the behaviour it was written to demand. Waiting for the child to fall
+    /// quiet first is exactly the sleep this was written to be rid of.
+    ///
+    /// What the caller is looking for survives it either way, because both needles are
+    /// the newest bytes on the stream: the repaint keystroke and the fence behind it are
+    /// the last few the child writes, `yes` writes nothing but the needle, and the
+    /// newest kilobyte is the one thing the ring never discards. What is *not* relaxed
+    /// is contiguity — output between gaps is still asserted to be unbroken, so the
+    /// hole this tolerates is only ever one the daemon owned up to.
     pub(crate) fn read_past_gaps(&mut self, needle: &str, from: u64) -> (String, u64) {
         self.read_until_inner(needle, from, true)
     }
