@@ -416,12 +416,20 @@ fn assert_same_stream(want: &[u8], got: &[u8], at: u64) {
 /// says the wrong thing, and until this test nothing in the suite could tell the
 /// two apart.
 ///
-/// The second assertion is the same fault caught by a different route and is cheap
-/// to state: what is left between `resume_from` and the end of the stream is what
-/// the ring is holding, so it can never exceed the ring. A base reported too low
-/// fails that one as well as the byte comparison, which is worth having — the two
-/// disagree about nothing, and a failure that fires twice is easier to read than
-/// one that fires once.
+/// The byte comparison is only half of it, and on its own it catches only half the
+/// fault. A base reported *too low* serves bytes the ring no longer starts at and
+/// the model comparison fires. A base reported too *high* — `resume_from + 16`, say
+/// — is a daemon silently throwing away sixteen bytes of scrollback it is still
+/// holding, and every byte it then sends is at the offset it claims, so nothing
+/// about the stream is wrong: it is simply short. Measured, on the first version of
+/// this test: that injection left the whole workspace green.
+///
+/// So `resume_from` is pinned to the value it must have rather than to a range. The
+/// child has finished before this client attaches, the ring is exactly full, and a
+/// `VecDeque` of `RING` bytes retains exactly `RING` — so the oldest byte the daemon
+/// can serve is `stream_end - RING` and there is nothing approximate to allow for.
+/// One equality catches both directions, and it is the only assertion here that
+/// catches the second.
 #[test]
 fn a_gap_at_the_handshake_names_the_byte_the_stream_actually_resumes_at() {
     /// Small enough that half a megabyte overruns it many times over, and larger
@@ -454,23 +462,36 @@ fn a_gap_at_the_handshake_names_the_byte_the_stream_actually_resumes_at() {
     drop(client);
 
     assert!(
-        poll_until(Duration::from_secs(30), || planted.sentinel.exists()),
+        poll_until(Duration::from_secs(10), || planted.sentinel.exists()),
         "the child never finished writing its {PRODUCED} bytes"
     );
 
-    let (mut client, resumed) = reconnect_until_gap(&session, 0, planted.stream_start);
+    // Connected and greeted once rather than through `reconnect_until_gap`, which
+    // exists for the case where whether the ring has overflowed *yet* is a question
+    // about the scheduler. It is not one here: the sentinel says the child has
+    // written every byte, so the overflow is behind us and the gap is owed on the
+    // first `Hello`. Retrying would only make a failure take twenty seconds to
+    // arrive.
+    let mut client = session.connect();
+    let resumed = client.hello(planted.stream_start);
     assert!(
-        resumed.resume_from > planted.stream_start,
-        "the resume point must have advanced past bytes that were dropped"
+        resumed.gap,
+        "the child wrote {PRODUCED} bytes through a {RING}-byte ring while this \
+         client was away, and the daemon reported no gap"
     );
+
     let stream_end = planted.stream_start + planted.expected.len() as u64;
-    assert!(
-        stream_end - resumed.resume_from <= RING as u64,
-        "the daemon offered to resume at {}, leaving {} bytes still to come out of a \
-         {RING}-byte ring — so the base it reported is below the oldest byte it can \
-         actually serve",
+    let oldest_held = stream_end - RING as u64;
+    assert_eq!(
         resumed.resume_from,
-        stream_end - resumed.resume_from
+        oldest_held,
+        "the daemon offered to resume at {}, where the oldest byte a full \
+         {RING}-byte ring can still serve is {oldest_held}. Below it and the daemon \
+         is serving bytes from somewhere other than where it says; above it and it \
+         has thrown away {} bytes of the user's scrollback that it was still \
+         holding",
+        resumed.resume_from,
+        oldest_held.abs_diff(resumed.resume_from)
     );
 
     let gaps = read_against(&mut client, &planted, resumed.resume_from);
@@ -510,6 +531,16 @@ fn a_gap_at_the_handshake_names_the_byte_the_stream_actually_resumes_at() {
 /// on trust: `read_against` checks every arriving byte against the byte its offset
 /// names, so the base the daemon reports has to be the right one rather than merely
 /// a plausible one.
+///
+/// And, as at the handshake, the byte comparison alone catches only a base that is
+/// too *low*. One that is too high sends every byte at the offset it claims and
+/// simply omits the ones in front of it, which is scrollback the ring was still
+/// holding thrown away without a word. So the gap is pinned to a number rather than
+/// to a property: there can be exactly one, at exactly `stream_end - RING`. Both
+/// halves of that follow from the setup rather than from timing — the ring's base
+/// can only pass `sent_through` once the send queue has saturated, and it stays
+/// saturated until this client reads, by which time the sentinel says the child has
+/// finished and the ring is static.
 #[test]
 fn an_overflow_that_outruns_an_attached_client_is_reported_as_a_gap_mid_stream() {
     /// Larger than the 64 KiB the daemon takes off the PTY in one pass, so a client
@@ -549,10 +580,12 @@ fn an_overflow_that_outruns_an_attached_client_is_reported_as_a_gap_mid_stream()
     // setup: the daemon's send queue fills, `sent_through` stops with it, and the
     // ring runs away from a client that has not gone anywhere.
     assert!(
-        poll_until(Duration::from_secs(30), || planted.sentinel.exists()),
+        poll_until(Duration::from_secs(10), || planted.sentinel.exists()),
         "the child never finished writing its {PRODUCED} bytes"
     );
 
+    let stream_end = planted.stream_start + planted.expected.len() as u64;
+    let oldest_held = stream_end - RING as u64;
     let gaps = read_against(&mut client, &planted, planted.stream_start);
     let (sent_through, base) = *gaps.first().expect(
         "the ring overran a client that never detached and nothing said so: the \
@@ -563,11 +596,20 @@ fn an_overflow_that_outruns_an_attached_client_is_reported_as_a_gap_mid_stream()
         "the gap must interrupt a stream this client was already receiving — that \
          is what makes it mid-stream rather than the handshake's"
     );
-    assert!(
-        base - sent_through > RING as u64,
-        "only {} bytes were reported lost, which is less than the ring itself \
-         holds: this client was not overrun",
-        base - sent_through
+    assert_eq!(
+        base,
+        oldest_held,
+        "the daemon resumed this client at {base}, where the oldest byte a full \
+         {RING}-byte ring can still serve is {oldest_held}. Below it and the stream \
+         is being served from somewhere other than where it says; above it and {} \
+         bytes the ring was still holding were thrown away without a word",
+        oldest_held.abs_diff(base)
+    );
+    assert_eq!(
+        gaps.len(),
+        1,
+        "the child had finished before this client read a byte, so the ring was \
+         static and one gap is all there was to report: {gaps:?}"
     );
 }
 
