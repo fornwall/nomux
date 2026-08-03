@@ -942,7 +942,7 @@ fn assert_refusal(ty: FrameType, payload: &[u8], code: ErrorCode, what: &str) {
 /// one call site. `UnixStream::peek` says this safely but is unstable on the pinned
 /// toolchain, and adding rustix's `net` feature to reach `RecvFlags::PEEK` would be
 /// a dependency change for a single test.
-fn has_unread_bytes(stream: &UnixStream) -> bool {
+pub(crate) fn has_unread_bytes(stream: &UnixStream) -> bool {
     use std::os::fd::AsRawFd;
 
     let mut byte = 0u8;

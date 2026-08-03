@@ -11,7 +11,7 @@
 //! `IMPLEMENTATION.md` § 6.2 for the detachment and § 6.5 for the stop signals.
 
 use std::io;
-use std::os::fd::{BorrowedFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd, OwnedFd};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use rustix::fs::{Mode, OFlags};
@@ -49,9 +49,10 @@ static STOP_PIPE: AtomicI32 = AtomicI32::new(-1);
 /// permitted list, the descriptor is non-blocking so a pipe somebody has filled
 /// cannot park the daemon inside a handler, and a refused write means a byte is
 /// already waiting — which is the whole of the message. Nor can this perturb
-/// `errno`: rustix issues the syscall directly and reports failure through its
-/// return value, so a handler landing between a failing call in the main flow and
-/// that call's `errno` read leaves it untouched.
+/// `errno`: rustix issues the syscall directly on the `linux_raw` backend, which
+/// every shipped target selects, and reports failure through its return value, so a
+/// handler landing between a failing call in the main flow and that call's `errno`
+/// read leaves it untouched.
 extern "C" fn note_stop_signal(_signum: libc::c_int) {
     let raw = STOP_PIPE.load(Ordering::Relaxed);
     if raw >= 0 {
@@ -240,5 +241,70 @@ fn silence_stdio() -> io::Result<()> {
     rustix::stdio::dup2_stdin(&null)?;
     rustix::stdio::dup2_stdout(&null)?;
     rustix::stdio::dup2_stderr(&null)?;
+    if null.as_raw_fd() <= libc::STDERR_FILENO {
+        // Leaked on purpose, and only where `open` handed back one of the three it
+        // was about to fill: it hands back the lowest free descriptor, so with one
+        // of them free that *is* the number, and the `dup2`s above have just left it
+        // as its own copy. Dropping it would close it again and leave the daemon
+        // running with that number free for the next `openpt`,
+        // `bind_socket_private` or `accept` to claim — after which everything it
+        // wrote to what it believed was `/dev/null` would land in a PTY master or in
+        // the middle of a client's frame stream, which is the failure this function
+        // exists to prevent.
+        //
+        // Belt and braces rather than a live bug: std reopens a standard descriptor
+        // it finds closed before `main` runs, so `nomux daemon <id> 1>&-` reaches
+        // here with all three taken. Nothing above rests on that, and this costs a
+        // compare.
+        let _ = null.into_raw_fd();
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::{AsFd, FromRawFd};
+    use std::path::Path;
+
+    use super::*;
+
+    /// Regression: every standard descriptor is left *open* on `/dev/null`,
+    /// including the one whose number `open` handed back.
+    ///
+    /// Freed here by hand because nothing else can, which is the same reason this is
+    /// a unit test: std reopens a standard descriptor it finds closed at startup, so
+    /// no command line reaches [`silence_stdio`] with one free.
+    ///
+    /// Fd 0 rather than 1 or 2, and everything restored before anything is asserted.
+    /// Under `cargo test` this runs in a thread of a process whose other threads are
+    /// printing: stdin is the one of the three nothing writes to, and the worst the
+    /// other two can cost in the microseconds they spend pointed at `/dev/null` is a
+    /// line that goes nowhere rather than a write that fails. A panic raised before
+    /// the restore would take its own failure message with it.
+    #[test]
+    fn silencing_stdio_leaves_a_freed_descriptor_open_on_dev_null() {
+        let saved_stdin = rustix::io::dup(io::stdin().as_fd()).expect("save stdin");
+        let saved_stdout = rustix::io::dup(io::stdout().as_fd()).expect("save stdout");
+        let saved_stderr = rustix::io::dup(io::stderr().as_fd()).expect("save stderr");
+
+        // SAFETY: fd 0 was duplicated above, so the open file description outlives
+        // this close, and nothing in the process owns that number — std's `Stdin`
+        // borrows it and never closes it.
+        drop(unsafe { OwnedFd::from_raw_fd(libc::STDIN_FILENO) });
+
+        let silenced = silence_stdio();
+        let stdin_now = std::fs::read_link("/proc/self/fd/0");
+
+        rustix::stdio::dup2_stdin(&saved_stdin).expect("restore stdin");
+        rustix::stdio::dup2_stdout(&saved_stdout).expect("restore stdout");
+        rustix::stdio::dup2_stderr(&saved_stderr).expect("restore stderr");
+
+        silenced.expect("silence stdio");
+        assert_eq!(
+            stdin_now.ok().as_deref(),
+            Some(Path::new("/dev/null")),
+            "the descriptor `open` handed back was closed again, leaving fd 0 for \
+             the next socket or PTY master to claim"
+        );
+    }
 }

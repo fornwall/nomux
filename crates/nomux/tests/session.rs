@@ -30,8 +30,8 @@ use nomux_proto::{
 };
 
 use harness::{
-    Reaper, Rng, Session, Spawned, accept_within, collect, control, hello_frame, join_within,
-    nomux, nomux_with_shell, poll_until, push_until_refused, read_uninterrupted,
+    Reaper, Rng, Session, Spawned, accept_within, collect, control, has_unread_bytes, hello_frame,
+    join_within, nomux, nomux_with_shell, poll_until, push_until_refused, read_uninterrupted,
     reconnect_until_gap, run_root, shrink_send_buffer, stderr, stdout, succeeded, wait_for,
     while_nothing_forks, write_frame,
 };
@@ -487,6 +487,17 @@ fn list_and_kill_operate_without_the_protocol() {
     assert!(
         listed.contains(&session.id),
         "list should report the live session, got {listed:?}"
+    );
+    // One line per session and not per run file: `list` walks a directory holding
+    // several names that lead to this one id, and it is the only thing that folds
+    // them back together.
+    assert_eq!(
+        listed
+            .lines()
+            .filter(|line| line.starts_with(&format!("{}\t", session.id)))
+            .count(),
+        1,
+        "list reported the same session more than once, got {listed:?}"
     );
 
     succeeded(
@@ -2955,6 +2966,87 @@ fn the_relay_exits_when_a_stdout_it_can_only_copy_to_stops_reading() {
     assert!(
         poll_until(Duration::from_secs(10), || !child.is_running()),
         "the relay was still running with a stdout it could only copy to gone"
+    );
+}
+
+/// Regression: a session that ends with the relay's own input still unread is a
+/// clean exit, and what is buffered for stdout still gets there.
+///
+/// That is the ordinary way a session ends rather than an exotic one. § 4.1 stops
+/// the daemon draining a client it is holding back, `write_client` drops a peer that
+/// has stopped reading, and `shutdown` closes straight after `flush_final` — each of
+/// them closes with bytes of the relay's still in the socket's receive queue, and a
+/// unix socket closed in that state hands the peer the last of the data and then
+/// `ECONNRESET` where an orderly close gives it a zero. Confirmed against a
+/// socketpair before this test was written, since the whole thing rests on it.
+///
+/// `copy_in` mapped only `EIO` to an ending, so that reset came back out of `relay`
+/// as a failure: `nomux: Connection reset by peer` and exit 126, where § 10 gives 0
+/// to "the session ended and the `Exit` frame was delivered". And the last of the
+/// session's output went with it — a `relay` that returns `Err` never goes back for
+/// what stdout is owed, and the buffer holds it precisely here, since a direction
+/// that had nothing queued when `poll` was called is not asking for `POLLOUT` yet.
+///
+/// Stdio on a socketpair for the reason [`the_relay_moves_the_same_traffic_by_copying_when_the_kernel_will_not_splice_it`]
+/// gives, and here it is what makes the bug reachable at all: the first `splice`
+/// consumes the socket's pending error, so a host whose stdio is a pipe never sees
+/// the reset. § 7 gives the other kind a socketpair.
+#[test]
+fn a_session_that_ends_with_the_relays_input_unread_still_exits_clean() {
+    use std::os::fd::OwnedFd;
+
+    /// Written in the same breath as the close, so it is still in the relay's
+    /// buffer when the reset arrives.
+    const LAST: &[u8] = b"NOMUX-LAST-OUTPUT";
+
+    let (mut feed, relay_stdin) = UnixStream::pair().expect("a socketpair for the relay's stdin");
+    let (mut drain, relay_stdout) =
+        UnixStream::pair().expect("a socketpair for the relay's stdout");
+    let (mut child, mut peer, _listener) = relay_onto_a_socket_over(
+        "relay_reset",
+        Stdio::from(OwnedFd::from(relay_stdin)),
+        Stdio::from(OwnedFd::from(relay_stdout)),
+        Stdio::piped(),
+    );
+
+    // Never read from this end, which is the whole provocation: the reset is the
+    // kernel's answer to a close over a receive queue that still has something in it.
+    feed.write_all(b"a keystroke this session never drains")
+        .expect("write to the relay's stdin");
+    // Waited for rather than assumed. A close that beats the relay's delivery of
+    // those bytes is an orderly FIN, and this test would then pass having provoked
+    // nothing at all.
+    assert!(
+        poll_until(RELAY_PATIENCE, || has_unread_bytes(&peer)),
+        "the relay never delivered the input this test leaves unread"
+    );
+
+    peer.write_all(LAST)
+        .expect("write the session's last words");
+    drop(peer);
+
+    assert!(
+        poll_until(RELAY_PATIENCE, || !child.is_running()),
+        "the relay never left after its session ended"
+    );
+    // After the exit, so nothing here can park: the relay's own end of this
+    // socketpair went with it, and what it wrote is waiting in the buffer.
+    let mut got = Vec::new();
+    drop(drain.read_to_end(&mut got));
+    let finished = child
+        .into_exited()
+        .wait_with_output()
+        .expect("collect the relay");
+    let complaints = String::from_utf8_lossy(&finished.stderr).into_owned();
+
+    assert_eq!(
+        got, LAST,
+        "the relay dropped the output it was still holding; it said {complaints:?}"
+    );
+    assert!(
+        finished.status.success(),
+        "a session that ended is exit 0 (§ 10), got {}; the relay said {complaints:?}",
+        finished.status
     );
 }
 

@@ -111,13 +111,21 @@ pub(crate) fn list() -> io::Result<()> {
         Err(err) => return Err(err),
     };
 
-    let mut ids: Vec<String> = entries
+    // One entry per session, not per file: five names lead to the same id. A linear
+    // scan rather than a sort and a `dedup`, which between them link a generic
+    // quicksort over `String` — 4.2 KiB of x86-64 and 3.4 KiB of armv7, measured, in
+    // a binary with a 400 KiB budget (§ 8) — to order a list the client caps at eight
+    // sessions and five files each. Nothing downstream reads an order: the directory
+    // has none to give, and § 6.6 promises none.
+    let mut ids: Vec<String> = Vec::new();
+    for id in entries
         .filter_map(Result::ok)
         .filter_map(|entry| session_id_of(&entry.path()))
-        .collect();
-    ids.sort_unstable();
-    // One entry per session, not per file: five names lead to the same id.
-    ids.dedup();
+    {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
