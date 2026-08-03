@@ -2198,10 +2198,12 @@ fn a_daemon_that_cannot_accept_stands_back_rather_than_spinning() {
     ///
     /// Half a second rather than the 300 ms the agent-channel test above uses,
     /// because that is what separates the two answers well enough for a threshold to
-    /// sit between them under load. The spin measures in the twenties to forties over
-    /// this window — 28 and 38 on two machines — and what it is *not* is the other
-    /// answer, which is exactly zero and cannot be moved by scheduling: the fixed
-    /// daemon sleeps 100 ms at a time and wakes five times to fail one `accept`.
+    /// sit between them under load. No figure is quoted for the spin: it is whatever
+    /// share of a core the scheduler hands the daemon, and three measurements of it
+    /// spread from the twenties to the forties. What the threshold rests on is the
+    /// other answer, which is not a share of anything — the fixed daemon sleeps
+    /// 100 ms at a time and wakes five times to fail one `accept`, so it measures
+    /// zero, and no amount of load moves zero.
     const WINDOW: Duration = Duration::from_millis(500);
     /// Five ticks is 50 ms of processor time against half a second of wall clock: a
     /// tenth of one core, well under the lowest spin figure seen and unreachable by a
@@ -2210,6 +2212,15 @@ fn a_daemon_that_cannot_accept_stands_back_rather_than_spinning() {
 
     let session = Session::start("emfile");
     let daemon = session.child.id();
+    // Not merely answering. `Session::start` waits for the socket, and the daemon
+    // binds that before it writes its pidfile, opens `/dev/null` over its stdio and
+    // asks `logind` about lingering — all of which need a descriptor, and the first
+    // of which is a `?` that ends the process. Starving it there is starving a
+    // *startup*, which is a different thing from the event loop this measures and
+    // fails it about one run in four on a loaded machine. The pidfile is the last of
+    // those that can refuse to start, so waiting for it is waiting for the state the
+    // test is about.
+    wait_for(&session.pid_file());
     let restore = open_file_limit(daemon);
     // Below the three the daemon cannot be without, so the next descriptor it asks
     // for is refused however few it is holding.

@@ -12,7 +12,7 @@
 use std::collections::VecDeque;
 use std::fs;
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -113,13 +113,24 @@ const FIRST_ATTACH_TIMEOUT: Duration = Duration::from_secs(30);
 /// under `ENFILE` is not being made worse by every nomux daemon on it burning a core.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
-/// Backlog for the session socket.
+/// Backlog for the session socket: as deep as this host allows.
 ///
-/// The figure `UnixListener::bind` uses, restated because [`start`] calls `listen`
-/// a second time to move the socket's `SO_PEERCRED` onto the process that survives
-/// § 6.2's fork, and `listen` takes a backlog rather than keeping the one in force.
-/// Passing anything smaller would quietly shrink the queue a `list` sweep fills.
-const SOCKET_BACKLOG: libc::c_int = 128;
+/// The value `UnixListener::bind` passes on Linux, and it is not a length. `listen`
+/// takes its argument as a signed `int` and `__sys_listen` casts it to unsigned
+/// before clamping it to `net.core.somaxconn`, so `-1` asks for more than any host
+/// can give and gets exactly the ceiling — 4096 where this was measured. [`start`]
+/// has to restate it because it calls `listen` a second time, to move the socket's
+/// `SO_PEERCRED` onto the process that survives § 6.2's fork, and `listen` installs a
+/// backlog rather than keeping the one in force.
+///
+/// A literal here would be a *shrink*, and a costly one: an `AF_UNIX` `connect` to a
+/// full backlog blocks rather than being refused, so a queue this daemon has stopped
+/// draining — which is exactly what [`ACCEPT_BACKOFF`] arranges under a descriptor
+/// shortage — parks `nomux list`, `nomux kill` and every attach on that id inside the
+/// kernel. Writing 128 for "what std uses" did that for one commit, at 32 times too
+/// small; the irony is that a *failed* re-listen would have preserved what a
+/// successful one destroyed.
+const SOCKET_BACKLOG: libc::c_int = -1;
 
 /// Fault injection: restores the pre-fix event ordering of § 6.4.1, where the
 /// takeover was serviced before the client it was replacing.
@@ -316,11 +327,13 @@ fn start(session_id: &str, label: Option<&str>) -> io::Result<()> {
     // kernel, both that the stamp moves and that a connection queued in between
     // survives the call.
     //
-    // The backlog is the one `UnixListener::bind` chose, restated because `listen` has
-    // no way to ask. A failure here is discarded rather than propagated: it leaves the
-    // socket exactly as every release so far has left it, named after the parent, and
-    // that is a worse answer to a question nothing in this tree asks yet — not a
-    // reason to refuse a session that is otherwise ready to serve.
+    // The backlog goes back in with it, since `listen` installs one rather than
+    // keeping what is in force and has no way to ask what that was; `SOCKET_BACKLOG`
+    // is what makes that a restatement rather than a change. A failure here is
+    // discarded rather than propagated: it leaves the socket exactly as every release
+    // so far has left it, named after the parent, and that is a worse answer to a
+    // question nothing in this tree asks yet — not a reason to refuse a session that
+    // is otherwise ready to serve.
     //
     // SAFETY: `listen` is passed a descriptor `listener` owns and keeps open across
     // the call, and a backlog. `UnixListener` has no safe spelling of a second
@@ -472,44 +485,29 @@ enum Source {
     AgentChannel(u32),
 }
 
-/// How many slots one [`Source`] can occupy in the poll set at once.
+/// Every source that appears in the poll set at most once, in the order
+/// [`Daemon::watches`] registers them.
 ///
-/// A `match` rather than a count, because `Source` has no count and the number this
-/// feeds is a fixed array's length: a seventh singleton added without widening that
-/// array would be a wakeup silently dropped, which is the one failure the named
-/// lookup below cannot catch. This is what a new variant cannot be added past — the
-/// match stops compiling until it is classified, and [`POLL_SLOTS`] is the sum over
-/// every arm.
-const fn slots_for(source: Source) -> usize {
-    match source {
-        Source::Listener
-        | Source::Signal
-        | Source::Pty
-        | Source::Client
-        | Source::Pending
-        | Source::AgentListener => 1,
-        // `Agent::accept` refuses a ninth, so the table cannot be longer than this.
-        Source::AgentChannel(_) => MAX_AGENT_CHANNELS as usize,
-    }
-}
+/// The list is what registers them — `watches` walks it and asks
+/// [`Daemon::watch_for`] about each — so it cannot fall out of step with the set it
+/// sizes. That is the whole point of writing it down rather than counting to six:
+/// [`POLL_SLOTS`] is this array's length plus the channel cap, and a seventh source
+/// cannot be *polled* without being added here, which cannot be done without changing
+/// the length this declares. Classifying one in `watch_for` alone leaves it
+/// unregistered rather than unaccounted for, and `watch_for`'s match cannot be got
+/// past without classifying it.
+const SINGLE_SOURCES: [Source; 6] = [
+    Source::Listener,
+    Source::Signal,
+    Source::Pty,
+    Source::Client,
+    Source::Pending,
+    Source::AgentListener,
+];
 
-/// Slots the poll set can ever need at once: the six sources that exist at most once
-/// each — the listener, the signal pipe, the PTY master, the client, the connection
-/// that has not greeted, the agent listener — plus one per agent channel.
-const POLL_SLOTS: usize = slots_for(Source::Listener)
-    + slots_for(Source::Signal)
-    + slots_for(Source::Pty)
-    + slots_for(Source::Client)
-    + slots_for(Source::Pending)
-    + slots_for(Source::AgentListener)
-    + slots_for(Source::AgentChannel(0));
-
-const _: () = assert!(
-    POLL_SLOTS >= 6 + MAX_AGENT_CHANNELS as usize,
-    "the poll set must hold every source that exists at most once and a full agent \
-     table at the same time, or `watches` drops the entries past the end and the loop \
-     never hears from the descriptors they belonged to"
-);
+/// Slots the poll set can ever need at once: [`SINGLE_SOURCES`] plus one per agent
+/// channel, which `Agent::accept` caps at [`MAX_AGENT_CHANNELS`].
+const POLL_SLOTS: usize = SINGLE_SOURCES.len() + MAX_AGENT_CHANNELS as usize;
 
 /// What one `poll` came back with: the readiness of each source in the order
 /// [`Daemon::watches`] registered them, and how many of the slots it used.
@@ -635,6 +633,80 @@ impl Daemon {
         self.stop_reason().is_some()
     }
 
+    /// What to ask `poll` about `source`, or `None` where it is not in the set now.
+    ///
+    /// Exhaustive over [`Source`] on purpose, and that is the whole of its second
+    /// job: a variant added to that enum cannot get past this match without being
+    /// classified, and it cannot be *registered* without being listed in
+    /// [`SINGLE_SOURCES`], which is what sizes the arrays [`Daemon::watches`] fills.
+    /// The two together are why a source added later cannot cost an agent channel its
+    /// slot.
+    fn watch_for(&self, source: Source) -> Option<(BorrowedFd<'_>, PollFlags)> {
+        match source {
+            // Out of the set while an `accept` that failed is being waited out, which
+            // is the only way to stand back from it: the queued connection that
+            // failure left behind keeps the descriptor readable, so a `poll` that
+            // still asks about it returns immediately however long the timeout says.
+            Source::Listener => self
+                .accept_retry
+                .is_none()
+                .then(|| (self.listener.as_fd(), PollFlags::IN)),
+            Source::Signal => Some((self.stop_pipe.as_ref()?.as_fd(), PollFlags::IN)),
+            // Dropped from the set once the child is gone: the master reports `HUP`
+            // from then on and would spin the loop at full tilt for the whole linger
+            // window, having nothing left to read.
+            Source::Pty => {
+                let pty = self.pty.as_ref().filter(|_| self.child_gone.is_none())?;
+                let mut flags = PollFlags::IN;
+                if !self.pending_input.is_empty() {
+                    flags |= PollFlags::OUT;
+                }
+                Some((pty.master(), flags))
+            }
+            Source::Client => {
+                let client = self.client.as_ref()?;
+                // Held out of `POLLIN` while the PTY queue is full, which is § 4.1's
+                // back pressure: the bytes wait in the kernel's socket buffer where
+                // the peer blocks on them, the same argument the agent channels make
+                // below. Nothing can wedge, because a non-empty queue is exactly what
+                // puts the master in the set asking for `POLLOUT`, and draining it
+                // re-arms this on the pass after. This holds back the *socket* only;
+                // what bounds the queue is `read_client` declining to decode past the
+                // cap, since the takeover path reaches that loop without passing
+                // through here at all.
+                let mut flags = if self.input_is_saturated() {
+                    PollFlags::empty()
+                } else {
+                    PollFlags::IN
+                };
+                // Ring bytes still owed count as wanting to write, not just bytes
+                // already encoded: `pump_output` stops at `MAX_PENDING_WRITE`, so a
+                // large replay routinely ends a pass with the queue drained and the
+                // ring still ahead, and without this the daemon would sleep on output
+                // it could send. The `OutputAck` that papers over it is advisory
+                // (§ 3), so it cannot be what the loop relies on.
+                if client.conn.wants_write()
+                    || (client.greeted && client.sent_through < self.ring.end())
+                {
+                    flags |= PollFlags::OUT;
+                }
+                // Registered even when the mask is empty, since `HUP` and `ERR` are
+                // reported whatever the mask says and are the only way to hear that a
+                // held-back peer has died (§ 4.1). `poll_once` answers that wakeup by
+                // letting the client go, so it cannot repeat, and it is what arms the
+                // idle deadline and fails the agent's waiting callers (§ 6.7).
+                Some((client.conn.stream().as_fd(), flags))
+            }
+            Source::Pending => Some((self.pending.as_ref()?.stream().as_fd(), PollFlags::IN)),
+            Source::AgentListener => Some((self.agent.as_ref()?.listener(), PollFlags::IN)),
+            // Never asked for: `watches` walks [`SINGLE_SOURCES`], and the channels
+            // come from the agent's own table with a mask that depends on the channel
+            // rather than on the session. The arm is here for the exhaustiveness the
+            // rest of this function exists to get.
+            Source::AgentChannel(_) => None,
+        }
+    }
+
     /// Everything the poll set watches, in the order it is registered, written into
     /// `sources` and `fds` in step. Returns how many slots were used.
     ///
@@ -656,10 +728,11 @@ impl Daemon {
     ) -> usize {
         let mut len = 0;
         let mut watch = |source, fd, flags| {
-            // Through `get_mut` rather than by index: the count below is bounded by
-            // the same constants [`POLL_SLOTS`] is derived from, so this cannot be
-            // reached, and an entry that could not be placed is a wakeup missed
-            // rather than a write past the end of the caller's frame.
+            // Through `get_mut` rather than by index. It cannot be reached — the
+            // budget is [`SINGLE_SOURCES`] long plus the cap `Agent::accept` enforces,
+            // and those are the only two things that push here — so this is about what
+            // an unreachable state may cost: a wakeup missed rather than a write past
+            // the end of the caller's frame.
             if let (Some(slot), Some(entry)) = (sources.get_mut(len), fds.get_mut(len)) {
                 *slot = source;
                 *entry = PollFd::from_borrowed_fd(fd, flags);
@@ -667,62 +740,10 @@ impl Daemon {
             }
         };
 
-        // Out of the set while an `accept` that failed is being waited out, which is
-        // the only way to stand back from it: the queued connection that failure left
-        // behind keeps the descriptor readable, so a `poll` that still asks about it
-        // returns immediately however long the timeout says.
-        if self.accept_retry.is_none() {
-            watch(Source::Listener, self.listener.as_fd(), PollFlags::IN);
-        }
-        if let Some(stop) = self.stop_pipe.as_ref() {
-            watch(Source::Signal, stop.as_fd(), PollFlags::IN);
-        }
-
-        // Dropped from the set once the child is gone: the master reports `HUP`
-        // from then on and would spin the loop at full tilt for the whole linger
-        // window, having nothing left to read.
-        if let Some(pty) = self.pty.as_ref().filter(|_| self.child_gone.is_none()) {
-            let mut flags = PollFlags::IN;
-            if !self.pending_input.is_empty() {
-                flags |= PollFlags::OUT;
+        for source in SINGLE_SOURCES {
+            if let Some((fd, flags)) = self.watch_for(source) {
+                watch(source, fd, flags);
             }
-            watch(Source::Pty, pty.master(), flags);
-        }
-
-        if let Some(client) = self.client.as_ref() {
-            // Held out of `POLLIN` while the PTY queue is full, which is § 4.1's back
-            // pressure: the bytes wait in the kernel's socket buffer where the peer
-            // blocks on them, the same argument the agent channels make below. Nothing
-            // can wedge, because a non-empty queue is exactly what puts the master in
-            // the set asking for `POLLOUT`, and draining it re-arms this on the pass
-            // after. This holds back the *socket* only; what bounds the queue is
-            // `read_client` declining to decode past the cap, since the takeover path
-            // reaches that loop without passing through here at all.
-            let mut flags = if self.input_is_saturated() {
-                PollFlags::empty()
-            } else {
-                PollFlags::IN
-            };
-            // Ring bytes still owed count as wanting to write, not just bytes already
-            // encoded: `pump_output` stops at `MAX_PENDING_WRITE`, so a large replay
-            // routinely ends a pass with the queue drained and the ring still ahead,
-            // and without this the daemon would sleep on output it could send. The
-            // `OutputAck` that papers over it is advisory (§ 3), so it cannot be what
-            // the loop relies on.
-            if client.conn.wants_write()
-                || (client.greeted && client.sent_through < self.ring.end())
-            {
-                flags |= PollFlags::OUT;
-            }
-            // Registered even when the mask is empty, since `HUP` and `ERR` are
-            // reported whatever the mask says and are the only way to hear that a
-            // held-back peer has died (§ 4.1). `poll_once` answers that wakeup by
-            // letting the client go, so it cannot repeat, and it is what arms the idle
-            // deadline and fails the agent's waiting callers (§ 6.7).
-            watch(Source::Client, client.conn.stream().as_fd(), flags);
-        }
-        if let Some(pending) = self.pending.as_ref() {
-            watch(Source::Pending, pending.stream().as_fd(), PollFlags::IN);
         }
 
         if let Some(agent) = self.agent.as_ref() {
@@ -730,7 +751,6 @@ impl Daemon {
                 .client
                 .as_ref()
                 .is_some_and(|client| client.conn.is_write_saturated());
-            watch(Source::AgentListener, agent.listener(), PollFlags::IN);
             for (id, fd, wants_write, wants_read) in agent.watches() {
                 // A saturated client is the one back pressure signal available:
                 // stop draining agent sockets until the queue it feeds has room.
@@ -1145,6 +1165,19 @@ impl Daemon {
     /// [`Daemon::pump_output`]'s decision and is gated on `child_gone` there, because
     /// an `Exit` frame is a promise that the session's output is finished — and while
     /// the slave is still held it plainly is not.
+    ///
+    /// What it costs is the child's pid, and that is worth writing down here because
+    /// nothing else in this file says it. A zombie holds its number reserved; reaping
+    /// releases it, and `Pty::terminate` still reaches for the session by that raw
+    /// number when the daemon eventually stops. Between the two, the kernel is free to
+    /// reissue it — so `terminate` has to establish that the pid it is about to signal
+    /// is still the child, by the start time in `/proc/<pid>/stat` rather than by
+    /// asking whether *something* with that number is alive, which a stranger answers
+    /// just as well. That check is what this call makes load-bearing: before it the
+    /// reap happened at end of file and `shutdown` followed within [`EXIT_LINGER`],
+    /// five seconds; now it can happen on any pass, and the gap runs to
+    /// [`IDLE_TIMEOUT`] with no client attached and to the whole life of the session
+    /// with one, since `stop_deadline` is then `None` and nothing is counting.
     fn collect_status(&mut self) {
         if self.exited.is_some() {
             return;
