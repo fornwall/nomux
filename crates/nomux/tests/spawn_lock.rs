@@ -557,6 +557,96 @@ fn kill_signals_the_process_the_socket_names_rather_than_the_pidfile() {
     );
 }
 
+/// Regression: a daemon is still recognised when the path it was started from is long.
+///
+/// The tie above is broken by reading `/proc/<pid>/cmdline`, and that read is bounded
+/// like every other one here. Bounded at the wrong size it answers "not this daemon"
+/// for a daemon whose `argv[0]` runs past the buffer — `attach` starts it from
+/// `env::current_exe()` resolved, and § 5.2 installs under a directory the *client*
+/// names — which is not a harmless answer: it is the one that leaves a healthy session
+/// refused for as long as it runs, since neither candidate can then be identified.
+///
+/// So the buffer is sized past any path the kernel will resolve, and a read that fills
+/// it says "cannot tell" rather than "no". The binary here is copied somewhere that
+/// puts the whole command line past 512 bytes — a deep install rather than an absurd
+/// one, and a twelfth of what the kernel allows: the daemon must still be picked out,
+/// and the `sleep` planted in the pidfile must still not be.
+#[test]
+fn a_daemon_started_from_a_long_path_is_still_told_from_a_stranger() {
+    let root = run_root("lk19");
+    let mut deep = root.clone();
+    for _ in 0..6 {
+        deep.push("d".repeat(100));
+    }
+    fs::create_dir_all(&deep).expect("create the deep install directory");
+    let exe = deep.join("nomux");
+    fs::copy(env!("CARGO_BIN_EXE_nomux"), &exe).expect("install the binary deep");
+    // What the daemon's `/proc/<pid>/cmdline` will hold: the three arguments and the
+    // NUL after each. Asserted rather than assumed, since the whole test is about
+    // where that length falls.
+    let cmdline = exe.as_os_str().len() + 1 + "daemon".len() + 1 + "lk19".len() + 1;
+    assert!(
+        cmdline > 512,
+        "the command line must overrun a fixed 512-byte read to test anything: \
+         {cmdline} bytes"
+    );
+
+    let started = collect(
+        Command::new(&exe)
+            .args(["attach", "lk19"])
+            .env("XDG_RUNTIME_DIR", &root)
+            .env("SHELL", "/bin/sh")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+    );
+    succeeded(
+        &started,
+        "the deeply installed binary failed to start a session",
+    );
+    let pid_path = root.join("nomux").join("lk19.pid");
+    wait_for(&pid_path);
+    let daemon: u32 = fs::read_to_string(&pid_path)
+        .expect("read the pidfile")
+        .trim()
+        .parse()
+        .expect("the pidfile holds a pid");
+    let _reaper = Reaper(daemon);
+
+    let mut bystander = Spawned::spawn(
+        Command::new("sleep")
+            .arg("300")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    );
+    fs::write(&pid_path, format!("{}\n", bystander.id())).expect("plant a stranger's pid");
+
+    let listed = stdout(&control(&root, &["list"]));
+    let killed = control(&root, &["kill", "lk19"]);
+    let survived = bystander.is_running();
+    drop(bystander);
+
+    assert!(
+        survived,
+        "a `sleep` was taken for the session's daemon: {:?}",
+        stderr(&killed)
+    );
+    succeeded(
+        &killed,
+        "a daemon started from a long path was not recognised as one",
+    );
+    assert_eq!(
+        listed.trim_end().split('\t').nth(1),
+        Some(daemon.to_string().as_str()),
+        "list must name the daemon it identified, not the planted pid: {listed:?}"
+    );
+    assert!(
+        poll_until(Duration::from_secs(10), || !process_alive(daemon)),
+        "kill reported success with the daemon still running as pid {daemon}"
+    );
+}
+
 /// The other half of that tie, and the one the fork of § 6.2 produces: the socket
 /// names a live process that is *not* this session's daemon, and `<id>.pid` names the
 /// one that is.

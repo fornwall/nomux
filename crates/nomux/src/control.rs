@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
+use nomux_proto::MAX_SESSION_ID_LEN;
+
 use crate::rundir::{SessionPaths, SpawnLock, check_run_dir, read_label, read_prefix, run_dir};
 
 /// How long a terminated daemon has to exit before it is killed outright.
@@ -66,6 +68,20 @@ const PUBLISH_GRACE: Duration = Duration::from_secs(2);
 /// by hand carries. Bounded at all for [`read_prefix`]'s reason: what somebody left
 /// at that path does not get to decide how much memory the escape hatch faults in.
 const MAX_PID_LEN: usize = 32;
+
+/// Longest `/proc/<pid>/cmdline` prefix [`is_daemon_for`] reads.
+///
+/// Sized so that no legitimate invocation can reach it, because a command line this
+/// cannot see the end of is one whose daemon it cannot recognise. `argv[0]` is
+/// `env::current_exe()` resolved, so its bound is the kernel's `PATH_MAX` rather than
+/// anything this program picks — § 5.2 installs under a directory the *client* names,
+/// which is not a length that can be assumed small — and behind it come the mode and
+/// an id of at most [`MAX_SESSION_ID_LEN`], with a NUL after each. Stack rather than
+/// text, on a path that runs at most twice per `kill`.
+const MAX_CMDLINE_LEN: usize = PATH_MAX + 1 + "daemon".len() + 1 + MAX_SESSION_ID_LEN + 1;
+
+/// The kernel's longest path, which is what bounds a resolved `argv[0]`.
+const PATH_MAX: usize = 4096;
 
 /// State of one session as seen from the run directory alone.
 #[derive(Debug)]
@@ -172,17 +188,20 @@ pub(crate) fn list() -> io::Result<()> {
             // loop goes on anyway.
             Liveness::Alive(_) if !listening => {}
             Liveness::Alive(answered) => {
-                // The same order of witnesses `kill` signals on, so the number a user
-                // reads here is the number that would be acted on. Taking it from the
-                // file alone printed the stale pid in exactly the case this column
-                // matters — a session whose `<id>.pid` no longer names its daemon —
-                // which is the one number nobody should be shown.
-                let pid = answered
-                    .as_ref()
-                    .and_then(daemon_of)
-                    .map(|pid| pid.as_raw_nonzero().get())
-                    .or_else(|| read_pid(&paths))
-                    .map_or_else(|| "?".to_owned(), |pid| pid.to_string());
+                // The same two witnesses `kill` signals on, weighed the same way, so
+                // the number a user reads here is the number that would be acted on —
+                // including the tie-break, which is the case this column matters in.
+                // A session whose `<id>.pid` no longer names its daemon printed the
+                // stale number, and `kill` refusing to choose *for* the user is what
+                // sends them here to choose themselves: it must not be the one place
+                // that hands back a stranger's pid to signal by hand. Where the two
+                // cannot be reconciled there is no number to print, and `?` says so.
+                let pid = chosen(
+                    &paths,
+                    answered.as_ref().and_then(daemon_of),
+                    read_pid(&paths).and_then(extant),
+                )
+                .map_or_else(|| "?".to_owned(), |pid| pid.as_raw_nonzero().to_string());
                 // Sanitised on read as well as on write. The file is sanitised
                 // going in, but this is the frozen layout (§ 6.6): the daemon that
                 // wrote it may be any version, and the bytes land on the terminal
@@ -207,10 +226,12 @@ pub(crate) fn list() -> io::Result<()> {
 /// alone (§ 6.3), if the spawn lock could not be taken within [`SPAWN_LOCK_GRACE`]
 /// — see [`hold_spawn_lock`] — if the session is alive but will not say which
 /// process it is, if its two witnesses name two live processes and neither of them
-/// is this session's daemon (both are [`resolve`]), or if it goes on answering after
+/// is this session's daemon (both are [`resolve`]), if it goes on answering after
 /// both signals, which means the pid that was signalled is not the process serving
-/// it. A session that is already gone is not an error — the postcondition is "no
-/// such session", which already holds.
+/// it, or if one of the five files will not go once it has stopped — the one refusal
+/// here that is not about establishing anything, since the session really did end
+/// (see [`SessionPaths::unlink_all_locked`]). A session that is already gone is not
+/// an error — the postcondition is "no such session", which already holds.
 pub(crate) fn kill(session_id: &str) -> io::Result<()> {
     let paths = SessionPaths::new(session_id)?;
     // The same check `list` makes, and this is where it bites hardest: the two
@@ -372,13 +393,17 @@ fn resolve(paths: &SessionPaths) -> io::Result<Target> {
         let waiting_on = match read_prefix(&paths.pid(), &mut buf) {
             Ok(body) if !body.trim_ascii().is_empty() => {
                 let filed = parse_pid(body).and_then(extant);
-                return match (named, filed) {
-                    (Some(named), Some(filed)) if named != filed => serving(paths, named, filed)
-                        .map(Target::Daemon)
-                        .ok_or_else(|| disagreement(paths, named, filed)),
-                    (Some(pid), _) | (None, Some(pid)) => Ok(Target::Daemon(pid)),
-                    (None, None) => Err(unreadable(paths, &unusable(body))),
-                };
+                return chosen(paths, named, filed)
+                    .map(Target::Daemon)
+                    .ok_or_else(|| {
+                        // Nothing came back, so either there was no witness at all or the
+                        // two could not be reconciled — and the two read very differently
+                        // to whoever has to act on them.
+                        match (named, filed) {
+                            (Some(named), Some(filed)) => disagreement(paths, named, filed),
+                            _ => unreadable(paths, &unusable(body)),
+                        }
+                    });
             }
             // Present but empty is the same window one syscall later, and is therefore
             // waited out rather than reported: `SessionPaths::write_pid` publishes in
@@ -481,6 +506,25 @@ fn extant(pid: i32) -> Option<rustix::process::Pid> {
         .then_some(pid)
 }
 
+/// The pid two witnesses come to, where they come to one.
+///
+/// Shared by both modes so that the number `list` prints is the number `kill` would
+/// signal — including in the case that most needs it, since `kill` deliberately
+/// recommends no repair for an unreconciled session and a user who wants to act then
+/// asks `list` what to signal. A column that answered from the file alone would hand
+/// them the stranger's.
+fn chosen(
+    paths: &SessionPaths,
+    named: Option<rustix::process::Pid>,
+    filed: Option<rustix::process::Pid>,
+) -> Option<rustix::process::Pid> {
+    match (named, filed) {
+        (Some(named), Some(filed)) if named != filed => serving(paths, named, filed),
+        (Some(pid), _) | (None, Some(pid)) => Some(pid),
+        (None, None) => None,
+    }
+}
+
 /// Which of two live candidates is this session's daemon, where that can be settled.
 ///
 /// The two witnesses disagree only when a number has been reissued, and from outside
@@ -494,8 +538,11 @@ fn extant(pid: i32) -> Option<rustix::process::Pid> {
 ///
 /// Both wearing it is § 6.2's fork and nothing else — one image, two halves — and
 /// there the file is the answer by construction, since `write_pid` runs after the fork
-/// in the half that survives it. Neither wearing it is not a tie to break: the caller
-/// refuses.
+/// in the half that survives it. Neither wearing it is not a tie to break, and neither
+/// is a candidate that could not be *asked*: both refuse. Those two are kept apart in
+/// [`is_daemon_for`] rather than folded together, because "it is not the daemon" and
+/// "I could not tell" differ in the direction they are wrong — the first, said of a
+/// daemon, is what strands a healthy session.
 ///
 /// This identifies the process rather than the *fd*, which is the stronger question
 /// and the more expensive one — `/proc/<pid>/fd` carries a socket's `sockfs` inode,
@@ -513,13 +560,13 @@ fn serving(
         is_daemon_for(named, paths.id()),
         is_daemon_for(filed, paths.id()),
     ) {
-        (_, true) => Some(filed),
-        (true, false) => Some(named),
-        (false, false) => None,
+        (_, Some(true)) => Some(filed),
+        (Some(true), Some(false)) => Some(named),
+        _ => None,
     }
 }
 
-/// Whether `pid` is a `nomux daemon <id>` process.
+/// Whether `pid` is a `nomux daemon <id>` process, where that can be established.
 ///
 /// The command line rather than the executable's name: `attach` spawns the daemon as
 /// `<exe> daemon <id>` (`attach::spawn_daemon`) and § 6.2 documents the same words
@@ -528,23 +575,24 @@ fn serving(
 /// version-stamped name. Both are required: a relay is `<exe> attach <id>` and would
 /// otherwise answer to this.
 ///
-/// Read through the same bounded call as the run files, which is what keeps a
-/// command line somebody chose from deciding how much this reads. A `/proc` that
-/// cannot be read at all — it is not mounted, or the process went away between the
-/// two questions — is "no", which leaves the caller refusing rather than guessing.
-fn is_daemon_for(pid: rustix::process::Pid, id: &str) -> bool {
-    // Long enough for the two arguments this looks at behind any plausible path to
-    // the binary; a command line that pushes them past it reads as "not this daemon",
-    // which is the safe direction.
-    let mut buf = [0u8; 512];
+/// `None` is "could not tell", and keeping it apart from `Some(false)` is the whole
+/// reason this returns an `Option`. A false *positive* is unreachable — a truncated
+/// last argument cannot equal both `daemon` and the id — but a false *negative* is
+/// how a healthy daemon becomes invisible, and an invisible daemon is a session
+/// [`serving`] refuses to identify for as long as it runs. So a read that cannot see
+/// the end of the command line says so, exactly as [`parse_pid`] does of a pidfile
+/// that runs past its own bound.
+fn is_daemon_for(pid: rustix::process::Pid, id: &str) -> Option<bool> {
+    let mut buf = [0u8; MAX_CMDLINE_LEN];
     let cmdline = PathBuf::from(format!("/proc/{}/cmdline", pid.as_raw_nonzero()));
-    let Ok(body) = read_prefix(&cmdline, &mut buf) else {
-        return false;
-    };
+    let body = read_prefix(&cmdline, &mut buf).ok()?;
+    if body.len() >= MAX_CMDLINE_LEN {
+        return None;
+    }
     // NUL-separated argv, so the arguments are compared whole: an id that is a prefix
     // of another session's is a different session.
     let mut args = body.split(|byte| *byte == 0);
-    args.any(|arg| arg == b"daemon") && args.any(|arg| arg == id.as_bytes())
+    Some(args.any(|arg| arg == b"daemon") && args.any(|arg| arg == id.as_bytes()))
 }
 
 /// The refusal to act when neither live candidate is this session's daemon.
