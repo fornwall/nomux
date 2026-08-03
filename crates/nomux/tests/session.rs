@@ -200,6 +200,132 @@ fn overflow_is_reported_as_a_gap_rather_than_silently_truncated() {
     );
 }
 
+/// The mid-stream half of the same invariant: a client that never left is still
+/// told when the ring overran it.
+///
+/// The test above pins the *other* place a gap is reported. There the client has
+/// been away and comes back, `on_hello` compares the offset it claims against the
+/// ring's base, and the answer is a flag on `HelloOk`. Nothing reconnects here, so
+/// that path is never entered: what this waits for is the `Gap` *frame*
+/// `pump_output` sends down a connection that has been attached and greeted the
+/// whole time — the case a slow terminal on a busy session actually meets. Neither
+/// is a duplicate of the other, and deleting either leaves half of § 9 undefended.
+///
+/// Deterministic because the state it needs is monotone rather than timed. The
+/// client greets and then reads nothing of the stream, so `sent_through` stops at
+/// whatever the daemon's send queue and the kernel's socket buffers hold between
+/// them, and stays there. The child goes on to write several times that much through
+/// a ring that keeps [`RING`], so `base` passes `sent_through` and can never come
+/// back under it: from that moment the `Gap` is owed, and draining a single byte is
+/// what collects it. Nothing here waits on the scheduler having got round to
+/// something — the sentinel file is how a client that is not reading learns the child
+/// has finished, since the stream it is ignoring cannot tell it.
+#[test]
+fn an_overflow_that_outruns_an_attached_client_is_reported_as_a_gap_mid_stream() {
+    /// Larger than the 64 KiB the daemon takes off the PTY in one pass, so a client
+    /// that is still keeping up cannot be gapped by a single read. That keeps the
+    /// setup below silent and leaves exactly one way to reach a gap here: the client
+    /// falling behind on purpose.
+    const RING: usize = 128 * 1024;
+    /// What the child writes, in blocks of [`BLOCK`]. Eight megabytes is comfortably
+    /// past everything between it and the client put together — the daemon's
+    /// megabyte of queued output, the 256 KiB frame it may overshoot that by, the
+    /// kernel's socket buffers, and [`RING`].
+    const PRODUCED: usize = 8 << 20;
+    const BLOCK: usize = 64 * 1024;
+    /// What the child is asked to say once the filler is behind it, and what that
+    /// becomes once it has. The arithmetic is the point, exactly as it is in
+    /// `Client::make_ready`: the line discipline echoes the command line before any
+    /// of it runs, and that echo carries `$((6*7))` unexpanded — so the marker the
+    /// read below stops at cannot be satisfied by the request for it.
+    const DONE_ECHO: &str = "echo NOMUX-$((6*7))-MIDSTREAM-DONE";
+    const DONE: &str = "NOMUX-42-MIDSTREAM-DONE";
+
+    let session = Session::start_with_ring("midstream_gap", RING);
+    let mut client = session.connect();
+    let ok = client.hello(RESUME_FROM_START, 0);
+    assert!(
+        !ok.gap,
+        "a session nobody has attached to before has nothing to report at the \
+         handshake, so every gap below is one this connection was sent"
+    );
+
+    // `raw` for the output side: with `opost` off the child's bytes reach the ring
+    // unmangled and at memcpy speed, which is what makes eight megabytes cheap. The
+    // sentinel is touched last, so its arrival means every byte above is already in
+    // the ring — or already evicted from it.
+    let produced = session.root.join("produced");
+    client.input(
+        0,
+        format!(
+            "stty raw -echo; dd if=/dev/zero bs={BLOCK} count={} 2>/dev/null; \
+             {DONE_ECHO}; touch produced\n",
+            PRODUCED / BLOCK
+        )
+        .as_bytes(),
+    );
+
+    // And from here to the sentinel the client reads nothing, which is the whole
+    // setup: the daemon's send queue fills, `sent_through` stops with it, and the
+    // ring runs away from a client that has not gone anywhere.
+    assert!(
+        poll_until(Duration::from_secs(30), || produced.exists()),
+        "the child never finished writing its {PRODUCED} bytes"
+    );
+
+    let mut expected = ok.resume_from;
+    let mut first_gap = None;
+    let mut tail: Vec<u8> = Vec::new();
+    loop {
+        let (ty, payload) = client.next_frame();
+        match Frame::decode(ty, &payload).expect("decode frame") {
+            Frame::Output { offset, data } => {
+                assert_eq!(
+                    offset,
+                    expected,
+                    "output must join up unless a Gap said otherwise, and this \
+                     frame opens {} bytes from where the stream stood",
+                    offset.abs_diff(expected)
+                );
+                expected += data.len() as u64;
+                tail.extend_from_slice(data);
+                if String::from_utf8_lossy(&tail).contains(DONE) {
+                    break;
+                }
+                // Only what a marker split across two frames needs.
+                tail.drain(..tail.len().saturating_sub(DONE.len()));
+            }
+            Frame::Gap { new_base_offset } => {
+                assert!(
+                    new_base_offset > expected,
+                    "a Gap must name a base past what the client was sent: \
+                     {new_base_offset} against {expected}"
+                );
+                first_gap.get_or_insert((expected, new_base_offset));
+                expected = new_base_offset;
+            }
+            Frame::InputAck { .. } | Frame::Pong { .. } => {}
+            other => panic!("unexpected {other:?} while reading the session's output"),
+        }
+    }
+
+    let (sent_through, base) = first_gap.expect(
+        "the ring overran a client that never detached and nothing said so: the \
+         whole stream arrived contiguous, which it cannot have been",
+    );
+    assert!(
+        sent_through > ok.resume_from,
+        "the gap must interrupt a stream this client was already receiving — that \
+         is what makes it mid-stream rather than the handshake's"
+    );
+    assert!(
+        base - sent_through > RING as u64,
+        "only {} bytes were reported lost, which is less than the ring itself \
+         holds: this client was not overrun",
+        base - sent_through
+    );
+}
+
 /// A `NOMUX_RING_BYTES` the daemon cannot use falls back to the default rather than
 /// refusing to start (`IMPLEMENTATION.md` § 4).
 ///
