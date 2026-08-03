@@ -3470,15 +3470,27 @@ fn a_signalled_daemon_collects_a_process_that_ignores_sighup() {
 /// hundred. Defensible in intent and indefensible in mechanism: the bound was
 /// wedged between the two with runqueue delay, which nothing here bounds, free to
 /// move either. So the comparison is now between two shutdowns rather than between
-/// one shutdown and a constant. Both sessions are signalled in the same test within
-/// milliseconds of each other, so whatever the machine is doing it is doing to
-/// both, and the ratio survives what an absolute bound cannot.
+/// one shutdown and a constant.
 ///
-/// `quiet < stubborn / 2` is the assertion because the two answers are an order of
-/// magnitude apart when the daemon is right and identical when it is wrong: the
-/// regression makes *every* shutdown the stubborn one. The stubborn measurement is
-/// itself checked against the grace period, so a run where nothing waited for
-/// anything fails as an instrument rather than passing as a result.
+/// What is asserted is the *difference*, and the arithmetic is why. The grace is an
+/// additive constant, not a factor: the stubborn shutdown costs `GRACE + W` and the
+/// quiet one `W`, for whatever the shared work `W` comes to on the day. A ratio
+/// reduces to `W < (GRACE + W)/2`, which is `W < GRACE`, an absolute half-second
+/// ceiling wearing a disguise — better than the old one, since it is anchored to a
+/// measurement rather than to a literal, but not the load-cancelling thing it looks
+/// like. The difference is `GRACE + (W_s − W_q)`, where the two `W`s are the same
+/// work on the same machine moments apart, so what has to stay small is their
+/// *spread* rather than either of them. Under the regression both shutdowns pay the
+/// grace and the difference collapses to that spread, which is what fails.
+///
+/// The two measurements are sequential rather than simultaneous — about half a
+/// second apart, since the first is the one that waits — so "the same machine" is a
+/// claim about half a second of it and not a guarantee. That is the residual risk,
+/// and it is why the load average goes into both messages.
+///
+/// The stubborn measurement is checked against the grace period first, so a run
+/// where nothing waited for anything fails as an instrument rather than passing as
+/// a result.
 #[test]
 fn a_signalled_daemon_with_a_quiet_child_does_not_wait_out_the_grace_period() {
     /// `pty::HANGUP_GRACE`, which is private to the daemon. Used only to say that
@@ -3521,12 +3533,17 @@ fn a_signalled_daemon_with_a_quiet_child_does_not_wait_out_the_grace_period() {
          un-hangupable child should have cost it — so it is not a grace period this \
          run measured, and the comparison below would mean nothing. Load: {load}"
     );
+    // `saturating_sub`, because `Duration` subtraction panics rather than going
+    // negative — and the case that would is precisely the failure, a quiet shutdown
+    // that took longer than the stubborn one.
     assert!(
-        quiet < stubborn / 2,
+        stubborn.saturating_sub(quiet) > GRACE / 2,
         "a session with nothing left running took {quiet:?} to stop against \
-         {stubborn:?} for one with a process that ignores SIGHUP: the two are the \
-         same shutdown, so the grace period is being paid whether or not anything \
-         is still there. Load: {load}"
+         {stubborn:?} for one with a process that ignores SIGHUP — a difference of \
+         {:?}, where the grace period only one of them should pay is {GRACE:?}. The \
+         two are the same shutdown, so it is being paid whether or not anything is \
+         still there. Load: {load}",
+        stubborn.saturating_sub(quiet)
     );
 }
 
