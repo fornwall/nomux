@@ -194,6 +194,12 @@ fn overflow_is_reported_as_a_gap_rather_than_silently_truncated() {
         "x".repeat(200)
     );
     client.input(0, filler.as_bytes());
+    // The command that makes the gap has to be the daemon's before the connection
+    // goes: an `Input` written but not yet decoded is lost when the socket closes
+    // with output queued (see `Client::drain_available`), and losing this one leaves
+    // the child silent, the ring never overflowing, and the wait below spending its
+    // whole twenty seconds blaming the ring for a keystroke that never arrived.
+    client.wait_for_input_ack(filler.len() as u64);
     drop(client);
 
     // The daemon must keep draining the PTY while detached, so the ring overflows
@@ -339,9 +345,23 @@ fn an_overflow_that_outruns_an_attached_client_is_reported_as_a_gap_mid_stream()
 /// anything, and every session on a host with that variable exported stops starting
 /// at once. A mistyped tuning variable should never cost somebody their session, so
 /// the value is dropped and the default used.
+///
+/// The third row is the one that is *not* a fallback, and it is here because it is
+/// the same promise reached by the other of the two routes to it. A value mistyped
+/// upwards parses and is positive, so nothing rejects it — `MAX_RING_CAPACITY` caps
+/// it instead, which its own doc gives as the whole reason it exists: without a
+/// ceiling `VecDeque::with_capacity` answers a request it cannot serve by aborting
+/// the process, and the daemon dies before it binds exactly as the zero would have
+/// made it. What the daemon then reserves is a gigabyte of *address space* rather
+/// than of memory — nothing here fills a ring, so the pages are never touched — which
+/// is what makes this row cost no more to run than the two above it.
 #[test]
 fn a_ring_capacity_the_daemon_cannot_use_falls_back_to_the_default() {
-    for (name, value) in [("ring_zero", "0"), ("ring_garbage", "not-a-number")] {
+    for (name, value) in [
+        ("ring_zero", "0"),
+        ("ring_garbage", "not-a-number"),
+        ("ring_huge", "99999999999999999"),
+    ] {
         let session = Session::start_with_raw_ring(name, value);
         let mut client = session.connect();
         let ok = client.hello(RESUME_FROM_START, 0);
@@ -423,17 +443,40 @@ fn an_output_ack_never_trims_the_ring() {
     );
 }
 
+/// § 6.4's whole sentence, rather than its first clause: "the previous connection
+/// receives `Error{TAKEOVER}` **and closes**", and the session goes to the newcomer.
+///
+/// The refusal alone is the cheapest third of that to satisfy and the least of what
+/// the client is promised. A daemon that sent the error and then kept the old
+/// connection in its poll set would leave two peers believing they hold the session,
+/// with the evicted one told never to reconnect (§ 6.4) and still receiving output —
+/// and a daemon that evicted the incumbent without promoting the newcomer leaves the
+/// shell running with nobody attached at all, which is the exact failure
+/// [`a_version_mismatch_refuses_the_newcomer_without_evicting_the_client`] guards
+/// from the other side. So all three are asserted here, in the order the daemon
+/// establishes them.
 #[test]
 fn a_second_client_takes_over_and_the_first_is_told_why() {
     let (session, mut first, _) = Session::attached("takeover");
 
     let mut second = session.connect();
-    second.hello(RESUME_FROM_START, 0);
+    let ok = second.hello(RESUME_FROM_START, 0);
 
     first.expect_error(
         ErrorCode::Takeover,
         "an evicted client must learn it was a takeover, not a network fault",
     );
+    // The refusal was the daemon's goodbye, not a message on a connection it means to
+    // go on serving. Nothing else may follow it — `expect_eof` fails on a second
+    // `Error`, which would be the daemon refusing this peer for some further reason
+    // rather than having finished with it.
+    first.expect_eof("an Error{TAKEOVER}");
+
+    // And the session is the newcomer's, which is the half the eviction exists for:
+    // a round trip through the child, so what is asserted is a client that can drive
+    // the shell rather than one that merely got a `HelloOk`.
+    second.input(ok.in_applied, b"echo NOMUX-TOOK-OVER\n");
+    second.read_until("NOMUX-TOOK-OVER", ok.resume_from);
 }
 
 #[test]
@@ -814,6 +857,30 @@ fn child_of(parent: u32) -> Option<u32> {
     None
 }
 
+/// A guard that collects the daemon `id` published a pidfile for, however this test
+/// ends.
+///
+/// For the two tests here that bring a session up through `nomux attach` rather than
+/// through [`Session`], which kills its own child on drop. The daemon such an attach
+/// spawns has `setsid`ed away, so killing the relay does not reach it and no
+/// [`Spawned`] covers it: it is collected by an explicit `nomux kill` further down,
+/// and a panic before that line skips it. What is left behind then holds its run
+/// directory for the whole 30-second first-attach timeout, and the *next* run's
+/// `sweep_finished_runs` deletes that directory out from under it — the pid in its
+/// name having gone with this process. `spawn_lock.rs` documents the same hazard at
+/// the one place it meets it; these are the other two.
+fn daemon_reaper(root: &Path, id: &str) -> Reaper {
+    let pid_file = root.join("nomux").join(format!("{id}.pid"));
+    wait_for(&pid_file);
+    Reaper(
+        fs::read_to_string(&pid_file)
+            .expect("read the pidfile")
+            .trim()
+            .parse()
+            .expect("the pidfile holds a pid"),
+    )
+}
+
 /// Ids are opaque per-tab identifiers, so the label is the only thing that makes a
 /// session recognisable to a human after the client loses its state.
 #[test]
@@ -833,6 +900,8 @@ fn a_label_survives_into_list() {
     // first would let `list` run against a session that is answering and has not
     // said what it is called, which prints `labelled\t?\t` and fails on the label.
     wait_for(&root.join("nomux").join("labelled.label"));
+    // And the pidfile is already there, being one step earlier in that same order.
+    let _reaper = daemon_reaper(&root, "labelled");
 
     let listed = stdout(&control(&root, &["list"]));
 
@@ -996,6 +1065,14 @@ fn attach_spawns_the_daemon_and_relays_transparently() {
         },
     );
     stdin.flush().expect("flush");
+
+    // The relay connected before it wrote anything, and `attach` connects only to a
+    // socket a daemon is already answering on — which § 6.2 puts one step before the
+    // pidfile — so this wait is over before it starts unless no daemon was spawned at
+    // all. That case is the one the assertion at the foot of this test is about, and
+    // it is reported here instead: a leak is not possible where there is nothing to
+    // leak, and "the daemon never created relay_probe.pid" says the same thing.
+    let _reaper = daemon_reaper(&root, "relay_probe");
 
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut seen = Vec::new();
@@ -2066,6 +2143,21 @@ fn repaint_transcript(name: &str, flags: u16) -> String {
     // whether the ring has overflowed yet is a question about the scheduler.
     let (mut client, resumed) = reconnect_until_gap(&session, flags, offset, in_offset);
 
+    // § 4.3: "`ctrl_l` goes through the same queue as client input ... It is not
+    // client input, so `in_applied` does not move for it." Asserted for both
+    // policies because the claim is only interesting for one of them: the daemon
+    // has just queued a `0x0c` this client never sent, and counting it would put
+    // `in_applied` one byte past what the client believes it has delivered — after
+    // which every offset the client sends is a byte low, and the daemon answers the
+    // next keystroke with an `Error{InputGap}` for input nobody skipped. The fence
+    // below is sent at `in_offset` for the same reason, so a daemon that moved it
+    // would fail here rather than in the read that follows.
+    assert_eq!(
+        resumed.in_applied, in_offset,
+        "the repaint moved the session's input position, but only the client's own \
+         keystrokes may"
+    );
+
     // A fence bounds the wait: whatever the repaint was going to be has been
     // echoed by the time this comes back.
     client.input(in_offset, b"FENCE\n");
@@ -2091,7 +2183,8 @@ fn a_gap_repaints_with_ctrl_l_only_when_the_client_asks() {
     );
 }
 
-/// A daemon spawned by a connection that died mid-handshake must reap itself.
+/// A daemon spawned by a connection that died mid-handshake must reap itself — and a
+/// session somebody has actually used must not.
 ///
 /// Every reaping rule is only checked when `poll` returns, so this is really a test
 /// that a wakeup is armed for the 30-second first-attach deadline rather than only
@@ -2099,15 +2192,70 @@ fn a_gap_repaints_with_ctrl_l_only_when_the_client_asks() {
 /// it from outside, which is why this is `#[ignore]`d: 30 seconds is unreasonable
 /// in a suite that otherwise finishes in two, and CI runs it with
 /// `--run-ignored all`.
+///
+/// Both halves, because `Daemon::detach_limit` is a *choice* — 30 seconds where no
+/// PTY was ever started, seven days once one was — and the rule was the untested one
+/// of the two. A regression returning `FIRST_ATTACH_TIMEOUT` for both would reap
+/// every real user's session half a minute after they shut their laptop, and nothing
+/// in the suite would go red: the timeout half would pass, being what the regression
+/// does everywhere. The other branch rides along at no cost in wall clock, since the
+/// wait is the same wait.
 #[test]
 #[ignore = "waits out the 30-second first-attach timeout; run in CI, not on every commit"]
 fn a_daemon_nobody_ever_attaches_to_reaps_itself() {
-    let session = Session::start("unattached");
-    assert!(session.socket.exists());
+    // The seven-day branch is set up first so that under the regression above its
+    // thirty seconds are up no later than the other session's. That ordering is not
+    // enough on its own, and measuring says so: with the regression applied by hand
+    // this session was reaped 107 ms *after* the wait below ended, so an assertion
+    // taken at that instant passed over a daemon that was already doomed. Whichever
+    // way that hundred milliseconds happens to fall is a matter of process startup
+    // against the daemon noticing a closed socket, which is not something to hang a
+    // guard on. So the assertion at the end asks for a margin instead.
+    let (greeted, client, _) = Session::attached("attached_once");
+    // The limit is consulted only while there is nobody attached, so a session still
+    // holding its client would satisfy the assertion below by never having been asked
+    // the question. The `Hello` that has just been answered is what makes this the
+    // seven-day branch: it is what started the PTY.
+    drop(client);
+    let detached_at = Instant::now();
+
+    let unattached = Session::start("unattached");
+    assert!(unattached.socket.exists());
 
     assert!(
-        poll_until(Duration::from_secs(45), || !session.socket.exists()),
+        poll_until(Duration::from_secs(45), || !unattached.socket.exists()),
         "daemon outlived its first-attach timeout"
+    );
+
+    // Stated rather than reasoned about: the wait above cannot end before the
+    // unattached daemon's own 30 seconds are up, and this session was detached before
+    // that daemon existed — so by here it has been clientless for longer than the
+    // deadline it must not be holding.
+    assert!(
+        detached_at.elapsed() > Duration::from_secs(30),
+        "the unattached daemon went in {:?}, which is short of the first-attach \
+         timeout — so nothing below says anything about the limit this session is on",
+        detached_at.elapsed()
+    );
+    // Asked as "still here three seconds from now" rather than "here at this
+    // instant", which is what makes this falsifiable rather than nearly so: the
+    // regression reaps this session within a hundred milliseconds either side of the
+    // wait above, so only a margin tells a session on the seven-day limit from one
+    // on the thirty-second limit that has not got round to it yet. Three seconds is
+    // two orders of magnitude above that scatter and still nowhere near a limit
+    // anything here holds.
+    //
+    // Answering, not merely present: the socket file outlives the process that bound
+    // it, so a daemon that died without unlinking would leave one behind. A bare
+    // `connect` is not an attach (§ 6.4) and costs this session nothing.
+    let reaped = poll_until(Duration::from_secs(3), || {
+        !greeted.socket.exists() || UnixStream::connect(&greeted.socket).is_err()
+    });
+    assert!(
+        !reaped,
+        "a session that was attached to and then detached was reaped on the \
+         first-attach deadline, so closing a laptop for half a minute now costs the \
+         user their shell"
     );
 }
 
@@ -2356,7 +2504,16 @@ fn a_takeover_never_discards_input_already_delivered() {
 
     for round in 0..15 {
         let mut next = session.connect();
-        thread::sleep(Duration::from_millis(60));
+        // The accept, asked for rather than waited out. `connect` on a listening unix
+        // socket completes in the kernel, so by the line above the connection is
+        // already in the backlog and the next `poll` reports the listener; that same
+        // pass services the client, then accepts, and only then writes what it queued
+        // — so a `Pong` for a ping sent from here cannot have been written by a pass
+        // that had not yet accepted. A sleep long enough to be safe was 900 ms across
+        // the fifteen rounds and still only ever made the interleaving *likely*, which
+        // is precisely what the paragraph above says this test does not do.
+        client.send(&Frame::Ping { nonce: 0x7AC0 });
+        drop(client.next_of(FrameType::Pong));
 
         client.input(expected, command);
         expected += command.len() as u64;

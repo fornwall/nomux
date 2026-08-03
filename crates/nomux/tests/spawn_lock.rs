@@ -28,7 +28,6 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
-use std::thread;
 use std::time::Duration;
 
 use nomux_proto::PROTOCOL_VERSION;
@@ -155,7 +154,12 @@ fn an_attach_re_takes_a_spawn_lock_that_was_collected() {
             .stderr(Stdio::null()),
     );
 
-    wait_until_blocked_on(held.dev(), orphan);
+    wait_until_flock(
+        Flock::Queued,
+        held.dev(),
+        orphan,
+        "the attach waited for the spawn lock",
+    );
 
     // Exactly what collection used to do to a lock in use.
     fs::remove_file(session.lock_path()).expect("unlink the lock");
@@ -239,20 +243,30 @@ fn kill_waits_out_a_pidfile_that_has_been_created_but_not_yet_written() {
     let session = LiveSession::create("lk9");
     let body = fs::read_to_string(session.pid_path()).expect("read the pidfile");
     fs::write(session.pid_path(), b"").expect("empty the pidfile");
+    // Stat'ed before `kill` runs, so the file the wait below watches is the one this
+    // session already has rather than whatever is at the path by then.
+    let lock = fs::metadata(session.run.lock_path()).expect("stat the spawn lock");
 
-    // `kill` is started first and the clock runs from there, so both halves of the
-    // window are measured from a point this test can see. Timed from before the fork
-    // instead, a slow `fork` and `exec` under load could republish the pid before
-    // `kill` ever opened the file — and a `kill` that reported the empty one at once
-    // would then pass this — while eating into the two-second publish grace `kill`
-    // measures from its own start, which would fail a healthy one.
     let mut killing = Spawned::spawn(
         nomux(&session.run.root, &["kill", "lk9"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped()),
     );
-    thread::sleep(Duration::from_millis(300));
+    // The window is closed on a condition rather than after a guess at how long `kill`
+    // takes to reach it. `kill` takes `<id>.lock` and holds it to the end (§ 6.6)
+    // strictly *before* it goes looking for a pid, so a granted `FLOCK` on that inode
+    // is the fence: past it, `kill` is one `connect` and one `open` away from the
+    // empty pidfile, where before it is a whole `fork`, `exec` and run-directory
+    // check away — which is what a fixed sleep was really racing, and what a loaded
+    // machine wins. A `kill` that never reached the empty file would pass this test
+    // having tested nothing at all, and say so nowhere.
+    wait_until_flock(
+        Flock::Granted,
+        lock.dev(),
+        lock.ino(),
+        "`kill` took the spawn lock",
+    );
     fs::write(session.pid_path(), body.as_bytes()).expect("republish the pid");
 
     assert!(
@@ -268,9 +282,16 @@ fn kill_waits_out_a_pidfile_that_has_been_created_but_not_yet_written() {
         &killed,
         "kill refused a session whose pidfile was merely still being written",
     );
+    // The daemon, not its socket. `kill` spins until the socket stops answering and
+    // only *then* unlinks it, so a `connect` to a path that is no longer there is
+    // false on every exit `succeeded` above lets through — [`LiveSession::is_alive`]
+    // cannot fail here, and an assertion that cannot fail is not one. The pid `kill`
+    // was told to signal is what had to go, and `/proc` is where that is visible.
     assert!(
-        !session.is_alive(),
-        "kill reported success without stopping the daemon"
+        poll_until(Duration::from_secs(10), || !process_alive(session.pid)),
+        "kill reported success with the daemon it was asked to stop still running \
+         as pid {}",
+        session.pid
     );
 }
 
@@ -430,7 +451,7 @@ fn the_control_surface_neither_creates_nor_complains_about_a_missing_run_directo
 /// which kind a refusal happens to carry.
 #[test]
 fn probe_and_version_report_what_a_client_bootstraps_from() {
-    let root = run_root("lk9");
+    let root = run_root("lk10");
     let data_home = root.join("xdg-data");
     fs::create_dir_all(&data_home).expect("create the install directory's parent");
 
@@ -575,6 +596,10 @@ impl Drop for HeldLock {
 /// of the business of driving a shell.
 struct LiveSession {
     run: StaleSession,
+    /// What the pidfile said when the session came up, for the one test that has to
+    /// be able to ask whether that process is still there after somebody else has
+    /// taken the pidfile away.
+    pid: u32,
     /// Whatever the test decided, this daemon is not the next run's business.
     _reaper: Reaper,
 }
@@ -597,6 +622,7 @@ impl LiveSession {
             .expect("the pidfile holds a pid");
         Self {
             run,
+            pid,
             _reaper: Reaper(pid),
         }
     }
@@ -722,46 +748,80 @@ fn entries(dir: &Path) -> Vec<String> {
     names
 }
 
-/// Waits until some process is blocked on an `flock` for `dev:ino`.
-///
-/// Without this the test would race the attach it is trying to catch mid-wait,
-/// and would usually collect the lock before anything was waiting on it — which
-/// asserts nothing. `/proc/locks` lists blocked requests alongside granted ones,
-/// marked with `->`, so the wait is on the condition rather than on a guess.
-fn wait_until_blocked_on(dev: u64, ino: u64) {
-    let blocked = poll_until(Duration::from_secs(20), || {
-        // A kernel without `/proc/locks` cannot be waited on, and the assertions
-        // below would then pass without ever having reached the window they are
-        // about. Failing loudly is the point: a guard that quietly stops guarding
-        // is worse than one that is not there.
-        let locks = fs::read_to_string("/proc/locks").unwrap_or_else(|err| {
-            panic!(
-                "/proc/locks is unreadable ({err}), so nothing here can tell that \
-                    the attach ever waited for the spawn lock"
-            )
-        });
-        locks.lines().any(|line| is_flock_waiter(line, dev, ino))
-    });
-    assert!(
-        blocked,
-        "nothing ever blocked on the spawn lock, inode {ino}"
-    );
+/// Which of the two states `/proc/locks` reports an `flock` request in.
+#[derive(Clone, Copy)]
+enum Flock {
+    /// Still queued behind somebody else's lock on the same file.
+    Queued,
+    /// Granted, and held until whoever took it lets go.
+    Granted,
 }
 
-/// Whether one `/proc/locks` line is a request waiting for an `flock` on `dev:ino`:
+/// Waits until an `flock` on `dev:ino` is in `state`, or says what never happened.
+///
+/// Both callers are trying to catch another process mid-operation, and without this
+/// each would race the very thing it means to observe: the attach test would collect
+/// the lock before anything was waiting on it, and the `kill` test would refill the
+/// pidfile before `kill` had opened it. Neither asserts anything then, and neither
+/// says so — which is what makes a fixed sleep the wrong tool for either. `/proc/locks`
+/// lists queued requests alongside granted ones, so both are conditions to wait on.
+fn wait_until_flock(state: Flock, dev: u64, ino: u64, what: &str) {
+    let reached = poll_until(Duration::from_secs(20), || {
+        // A kernel without `/proc/locks` cannot be waited on, and the assertions
+        // that follow would then pass without ever having reached the window they
+        // are about. Failing loudly is the point: a guard that quietly stops
+        // guarding is worse than one that is not there.
+        let locks = fs::read_to_string("/proc/locks").unwrap_or_else(|err| {
+            panic!(
+                "/proc/locks is unreadable ({err}), so nothing here can tell \
+                    whether {what}"
+            )
+        });
+        locks.lines().any(|line| is_flock(line, state, dev, ino))
+    });
+    assert!(reached, "nothing ever showed that {what}, for inode {ino}");
+}
+
+/// Whether one `/proc/locks` line reports an `flock` on `dev:ino` in `state`:
 ///
 /// ```text
+/// 1:    FLOCK  ADVISORY  WRITE 3389 08:01:7746 0 EOF
 /// 2: -> FLOCK  ADVISORY  WRITE 3390 08:01:7746 0 EOF
 /// ```
 ///
-/// The field is recognised by its shape rather than by position, since the columns
-/// before it vary with the lock type.
-fn is_flock_waiter(line: &str, dev: u64, ino: u64) -> bool {
-    line.contains("->")
-        && line.contains("FLOCK")
+/// The `->` is the whole of the difference between the two: it marks a request still
+/// queued behind the lock above it, and a line without one is a lock somebody holds.
+/// Neither that field nor the file's is recognised by position, since the columns
+/// before them vary with the lock type.
+fn is_flock(line: &str, state: Flock, dev: u64, ino: u64) -> bool {
+    if line.contains("->") != matches!(state, Flock::Queued) {
+        return false;
+    }
+    line.contains("FLOCK")
         && line
             .split_whitespace()
             .any(|field| names_the_file(field, dev, ino))
+}
+
+/// Whether `pid` is still a process rather than gone or a zombie nobody has
+/// collected.
+///
+/// A zombie counts as gone because it has already run its `exit`, which is the whole
+/// of what a `kill` has to establish — and it is a state this cannot rule out by
+/// waiting: the daemon asked about here `setsid`ed away, so whoever reaps it is init
+/// rather than anything in this process, and inside a container that may be a pid 1
+/// that never calls `wait`.
+fn process_alive(pid: u32) -> bool {
+    // Read from after the parenthesised command name, because counting fields from
+    // the front stops working the moment a command name contains a space or a
+    // bracket. A process that is gone has no `stat` to read, which is the answer.
+    fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            let (_, tail) = stat.rsplit_once(')')?;
+            tail.trim_start().chars().next()
+        })
+        .is_some_and(|state| state != 'Z')
 }
 
 /// Whether a `/proc/locks` field is the `MAJOR:MINOR:INODE` of one file.

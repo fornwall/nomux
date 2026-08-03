@@ -2,10 +2,21 @@
 # prints a warning and then waits for ever, so a session test whose daemon never
 # answers holds the runner with no failing test to point at.
 #
-# Twenty seconds is well clear of the slowest ordinary test; terminating at four
-# periods leaves room for `a_daemon_nobody_ever_attaches_to_reaps_itself`, which sits
-# out a real 30-second first-attach deadline and which CI runs with
-# `--run-ignored all`. So the kill is a backstop for a test that has outlived its own
-# patience, never the thing that decides a result.
+# Twenty seconds is well clear of the slowest ordinary test, which finishes in six.
+# Terminating at two periods puts the kill at forty, above every deadline a test sets
+# for itself — the longest is the thirty seconds one direction of the relay is given —
+# so the kill stays a backstop for a test that has outlived its own patience and is
+# never the thing that decides a result.
 [profile.default]
+slow-timeout = { period = "20s", terminate-after = 2 }
+
+# The one exception, and the reason the budget above is not simply everyone's:
+# `a_daemon_nobody_ever_attaches_to_reaps_itself` sits out a real deadline of the
+# daemon's rather than waiting for something to happen — 30 seconds of first-attach
+# timeout, and it waits 45 for the socket to go. Forty is not room for that, and
+# raising the default to fit it hands every other test a ceiling twice what it needs,
+# so the four periods stay here where they are earned. CI is what runs this, with
+# `--run-ignored all`.
+[[profile.default.overrides]]
+filter = 'test(=a_daemon_nobody_ever_attaches_to_reaps_itself)'
 slow-timeout = { period = "20s", terminate-after = 4 }
