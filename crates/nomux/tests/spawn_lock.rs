@@ -254,14 +254,22 @@ fn kill_waits_out_a_pidfile_that_has_been_created_but_not_yet_written() {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped()),
     );
-    // The window is closed on a condition rather than after a guess at how long `kill`
-    // takes to reach it. `kill` takes `<id>.lock` and holds it to the end (§ 6.6)
-    // strictly *before* it goes looking for a pid, so a granted `FLOCK` on that inode
-    // is the fence: past it, `kill` is one `connect` and one `open` away from the
-    // empty pidfile, where before it is a whole `fork`, `exec` and run-directory
-    // check away — which is what a fixed sleep was really racing, and what a loaded
-    // machine wins. A `kill` that never reached the empty file would pass this test
-    // having tested nothing at all, and say so nowhere.
+    // The window is closed on two conditions rather than on a guess at how long `kill`
+    // takes to reach it, and the first of them is the property itself: while the
+    // pidfile says nothing, `kill` must still be *running*. That is what a fixed sleep
+    // and the fence below cannot assert between them — a `kill` that answered the empty
+    // file at once would let the fence miss it and fail this test somewhere else, or
+    // win the race and pass it having tested nothing. Half a second against a grace of
+    // two, so the margin is the wait rather than the scheduler.
+    assert!(
+        !poll_until(Duration::from_millis(500), || !killing.is_running()),
+        "`kill` returned while the pidfile was still empty, so it is answering the \
+         publish window rather than waiting it out"
+    );
+    // And the fence, which says *where* it is waiting. `kill` takes `<id>.lock` and
+    // holds it to the end (§ 6.6) strictly before it goes looking for a pid, so a
+    // granted `FLOCK` on that inode puts it past the whole `fork`, `exec` and
+    // run-directory check and one `connect` and one `open` from the empty file.
     wait_until_flock(
         Flock::Granted,
         lock.dev(),
@@ -373,17 +381,22 @@ fn kill_leaves_a_live_session_alone_when_nothing_will_say_which_process_it_is() 
 ///
 /// The first assertion is that claim about `SO_PEERCRED` itself, checked against a
 /// daemon in another process rather than assumed from the manual page.
+///
+/// What the socket names is not simply preferred, though: two *live* processes, one
+/// on the socket and one in the file, are a state in which nothing here can say which
+/// is the daemon — a reissued number looks the same from both directions — so `kill`
+/// refuses rather than picking. The bystander below is live, which is what makes this
+/// that case; removing the file it was planted in is the repair the refusal names, and
+/// the second half of the test is that the repair works.
 #[test]
 fn kill_signals_the_process_the_socket_names_rather_than_the_pidfile() {
     let session = LiveSession::create("lk11");
 
     let answered = UnixStream::connect(session.run.socket()).expect("connect to the session");
-    let named = rustix::net::sockopt::socket_peercred(&answered)
-        .expect("the credentials of whoever is listening")
-        .pid;
+    let named = peer_pid(&answered);
     drop(answered);
     assert_eq!(
-        named.as_raw_nonzero().get().cast_unsigned(),
+        named.cast_unsigned(),
         session.pid,
         "a connection must name the process that called `listen` on the socket"
     );
@@ -400,23 +413,103 @@ fn kill_signals_the_process_the_socket_names_rather_than_the_pidfile() {
     fs::write(session.pid_path(), format!("{}\n", bystander.id()))
         .expect("plant a reissued pid in the pidfile");
 
-    let killed = session.run.run(&["kill", "lk11"]);
+    let refused = session.run.run(&["kill", "lk11"]);
     // Read before anything is asserted, so a failure cannot also leave the bystander
     // behind — and `Spawned` collects it either way.
     let survived = bystander.is_running();
+    let listed = stdout(&session.run.run(&["list"]));
     drop(bystander);
+
+    // The repair the refusal asks for, and then the same command again: with the file
+    // gone the socket is the only witness, and it is enough. This is also the one path
+    // that reaches the publish grace's "it never appeared" arm and comes out the far
+    // side of it, which is why the kill below is allowed to take two seconds.
+    fs::remove_file(session.pid_path()).expect("take the planted pidfile away");
+    let killed = session.run.run(&["kill", "lk11"]);
 
     assert!(
         survived,
         "kill signalled an unrelated process of the user's: {:?}",
-        stderr(&killed)
+        stderr(&refused)
     );
-    succeeded(&killed, "kill could not stop the session");
+    assert!(
+        !refused.status.success() && stderr(&refused).contains("both are live processes"),
+        "two live candidates must be refused rather than guessed between: {:?}",
+        stderr(&refused)
+    );
+    assert_eq!(
+        listed.trim_end().split('\t').nth(1),
+        Some(session.pid.to_string().as_str()),
+        "list must show the pid kill would act on, not the one in the file: {listed:?}"
+    );
+    succeeded(
+        &killed,
+        "kill could not stop the session with the file gone",
+    );
     assert!(
         poll_until(Duration::from_secs(10), || !process_alive(session.pid)),
         "kill reported success with the daemon it was asked to stop still running \
          as pid {}",
         session.pid
+    );
+}
+
+/// Regression: a pidfile whose number ran past the end of the read is not a pid.
+///
+/// The bounded read that keeps `list` off a planted gigabyte hands back a prefix, and
+/// a prefix that ends mid-number parses as a smaller one: `" "*25 + "32770419\n"` came
+/// back as 3277041, which was a real process of this test's. That is the harm the
+/// socket-first change exists to remove, re-entering through the fix for the one
+/// beside it, and the input is exactly what `MAX_PID_LEN`'s own reasoning invites — a
+/// file somebody padded by hand.
+///
+/// The socket is shut so that it cannot answer, since a witness that works would make
+/// the pidfile irrelevant and this is a test about the pidfile.
+#[test]
+fn a_pidfile_whose_number_is_cut_off_by_the_read_is_refused_rather_than_signalled() {
+    if rustix::process::getuid().is_root() {
+        // A mode keeps nobody out of their own socket as root, so the daemon would
+        // name itself on the connection and the pidfile would never be consulted.
+        return;
+    }
+    let session = LiveSession::create("lk17");
+    let mut bystander = Spawned::spawn(
+        Command::new("sleep")
+            .arg("300")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    );
+    // Padded so that the number straddles the end of any bounded read: a reader that
+    // stops inside it comes back with a different, plausible, live pid.
+    let padded = format!("{}{}\n", " ".repeat(25), 10 * bystander.id() + 7);
+    fs::write(session.pid_path(), &padded).expect("plant a padded pidfile");
+    fs::set_permissions(session.run.socket(), fs::Permissions::from_mode(0o000))
+        .expect("shut the socket");
+
+    let killed = session.run.run(&["kill", "lk17"]);
+    let listed = stdout(&session.run.run(&["list"]));
+    let survived = bystander.is_running();
+    fs::set_permissions(session.run.socket(), fs::Permissions::from_mode(0o600))
+        .expect("restore the socket");
+    drop(bystander);
+    fs::remove_file(session.pid_path()).expect("take the planted pidfile away");
+    succeeded(&session.run.run(&["kill", "lk17"]), "kill failed");
+
+    assert!(
+        survived,
+        "a truncated pidfile was parsed into somebody else's pid and signalled: {:?}",
+        stderr(&killed)
+    );
+    assert!(
+        !killed.status.success(),
+        "a pidfile that does not end inside the read is no pidfile, and a live \
+         session it cannot identify is not one to unlink"
+    );
+    assert_eq!(
+        listed.trim_end().split('\t').nth(1),
+        Some("?"),
+        "list must not print half a number as a pid: {listed:?}"
     );
 }
 
@@ -460,18 +553,21 @@ fn list_reads_the_pidfile_as_far_as_the_layout_goes_and_no_further() {
     );
 }
 
-/// Regression: neither run file `list` reads can park it in a syscall.
+/// Regression: no run file can park the control surface in a syscall.
 ///
 /// A FIFO opened `O_RDONLY` without `O_NONBLOCK` blocks in `open(2)` until somebody
 /// opens it for writing, which for a file nobody is writing is for ever — so a FIFO
 /// at `<id>.pid` or `<id>.label` stopped the escape hatch dead. The 0700 directory
-/// bounds that to the session's own user, so it is the robustness of `list` rather
-/// than a way in, but so was the bound on the label's length.
+/// bounds that to the session's own user, so it is the robustness of the surface
+/// rather than a way in, but so was the bound on the label's length.
 ///
-/// Both files at once, since one open is as far as the old reader ever got. `kill`
-/// reads the pidfile through the same call, so it is fixed by the same flag.
+/// Both modes, because they no longer read the same files: `list` opens `<id>.label`
+/// on every live session and reaches `<id>.pid` only when the socket will not name a
+/// pid, while `kill` reads `<id>.pid` on every session alive or not, since a second
+/// witness is what its cross-check is made of. One FIFO each would leave the other
+/// reader untested; both files and both modes leave nothing.
 #[test]
-fn list_does_not_park_on_a_run_file_that_is_a_fifo() {
+fn the_control_surface_does_not_park_on_a_run_file_that_is_a_fifo() {
     let session = LiveSession::create("lk13");
     for path in [session.pid_path(), session.run.dir.join("lk13.label")] {
         drop(fs::remove_file(&path));
@@ -486,43 +582,59 @@ fn list_does_not_park_on_a_run_file_that_is_a_fifo() {
     }
 
     // Backgrounded with a deadline of its own: the defect is a wait with no end, and
-    // a test that waits for it is one that never fails.
-    let mut listing = Spawned::spawn(
-        nomux(&session.run.root, &["list"])
+    // a test that waits for it is one that never fails. `kill` is given longer
+    // because a pidfile that never says anything is the publish grace, waited out in
+    // full before the socket's word is taken instead.
+    let listed = ran_within(&session.run.root, &["list"], Duration::from_secs(10));
+    let killed = ran_within(
+        &session.run.root,
+        &["kill", "lk13"],
+        Duration::from_secs(20),
+    );
+
+    // Before the assertions, so a failure cannot leave a session behind — and a
+    // second `kill` is what collects it if the first was the thing that broke.
+    for path in [session.pid_path(), session.run.dir.join("lk13.label")] {
+        drop(fs::remove_file(path));
+    }
+    let collected = session.run.run(&["kill", "lk13"]);
+
+    let listed = listed.expect("`nomux list` parked on a FIFO in the run directory");
+    succeeded(&listed, "list failed");
+    assert_eq!(
+        stdout(&listed),
+        format!("lk13\t{}\t\n", session.pid),
+        "a FIFO holds no label, and the pid comes off the socket"
+    );
+    let killed = killed.expect("`nomux kill` parked on a FIFO in the run directory");
+    succeeded(
+        &killed,
+        "kill failed with a FIFO where the pidfile should be",
+    );
+    succeeded(
+        &collected,
+        "the session outlived the kill that reported success",
+    );
+}
+
+/// Runs one mode with a deadline, and hands back `None` if it never came back.
+///
+/// For the defects that are a wait with no end: a test that simply waits for the
+/// process is one that hangs instead of failing, and nextest's own timeout kills the
+/// runner without saying which call never returned.
+fn ran_within(root: &Path, args: &[&str], within: Duration) -> Option<Output> {
+    let mut running = Spawned::spawn(
+        nomux(root, args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped()),
     );
-    let returned = poll_until(Duration::from_secs(10), || !listing.is_running());
-    let listed = if returned {
-        Some(
-            listing
-                .into_exited()
-                .wait_with_output()
-                .expect("collect what list said"),
-        )
-    } else {
-        None
-    };
-
-    // The FIFOs go before the assertions, so a `kill` that has to fall back to the
-    // pidfile is not itself parked on one.
-    for path in [session.pid_path(), session.run.dir.join("lk13.label")] {
-        drop(fs::remove_file(path));
-    }
-    succeeded(&session.run.run(&["kill", "lk13"]), "kill failed");
-
-    assert!(
-        returned,
-        "`nomux list` parked on a FIFO in the run directory"
-    );
-    let listed = listed.expect("the output of a list that returned");
-    succeeded(&listed, "list failed");
-    assert_eq!(
-        stdout(&listed),
-        "lk13\t?\t\n",
-        "a FIFO holds no pid and no label, and says so in the columns"
-    );
+    poll_until(within, || !running.is_running()).then(|| {
+        running
+            .into_exited()
+            .wait_with_output()
+            .expect("collect what it said")
+    })
 }
 
 /// One line per session, however many of its five files are on disk.
@@ -1058,6 +1170,41 @@ fn abandon_socket(path: &Path) {
         std::io::Error::last_os_error()
     );
     drop(listener);
+}
+
+/// The pid `SO_PEERCRED` reports for whoever called `listen` on `socket`, read the
+/// way `control::peer_pid` reads it.
+///
+/// Through `libc` for the reason that function gives: rustix's `socket_peercred`
+/// hands back a `UCred` whose `pid` is a `NonZeroI32`, and the kernel answers zero
+/// for a peer in a pid namespace the caller cannot see.
+fn peer_pid(socket: &UnixStream) -> i32 {
+    use std::os::fd::AsRawFd;
+
+    let mut peer = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = libc::socklen_t::try_from(size_of::<libc::ucred>()).expect("the size of a ucred");
+    // SAFETY: `getsockopt` is given the address and length of a `ucred` that outlives
+    // the call, on a descriptor the borrow keeps open for it.
+    let got = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            std::ptr::from_mut(&mut peer).cast::<libc::c_void>(),
+            &raw mut len,
+        )
+    };
+    assert_eq!(
+        got,
+        0,
+        "read SO_PEERCRED: {}",
+        std::io::Error::last_os_error()
+    );
+    peer.pid
 }
 
 fn inode(path: &Path) -> u64 {

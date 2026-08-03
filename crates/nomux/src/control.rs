@@ -134,12 +134,22 @@ pub(crate) fn list() -> io::Result<()> {
     // One entry per session, not per file: five names lead to the same id (§ 6.6).
     //
     // Folded by a scan of what is already here rather than by sorting and `dedup`ing,
-    // which is a size decision and not a taste one — `sort_unstable` on a `String`
-    // instantiates a quicksort and its insertion-sort fallback, 1.6 KiB of the § 8
-    // budget, and the whole cost of this scan is bounded by five files times the eight
-    // sessions a client mints. Nothing downstream is owed an order: § 6.6 states what
-    // a listing contains and never what sequence it arrives in, and no caller in or
-    // out of this tree reads it by position.
+    // which is a size decision and not a taste one: `sort_unstable` on a `String`
+    // instantiates a quicksort and its insertion-sort fallback, and taking it out of
+    // the binary was worth 3 KiB of the § 8 budget on every target.
+    //
+    // What it costs back is quadratic in the number of *distinct* ids — measured at
+    // 0.26 s of CPU for 5 000 and 3.35 s for 20 000, against 0.06 s and 0.32 s for the
+    // sort. That is a real trade and not a rounding error, and it is taken because a
+    // run directory in that state is one this very call empties: every id in it that
+    // is not answering is collected below, so the cost is paid once and the directory
+    // that would charge it again does not survive the pass. Eight sessions is what a
+    // client mints, five files is what one leaves, and forty names is where this ends
+    // on any host that is not already the pathology.
+    //
+    // Nothing downstream is owed an order: § 6.6 states what a listing contains and
+    // never what sequence it arrives in, and no caller in or out of this tree reads it
+    // by position.
     let mut ids: Vec<String> = Vec::new();
     for entry in entries.filter_map(Result::ok) {
         if let Some(id) = session_id_of(&entry.path())
@@ -161,8 +171,18 @@ pub(crate) fn list() -> io::Result<()> {
             // Nowhere left to print to, and the arm above is the whole reason the
             // loop goes on anyway.
             Liveness::Alive(_) if !listening => {}
-            Liveness::Alive(_) => {
-                let pid = read_pid(&paths).map_or_else(|| "?".to_owned(), |pid| pid.to_string());
+            Liveness::Alive(answered) => {
+                // The same order of witnesses `kill` signals on, so the number a user
+                // reads here is the number that would be acted on. Taking it from the
+                // file alone printed the stale pid in exactly the case this column
+                // matters — a session whose `<id>.pid` no longer names its daemon —
+                // which is the one number nobody should be shown.
+                let pid = answered
+                    .as_ref()
+                    .and_then(daemon_of)
+                    .map(|pid| pid.as_raw_nonzero().get())
+                    .or_else(|| read_pid(&paths))
+                    .map_or_else(|| "?".to_owned(), |pid| pid.to_string());
                 // Sanitised on read as well as on write. The file is sanitised
                 // going in, but this is the frozen layout (§ 6.6): the daemon that
                 // wrote it may be any version, and the bytes land on the terminal
@@ -310,17 +330,29 @@ enum Target {
 ///
 /// It is the authority on *which* process it is, too, wherever it will say: the
 /// connection that just answered carries the pid in [`daemon_of`], and nothing at a
-/// filename can forge that. `<id>.pid` is what is left when it will not — the
-/// bind-to-publish window has no file yet, and § 6.2's fork leaves a socket whose
-/// creator is gone and an heir only the file names — so the file is read second and
-/// believed only there.
+/// filename can forge that.
+///
+/// Both sources are consulted rather than one preferred outright, because each is
+/// the only account of a state the other cannot describe. The socket names nobody
+/// during the bind-to-publish window, or where a `connect` failed for a reason that
+/// is not death, or where the peer is in a pid namespace this process cannot see
+/// (see [`peer_pid`]) — and `<id>.pid` is what is left there. The *file* names the
+/// wrong process where a dead daemon's number outlived it, which is the whole reason
+/// this function was rewritten. So each is discarded when it names no process at
+/// all, and where both survive that and still disagree, neither is believed: one of
+/// them is a stranger's number and nothing here can say which, so this refuses
+/// exactly as it refuses a pid it cannot read. That case is not hypothetical — a
+/// daemon built before the bind moved after § 6.2's fork answers with its exited
+/// creator's number, and the frozen surface must manage a daemon of any version.
 ///
 /// The other direction is § 6.6's rule that a live session's files are never
 /// unlinked: a socket that answers and no pid to be had either way is an **error**,
 /// never a "no such session". There is exactly one benign reason for that state,
-/// which is the daemon's own bind-to-publish window, so a *missing* pidfile is
-/// waited out for [`PUBLISH_GRACE`] and anything else — a mode that hides it, a
-/// body that is not a pid — is reported at once, since waiting cannot change it.
+/// which is the daemon's own bind-to-publish window, so a pidfile that is *missing
+/// or still empty* is waited out for [`PUBLISH_GRACE`] — even when the socket has
+/// already named somebody, since a second witness one interval away is worth more
+/// than the interval — and anything else is settled at once, since waiting cannot
+/// change it.
 ///
 /// # Errors
 ///
@@ -331,19 +363,21 @@ fn resolve(paths: &SessionPaths) -> io::Result<Target> {
         let Liveness::Alive(answered) = liveness(paths) else {
             return Ok(Target::Gone);
         };
-        if let Some(pid) = answered.as_ref().and_then(daemon_of) {
-            return Ok(Target::Daemon(pid));
-        }
+        let named = answered.as_ref().and_then(daemon_of);
         let mut buf = [0u8; MAX_PID_LEN];
         let waiting_on = match read_prefix(&paths.pid(), &mut buf) {
             Ok(body) if !body.trim_ascii().is_empty() => {
-                return parse_pid(body)
-                    .and_then(rustix::process::Pid::from_raw)
-                    .map(Target::Daemon)
-                    .ok_or_else(|| {
+                let filed = parse_pid(body).and_then(extant);
+                return match (named, filed) {
+                    (Some(named), Some(filed)) if named != filed => {
+                        Err(disagreement(paths, named, filed))
+                    }
+                    (Some(pid), _) | (None, Some(pid)) => Ok(Target::Daemon(pid)),
+                    (None, None) => {
                         let body = String::from_utf8_lossy(body);
-                        unreadable(paths, &format!("it holds {body:?}"))
-                    });
+                        Err(unreadable(paths, &format!("it holds {body:?}")))
+                    }
+                };
             }
             // Present but empty is the same window one syscall later, and is therefore
             // waited out rather than reported: `SessionPaths::write_pid` publishes in
@@ -352,13 +386,29 @@ fn resolve(paths: &SessionPaths) -> io::Result<Target> {
             // error it refused to kill a session in perfect health.
             Ok(_) => "it was created but never written",
             Err(err) if err.kind() == io::ErrorKind::NotFound => "it never appeared",
-            Err(err) => return Err(unreadable(paths, &err.to_string())),
+            // Unreadable is not the publish window and never becomes it, so it is
+            // settled now: on the socket's word where there is one, and refused where
+            // there is not.
+            Err(err) => return decided(paths, named, &err.to_string()),
         };
         if Instant::now() >= deadline {
-            return Err(unreadable(paths, waiting_on));
+            return decided(paths, named, waiting_on);
         }
         thread::sleep(POLL_INTERVAL);
     }
+}
+
+/// What a live session comes to when `<id>.pid` will not say: the socket's word, or
+/// a refusal carrying `problem`.
+fn decided(
+    paths: &SessionPaths,
+    named: Option<rustix::process::Pid>,
+    problem: &str,
+) -> io::Result<Target> {
+    named.map_or_else(
+        || Err(unreadable(paths, problem)),
+        |pid| Ok(Target::Daemon(pid)),
+    )
 }
 
 /// The daemon behind a connection that answered: the process that called `listen`.
@@ -368,18 +418,92 @@ fn resolve(paths: &SessionPaths) -> io::Result<Target> {
 /// process performing it. So this is the one number on this surface that is tied to
 /// the socket rather than to a name in a directory — a stale `<id>.pid`, or one a
 /// user repaired by hand, cannot make it point anywhere.
-///
-/// `None` where that process no longer exists, which is not a formality: § 6.2's
-/// interactive path binds the socket and *then* forks, so a daemon that had to detach
-/// that way is an heir serving a socket its exited parent created, and the parent's
-/// number is exactly the reissuable one this exists to stop signalling. The pidfile,
-/// written after that fork by the process that survived it, is the only account of
-/// the heir — so an answer of `None` sends [`resolve`] there rather than at a stranger.
 fn daemon_of(answered: &UnixStream) -> Option<rustix::process::Pid> {
-    let creator = rustix::net::sockopt::socket_peercred(answered).ok()?.pid;
-    rustix::process::test_kill_process(creator)
+    extant(peer_pid(answered)?)
+}
+
+/// The pid the kernel recorded for whoever called `listen` on `answered`, or nothing
+/// where it will not say.
+///
+/// Through `libc` rather than through rustix's `socket_peercred`, and not by
+/// preference: that function fills a `MaybeUninit<UCred>` straight from the syscall
+/// and `assume_init`s it, and `UCred::pid` is a `NonZeroI32`. The kernel writes
+/// **zero** into that field for a peer whose pid does not map into the caller's pid
+/// namespace — `pid_vnr` on an unmappable pid — which is an invalid niche and so
+/// undefined behaviour rather than an error, in the one binary that is the escape
+/// hatch and is built `panic = "abort"`. `nomux list` inside a container that shares
+/// the run directory with a daemon started outside it reaches exactly that, and it
+/// was reproduced with `unshare --user --pid --fork` before this was written.
+///
+/// So zero is read here as an answer, and the right one: a number that names no
+/// process *in this namespace* is not a number to signal, and the pidfile — which
+/// the daemon wrote in its own namespace and which means nothing here either — is
+/// left to [`resolve`] to refuse. The `libc` call costs nothing the binary did not
+/// already link, and takes rustix's `net` feature back out with it.
+fn peer_pid(answered: &UnixStream) -> Option<i32> {
+    use std::os::fd::AsRawFd;
+
+    let mut peer = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = libc::socklen_t::try_from(size_of::<libc::ucred>()).ok()?;
+    // SAFETY: `getsockopt` is given the address and length of a `ucred` that outlives
+    // the call, on a descriptor the borrow above keeps open for it, and it writes at
+    // most `len` bytes into it. Both are read back only on a zero return, and the
+    // length it reports is checked before the value is used.
+    let got = unsafe {
+        libc::getsockopt(
+            answered.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            std::ptr::from_mut(&mut peer).cast::<libc::c_void>(),
+            &raw mut len,
+        )
+    };
+    (got == 0 && usize::try_from(len) == Ok(size_of::<libc::ucred>()) && peer.pid > 0)
+        .then_some(peer.pid)
+}
+
+/// A number that still names a process this user may signal, or nothing.
+///
+/// Both accounts of a session's identity come through here, and it is what makes
+/// them comparable: a number naming nothing is not evidence, so it neither gets
+/// signalled nor contradicts the other source. It cannot tell a reissued number from
+/// the original — nothing available here can — which is why the disagreement of two
+/// *live* numbers is refused rather than guessed at.
+fn extant(pid: i32) -> Option<rustix::process::Pid> {
+    let pid = rustix::process::Pid::from_raw(pid)?;
+    rustix::process::test_kill_process(pid)
         .is_ok()
-        .then_some(creator)
+        .then_some(pid)
+}
+
+/// The refusal to act on two live processes when only one of them can be the daemon.
+///
+/// It prints both numbers because the user is the only one who can tell them apart,
+/// and because the repair is theirs: a `<id>.pid` naming something other than the
+/// process on the socket is either an old daemon's number the kernel has reissued or
+/// a file edited by hand, and removing it leaves the socket as the only witness,
+/// which `kill` then acts on.
+fn disagreement(
+    paths: &SessionPaths,
+    named: rustix::process::Pid,
+    filed: rustix::process::Pid,
+) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "session {id} is running, but its socket names pid {named} and {pid} names \
+             pid {filed}, and both are live processes; leaving it alone rather than \
+             signalling the wrong one",
+            id = paths.id(),
+            pid = paths.pid().display(),
+            named = named.as_raw_nonzero(),
+            filed = filed.as_raw_nonzero(),
+        ),
+    )
 }
 
 /// The refusal to touch a live session whose pid is not knowable.
@@ -485,7 +609,21 @@ fn read_pid(paths: &SessionPaths) -> Option<i32> {
 /// a whole process group and as every process the caller may signal, so a pidfile
 /// holding one is a number that must never reach a signal — and a daemon whose
 /// pidfile says `0` is not a daemon this can identify.
+///
+/// A body that filled the reader's buffer is refused for a sharper reason: it is a
+/// prefix of a file whose end was never seen, so a number still running at the last
+/// byte is a *truncation* — `" "*25 + "32770419\n"` comes back as 3277041, which is
+/// not the pid in the file and may well be somebody else's. Reading less than the
+/// whole file is what keeps `list` off a planted gigabyte ([`MAX_PID_LEN`]), and this
+/// is the other half of that bargain: what the prefix does not settle, it does not
+/// get to answer. The layout puts a pid and a newline in this file, which is eleven
+/// bytes at the widest; nothing legitimate reaches the bound. [`read_label`] is
+/// deliberately not symmetric — truncating a decoration costs a column, truncating a
+/// number costs somebody else's process.
 fn parse_pid(body: &[u8]) -> Option<i32> {
+    if body.len() >= MAX_PID_LEN {
+        return None;
+    }
     str::from_utf8(body)
         .ok()?
         .trim()

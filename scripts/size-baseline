@@ -15,7 +15,7 @@
 # Which is also why the toolchain is pinned in `scripts/nightly-version` rather than
 # named at each site: that file and this one move together, and a commit that changes
 # one without the other is the mistake both exist to make visible.
-x86_64-unknown-linux-musl             164776
-aarch64-unknown-linux-musl            155056
-armv7-unknown-linux-musleabihf        224556
-riscv64gc-unknown-linux-musl          135632
+x86_64-unknown-linux-musl             160520
+aarch64-unknown-linux-musl            150952
+armv7-unknown-linux-musleabihf        221372
+riscv64gc-unknown-linux-musl          131624
