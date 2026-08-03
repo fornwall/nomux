@@ -344,6 +344,7 @@ mkdir -p "$p" && cat > "$p/.up.$$" && chmod 755 "$p/.up.$$" \
 - Version in the filename: an upgraded client cannot break sessions an older daemon still holds.
 - Transfer over an **exec channel with `cat`**, not SFTP. `Subsystem sftp` gets disabled on hardened hosts, and modern `scp` is SFTP underneath. SSH channels are 8-bit clean, so no base64 tax.
 - Enable `zlib@openssh.com` on this channel: ~3× on a static binary, requiring nothing on the remote.
+- **The install directory is created, not checked**, and that is a materially weaker guarantee than §6.3 gives the *run* directory. `mkdir -p "$p"` takes whatever mode the umask leaves and asks nothing about where `$XDG_DATA_HOME` points — no `O_NOFOLLOW`, no uid check, no refusal of a group- or other-writable parent. Under a lax umask, or with `$XDG_DATA_HOME` aimed at a shared directory, another user can replace `nomux-$VER` between one connection and the next, and §5.1 `exec`s whatever is at that path on every connection that does not go straight to the socket. Nothing here can close it: the client composes this command line, so the check has to be part of it. Recorded rather than fixed, in [DESIGN.md § 8](DESIGN.md#8-security-model).
 
 ### 5.3 Decision tree
 
@@ -878,7 +879,7 @@ that is worth a sub-channel in a protocol that otherwise refuses to multiplex:
 Security — the two consequences that are this side of the boundary; the policy that
 follows from them is [DESIGN.md § 5.4](DESIGN.md#54-agent-forwarding)'s:
 
-- The socket is `0600` inside the `0700` run directory, so reachable only by the session's own user — the same exposure as sshd's forwarded socket.
+- The socket is `0600` inside the `0700` run directory, so reachable only by the session's own user — the same permissions as sshd's forwarded socket, but a longer window: sshd's dies with the connection, this one lives as long as the session does. That is the point of it ([DESIGN.md § 5.4](DESIGN.md#54-agent-forwarding)), and it is why forwarding is opt-in per host.
 - If sshd forwarding is also active, `SSH_AUTH_SOCK` is set by sshd and then overwritten by the daemon (§6.1.1). Ours wins.
 
 ## 7. Attach relay
@@ -886,7 +887,7 @@ follows from them is [DESIGN.md § 5.4](DESIGN.md#54-agent-forwarding)'s:
 `nomux attach <id>` when `direct-streamlocal` is unavailable. Deliberately dumb:
 
 - `poll` on stdin/stdout and the socket, moving bytes with `splice(2)` and falling back to a userspace copy.
-- No frame parsing, no buffering beyond the pipe.
+- No frame parsing. A small userspace buffer per direction, used only where `splice` is unavailable; nothing protocol-shaped is ever held.
 - Spawns the daemon (§6.3) if the socket is absent, then connects.
 - Half-close propagation: EOF on stdin → `shutdown(SHUT_WR)` on the socket, keep draining the other direction.
 
@@ -981,15 +982,22 @@ the lint wall in `Cargo.toml` already denies `unwrap`, `expect`, `panic` and
 `indexing_slicing`. `NOMUX_STABLE_STD=1` builds against the pinned stable toolchain
 instead, and is expected to fail the size gate; it exists to keep that cost visible.
 
-Builds are reproducible: the client pins a SHA-256 per arch and verifies after
-upload. `scripts/build-release.sh` checks this the only way that means anything —
-by grepping each artifact for the builder's `$CARGO_HOME`, sysroot and checkout
-path, since two clean builds on one machine are byte-identical whether or not the
-paths were remapped. Three `--remap-path-prefix` flags are what make it true — for
-`$CARGO_HOME`, the sysroot and the checkout — because rustc bakes absolute paths
-into panic location strings, and an unremapped binary contains the builder's home
-directory 56 times over. Release builds must pin a **dated** nightly
-(`NOMUX_NIGHTLY`), since a floating one moves the bytes the client pinned.
+Builds are reproducible, and `scripts/build-release.sh` checks it the only way that
+means anything — by grepping each artifact for the builder's `$CARGO_HOME`,
+sysroot and checkout path, since two clean builds on one machine are byte-identical
+whether or not the paths were remapped. Three `--remap-path-prefix` flags are what
+make it true — for `$CARGO_HOME`, the sysroot and the checkout — because rustc bakes
+absolute paths into panic location strings, and an unremapped binary contains the
+builder's home directory 56 times over.
+
+Reproducibility is the producing half of a check whose consuming half does not exist
+yet. **The client is meant to pin a SHA-256 per architecture and verify it after
+upload; nothing does that today** — `SHA256SUMS` is built here and uploaded as a CI
+artifact that expires behind a login, no workflow triggers on a tag, and what a
+client should do with a binary whose hash it no longer recognises is undecided
+([PLAN.md § P3](PLAN.md#p3--release-process)). Release builds must pin a **dated**
+nightly (`NOMUX_NIGHTLY`) regardless, since a floating one moves the bytes that hash
+would be taken over.
 
 ## 9. Testing
 
@@ -1044,7 +1052,7 @@ delay.
 
 | Code | Meaning |
 | --- | --- |
-| 0 | The relay ended cleanly: the client detached, or the session ended and the `Exit` frame was delivered |
+| 0 | The relay ended cleanly: the client detached, the session ended and the `Exit` frame was delivered, or the relay's own stdout was closed by its reader |
 | 64 | Malformed invocation (`EX_USAGE`) |
 | 126 | Session exists but is unattachable (permissions, protocol) |
 | 127 | No such session and spawn failed |

@@ -21,6 +21,18 @@
 # guard has stopped guarding anything.
 set -eu
 
+# Both runs below are `cargo nextest`, and cargo reports a missing subcommand the same
+# way it reports a failing test: a non-zero exit. Without this check the first run's
+# failure is announced as "the guard fails on correct code once the interleaving is
+# forced" — the script accusing the code under test of a tool that was never installed.
+# The replayed log does say `no such command: nextest` on its first line, but the
+# headline is the part that gets read, and it is the part that would be wrong.
+if ! command -v cargo-nextest >/dev/null 2>&1; then
+    echo "this script runs the guard under cargo-nextest, which is not installed:" >&2
+    echo "  cargo install cargo-nextest --locked" >&2
+    exit 1
+fi
+
 test_name=a_takeover_never_discards_input_already_delivered
 
 # nextest's exit code, which is what makes the second run's expectation meaningful:

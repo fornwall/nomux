@@ -1,2 +1,17 @@
 /target
 /.claude/
+
+# Coverage and profiling output. An instrumented binary and `perf record` both write
+# into the directory they were started from rather than into target/, so these are
+# unanchored: they land next to whatever was run.
+*.profraw
+perf.data
+perf.data.old
+
+# Written without anyone asking, by editors and by the Finder. The project
+# directories are anchored, since an editor puts them at the root of the tree it
+# opened; the scratch files are not, since they appear beside the file being edited.
+/.idea/
+/.vscode/
+.DS_Store
+*.swp

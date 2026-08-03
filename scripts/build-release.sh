@@ -19,8 +19,9 @@
 #
 # Two things have to be true of the output:
 #
-#   1. It is byte-identical everywhere. The client pins a SHA-256 per architecture
-#      and re-checks it after upload, so "the same commit" has to mean "the same
+#   1. It is byte-identical everywhere. The client is meant to pin a SHA-256 per
+#      architecture and re-check it after upload — nothing does that yet, see
+#      PLAN.md § P3 — so "the same commit" has to mean "the same
 #      bytes" whether it was built in CI or on a laptop. Cargo hands rustc absolute
 #      paths for registry crates and for the standard library, and those paths end
 #      up verbatim in panic-location strings — so an unremapped build embeds the
@@ -183,6 +184,26 @@ else
     RUSTUP_TOOLCHAIN="$nightly"
     export RUSTUP_TOOLCHAIN
     toolchain="$RUSTUP_TOOLCHAIN"
+
+    # -Zbuild-std and -Cpanic=immediate-abort are nightly-only, and NOMUX_NIGHTLY is
+    # the one place a stable toolchain can get in. It passes every check below — the
+    # rust-std and rust-src ones both look at the sysroot, which says nothing about the
+    # channel — and then the first cross build dies on `the -Z flag is only accepted on
+    # the nightly channel`, minutes in and nowhere near the variable that caused it.
+    # Asked of rustc rather than pattern-matched on the toolchain name, so a custom
+    # `rustup toolchain link` to a nightly is not refused for what it is called.
+    version=$(rustc --version)
+    case "$version" in
+    *-nightly* | *-dev*) ;;
+    *)
+        echo "$toolchain is not a nightly toolchain:" >&2
+        echo "  $version" >&2
+        echo "  the shipping build rebuilds std with panics compiled out, which only" >&2
+        echo "  nightly accepts. Name a nightly, or set NOMUX_STABLE_STD=1 to build" >&2
+        echo "  against the released std and expect to miss the size budget." >&2
+        exit 1
+        ;;
+    esac
 fi
 
 # Every path that could differ between two machines building the same commit. $repo is

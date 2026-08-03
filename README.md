@@ -1,4 +1,8 @@
-**NOTE**: Experimental, untested AI generated project.
+> [!WARNING]
+> **Experimental.** nomux is AI-generated: written by an AI agent, reviewed but not
+> battle-tested. It has a thorough test suite and no real-world mileage, and the
+> client that drives it does not exist publicly yet — so this is something to read,
+> not something to point at a server you care about.
 
 # nomux
 
@@ -7,16 +11,20 @@ session alive across the loss of the SSH connection that created it.
 
 Persistence without a multiplexer: no prefix key, no panes, no status bar, no
 rewritten `TERM`. Byte-exact passthrough, so sixel, OSC 52, hyperlinks, mouse
-reporting and scrollback all work unchanged.
+reporting and scrollback all work unchanged — up to the ring's capacity; a
+disconnect that outlasts it is reported as an explicit gap rather than silently
+truncated.
 
 ```
-nomux daemon <session-id>   Own a PTY session
+nomux daemon <session-id>   Own a PTY session (normally spawned by `attach`)
 nomux attach <session-id>   Relay stdio to a session, spawning it if absent
 nomux probe                 Report OS, architecture and install path
 nomux list                  List sessions in the run directory
 nomux kill <session-id>     Terminate a session and unlink its run files
 
-  --label <text>            Display name for `list`, recorded at session creation
+  --label <text>            Display name for `list`, recorded at session creation.
+                            Honoured by `daemon` and `attach`; `kill` parses it and
+                            ignores it, the label belonging to the session
   --version, -V             Print version and protocol revision
   --help, -h                Print this usage
 ```
@@ -26,11 +34,15 @@ Four properties drive the design:
 - **Byte-stream replay, not screen-state sync** — no terminal emulator on the server.
 - **Resume over a fresh SSH connection, not a side channel** — inherits ProxyJump, certificates, 2FA, agent forwarding.
 - **Zero server-side install** — the client carries the binary and pushes it on first use.
-- **No new ports, no new crypto** — the only endpoint is a `0600` unix socket.
+- **No new ports, no new crypto** — the only endpoints are unix sockets at `0600` inside a `0700` directory, one per session, plus one more when agent forwarding is enabled.
 
-The SSH client and terminal emulator are a **separate project**; this repository is
-the server-side binary only. The two ship as one unit and are versioned in lockstep,
-so the wire protocol is private and carries no stability guarantee.
+**There is nothing to run yet.** This repository is the server half. The SSH client
+and terminal emulator that drive it are a separate, unreleased project, and
+`nomux attach` speaks a binary frame protocol over stdio rather than a terminal — so
+without that client there is no way to get a shell out of this. What works standalone
+today is `nomux probe`, `nomux list` and `nomux kill`. The two halves ship as one unit
+and are versioned in lockstep, so the wire protocol is private and carries no
+stability guarantee.
 
 - [DESIGN.md](DESIGN.md) — problem, properties, architecture, security model, prior art.
 - [IMPLEMENTATION.md](IMPLEMENTATION.md) — wire protocol, ring buffer, PTY handling, bootstrap, build.
@@ -38,9 +50,23 @@ so the wire protocol is private and carries no stability guarantee.
 
 ## Build
 
-Requires Rust 1.97.1, pinned in `rust-toolchain.toml`.
+Nothing has to be installed by hand: the toolchain is pinned in
+`rust-toolchain.toml`, and rustup fetches it on the first command.
 
 ```sh
+git clone https://github.com/fornwall/nomux && cd nomux
+cargo build     # rustup installs the pinned 1.97.1 on first use
+cargo test      # 111 tests plus 2 doctests, about 10 s
+```
+
+The tree is developed against `cargo-nextest` instead — one more tool, for one
+property: it runs every test in its own process. Several of these tests fork, and a
+forked child inherits every open descriptor of whichever other test happens to be
+mid-flight, which under `cargo test`'s single process is a sharpness the suite has
+to absorb rather than one it is spared ([PLAN.md § P2](PLAN.md#p2--structure)).
+
+```sh
+cargo install cargo-nextest
 cargo clippy --workspace --all-targets
 cargo nextest run --workspace
 ```
@@ -116,22 +142,20 @@ toolchain and is expected to fail the gate. The nightly is dated rather than
 floating, and `scripts/nightly-version` is where it is named: the script and CI both
 read it from there, so a local build and the runner measure the same bytes against a
 baseline recorded by the same compiler. `NOMUX_NIGHTLY` overrides it for a build that
-is not a release; a release must pin, because the client pins a SHA-256 per
-architecture and a floating compiler moves it. See
-[IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build) for the measurements.
+is not a release; a release must pin, because the client is meant to pin a SHA-256
+per architecture and a floating compiler moves the bytes that hash is taken over.
+Nothing verifies a hash today — `SHA256SUMS` is built and nothing publishes it
+([PLAN.md § P3](PLAN.md#p3--release-process)). The measurements are in
+[IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build).
 
 ## Status
 
-Working end to end on Linux: the daemon owns a PTY and ring buffer, clients resume
-by byte offset across a severed connection, agent forwarding proxies `ssh-agent`
-over the same channel, `attach` spawns a daemon on demand and relays, and
-`list`/`kill` operate on the run directory alone.
-
-What is left is the rest of the release process — publishing the checksums the
-client verifies against, and deciding what it does with a binary whose hash it no
-longer recognises — plus client-side work (`direct-streamlocal`, bootstrap
-orchestration, emulator reset on gap) and a handful of decisions deliberately
-deferred. See [PLAN.md](PLAN.md).
+Complete and under test on Linux, and not released: every property above is
+implemented in the daemon and covered by the suite, and what is left is the release
+process and the client that drives it. The standing state — what works, what is
+known to be missing, and what was deferred on purpose — is
+[PLAN.md § Status](PLAN.md#status), which is the copy kept current rather than a
+second copy that drifts.
 
 ## License
 

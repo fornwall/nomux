@@ -18,7 +18,7 @@ passthrough bugs — a large visible surface for one property.
 ## 2. Scope
 
 This repo is **the server binary only**. The SSH client and terminal emulator are a
-separate project — but one we also own.
+separate project — but one written by the same author.
 
 That matters more than it sounds. The two ship as a unit, so:
 
@@ -67,18 +67,21 @@ Contrast: Eternal Terminal opens its own TCP port; mosh needs a UDP range.
 The client carries the binary and pushes it on first use. Nothing is installed by
 an administrator, no package exists, no root is required.
 
-This is the adoption property. Every other persistence tool needs the remote admin
-to act first, which is precisely why people still fall back to `tmux` — it is at
-least already on the box. `nomux` works on a host you were handed access to five
-minutes ago.
+This is the adoption property. Every other persistence tool needs a binary put on
+the host first — by an administrator, or by you, once per host and once per upgrade.
+That step is why people fall back to `tmux`: it is at least already on the box.
+`nomux` does it for you, on a host you were handed access to five minutes ago.
 
 ### No new ports, no new crypto
 
-No listeners, no key exchange, no cipher selection, no certificate handling. The
-only IPC endpoint is a unix socket at mode `0600` inside a `0700` directory.
+No network listener, no key exchange, no cipher selection, no certificate handling.
+What the daemon does listen on is the filesystem: a unix socket at mode `0600`
+inside a `0700` directory per session, and a second one beside it — `<id>.agent` —
+for the sessions that opted into agent forwarding (§5.4).
 
-There is nothing new for a firewall to block or a security team to review. All
-confidentiality and authentication is SSH's, unchanged.
+There is nothing new for a firewall to block, and what a security team has to review
+is the local surface enumerated in §8 rather than a protocol. All confidentiality and
+authentication is SSH's, unchanged.
 
 ## 4. Architecture
 
@@ -276,7 +279,7 @@ plain SSH session and is cached per-host so it is not re-probed on every connect
 
 | Condition | Behaviour |
 | --- | --- |
-| `uname -s` is not `Linux` | No static binary possible (notably macOS). Plain SSH. |
+| `uname -s` is not `Linux` | Linux only by construction — the daemon uses Linux syscall and `/proc` interfaces directly. Plain SSH. |
 | Unknown architecture | Plain SSH. |
 | Exec fails with format error | Retry next-best architecture once, then plain SSH. |
 | Home is `noexec` or read-only | Plain SSH. Detected by exec failing, never by parsing mounts. |
@@ -286,9 +289,11 @@ plain SSH session and is cached per-host so it is not re-probed on every connect
 
 ## 8. Security model
 
-- **No new attack surface.** Anyone who can write `~/.local/share/nomux/` — where the uploaded binary lands — can already edit `.bashrc`. The binary being user-writable is not a new capability.
+- **No new *network* attack surface.** No listening TCP or UDP port, nothing for a firewall to open. Locally there is new surface and it is enumerated below: a unix socket per session, an optional agent socket, and a process that outlives the login. The uploaded binary is not among it — anyone who can write `~/.local/share/nomux/` can already edit `.bashrc`.
+- **That last equivalence is for the same user only.** The install directory is not checked the way the run directory is. The run directory is opened `O_NOFOLLOW`, refused if another uid owns it or if group or other can write to it, and repaired to exactly `0700` otherwise ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)). The install directory gets none of that: the upload is a shell one-liner whose `mkdir -p "$p"` takes whatever the umask leaves and asks nothing about where `$XDG_DATA_HOME` points ([IMPLEMENTATION.md § 5.2](IMPLEMENTATION.md#52-upload-and-attach-in-one-round-trip)). Under a lax umask, or with `$XDG_DATA_HOME` pointed into a shared directory, *another* user can replace the binary that every connection taking the exec path runs ([IMPLEMENTATION.md § 5.1](IMPLEMENTATION.md#51-probe-and-attach-in-one-round-trip)) — which is code execution as the victim, and not something they could already do. Closing it is the client's work, since the client is what sends that command line; recorded here so the rigour of § 6.3 is not read into § 5 by mistake.
 - **No new secrets.** No keys, no tokens, no crypto. Authentication is the unix socket's filesystem permissions (`0600` in a `0700` directory) plus SSH itself.
 - **No abstract sockets.** They are namespace-scoped, not permission-scoped, and would be reachable by any local user.
+- **Agent forwarding is a real capability expansion — the only one here.** The daemon serves an `ssh-agent` socket of its own, so a session reaches the user's keys on a connection that never set `ForwardAgent`, which is a deliberate decision being bypassed (§5.4). It is therefore opt-in per host, off by default, never enabled silently, and bound only for sessions created with the flag set. What it buys back is that the client sees every request, so it can prompt per signature — something `ssh -A` cannot.
 - **Auditability.** A persistent shell can outlive the login session that spawned it. On hosts with session recording this is a policy question, not a technical one; it is why the feature is opt-in per host.
 - **File integrity monitoring** (AIDE, tripwire, osquery) will flag a new executable in a home directory. Expected, documented, not worked around.
 
@@ -298,7 +303,7 @@ Each layer has precedent; the assembly is what is new.
 
 | Layer | Existing work | Difference |
 | --- | --- | --- |
-| Detach/attach daemon | `dtach`, `abduco`, `shpool` | Those require server-side install; no resume protocol across a broken link. |
+| Detach/attach daemon | `dtach`, `abduco`, `shpool` | Those require server-side install, and reattaching resumes the terminal rather than the byte stream — output produced while you were disconnected is not replayed. |
 | Byte-stream resume | Eternal Terminal | Opens its own TCP port with its own crypto. |
 | Roaming | mosh | UDP range, server-side emulator, no scrollback or port forwarding. |
 | Self-bootstrap over SSH | VS Code Remote-SSH, JetBrains Gateway, `sshuttle`, `xxh` | Not terminal-persistence tools. |
@@ -309,5 +314,5 @@ The combination — zero-install, no new ports, byte-exact — does not exist to
 ## 10. Open questions
 
 - Default ring capacity: 4 MiB covers a multi-hour idle disconnect but not `yes` for ten seconds. `NOMUX_RING_BYTES` already makes it tunable per daemon, so the open question is only what the *default* should be — fixed, or client-negotiated in `Hello`? Now multiplied by the §5.1 cap — eight sessions at 4 MiB is 32 MiB resident on a host whose administrator never agreed to any of this.
-- Optional `libvterm` screen snapshot on overflow, to replace the SIGWINCH repaint heuristic with an exact redraw. Adds a C dependency and ~100 KiB; deferred until the heuristic proves insufficient.
+- Optional server-side screen snapshot on overflow, to replace the SIGWINCH repaint heuristic with a redraw that does not depend on the child cooperating. What it would buy is determinism, not exactness: the snapshot matches the client's screen only where the server's model of the stream agrees with the client's emulator, and by default those are two different programs — they can disagree about character width, about sequences one implements and the other does not, and about everything that is not cell state at all, which is where the sixel, OSC 8 and OSC 52 passthrough of §3 lives. It also reconstructs the visible screen only; scrollback below the gap is gone either way. So it trades a repaint the child may ignore for one that always happens and may be quietly wrong — the second, lossier server-side emulator §3 rejects, admitted for one frame and on purpose. Which engine matters less than whether it is *the client's* engine: the divergence above disappears only where both ends interpret the stream identically, so a core shared with the client — Ghostty's, if the client is built on it — is worth more here than a better standalone one, and is the version of this idea to evaluate first. Against that, a Zig-built core reintroduces the toolchain `zig cc` was rejected over ([IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build): its musl is not pinned by `rust-toolchain.toml`), and any of them has to fit a 400 KiB cap the largest target already fills two thirds of. `libvterm` adds a C dependency and ~100 KiB — and, because it is the first C object in a tree that has none, it also costs the no-cross-toolchain property that makes four musl targets build from `rustup target add` alone ([IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)). Deferred until the heuristic proves insufficient.
 - Cross-device handover (start on desktop, resume on mobile). Deferred. It needs no new concurrency — takeover ([IMPLEMENTATION.md § 6.4](IMPLEMENTATION.md#64-multiple-clients)) is already the right primitive, since handover is serial — but it does need three things: a `u64::MAX` "tell me" sentinel for `Hello.in_offset` mirroring the output side, a rule that clients never auto-reconnect after `Error{TAKEOVER}` (otherwise two resilient clients evict each other forever), and geometry-conditional replay, because scrollback carries absolute cursor positioning computed for the old width.

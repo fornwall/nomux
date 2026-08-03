@@ -4,11 +4,18 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The release job's artifacts expire, and it is the only producer of the
+  # per-architecture binaries and their checksums. Without this, getting them back
+  # means an empty commit.
+  workflow_dispatch:
 
-# A pushed fixup makes the run it superseded worthless; don't pay for it.
+# A pushed fixup makes the run it superseded worthless; don't pay for it. On `main`
+# it is the opposite: each commit there is a distinct set of musl artifacts, so a
+# second push arriving while the first is still building would discard binaries
+# nothing else produces. Cancel branch runs, let `main` finish.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -19,6 +26,14 @@ env:
   # backtrace in the log.
   RUST_BACKTRACE: 1
 
+# Third-party actions are pinned to a commit, not to a tag. A tag is a mutable
+# pointer in someone else's repository, and the release job below builds the four
+# binaries whose SHA-256 the client is designed to pin — so an action that quietly
+# moves there changes bytes users have been told to trust. The version is in the
+# trailing comment because the SHA does not say which one it is; dependabot bumps
+# both. The `actions/*` steps are left on their major tag deliberately: they are
+# GitHub's own, running on GitHub's runner with GitHub's token, so pinning them
+# narrows a trust boundary the job is already entirely inside.
 jobs:
   # The prek gate, run in the same cheapest-first order. One job, so the workspace
   # and its dependencies are compiled against a single cache.
@@ -36,11 +51,11 @@ jobs:
       - name: Install the pinned toolchain
         run: rustup toolchain install --profile minimal --no-self-update
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       # Prebuilt binary; `cargo install` would build nextest from source on every
       # cache miss.
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
         with:
           tool: cargo-nextest
 
@@ -86,12 +101,12 @@ jobs:
       - name: Install the pinned toolchain
         run: rustup toolchain install --profile minimal --no-self-update
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           # Separate target directory, separate fingerprints, separate cache.
           key: fault-injection
 
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
         with:
           tool: cargo-nextest
 
@@ -112,8 +127,10 @@ jobs:
       # file, so this job and a laptop build use one compiler and their sizes are
       # comparable against a baseline recorded by it. A literal in this file left the
       # script free to float, which is how a local run comes to fail on growth nobody
-      # introduced. Dated, never floating: the client pins a SHA-256 per architecture,
-      # and a compiler that moves moves those bytes underneath it.
+      # introduced. Dated, never floating: the client is meant to pin a SHA-256 per
+      # architecture, and a compiler that moves moves those bytes underneath it.
+      # Nothing verifies a hash today — see PLAN.md § P3 — but the bytes still have
+      # to be the same ones, or there is nothing to start pinning when it does.
       - name: Read the pinned release nightly
         run: echo "NOMUX_NIGHTLY=$(cat scripts/nightly-version)" >> "$GITHUB_ENV"
 
@@ -128,7 +145,7 @@ jobs:
           --component rust-src
           --target x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,armv7-unknown-linux-musleabihf,riscv64gc-unknown-linux-musl
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: musl-${{ env.NOMUX_NIGHTLY }}
 
@@ -137,7 +154,12 @@ jobs:
 
       # The checksums are the point of this job — the client pins one per
       # architecture — so they have to outlive the log they were printed to.
-      - uses: actions/upload-artifact@v4
+      #
+      # v7 rather than v4, which is the last `node20` action in this file: the
+      # runners defaulted to Node 24 in June 2026 and drop Node 20 entirely in the
+      # autumn, and the v4 branch has been frozen since March 2025, so the fix will
+      # not arrive there. The three inputs below are unchanged across the majors.
+      - uses: actions/upload-artifact@v7
         with:
           name: musl-binaries
           path: target/dist/

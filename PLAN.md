@@ -1,6 +1,8 @@
 # nomux — Plan
 
 Backlog. Rationale: [DESIGN.md](DESIGN.md). Mechanics: [IMPLEMENTATION.md](IMPLEMENTATION.md).
+The `P` in `P1`–`P4` is priority, highest first: what is known to be wrong, then what
+is merely awkward, then process, then depth nobody is blocked on.
 
 ## Status
 
@@ -9,9 +11,12 @@ deferred, or client-side work recorded because its server-side contract is fixed
 here. This section is the standing state; the deltas that produced it are what
 `git log` is for.
 
-Working end to end on Linux, protocol revision 2. The daemon owns a PTY, a child and
-a bounded ring buffer; clients resume by absolute byte offset across a severed
-connection, replayed input is trimmed rather than re-applied, and overflow is
+Complete and under test on Linux, protocol revision 2, and not usable on its own:
+the client that speaks this protocol is a separate, unreleased project, so a clone
+of this repository gives you `probe`, `list`, `kill` and a daemon nothing can hold a
+conversation with. What is complete is the whole server half. The daemon owns a PTY,
+a child and a bounded ring buffer; clients resume by absolute byte offset across a
+severed connection, replayed input is trimmed rather than re-applied, and overflow is
 reported as an explicit gap rather than papered over. Agent forwarding proxies
 `ssh-agent` to the client as a sub-channel of the same connection. `attach` spawns a
 daemon on demand and relays bytes to it, knowing nothing of the protocol. `list` and
@@ -20,11 +25,13 @@ protocol it speaks. Mechanics: [IMPLEMENTATION.md](IMPLEMENTATION.md).
 
 - **Platform** — Linux only, by construction. Everything else degrades to plain SSH
   ([DESIGN.md § 7](DESIGN.md#7-degradation)).
-- **Suite** — 107 tests plus 2 doctests, and a per-test timeout in
-  `.config/nextest.toml` so a hang is a failure rather than a hung run. One test is
-  `#[ignore]`d because it sits out the real 30 s first-attach reap, and CI runs it
-  with `--run-ignored all`. What each layer covers, and the two invariants the whole
-  thing exists to protect: [IMPLEMENTATION.md § 9](IMPLEMENTATION.md#9-testing).
+- **Suite** — a per-test timeout in `.config/nextest.toml` makes a hang a failure
+  rather than a hung run, and one test is `#[ignore]`d because it sits out the real
+  30 s first-attach reap, which CI covers with `--run-ignored all`. The count is
+  whatever `cargo nextest list --workspace` prints; it lives there rather than here,
+  for the same reason the sizes live in `scripts/size-baseline`. What each layer
+  covers, and the two invariants the whole thing exists to protect:
+  [IMPLEMENTATION.md § 9](IMPLEMENTATION.md#9-testing).
 - **Release** — all four musl targets build reproducibly, inside the 400 KiB budget
   and against a per-target growth gate, from `scripts/build-release.sh`. armv7 has by
   far the least headroom, for the reason in P1. The sizes live in
@@ -36,8 +43,8 @@ protocol it speaks. Mechanics: [IMPLEMENTATION.md](IMPLEMENTATION.md).
 ## P1 — known gaps
 
 Two, and in both the honest answer is a known cost rather than a missing line of
-code. Each was found by review or by measurement rather than by guessing, which is
-the bar for landing here.
+code. Each was found by review or by measurement rather than by guessing, and is
+recorded with what it was measured against.
 
 - **A hand-started daemon has a bind-to-publish window.** `attach` holds the spawn
   lock until `<id>.pid` exists, so a session it created is never visible without its
@@ -48,12 +55,12 @@ the bar for landing here.
   destroyed session — but the window is still there. Only the hand-started case:
   a session `attach` spawned is never visible without its pidfile, and a pidfile
   caught between creation and its first write is waited out like a missing one.
-- **The run-directory check costs armv7 66 KiB.** Bisected to the commit, and the
-  jump is that architecture alone: 148,292 → 215,884 bytes, a 46% step against
-  roughly 6 KiB for the whole branch on each of the other three. Ruled out by
-  probe: the two dynamic error messages (168 bytes) and the `fchmod` repair (120
-  bytes). Removing the check recovers all of it, so the cost is in the
-  `open`/`fstat`/`Mode` path as 32-bit ARM codegen renders it. It stays inside the
+- **The run-directory check costs armv7 66 KiB.** Bisected to `4d5d465`, the commit
+  that introduced it, and the jump is that architecture alone: 148,292 → 215,884
+  bytes, a 46% step against roughly 6 KiB for the whole branch on each of the other
+  three. Ruled out by probe: the two dynamic error messages (168 bytes) and the
+  `fchmod` repair (120 bytes). Removing the check recovers all of it, so the cost is
+  in the `open`/`fstat`/`Mode` path as 32-bit ARM codegen renders it. It stays inside the
   budget, so this is a size regression rather than a broken release — but it is very
   nearly a third of the binary users upload over cellular, and armv7 is the target
   least likely to be on a fast link. It went unnoticed because the release script
