@@ -69,8 +69,18 @@ const SOCKET_POLL: Duration = Duration::from_millis(100);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Waits up to `within` for `condition` to hold, and reports whether it ever did.
-pub(crate) fn poll_until(within: Duration, mut condition: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + within;
+pub(crate) fn poll_until(within: Duration, condition: impl FnMut() -> bool) -> bool {
+    poll_by(Instant::now() + within, condition)
+}
+
+/// [`poll_until`] against a deadline the caller shares between several waits.
+///
+/// A test that waits for two things one after another with a bound each is bounded
+/// by the *sum*, which is how a test can allow itself fifty seconds against a runner
+/// that kills at forty — and then be killed with nothing to point at, which is the
+/// failure these bounds exist to replace. [`join_before`] is the same argument for
+/// threads.
+pub(crate) fn poll_by(deadline: Instant, mut condition: impl FnMut() -> bool) -> bool {
     loop {
         if condition() {
             return true;
@@ -99,7 +109,8 @@ pub(crate) fn join_within<T>(handle: thread::JoinHandle<T>, within: Duration, wh
 /// minutes against a runner that kills at forty seconds — so a relay that stalled in
 /// the last direction was killed by nextest with nothing to point at, which is the
 /// exact failure `join_within` exists to prevent. One deadline for the sequence
-/// keeps the promise the individual bounds were written to make.
+/// keeps the promise the individual bounds were written to make. [`poll_by`] is the
+/// same argument for conditions.
 pub(crate) fn join_before<T>(handle: thread::JoinHandle<T>, deadline: Instant, what: &str) -> T {
     let remaining = deadline.saturating_duration_since(Instant::now());
     assert!(
@@ -707,7 +718,18 @@ impl Client {
     /// was for, which is the only place that can also say what it saw instead.
     /// Everything that is *not* a timeout is fatal here and says `awaiting`, because
     /// none of it leaves the caller anything to add.
-    fn frame_before(&mut self, deadline: Instant, awaiting: &str) -> Option<(FrameType, Vec<u8>)> {
+    ///
+    /// Reachable from the test binaries for that same first reason. A loop over
+    /// [`Client::next_frame`] takes a fresh [`PATIENCE`] on every frame, so a daemon
+    /// dribbling one frame just inside it is never late and the loop as a whole has
+    /// no bound at all — it runs until nextest's own kill, which cannot say which
+    /// wait never ended. A test reading many frames wants one deadline, and this is
+    /// where it gets it.
+    pub(crate) fn frame_before(
+        &mut self,
+        deadline: Instant,
+        awaiting: &str,
+    ) -> Option<(FrameType, Vec<u8>)> {
         loop {
             if let Some(frame) = self.take_pending_frame() {
                 return Some(frame);

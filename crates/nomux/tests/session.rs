@@ -31,7 +31,7 @@ use nomux_proto::{
 
 use harness::{
     Client, Reaper, Rng, Session, Spawned, accept_within, collect, control, has_unread_bytes,
-    hello_frame, join_before, nomux, nomux_with_shell, poll_until, push_until_refused,
+    hello_frame, join_before, nomux, nomux_with_shell, poll_by, poll_until, push_until_refused,
     read_uninterrupted, reconnect_until_gap, run_root, shrink_send_buffer, stderr, stdout,
     succeeded, wait_for, while_nothing_forks, write_frame,
 };
@@ -373,18 +373,36 @@ fn plant_blob(
 /// stream and both corrupt the user's scrollback, which is the single failure
 /// `IMPLEMENTATION.md` § 9's second invariant exists to prevent. Indexing a model of
 /// the child's own output by absolute offset is what makes that claim falsifiable.
+///
+/// One deadline for the whole read rather than one per frame. A loop over
+/// `next_frame` renews its patience on every frame that arrives, so a daemon
+/// handing over a byte every fourteen seconds is never late by that measure and the
+/// read has no bound at all — it would run until nextest's kill, which is exactly
+/// the failure `join_within` and `.config/nextest.toml` are written to avoid.
 #[expect(
     clippy::panic,
     reason = "clippy.toml's allow-panic-in-tests reaches `#[test]` bodies, not the \
               helpers an integration test crate keeps beside them"
 )]
 fn read_against(client: &mut Client, planted: &Planted, from: u64) -> Vec<(u64, u64)> {
+    /// Two orders of magnitude above the tenth of a second the largest of these
+    /// reads takes, and well under the kill in `.config/nextest.toml`.
+    const PATIENCE: Duration = Duration::from_secs(15);
+
     let expected = &planted.expected;
     let end = planted.stream_start + expected.len() as u64;
     let mut offset = from;
     let mut gaps = Vec::new();
+    let awaiting = format!("the {} bytes the child wrote", expected.len());
+    let deadline = Instant::now() + PATIENCE;
     while offset < end {
-        let (ty, payload) = client.next_frame();
+        let (ty, payload) = client.frame_before(deadline, &awaiting).unwrap_or_else(|| {
+            panic!(
+                "the session stopped {} bytes short of everything the child wrote, \
+                 with the stream standing at {offset}",
+                end - offset
+            )
+        });
         match Frame::decode(ty, &payload).expect("decode frame") {
             Frame::Output { offset: at, data } => {
                 assert_eq!(
@@ -3831,18 +3849,24 @@ fn the_relay_moves_the_same_traffic_by_copying_when_the_kernel_will_not_splice_i
     );
 }
 
-/// How long *all four* of a relay's directions have between them before the wait on
-/// them is called a hang rather than slowness.
+/// The budget a relay test gives the relay, as a whole rather than per wait.
 ///
 /// Far above the second or so the transfers really take, and far below the
 /// termination in `.config/nextest.toml`, so a stalled relay fails here — naming the
 /// direction that stopped — rather than being killed there with nothing to point at.
 ///
-/// The four joins share it rather than each getting one, which is what makes the
-/// second half of that sentence true. Thirty seconds apiece was a hundred and twenty
-/// against a runner that kills at forty: a relay that stalled in any direction but
-/// the first was killed by nextest, and the named failure this exists to produce
-/// never ran.
+/// A *whole*, at every site that makes more than one wait: the four joins in
+/// [`assert_relay_moves_bulk`] share one deadline, and so do the two waits in
+/// [`a_session_that_ends_with_the_relays_input_unread_still_exits_clean`]. Each of
+/// those used to spend the figure again per wait, which came to a hundred and twenty
+/// seconds and fifty against a runner that kills at forty — so a relay that stalled
+/// anywhere but in the first wait was killed by nextest, and the named failure this
+/// exists to produce never ran.
+///
+/// The read timeout in [`relay_onto_a_socket_over`] is the one place it is a per-call
+/// figure, and it is not a deadline: it is what stops a `read_to_end` on a socket
+/// with no timeout of its own from parking a test thread for ever, so the wait that
+/// *is* bounded — the join around that thread — can report it.
 const RELAY_PATIENCE: Duration = Duration::from_secs(25);
 
 /// Moves `bulk` bytes each way through a relay and compares both directions.
@@ -4128,6 +4152,12 @@ fn a_session_that_ends_with_the_relays_input_unread_still_exits_clean() {
         Stdio::piped(),
     );
 
+    // One deadline across both waits below rather than one each, for the reason
+    // [`RELAY_PATIENCE`] gives: two of them in sequence is fifty seconds against a
+    // runner that kills at forty, and a stall in the second would have been killed
+    // rather than reported.
+    let deadline = Instant::now() + RELAY_PATIENCE;
+
     // Never read from this end, which is the whole provocation: the reset is the
     // kernel's answer to a close over a receive queue that still has something in it.
     feed.write_all(b"a keystroke this session never drains")
@@ -4136,7 +4166,7 @@ fn a_session_that_ends_with_the_relays_input_unread_still_exits_clean() {
     // those bytes is an orderly FIN, and this test would then pass having provoked
     // nothing at all.
     assert!(
-        poll_until(RELAY_PATIENCE, || has_unread_bytes(&peer)),
+        poll_by(deadline, || has_unread_bytes(&peer)),
         "the relay never delivered the input this test leaves unread"
     );
 
@@ -4145,7 +4175,7 @@ fn a_session_that_ends_with_the_relays_input_unread_still_exits_clean() {
     drop(peer);
 
     assert!(
-        poll_until(RELAY_PATIENCE, || !child.is_running()),
+        poll_by(deadline, || !child.is_running()),
         "the relay never left after its session ended"
     );
     // After the exit, so nothing here can park: the relay's own end of this
