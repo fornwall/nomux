@@ -382,12 +382,11 @@ fn kill_leaves_a_live_session_alone_when_nothing_will_say_which_process_it_is() 
 /// The first assertion is that claim about `SO_PEERCRED` itself, checked against a
 /// daemon in another process rather than assumed from the manual page.
 ///
-/// What the socket names is not simply preferred, though: two *live* processes, one
-/// on the socket and one in the file, are a state in which nothing here can say which
-/// is the daemon — a reissued number looks the same from both directions — so `kill`
-/// refuses rather than picking. The bystander below is live, which is what makes this
-/// that case; removing the file it was planted in is the repair the refusal names, and
-/// the second half of the test is that the repair works.
+/// The two live numbers do not cancel out: where they disagree, the tie is broken by
+/// asking each candidate what it *is*, since only one of them runs `nomux daemon
+/// <id>`. The bystander below is live and is a `sleep`, so the socket wins and the
+/// session is stopped — which is the whole point of the change, and what refusing
+/// instead would have thrown away.
 #[test]
 fn kill_signals_the_process_the_socket_names_rather_than_the_pidfile() {
     let session = LiveSession::create("lk11");
@@ -413,44 +412,96 @@ fn kill_signals_the_process_the_socket_names_rather_than_the_pidfile() {
     fs::write(session.pid_path(), format!("{}\n", bystander.id()))
         .expect("plant a reissued pid in the pidfile");
 
-    let refused = session.run.run(&["kill", "lk11"]);
+    let listed = stdout(&session.run.run(&["list"]));
+    let killed = session.run.run(&["kill", "lk11"]);
     // Read before anything is asserted, so a failure cannot also leave the bystander
     // behind — and `Spawned` collects it either way.
     let survived = bystander.is_running();
-    let listed = stdout(&session.run.run(&["list"]));
     drop(bystander);
-
-    // The repair the refusal asks for, and then the same command again: with the file
-    // gone the socket is the only witness, and it is enough. This is also the one path
-    // that reaches the publish grace's "it never appeared" arm and comes out the far
-    // side of it, which is why the kill below is allowed to take two seconds.
-    fs::remove_file(session.pid_path()).expect("take the planted pidfile away");
-    let killed = session.run.run(&["kill", "lk11"]);
 
     assert!(
         survived,
         "kill signalled an unrelated process of the user's: {:?}",
-        stderr(&refused)
-    );
-    assert!(
-        !refused.status.success() && stderr(&refused).contains("both are live processes"),
-        "two live candidates must be refused rather than guessed between: {:?}",
-        stderr(&refused)
+        stderr(&killed)
     );
     assert_eq!(
         listed.trim_end().split('\t').nth(1),
         Some(session.pid.to_string().as_str()),
         "list must show the pid kill would act on, not the one in the file: {listed:?}"
     );
-    succeeded(
-        &killed,
-        "kill could not stop the session with the file gone",
-    );
+    succeeded(&killed, "kill could not stop the session");
     assert!(
         poll_until(Duration::from_secs(10), || !process_alive(session.pid)),
         "kill reported success with the daemon it was asked to stop still running \
          as pid {}",
         session.pid
+    );
+}
+
+/// The other half of that tie, and the one the fork of § 6.2 produces: the socket
+/// names a live process that is *not* this session's daemon, and `<id>.pid` names the
+/// one that is.
+///
+/// A daemon built before the bind moved after that fork has exactly this shape — the
+/// half that called `listen` left, and if the kernel has since handed its number to
+/// somebody else, the socket names a stranger while the file names the heir that
+/// serves. Preferring the socket there signals the stranger and leaves the session
+/// running, and the repair that suggests itself, removing the pidfile, makes it
+/// certain; preferring the file blindly is the defect this whole change removed. So
+/// the candidates are asked what they are, and `nomux daemon <id>` is the answer.
+///
+/// The shape is built rather than provoked. The creator that survives its own fork
+/// holding nothing cannot be produced by this tree — the real one `_exit`s — so a
+/// second daemon's socket is moved over this session's, which leaves a live, unrelated
+/// `nomux daemon` process wearing the socket's credentials and the real daemon in the
+/// file. What that costs is the end of the story: killing the pid the file names does
+/// not close a socket the other daemon holds, so `kill` goes on to report a session it
+/// could not establish had stopped. Which process was chosen is the assertion.
+#[test]
+fn kill_prefers_the_pidfile_when_the_socket_names_a_process_that_is_not_the_daemon() {
+    let session = LiveSession::create("lk18");
+    // A daemon of its own, in the same run directory and under a different id, whose
+    // socket stands in for one an exited creator left behind.
+    let other = collect(
+        nomux_with_shell(&session.run.root, &["attach", "lk18b"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+    );
+    succeeded(&other, "the second daemon failed to start");
+    wait_for(&session.run.dir.join("lk18b.pid"));
+    let creator: u32 = fs::read_to_string(session.run.dir.join("lk18b.pid"))
+        .expect("read the second pidfile")
+        .trim()
+        .parse()
+        .expect("the pidfile holds a pid");
+    let _reaper = Reaper(creator);
+
+    fs::rename(session.run.dir.join("lk18b.sock"), session.run.socket())
+        .expect("move the second daemon's socket over this session's");
+    let answered = UnixStream::connect(session.run.socket()).expect("connect to the session");
+    assert_eq!(
+        peer_pid(&answered).cast_unsigned(),
+        creator,
+        "the socket must now carry the other daemon's credentials"
+    );
+    drop(answered);
+
+    let killed = session.run.run(&["kill", "lk18"]);
+    let chosen_died = poll_until(Duration::from_secs(10), || !process_alive(session.pid));
+    let creator_survived = process_alive(creator);
+    drop(control(&session.run.root, &["kill", "lk18b"]));
+
+    assert!(
+        chosen_died,
+        "kill did not signal the daemon the pidfile names: {:?}",
+        stderr(&killed)
+    );
+    assert!(
+        creator_survived,
+        "kill signalled the process the socket names, which is another session's \
+         daemon and not this one's: {:?}",
+        stderr(&killed)
     );
 }
 

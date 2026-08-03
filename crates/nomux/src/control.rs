@@ -7,7 +7,7 @@
 
 use std::io::{self, Write};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
@@ -206,10 +206,11 @@ pub(crate) fn list() -> io::Result<()> {
 /// Fails if the session id is invalid, if the run directory is not this user's
 /// alone (§ 6.3), if the spawn lock could not be taken within [`SPAWN_LOCK_GRACE`]
 /// — see [`hold_spawn_lock`] — if the session is alive but will not say which
-/// process it is (see [`resolve`]), or if it goes on answering after both signals,
-/// which means the pid it published is not the process serving it. A session that
-/// is already gone is not an error — the postcondition is "no such session", which
-/// already holds.
+/// process it is, if its two witnesses name two live processes and neither of them
+/// is this session's daemon (both are [`resolve`]), or if it goes on answering after
+/// both signals, which means the pid that was signalled is not the process serving
+/// it. A session that is already gone is not an error — the postcondition is "no
+/// such session", which already holds.
 pub(crate) fn kill(session_id: &str) -> io::Result<()> {
     let paths = SessionPaths::new(session_id)?;
     // The same check `list` makes, and this is where it bites hardest: the two
@@ -328,22 +329,25 @@ enum Target {
 /// kill` ends up terminating an unrelated process of the user's. The socket is the
 /// authority on whether the daemon is still there.
 ///
-/// It is the authority on *which* process it is, too, wherever it will say: the
-/// connection that just answered carries the pid in [`daemon_of`], and nothing at a
-/// filename can forge that.
+/// It says *which* process it is, too, wherever it will: the connection that just
+/// answered carries the pid in [`daemon_of`], and nothing at a filename can forge
+/// that.
 ///
 /// Both sources are consulted rather than one preferred outright, because each is
 /// the only account of a state the other cannot describe. The socket names nobody
 /// during the bind-to-publish window, or where a `connect` failed for a reason that
 /// is not death, or where the peer is in a pid namespace this process cannot see
 /// (see [`peer_pid`]) — and `<id>.pid` is what is left there. The *file* names the
-/// wrong process where a dead daemon's number outlived it, which is the whole reason
-/// this function was rewritten. So each is discarded when it names no process at
-/// all, and where both survive that and still disagree, neither is believed: one of
-/// them is a stranger's number and nothing here can say which, so this refuses
-/// exactly as it refuses a pid it cannot read. That case is not hypothetical — a
-/// daemon built before the bind moved after § 6.2's fork answers with its exited
-/// creator's number, and the frozen surface must manage a daemon of any version.
+/// wrong process where a dead daemon's number outlived it and the kernel handed that
+/// number to somebody else. Neither is the senior witness: § 6.2 forks *after* the
+/// bind, so on a daemon built before that changed the socket names the half that
+/// left and the file names the half that serves.
+///
+/// So each is discarded when it names no process at all, which settles both of the
+/// ordinary shapes, and a disagreement that survives that is put to [`serving`],
+/// which asks the two candidates what they are rather than inferring it. Only where
+/// *that* cannot answer is the session refused, exactly as a pid that cannot be read
+/// is refused.
 ///
 /// The other direction is § 6.6's rule that a live session's files are never
 /// unlinked: a socket that answers and no pid to be had either way is an **error**,
@@ -369,14 +373,11 @@ fn resolve(paths: &SessionPaths) -> io::Result<Target> {
             Ok(body) if !body.trim_ascii().is_empty() => {
                 let filed = parse_pid(body).and_then(extant);
                 return match (named, filed) {
-                    (Some(named), Some(filed)) if named != filed => {
-                        Err(disagreement(paths, named, filed))
-                    }
+                    (Some(named), Some(filed)) if named != filed => serving(paths, named, filed)
+                        .map(Target::Daemon)
+                        .ok_or_else(|| disagreement(paths, named, filed)),
                     (Some(pid), _) | (None, Some(pid)) => Ok(Target::Daemon(pid)),
-                    (None, None) => {
-                        let body = String::from_utf8_lossy(body);
-                        Err(unreadable(paths, &format!("it holds {body:?}")))
-                    }
+                    (None, None) => Err(unreadable(paths, &unusable(body))),
                 };
             }
             // Present but empty is the same window one syscall later, and is therefore
@@ -480,13 +481,79 @@ fn extant(pid: i32) -> Option<rustix::process::Pid> {
         .then_some(pid)
 }
 
-/// The refusal to act on two live processes when only one of them can be the daemon.
+/// Which of two live candidates is this session's daemon, where that can be settled.
 ///
-/// It prints both numbers because the user is the only one who can tell them apart,
-/// and because the repair is theirs: a `<id>.pid` naming something other than the
-/// process on the socket is either an old daemon's number the kernel has reissued or
-/// a file edited by hand, and removing it leaves the socket as the only witness,
-/// which `kill` then acts on.
+/// The two witnesses disagree only when a number has been reissued, and from outside
+/// the two ways that happens look identical: the socket names an exited creator whose
+/// number came round again — § 6.2 forks *after* the bind, so a daemon built before
+/// that changed is served by the heir the pidfile names — or the file holds a dead
+/// daemon's number that now belongs to a stranger while the socket names the live one.
+/// Guessing between them signals somebody's process either way, so the tie is settled
+/// by asking each candidate what it *is*: this session's daemon runs `nomux daemon
+/// <id>`, and no reissued number wears that by accident.
+///
+/// Both wearing it is § 6.2's fork and nothing else — one image, two halves — and
+/// there the file is the answer by construction, since `write_pid` runs after the fork
+/// in the half that survives it. Neither wearing it is not a tie to break: the caller
+/// refuses.
+///
+/// This identifies the process rather than the *fd*, which is the stronger question
+/// and the more expensive one — `/proc/<pid>/fd` carries a socket's `sockfs` inode,
+/// which no `stat` of the path yields, so matching them means parsing `/proc/net/unix`
+/// as well, on the one surface that has to keep working on any host. What is bought
+/// with the cheaper question is every shape the tree can produce; what is given up is
+/// a second `nomux daemon <id>` that is not this one, which the bind in § 6.3 already
+/// makes unreachable while the first still answers.
+fn serving(
+    paths: &SessionPaths,
+    named: rustix::process::Pid,
+    filed: rustix::process::Pid,
+) -> Option<rustix::process::Pid> {
+    match (
+        is_daemon_for(named, paths.id()),
+        is_daemon_for(filed, paths.id()),
+    ) {
+        (_, true) => Some(filed),
+        (true, false) => Some(named),
+        (false, false) => None,
+    }
+}
+
+/// Whether `pid` is a `nomux daemon <id>` process.
+///
+/// The command line rather than the executable's name: `attach` spawns the daemon as
+/// `<exe> daemon <id>` (`attach::spawn_daemon`) and § 6.2 documents the same words
+/// typed by hand, so the mode and the id are two arguments whatever the binary is
+/// called or where it was installed — which matters, since § 5.2 installs it under a
+/// version-stamped name. Both are required: a relay is `<exe> attach <id>` and would
+/// otherwise answer to this.
+///
+/// Read through the same bounded call as the run files, which is what keeps a
+/// command line somebody chose from deciding how much this reads. A `/proc` that
+/// cannot be read at all — it is not mounted, or the process went away between the
+/// two questions — is "no", which leaves the caller refusing rather than guessing.
+fn is_daemon_for(pid: rustix::process::Pid, id: &str) -> bool {
+    // Long enough for the two arguments this looks at behind any plausible path to
+    // the binary; a command line that pushes them past it reads as "not this daemon",
+    // which is the safe direction.
+    let mut buf = [0u8; 512];
+    let cmdline = PathBuf::from(format!("/proc/{}/cmdline", pid.as_raw_nonzero()));
+    let Ok(body) = read_prefix(&cmdline, &mut buf) else {
+        return false;
+    };
+    // NUL-separated argv, so the arguments are compared whole: an id that is a prefix
+    // of another session's is a different session.
+    let mut args = body.split(|byte| *byte == 0);
+    args.any(|arg| arg == b"daemon") && args.any(|arg| arg == id.as_bytes())
+}
+
+/// The refusal to act when neither live candidate is this session's daemon.
+///
+/// It prints both numbers and what each of them came from, because that is the whole
+/// of what is known and the user is the only one who can look further. It recommends
+/// nothing: the repair that suggests itself — remove the pidfile and let the socket
+/// decide — is the catastrophic one exactly half the time, since the number the
+/// socket carries is the one that may have been reissued.
 fn disagreement(
     paths: &SessionPaths,
     named: rustix::process::Pid,
@@ -496,14 +563,31 @@ fn disagreement(
         io::ErrorKind::InvalidData,
         format!(
             "session {id} is running, but its socket names pid {named} and {pid} names \
-             pid {filed}, and both are live processes; leaving it alone rather than \
-             signalling the wrong one",
+             pid {filed}, and neither is a `nomux daemon {id}` process; leaving it alone \
+             rather than signalling the wrong one",
             id = paths.id(),
             pid = paths.pid().display(),
             named = named.as_raw_nonzero(),
             filed = filed.as_raw_nonzero(),
         ),
     )
+}
+
+/// What is wrong with a pidfile body that yielded no pid, in the terms of the repair.
+///
+/// The two are not the same fault and do not read the same way: a body that reached
+/// the bound holds what may be a perfectly good number with the end of it unread, so
+/// quoting it alone would show the user a pid and call it unusable.
+fn unusable(body: &[u8]) -> String {
+    let quoted = String::from_utf8_lossy(body);
+    if body.len() >= MAX_PID_LEN {
+        format!(
+            "it runs past the {MAX_PID_LEN} bytes a pidfile may be, so any number in it \
+             is cut off rather than read; it begins {quoted:?}"
+        )
+    } else {
+        format!("it holds {quoted:?}")
+    }
 }
 
 /// The refusal to touch a live session whose pid is not knowable.
