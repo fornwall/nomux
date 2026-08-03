@@ -54,6 +54,10 @@ const HANGUP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_mill
 pub(crate) struct Pty {
     master: OwnedFd,
     child: Child,
+    /// The child's start time, read once at spawn — the other half of its identity,
+    /// for [`Pty::pid_reissued`]. `None` where `/proc` could not answer, which is
+    /// read as "cannot tell" rather than as an answer.
+    started: Option<u64>,
 }
 
 impl Pty {
@@ -156,6 +160,10 @@ impl Pty {
         }
 
         let child = command.spawn()?;
+        // Read here, where the child is certainly still this pid: it is held
+        // unreaped by the `Child` above, so even an exit in the meantime leaves the
+        // zombie `/proc` answers from.
+        let started = start_time(i32::try_from(child.id()).unwrap_or(0));
         // Both the copy in this frame and the three `Stdio::from` took: std only
         // *borrows* an owned descriptor for the child, so `Command` holds all three
         // until it is itself dropped. The master reports `EIO` — which `read_pty`
@@ -165,7 +173,11 @@ impl Pty {
         // end of the scope, since that is an invariant something depends on.
         drop(command);
         drop(slave);
-        Ok(Self { master, child })
+        Ok(Self {
+            master,
+            child,
+            started,
+        })
     }
 
     /// The PTY master, for reading output and writing input.
@@ -238,18 +250,24 @@ impl Pty {
     /// over, and on most shutdowns happens once.
     pub(crate) fn terminate(&mut self) {
         let raw = i32::try_from(self.child.id()).unwrap_or(0);
-        if let Some(pid) = rustix::process::Pid::from_raw(raw) {
+        if let Some(pid) = rustix::process::Pid::from_raw(raw)
+            && !self.pid_reissued(raw)
+        {
             // The same probe the `SIGKILL` escalation below is guarded by, one
-            // signal earlier and for the same reason. An ordinary exit reaps the
-            // child long before `shutdown` gets here, so `raw` names a pid the
-            // kernel is free to have reissued, and neither reach below can tell that
-            // apart from its own session. It costs nothing in the case they exist
-            // for: while anything is left of the session the child's own group holds
-            // a member — a zombie counts, which is why `shutdown` reaching here
-            // unreaped answers `Ok` — so the `&&` short-circuits and the guard is
-            // one `kill(-pgid, 0)`.
-            // What the last probe said, so neither signal below is sent to a group
-            // this has already watched go.
+            // signal earlier and for the same reason: an ordinary exit reaps the
+            // child long before `shutdown` gets here, so by then there may be
+            // nothing behind either reach. It costs nothing in the case they exist
+            // for — while anything is left of the session the child's own group
+            // holds a member, a zombie counting for one, so the `&&` short-circuits
+            // and the guard is one `kill(-pgid, 0)`.
+            //
+            // What this cannot ask is whether what it found is *ours*, which is what
+            // [`Pty::pid_reissued`] is for. The two are one guard in two halves:
+            // this one says something is there, that one says the number still names
+            // the child.
+            //
+            // The value is what the last probe said, so neither signal below is sent
+            // to a group this has already watched go.
             let mut group_alive = rustix::process::test_kill_process_group(pid).is_ok();
             let mut settled = !group_alive && session_members(raw).is_empty();
             if !settled {
@@ -287,16 +305,14 @@ impl Pty {
             }
             // Only if something is still standing. Settling means the group is gone
             // *and* the session is empty, so there is nothing left for these to
-            // reach — and once the child has been reaped its pid is free for the
-            // kernel to reissue, which is the one case where signalling a group that
-            // no longer exists could land somewhere it was never meant to.
+            // reach.
             //
-            // The two reaches are separately conditional for that reason, because
-            // the two conditions come apart: a backgrounded job in a group of its
-            // own — the case this whole function exists for — outlives the grace
-            // while the *child's* group is already gone and reaped. Signalling that
-            // group anyway is a `SIGKILL` sent to a pid the kernel is free to have
-            // reissued, which is exactly what the paragraph above refuses to do.
+            // The two reaches are separately conditional because the two conditions
+            // come apart: a backgrounded job in a group of its own — the case this
+            // whole function exists for — outlives the grace while the *child's*
+            // group is already gone. A `SIGKILL` at that group would be aimed at a
+            // pgid nothing holds, which is the one number in here that can be given
+            // away while the loop above runs.
             if !settled {
                 if group_alive {
                     let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
@@ -307,6 +323,44 @@ impl Pty {
         drop(self.child.kill());
         drop(self.child.wait());
     }
+
+    /// Whether `raw` has been handed to somebody else since the child was spawned.
+    ///
+    /// Both reaches in [`Pty::terminate`] address the child by number — a pgid and a
+    /// session id are pids — and the liveness probe above them can only ask whether
+    /// *something* is there, never whether it is ours. The daemon reaps the child on
+    /// every pass, so the number can be free for as long as the session then runs,
+    /// and a stranger who took it and called `setsid` answers that probe exactly as
+    /// the child would have. The start time is what tells them apart: pids are
+    /// reissued, and start times are not reissued with them.
+    ///
+    /// A *missing* `/proc/<raw>` is deliberately not a reissue, and that is the case
+    /// this turns on rather than an oversight. No task holds the number, so it
+    /// cannot have been given to one — the kernel keeps a pid reserved for as long
+    /// as anything still names it as a session or a group, which is precisely the
+    /// state a reaped shell with a surviving job leaves behind. Reading it as a
+    /// reissue would abandon the orphan the `/proc` walk exists to collect, and
+    /// `terminate_still_collects_a_job_whose_shell_has_been_reaped` fails on it.
+    ///
+    /// Unknown either way — `/proc` unreadable now, or at spawn — is not a reissue
+    /// either. That leaves the hazard open on a host where nothing here can work
+    /// anyway, and the alternative is a daemon that stops collecting its own child's
+    /// group on it, which is the only reach left when the walk cannot run.
+    ///
+    /// What remains is the microseconds between this read and the signal, against
+    /// the whole life of a session before it.
+    fn pid_reissued(&self, raw: i32) -> bool {
+        matches!((self.started, start_time(raw)), (Some(ours), Some(now)) if ours != now)
+    }
+}
+
+/// The start time of the process holding `pid`, in clock ticks since boot.
+///
+/// The other half of a pid's identity, and never read for its value: two of these
+/// are only ever compared. Field 22 of `/proc/<pid>/stat`, counted through the same
+/// fixed-width tail [`stat_session`] reads and for the same reason.
+fn start_time(pid: i32) -> Option<u64> {
+    stat_start_time(&std::fs::read(format!("/proc/{pid}/stat")).ok()?)
 }
 
 /// Signals every live process still in session `sid`.
@@ -351,14 +405,14 @@ fn session_members(sid: i32) -> Vec<i32> {
         .collect()
 }
 
-/// The session id and whether the process is a zombie, from one `/proc/<pid>/stat`.
+/// The fields of one `/proc/<pid>/stat` from the third onwards: state, ppid, pgrp,
+/// session, and so on to the end.
 ///
-/// Parsed from the last `)` rather than by splitting on whitespace from the left,
+/// Taken from the last `)` rather than by splitting on whitespace from the left,
 /// because field two is the executable's name in parentheses and the kernel does
 /// not escape it: a process called `foo bar) 1 2 3` is a name somebody can choose,
 /// and splitting from the left hands back whatever they put there. Everything after
-/// the final `)` is fixed-width and space-separated, so it is safe to count through
-/// — state, ppid, pgrp, then the session.
+/// the final `)` is fixed-width and space-separated, so it is safe to count through.
 ///
 /// Bytes rather than a `&str` for the same reason, taken one step further. That
 /// name is copied from the executable's basename, and the kernel escapes only `\n`
@@ -369,13 +423,24 @@ fn session_members(sid: i32) -> Vec<i32> {
 /// session has settled — it skips the `SIGKILL` escalation and reports a clean
 /// shutdown over a job that is still running. Only the fixed-width tail is decoded,
 /// which is ASCII by construction.
-fn stat_session(stat: &[u8]) -> Option<(i32, bool)> {
+fn stat_tail(stat: &[u8]) -> Option<std::str::SplitWhitespace<'_>> {
     let close = stat.iter().rposition(|byte| *byte == b')')?;
     let rest = str::from_utf8(stat.get(close + 1..)?).ok()?;
-    let mut fields = rest.split_whitespace();
+    Some(rest.split_whitespace())
+}
+
+/// The session id and whether the process is a zombie, from one `/proc/<pid>/stat`.
+fn stat_session(stat: &[u8]) -> Option<(i32, bool)> {
+    let mut fields = stat_tail(stat)?;
     let state = fields.next()?;
     let session = fields.nth(2)?.parse().ok()?;
     Some((session, state == "Z"))
+}
+
+/// The start time, from one `/proc/<pid>/stat`: field 22 of the line, and the
+/// twentieth of the tail [`stat_tail`] hands back.
+fn stat_start_time(stat: &[u8]) -> Option<u64> {
+    stat_tail(stat)?.nth(19)?.parse().ok()
 }
 
 const fn to_winsize(win: WinSize) -> Winsize {
@@ -520,6 +585,48 @@ mod tests {
         );
     }
 
+    /// The start time is field 22, counted through the same tail, and a pid's
+    /// identity now rests on this arithmetic being right.
+    ///
+    /// Pinned against the kernel rather than only against a line written here: this
+    /// process's own `stat` is decoded both ways, by the parser and by a plain
+    /// left-to-right split, which is a valid reading for a `comm` of `nomux` and
+    /// only for one. A line whose name defeats that split is what the synthetic
+    /// case below is for.
+    #[test]
+    fn a_stat_line_gives_up_the_start_time_field() {
+        let mine = std::fs::read("/proc/self/stat").expect("read this process's stat");
+        let naive: Vec<&str> = str::from_utf8(&mine)
+            .expect("this binary's own comm is ASCII")
+            .split_whitespace()
+            .collect();
+        assert_eq!(
+            stat_start_time(&mine)
+                .map(|ticks| ticks.to_string())
+                .as_deref(),
+            naive.get(21).copied(),
+            "the parser and a plain split must read the same field 22"
+        );
+
+        // The same hostile name the test above uses, with a full tail behind it:
+        // state, ppid, pgrp, session, tty_nr, tpgid, flags, four faults, four
+        // times, priority, nice, threads, itrealvalue, and then the start time.
+        let hostile = b"42 (evil) 1 2 3) S 1 42 7 34816 99 4194304 0 0 0 0 \
+                        0 0 0 0 20 0 1 0 987654321 4096";
+        assert_eq!(stat_start_time(hostile), Some(987_654_321));
+        assert_eq!(
+            stat_session(hostile),
+            Some((7, false)),
+            "the two fields are read from one tail and must agree about where it starts"
+        );
+
+        assert_eq!(
+            stat_start_time(b"42 (sh) S 1 42 42 0 -1 4194304 0 0"),
+            None,
+            "too few fields to answer"
+        );
+    }
+
     /// The daemon must never appear in the set it is about to signal, whatever
     /// `/proc` says.
     #[test]
@@ -547,19 +654,7 @@ mod tests {
     /// thing being exercised.
     #[test]
     fn terminate_collects_a_backgrounded_job_in_its_own_process_group() {
-        let config = Spawn {
-            term: "dumb",
-            win: WinSize {
-                cols: 80,
-                rows: 24,
-                xpixel: 0,
-                ypixel: 0,
-            },
-            session_id: "terminate_test",
-            cwd: Path::new("/tmp"),
-            agent_sock: None,
-        };
-        let mut pty = Pty::spawn(&config).expect("spawn a shell on a pty");
+        let mut pty = shell("terminate_test");
 
         let script = "set -m\n(trap '' HUP; sleep 30) &\necho NOMUX-JOB=$!\n";
         rustix::io::write(pty.master(), script.as_bytes()).expect("write the script");
@@ -596,19 +691,7 @@ mod tests {
     /// keeps one reserved for as long as anything still names it as a session.
     #[test]
     fn terminate_still_collects_a_job_whose_shell_has_been_reaped() {
-        let config = Spawn {
-            term: "dumb",
-            win: WinSize {
-                cols: 80,
-                rows: 24,
-                xpixel: 0,
-                ypixel: 0,
-            },
-            session_id: "terminate_orphan",
-            cwd: Path::new("/tmp"),
-            agent_sock: None,
-        };
-        let mut pty = Pty::spawn(&config).expect("spawn a shell on a pty");
+        let mut pty = shell("terminate_orphan");
 
         // `exit` twice, because a shell with job control may answer the first one
         // by pointing out that a job is still running and asking again — zsh does.
@@ -617,13 +700,7 @@ mod tests {
         rustix::io::write(pty.master(), script.as_bytes()).expect("write the script");
         let job = read_marker(&pty, "NOMUX-JOB=").expect("the shell reported its job pid");
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut reaped = false;
-        while std::time::Instant::now() < deadline && !reaped {
-            reaped = pty.try_wait().expect("wait for the shell").is_some();
-            std::thread::sleep(HANGUP_POLL_INTERVAL);
-        }
-        assert!(reaped, "the shell never exited");
+        assert!(reaped_within(&mut pty), "the shell never exited");
         assert!(
             !collected(job),
             "the job should outlive the shell that started it"
@@ -641,30 +718,122 @@ mod tests {
         );
     }
 
-    /// Regression: with the child reaped and nothing left of its session,
-    /// `terminate` sends no signal at all.
+    /// Regression: the two reaches go out while the pid is still the child's, and
+    /// not once it is somebody else's.
     ///
-    /// An ordinary exit reaps the child (`daemon::collect_status`) long before
-    /// `shutdown` calls this, so by then `raw` is a number the kernel is free to
-    /// have handed to somebody else — and a `SIGHUP` at that pid's group and session
-    /// is one aimed at whoever holds it now. The `SIGKILL` escalation was guarded
-    /// against exactly this and the `SIGHUP` above it was not.
+    /// Three states in one test because the observation is a process-wide flag: a
+    /// second test setting it from another thread would fail this one over a signal
+    /// it never sent, and `cargo test` runs the suite in one process.
+    ///
+    /// The first is the ordinary case, and it is also what keeps the two negatives
+    /// from passing vacuously — a filter that matched nothing would satisfy them
+    /// both. The second is an ordinary exit, which reaps the child
+    /// (`daemon::collect_status`) long before `shutdown` gets here and leaves
+    /// nothing for either reach. The third is that same pid handed to somebody else,
+    /// which the liveness probe cannot see: a stranger who took the number and
+    /// called `setsid` answers it exactly as the child would have, and the daemon
+    /// reaps on every pass, so the window is the session's whole life rather than
+    /// the linger.
     ///
     /// Watched as the syscall rather than as its effect, which is the only thing
     /// that *can* be watched: where the guard skips, what it skips would have landed
-    /// nowhere by construction — the group is gone and the session is empty — so no
-    /// observer can be put where the signal would have arrived. A recycled pid is
-    /// not arrangeable either, since the kernel hands them out in sequence and keeps
-    /// one reserved for as long as any process still names it as a session or group.
+    /// nowhere by construction, so no observer can be put where the signal would
+    /// have arrived. Nor can a reissued pid be arranged — the kernel hands them out
+    /// in sequence, `pid_max` is millions, and it keeps one reserved for as long as
+    /// anything names it as a session or a group. So the third state is reached by
+    /// falsifying this side's half of the identity instead, which asks the same
+    /// question of the same branch.
     ///
-    /// A build that does signal may well fail inside rustix rather than on the
-    /// assertion below, and that is the same failure wearing a different hat: the
-    /// kernel rolls the registers back before raising `SIGSYS`, so a trapped `kill`
-    /// returns its own syscall number and rustix's debug assertion on the range of a
-    /// return value fires on it.
+    /// `SIGHUP` alone is trapped, because a live child really is sent a `SIGKILL` by
+    /// `Child::kill` on the way out of `terminate`, and that is not a reach.
+    ///
+    /// Trapping a syscall is not free of consequence for whoever made it: the kernel
+    /// rolls the registers back before raising `SIGSYS`, so the call returns its own
+    /// syscall number and rustix's debug assertion on the range of a return value
+    /// fires on it. Hence the `catch_unwind` around each of the three — the flag is
+    /// set inside the handler, before any of that, so it is the flag that says what
+    /// happened and an unwind on its own is reported as the separate thing it is.
     #[test]
-    fn terminate_signals_nothing_once_the_child_has_been_reaped_and_its_session_is_gone() {
-        let config = Spawn {
+    fn terminate_signals_a_pid_only_while_it_is_still_the_childs() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        // A live shell, whose session is emphatically not empty.
+        let mut pty = shell("terminate_live");
+        let raw = i32::try_from(pty.child.id()).unwrap_or(0);
+        if !trap_hangups_of(raw) {
+            // A host that will not take the filter cannot answer any of this, the
+            // way `the_walk_never_returns_this_process` cannot without a session id.
+            return;
+        }
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pty.terminate()));
+        assert!(
+            SIGNALLED_A_FREED_PID.swap(false, Relaxed),
+            "the ordinary case sent no SIGHUP, so the two assertions below are \
+             about an instrument that measures nothing"
+        );
+        // What `terminate` may not have got round to, having possibly left through
+        // the trapped syscall rather than through its own end.
+        drop(unwound);
+        drop(pty.child.kill());
+        drop(pty.child.wait());
+
+        // An ordinary exit, collected the way the daemon collects one — which is
+        // what frees the pid both reaches are addressed to.
+        let mut pty = shell("terminate_reaped");
+        rustix::io::write(pty.master(), b"exit\n").expect("ask the shell to leave");
+        assert!(reaped_within(&mut pty), "the shell never exited");
+        let raw = i32::try_from(pty.child.id()).unwrap_or(0);
+        let pid = rustix::process::Pid::from_raw(raw).expect("the reaped child's pid");
+        // Deterministic rather than hopeful, for the reason above: a pid stays
+        // reserved while anything still names it.
+        assert!(
+            rustix::process::test_kill_process_group(pid).is_err()
+                && session_members(raw).is_empty(),
+            "nothing of the session may be left, or this is the other case"
+        );
+        assert!(trap_hangups_of(raw), "the filter was taken once already");
+        // Caught here too, and for the opposite reason: a build that signals takes
+        // rustix's assertion with it, and the failure worth reading is the flag
+        // below rather than that one. An unwind with the flag clear is somebody
+        // else's bug and is reported as itself.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pty.terminate()));
+        assert!(
+            !SIGNALLED_A_FREED_PID.swap(false, Relaxed),
+            "terminate signalled a pid the kernel had already taken back"
+        );
+        assert!(
+            outcome.is_ok(),
+            "terminate panicked with no signal behind it"
+        );
+
+        // And a live session again, with the number no longer the child's.
+        // Everything the probe can see says signal; only the start time says the
+        // process answering to it is not the one this spawned.
+        let mut pty = shell("terminate_reissued");
+        let raw = i32::try_from(pty.child.id()).unwrap_or(0);
+        let started = pty
+            .started
+            .expect("a start time for a child that is running");
+        pty.started = Some(started.wrapping_add(1));
+        assert!(trap_hangups_of(raw), "the filter was taken twice already");
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pty.terminate()));
+        assert!(
+            !SIGNALLED_A_FREED_PID.load(Relaxed),
+            "terminate signalled a pid that had been handed to somebody else"
+        );
+        assert!(
+            outcome.is_ok(),
+            "terminate panicked with no signal behind it"
+        );
+        // The child outlives a `terminate` that left early, either way.
+        drop(pty.child.kill());
+        drop(pty.child.wait());
+    }
+
+    /// A shell on a PTY of its own, which is what the four tests around this
+    /// terminate.
+    fn shell(session_id: &str) -> Pty {
+        Pty::spawn(&Spawn {
             term: "dumb",
             win: WinSize {
                 cols: 80,
@@ -672,47 +841,27 @@ mod tests {
                 xpixel: 0,
                 ypixel: 0,
             },
-            session_id: "terminate_reaped",
+            session_id,
             cwd: Path::new("/tmp"),
             agent_sock: None,
-        };
-        let mut pty = Pty::spawn(&config).expect("spawn a shell on a pty");
-        rustix::io::write(pty.master(), b"exit\n").expect("ask the shell to leave");
-
-        // Collected here the way the daemon collects at an ordinary exit, which is
-        // what frees the pid the two reaches below are addressed to.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut reaped = false;
-        while std::time::Instant::now() < deadline && !reaped {
-            reaped = pty.try_wait().expect("wait for the shell").is_some();
-            std::thread::sleep(HANGUP_POLL_INTERVAL);
-        }
-        assert!(reaped, "the shell never exited");
-
-        let raw = i32::try_from(pty.child.id()).unwrap_or(0);
-        let pid = rustix::process::Pid::from_raw(raw).expect("the reaped child's pid");
-        // Deterministic rather than hopeful, for the reason above: a pid is not
-        // reissued while anything still names it.
-        assert!(
-            rustix::process::test_kill_process_group(pid).is_err()
-                && session_members(raw).is_empty(),
-            "nothing of the session may be left, or this test is about the other case"
-        );
-
-        if !trap_kills_of(raw) {
-            // A host that will not take the filter cannot answer the question, the
-            // way `the_walk_never_returns_this_process` cannot without a session id.
-            return;
-        }
-        pty.terminate();
-
-        assert!(
-            !SIGNALLED_A_FREED_PID.load(std::sync::atomic::Ordering::Relaxed),
-            "terminate signalled a pid the kernel had already taken back"
-        );
+        })
+        .expect("spawn a shell on a pty")
     }
 
-    /// Set by [`note_sigsys`] when [`trap_kills_of`] catches a signal going out.
+    /// Collects the child once it goes, the way the daemon does at an ordinary
+    /// exit — which is what frees its pid. `false` if it never left.
+    fn reaped_within(pty: &mut Pty) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if pty.try_wait().expect("wait for the shell").is_some() {
+                return true;
+            }
+            std::thread::sleep(HANGUP_POLL_INTERVAL);
+        }
+        false
+    }
+
+    /// Set by [`note_sigsys`] when [`trap_hangups_of`] catches a reach going out.
     static SIGNALLED_A_FREED_PID: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 
@@ -720,18 +869,20 @@ mod tests {
         SIGNALLED_A_FREED_PID.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Traps every `kill(2)` at `pid` or at its process group carrying a real
-    /// signal, so that issuing one sets [`SIGNALLED_A_FREED_PID`] instead of
-    /// reaching the kernel. `false` where the filter was refused.
+    /// Traps every `SIGHUP` at `pid` or at its process group, so that issuing one
+    /// sets [`SIGNALLED_A_FREED_PID`] instead of reaching the kernel. `false` where
+    /// the filter was refused.
     ///
-    /// Signal 0 is deliberately let through: that is the liveness probe the guard
-    /// under test makes, and trapping it would break the very thing being measured.
+    /// `SIGHUP` because both reaches begin with one, and nothing else does: the
+    /// liveness probe sends signal 0, and `Child::kill` on the way out sends
+    /// `SIGKILL` at a child that is still there, which is not a reach and must not
+    /// be counted as one.
     ///
     /// This thread's alone — no `TSYNC` flag — which is what keeps it off the rest
     /// of a `cargo test` run, where the other tests in this binary have threads of
     /// their own. It cannot be removed once installed, and is not: the thread a test
-    /// runs on ends with it.
-    fn trap_kills_of(pid: i32) -> bool {
+    /// runs on ends with it. Installing a second is how one test watches three pids.
+    fn trap_hangups_of(pid: i32) -> bool {
         // `struct seccomp_data`: the syscall number at 0, then the arguments from
         // 16, eight bytes each. Only the low half of an argument is loaded, which is
         // the whole of a pid and is where it sits on every little-endian target.
@@ -755,7 +906,12 @@ mod tests {
                 u32::try_from(libc::SYS_kill).expect("the kill syscall"),
             ),
             jump(load, 0, 0, SIGNAL),
-            jump(equals, 3, 0, 0),
+            jump(
+                equals,
+                0,
+                3,
+                u32::try_from(libc::SIGHUP).expect("a signal number"),
+            ),
             jump(load, 0, 0, TARGET),
             jump(equals, 2, 0, pid.cast_unsigned()),
             jump(equals, 1, 0, pid.wrapping_neg().cast_unsigned()),
