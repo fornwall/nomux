@@ -3164,6 +3164,22 @@ const WINCHED: &str = "NOMUX-42-WINCHED";
 /// holding only what comes after — and it also turns the reconnect below into
 /// arithmetic rather than a wait, since `base` is already tens of kilobytes above
 /// where this client resumes from.
+///
+/// The setup line is written out here rather than through `Client::make_ready`, and
+/// the reason is the whole of why the subshell announces itself. That helper's
+/// marker is printed by the shell *before* the command behind it starts, so at the
+/// moment it arrives the subshell may not exist and certainly has not run `trap` — a
+/// `SIGWINCH` in that window lands on the default disposition, which is to ignore
+/// it, and no marker ever comes. That is a failure of the fixture wearing the face
+/// of a daemon that never repainted, and it was seen once in a full parallel run.
+///
+/// Waiting for a *second* marker behind the helper's does not fix it: `read_until`
+/// returns the offset one past everything it consumed, so a subshell quick enough
+/// to have printed before the daemon's next read puts both markers in one frame,
+/// and the wait for the second one starts already past it. That failed one run in
+/// three. One marker, printed by the subshell itself, is the shape with no race in
+/// it: reaching it proves the `stty` in front of it took effect *and* that the trap
+/// is armed, which is what the two markers were separately for.
 fn repaint_transcript(name: &str, flags: u16) -> String {
     /// The child echoes far more than this, so what the client comes back to is a
     /// gap by construction.
@@ -3171,6 +3187,12 @@ fn repaint_transcript(name: &str, flags: u16) -> String {
     /// The last line of the filler, and how the client learns the child has caught
     /// up: `cat` echoes it, so seeing it means everything before it is behind us.
     const DRAINED: &str = "NOMUX-FILLER-DRAINED";
+    /// Printed by the subshell once its `SIGWINCH` trap is in place, which is behind
+    /// the `stty` in the same line — so arriving at it is proof of both. Arithmetic
+    /// for the reason [`WINCHED`] is: the line discipline echoes the command that
+    /// sets it up before `stty -echo` takes effect, and that echo carries `$((6*7))`
+    /// unexpanded.
+    const ARMED: &str = "NOMUX-42-TRAP-ARMED";
 
     let session = Session::start_with_ring(name, RING);
     let mut client = session.connect();
@@ -3180,22 +3202,19 @@ fn repaint_transcript(name: &str, flags: u16) -> String {
     // asleep rather than looping, and gone within seconds either way. It does not
     // normally have to be: everything here shares the shell's process group, so
     // closing the PTY master hangs the lot up.
-    let ready = client.make_ready(
-        "-echo -onlcr",
-        Some(
-            "set +m; (trap 'printf NOMUX-$((6*7))-WINCHED' WINCH; \
-             while :; do sleep 5 & wait; done) & cat",
-        ),
-        ok.resume_from,
-    );
-    let offset = ready.offset;
+    let setup = "stty -echo -onlcr; set +m; \
+                 (trap 'printf NOMUX-$((6*7))-WINCHED' WINCH; \
+                 printf NOMUX-$((6*7))-TRAP-ARMED; \
+                 while :; do sleep 5 & wait; done) & cat\n";
+    client.input(0, setup.as_bytes());
+    let (_, offset) = client.read_until(ARMED, ok.resume_from);
 
     // Echoed back by `cat`, which is what overflows the ring. In lines, because the
     // line discipline is still canonical: `cat` would see nothing at all until a
     // newline arrived, and the overflow would never happen.
     let filler = format!("{}{DRAINED}\n", format!("{}\n", "x".repeat(63)).repeat(512));
     let filler = filler.as_bytes();
-    let mut in_offset = ready.in_offset;
+    let mut in_offset = setup.len() as u64;
     client.input(in_offset, filler);
     in_offset += filler.len() as u64;
     // Past gaps, since overflowing the ring is the point; what this waits for is the
