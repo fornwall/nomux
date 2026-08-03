@@ -109,11 +109,10 @@ sh scripts/build-release.sh     # → target/dist/ plus SHA256SUMS
 ```
 
 It builds every musl target, prints a size table with the change against the
-per-target baseline in `scripts/size-baseline`, and fails if any binary exceeds the
-400 KiB budget or has grown more than 3% since that baseline — the cap on its own
-let a regression through unremarked once ([PLAN.md § P1](PLAN.md#p1--known-gaps)).
-`NOMUX_UPDATE_BASELINE=1` rewrites the baseline from that build and skips the growth
-gate, so an intended size change lands in the diff. There is no cross toolchain to
+per-target baseline in `scripts/size-baseline`, and fails a binary that misses either
+the size budget or the growth gate — both numbers, and the variable that rewrites the
+baseline for an intended change, are in
+[IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build). There is no cross toolchain to
 install — `rust-lld` links all four and each `rust-std` component carries its own
 musl objects — but the shipping configuration rebuilds the standard library with
 panics compiled out, which needs nightly and its sources:
@@ -147,13 +146,13 @@ purpose — under `attach` those descriptors are the SSH channel carrying the cl
 frame stream, and a diagnostic written there would land in the middle of it — so from
 that point on a failure would be silent. Two things answer that.
 
-A session that fails to *start* reports why to the `attach` that tried to start it,
+A session that fails to *start* reports why at the `attach` that tried to start it,
 which is where the reason is wanted:
 
 ```
 $ nomux attach work
-nomux: daemon for session work did not start: run directory /run/user/1000/nomux is
-       group-writable
+nomux: run directory /run/user/1000/nomux: mode 770 lets other users create
+       files in it; expected a directory owned by this user, mode 700
 ```
 
 Everything after that goes to syslog, tagged `nomux`, as `user.err` for failures and

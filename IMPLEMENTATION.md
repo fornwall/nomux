@@ -345,7 +345,7 @@ mkdir -p "$p" && cat > "$p/.up.$$" && chmod 755 "$p/.up.$$" \
 - Version in the filename: an upgraded client cannot break sessions an older daemon still holds.
 - Transfer over an **exec channel with `cat`**, not SFTP. `Subsystem sftp` gets disabled on hardened hosts, and modern `scp` is SFTP underneath. SSH channels are 8-bit clean, so no base64 tax.
 - Enable `zlib@openssh.com` on this channel: ~3× on a static binary, requiring nothing on the remote.
-- **The install directory is created, not checked**, and that is a materially weaker guarantee than §6.3 gives the *run* directory. `mkdir -p "$p"` takes whatever mode the umask leaves and asks nothing about where `$XDG_DATA_HOME` points — no `O_NOFOLLOW`, no uid check, no refusal of a group- or other-writable parent. Under a lax umask, or with `$XDG_DATA_HOME` aimed at a shared directory, another user can replace `nomux-$VER` between one connection and the next, and §5.1 `exec`s whatever is at that path on every connection that does not go straight to the socket. Nothing here can close it: the client composes this command line, so the check has to be part of it. Recorded rather than fixed, in [DESIGN.md § 8](DESIGN.md#8-security-model).
+- **The install directory is created, not checked**, and that is a materially weaker guarantee than §6.3 gives the *run* directory: `mkdir -p "$p"` takes whatever mode the umask leaves and asks nothing about where `$XDG_DATA_HOME` points, and §5.1 `exec`s whatever is at that path on every connection that does not go straight to the socket. Nothing here can close it — the client composes this command line, so the check has to be part of it. What it costs, and to whom, is [DESIGN.md § 8](DESIGN.md#8-security-model)'s to state.
 
 ### 5.3 Decision tree
 
@@ -565,8 +565,7 @@ Directory `0700`, socket `0600`, and the three plain files — pidfile, lock, la
 suppressed around each creating call, since `mkdir`, `bind` and `open` all subtract
 it, and a `<id>.lock` created `0400` under `umask 0200` is one no later process can
 open at all, which loses the mutex the control surface rests on. Filesystem sockets
-only — never abstract sockets, which are namespace- rather than permission-scoped
-and would be reachable by any local user.
+only, never abstract ones ([DESIGN.md § 8](DESIGN.md#8-security-model)).
 
 The directory is *checked* rather than merely created, because on every run but the
 first it already exists, and that it exists says nothing about what it is. It is
@@ -814,9 +813,10 @@ $RUNDIR/<id>.agent   ssh-agent socket, 0600 (§6.7)
 - Both establish first that the run directory is this user's alone (§6.3), before any name in it is read, connected to or signalled. Neither creates it: on a host that has never run a session, `list` prints nothing and exits 0, and `kill` reports the "no such session" that already holds.
 - `list` reads the directory and probes each socket with `connect`; `ECONNREFUSED` — or a socket that is no longer there at all — means stale, and stale entries are unlinked. The probe is safe because connecting is not attaching (§6.4) — it costs a live session nothing.
 - Unlinking happens under `<id>.lock`, and the probe is repeated once it is held, since that is the only point at which the answer cannot change between being read and being acted on. An entry whose lock somebody else holds is skipped: it is a session being started rather than garbage, and it stays collectable for as long as it stays dead. An entry whose lock is not *obtainable at all* is collected anyway, per §6.3 — a collector that stops collecting because of the mutex protecting it leaks under exactly the conditions it exists for.
-- `kill` takes `<id>.lock` first and holds it to the end, so nothing can spawn into the id it is removing; then probes the socket, reads the pidfile, sends `SIGTERM`, waits up to 2 s, then `SIGKILL`, then unlinks all five files. It waits up to 2 s for that lock — which is long enough to win the race against an attach creating the session, rather than merely lose it.
+- `kill` takes `<id>.lock` first and holds it to the end, so nothing can spawn into the id it is removing; then probes the socket, reads the pidfile, sends `SIGTERM`, waits up to 2 s, then `SIGKILL`, and unlinks all five files once the session has actually stopped answering. It waits up to 2 s for that lock — which is long enough to win the race against an attach creating the session, rather than merely lose it.
 - **A live session's files are never unlinked.** Where the socket answers and the pidfile cannot be read, `kill` exits non-zero and leaves all five alone. Removing them there takes the socket away from a daemon that is still holding the user's shell: the session answers nothing, appears in no listing, and the id is free for a second daemon to bind over. The one benign reason for that state is the daemon's own bind-to-publish window (§6.2), so a *missing* pidfile is waited out for 2 s; a mode that hides it, or a body that is not a pid, is reported at once, since waiting cannot change either.
-- `kill` exits non-zero rather than reporting a "no such session" it did not establish. Two states do that, and both are honest rather than ideal: the live-but-unreadable case above, and a lock still held at the 2 s deadline. That deadline is shorter than the five seconds an attach spends waiting for a daemon that never starts, so an attach parked on that timeout makes `kill` report a session that by then does not exist. The attach is about to fail, and its own failure is the better account of what happened.
+- `kill` exits non-zero rather than reporting a "no such session" it did not establish. Three states do that, and each is honest rather than ideal: the live-but-unreadable case above; a session still answering half a second after `SIGKILL`, which nothing survives — so the pid it published is not the process serving it, a stale pidfile whose number the kernel has reissued being how that happens, and the five files are left alone for the same reason as above; and a lock still held at the 2 s deadline. That deadline is shorter than the five seconds an attach spends waiting for a daemon that never starts, so an attach parked on that timeout makes `kill` report a session that by then does not exist. The attach is about to fail, and its own failure is the better account of what happened.
+- One further non-zero exit is not about establishing anything, and is the one case where the session really did stop: the unlink itself failing. Absence is success — the five go in one order, and a collection often finishes one that was interrupted — but a read-only run directory, an `EIO`, or an immutable `<id>.lock` is reported rather than swallowed. Every path is still attempted, so one stubborn file does not strand the other four, and the first real failure is what `kill` exits on. Silence here would be worse than it sounds: exit status is the caller's only account of whether the session went, and a surviving `<id>.lock` is a session `list` rediscovers and tries to collect on every run from then on.
 
 `<id>.label` exists because ids are opaque per-tab identifiers
 ([DESIGN.md § 5.1](DESIGN.md#51-identity)). Without it, a client that has lost its
@@ -988,10 +988,8 @@ builder's home directory 56 times over.
 
 Reproducibility is the producing half of a check whose consuming half does not exist
 yet. **The client is meant to pin a SHA-256 per architecture and verify it after
-upload; nothing does that today** — `SHA256SUMS` is built here and uploaded as a CI
-artifact that expires behind a login, no workflow triggers on a tag, and what a
-client should do with a binary whose hash it no longer recognises is undecided
-([PLAN.md § P3](PLAN.md#p3--release-process)). Release builds must pin a **dated**
+upload; nothing does that today** — `SHA256SUMS` is built here and nothing publishes
+it ([PLAN.md § P3](PLAN.md#p3--release-process)). Release builds must pin a **dated**
 nightly (`NOMUX_NIGHTLY`) regardless, since a floating one moves the bytes that hash
 would be taken over.
 
@@ -1058,3 +1056,39 @@ The child's own status is **not** propagated through this exit code, and the
 forbids, because protocol logic must exist in exactly one place. The client is also
 the side that can do something useful with it; a relay exit code is invisible to
 the user behind an SSH exec channel.
+
+Two conventions meet in that table, and only one of them is `sysexits.h`. 64 is
+`EX_USAGE` and is the only code borrowed from it. 126 and 127 are the *shell's*
+exec codes — "found but not executable" and "not found" — applied to a session
+rather than a command, which reads as an analogy and is one: `attach` is what a
+client runs over an SSH exec channel, so these reach it exactly where a shell's own
+would. They therefore collide with a shell's, and deliberately: a missing binary
+also exits 127 and a `noexec` home also exits 126. Nothing has to tell those apart
+from the codes, because §5.1's `NOMUX-BOOTSTRAP` line is what distinguishes them,
+and it arrives on stdout rather than in the status.
+
+`daemon`, `list` and `kill` share a smaller table:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | The postcondition holds: for `kill`, that there is no such session — whether it was stopped and its five files removed, or already gone before the command ran |
+| 64 | A session id that could never have named a session (`EX_USAGE`) — the sole source is `SessionPaths::new`, so it is always a malformed command line rather than an operation that failed |
+| 1 | Everything else |
+
+That last row is deliberately coarse, and §6.6 lists the four states behind it: a
+live session whose pidfile cannot be read, a session still answering after
+`SIGKILL`, a spawn lock still held at the 2 s deadline, and an unlink that failed
+over a session that did stop. The temptation is to give each a code of its own out
+of the range `EX_USAGE` came from, and it is worth writing down why that is
+refused. `EX_TEMPFAIL` is the fit that suggests itself and is wrong for two of the
+four: it means *"user is invited to retry"*, and the pid a stale pidfile names is
+not the process serving the session, so retrying re-signals somebody else's
+process — the code would be recommending the harm. Only the held lock is genuinely
+temporary. Splitting the rest would add a third convention to a surface §6.6
+freezes, for a private contract with one consumer, and buy resolution the stderr
+line already carries in words.
+
+What a client actually wants from a non-zero `kill` is whether the session is still
+alive, and that question has a better answer than an exit code: `list`, which is
+the same frozen surface and exists to answer it. So the contract here stays binary
+— zero means established, non-zero means not — which is the form that cannot rot.

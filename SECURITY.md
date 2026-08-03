@@ -17,9 +17,9 @@ There is no SLA — this is a personal project — but reports are read.
 
 nomux has no released version and none receives security updates; fixes land on
 `main`. See [DESIGN.md § 8](DESIGN.md#8-security-model) for the threat model and
-[PLAN.md](PLAN.md) for known gaps — notably that publishing and verifying the
-per-architecture binary checksums is unfinished: the release build emits
-`SHA256SUMS`, but nothing yet puts it anywhere a client can read it.
+[PLAN.md](PLAN.md) for known gaps — notably
+[§ P3](PLAN.md#p3--release-process)'s: nothing publishes the per-architecture
+checksums a client would verify an uploaded binary against.
 
 ## Not in scope
 
@@ -31,10 +31,9 @@ report twice.
   already edit `.bashrc`. nomux adds no capability shell startup files do not
   already grant (DESIGN.md § 8).
 
-  Note the qualifier: that argument is about the same user, and does not cover a
-  *different* one. Another local user can replace a binary the victim then execs,
-  which is a real gap and is in scope; it is recorded in
-  [DESIGN.md § 8](DESIGN.md#8-security-model) with the mechanism that opens it.
+  Note the qualifier: it is about the same user. A *different* one replacing a
+  binary the victim then execs is a real gap and is in scope —
+  [DESIGN.md § 8](DESIGN.md#8-security-model) has the mechanism.
 - **The wire protocol's lack of authentication.** A session's endpoints are unix
   sockets — `<id>.sock`, plus `<id>.agent` when agent forwarding is enabled — each
   `0600` inside a `0700` run directory. Reaching either already means being the user

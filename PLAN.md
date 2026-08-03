@@ -32,18 +32,20 @@ protocol it speaks. Mechanics: [IMPLEMENTATION.md](IMPLEMENTATION.md).
   for the same reason the sizes live in `scripts/size-baseline`. What each layer
   covers, and the two invariants the whole thing exists to protect:
   [IMPLEMENTATION.md § 9](IMPLEMENTATION.md#9-testing).
-- **Release** — all four musl targets build reproducibly, inside the 400 KiB budget
-  and against a per-target growth gate, from `scripts/build-release.sh`. armv7 has by
-  far the least headroom, for the reason in P1. The sizes live in
-  `scripts/size-baseline`, which a build writes.
+- **Release** — all four musl targets build reproducibly and inside the size and
+  growth gates `scripts/build-release.sh` enforces
+  ([IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)). armv7 has by far the least
+  headroom, for the reason in P1. The sizes live in `scripts/size-baseline`, which a
+  build writes.
 - **Not started** — the release process of P3, and the client, which is a separate
   repository and whose server-side contract is the last section of this file.
 
 ## P1 — known gaps
 
-Two, and in both the honest answer is a known cost rather than a missing line of
-code. Each was found by review or by measurement rather than by guessing, and is
-recorded with what it was measured against.
+Four, and in the first two the honest answer is a known cost rather than a
+missing line of code; the third is a gap nothing can close, and the fourth a limit
+nobody has built yet. Each was found by review or by measurement rather than by
+guessing, and is recorded with what it was measured against.
 
 - **A hand-started daemon has a bind-to-publish window.** `attach` holds the spawn
   lock until `<id>.pid` exists, so a session it created is never visible without its
@@ -75,7 +77,6 @@ recorded with what it was measured against.
   least likely to be on a fast link. It went unnoticed because the release script
   enforced the cap and not the delta; the 3% gate that now exists would fail the
   same commit.
-
 - **An abort still says nothing, and cannot.** The daemon now reports startup failures
   to the `attach` that spawned it and everything afterwards to syslog, which covers
   every failure it can see coming. An *abort* is not one of those: the shipping build
