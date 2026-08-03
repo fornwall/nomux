@@ -44,11 +44,11 @@ protocol it speaks. Mechanics: [IMPLEMENTATION.md](IMPLEMENTATION.md).
 
 ## P1 — known gaps
 
-Five, and in the first two the honest answer is a known cost rather than a
-missing line of code; the third is a gap nothing can close, the fourth a limit
-nobody has built yet, and the fifth the one wait on the control surface that has no
-bound. Each was found by review or by measurement rather than by
-guessing, and is recorded with what it was measured against.
+Six, and in the first two the honest answer is a known cost rather than a missing line
+of code; the third is a gap nothing can close, the fourth a limit nobody has built
+yet, the fifth the one wait on the control surface that has no bound, and the sixth a
+hole in that surface's own promise. Each was found by review or by measurement rather
+than by guessing, and is recorded with what it was measured against.
 
 - **A hand-started daemon has a bind-to-publish window.** `attach` holds the spawn
   lock until `<id>.pid` exists, so a session it created is never visible without its
@@ -112,6 +112,24 @@ guessing, and is recorded with what it was measured against.
   mitigation and not a fix, `somaxconn` being finite. The fix is a non-blocking
   `connect` with a `poll` deadline, read exactly as the blocking one is: anything that
   is not a refusal is a session too alive to unlink.
+- **An id this run directory cannot hold makes its files invisible *and*
+  uncollectable.** The `sun_path` refusal in
+  [IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket) is environment-dependent — the
+  same id fits under `/run/user/1000` and not under the `$HOME` fallback — and both
+  modes meet it by giving up. `list` discovers the id from the filenames and then drops
+  it, because building its paths is fallible in the middle of the sweep; `kill` cannot
+  be told about it at all, since the id it is handed is refused before anything is
+  read. Measured with four files planted under a 50-byte id in a 53-byte run directory:
+  `list` prints nothing and exits 0, `kill` exits 64, all four files are still there
+  afterwards. This binary cannot create that state, but § 6.6 freezes the layout
+  *precisely* so that a directory can be managed by a binary that did not create it,
+  and a bind mount, a symlinked `XDG_RUNTIME_DIR` or a file repaired by hand all reach
+  it. The argument in § 6.3 for refusing early — that refusing at the `bind` would
+  leave a `<id>.lock` behind from the command whose job is to collect it — is one-sided
+  while the alternative leaves everything already there for good. What closes it is
+  `list` reporting an id it cannot build paths for instead of skipping it, and `kill`
+  collecting by name in the case where no socket address can be formed, which is
+  exactly the case where there is no live session to protect.
 
 ## P2 — structure
 
@@ -181,6 +199,18 @@ guessing, and is recorded with what it was measured against.
   and `harness::write_uninterrupted` are what every socket call in the harness goes
   through, for the same reason `nbio::read` is the only raw read in the daemon, and a
   bare `stream.read` added later is what would bring this back.
+- **Collection names the five files it knows, so every name added after it leaks
+  once.** The documentation half of this is done:
+  [IMPLEMENTATION.md § 6.6](IMPLEMENTATION.md#66-frozen-control-surface) now promises
+  the five existing names, their permissions and the pidfile format rather than the
+  layout as a whole, and says what growth costs. The code half is untouched.
+  `SessionPaths::removal_order` is five paths and `control::session_id_of` matches five
+  extensions, so a `kill` older than a name neither discovers a session by it nor
+  removes it — one file per collected session, for as long as the two versions share a
+  host, which is what `<id>.agent` would have cost had it arrived after a release.
+  Removing and discovering `<id>.*` instead covers every future name at once, and the
+  window for it is closing rather than open: cheap while five names are all there have
+  ever been, impossible once a binary in the wild depends on the enumeration.
 
 ## P3 — release process
 
@@ -254,7 +284,7 @@ Not backlog — recorded so they are not rediscovered as gaps.
 | Cross-device handover | [DESIGN.md § 10](DESIGN.md#10-open-questions), with its three prerequisites |
 | `libvterm` overflow snapshot | [DESIGN.md § 10](DESIGN.md#10-open-questions) |
 | Ring capacity default | [DESIGN.md § 10](DESIGN.md#10-open-questions); `NOMUX_RING_BYTES` makes it tunable, but the default is unchosen. § 10 has why the memory figure that argues for keeping it small overstates what a session holds; what argues for a larger default is the case § 10 does not name — an ordinary twenty-minute disconnect across a build, which overruns 4 MiB and loses the output the reconnect was for |
-| `daemon::run` taking the spawn lock | `attach` holds it across the whole spawn, so a daemon taking it would block on its own parent until that attach times out. Closed from the attach side instead ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)) |
+| `daemon::run` *waiting* for the spawn lock | It takes one without blocking and goes on without one where somebody holds it. Waiting would park the session's own creation behind the `attach` that spawned it, since that attach holds this very lock on its behalf until the pidfile exists ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)) |
 | Addressing the run files through a validated directory descriptor | There is no `bindat(2)`, so the sockets must resolve by name whatever the check returns ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)) |
 
 ## Client-side, not this repo
