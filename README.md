@@ -175,12 +175,10 @@ sh scripts/build-release.sh     # → target/dist/ plus SHA256SUMS
 
 It builds every musl target, prints a size table with the change against the
 per-target baseline in `scripts/size-baseline`, and fails a binary that misses either
-the size budget or the growth gate — both numbers, and the variable that rewrites the
-baseline for an intended change, are in
-[IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build). There is no cross toolchain to
-install — `rust-lld` links all four and each `rust-std` component carries its own
-musl objects — but the shipping configuration rebuilds the standard library with
-panics compiled out, which needs nightly and its sources:
+the size budget or the growth gate. There is no cross toolchain to install —
+`rust-lld` links all four and each `rust-std` component carries its own musl
+objects — but the shipping configuration rebuilds the standard library with panics
+compiled out, which needs nightly and its sources:
 
 ```sh
 nightly=$(cat scripts/nightly-version)
@@ -192,17 +190,14 @@ rustup target add --toolchain "$nightly" \
   riscv64gc-unknown-linux-musl
 ```
 
-That is not an optimisation: with the released standard library, every target
-misses the size budget. `NOMUX_STABLE_STD=1` builds against the pinned stable
-toolchain and is expected to fail the gate. The nightly is dated rather than
-floating, and `scripts/nightly-version` is where it is named: the script and CI both
-read it from there, so a local build and the runner measure the same bytes against a
-baseline recorded by the same compiler. `NOMUX_NIGHTLY` overrides it for a build that
-is not a release; a release must pin, because the client is meant to pin a SHA-256
-per architecture and a floating compiler moves the bytes that hash is taken over.
-Nothing verifies a hash today — `SHA256SUMS` is built and nothing publishes it
-([PLAN.md § P3](PLAN.md#p3--release-process)). The measurements are in
-[IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build).
+That nightly is dated rather than floating, and `scripts/nightly-version` is the
+one place it is named — the build script and CI read it from there too. Why the
+standard library is rebuilt at all, why the pin has to be dated, what
+`NOMUX_STABLE_STD=1`, `NOMUX_NIGHTLY` and `NOMUX_UPDATE_BASELINE=1` are for, and
+the two numbers the script gates on are
+[IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)'s; when the pin moves, and what
+becomes of `SHA256SUMS` after the script writes it, are
+[PLAN.md § P3](PLAN.md#p3--release-process)'s.
 
 ## Diagnostics
 

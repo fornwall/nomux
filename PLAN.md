@@ -195,24 +195,20 @@ The four musl targets build, land under the 400 KiB budget, and are byte-reprodu
   fixture from the same test — hex per frame, checked in — would let an independent
   implementation be verified against the identical bytes. Until something does, the
   protocol has never met a second implementation.
-- **Four documented numbers and arms still have nothing behind them.** Each was found
+- **Three documented numbers and arms still have nothing behind them.** Each was found
   by reading § 9 against the suite rather than by a failure, and each is cheap except
   where noted. `MAX_CHANNEL_QUEUE` — an agent channel whose local peer stops reading
   is closed once its queue passes 256 KiB; `agent_channels_are_capped` covers the
-  count cap, not the byte cap. `MAX_RING_CAPACITY` — the ceiling exists because
-  `VecDeque::with_capacity` aborts the process on a request it cannot serve, so the
-  promise holds for a `NOMUX_RING_BYTES` that is mistyped downwards and is untested
-  for one mistyped upwards; it needs its own test rather than a row in the existing
-  table, since a huge value clamps to 1 GiB rather than falling back to the default.
-  The `frame is not valid from a client` arm — a server-only frame arriving *after* a
-  successful greeting, which is a different function from the ungreeted refusal that
-  is tested, and a different claim: that the session survives a client which
-  misbehaves once attached. And exit codes 126 and 127, which are deliberately left:
-  both are `attach`'s mapping of what it met, so reaching either honestly means a real
-  relay — a mode that goes on to serve and so cannot be run to completion by a test
-  that waits for it. What an argument-parsing test could reach is only the
-  `io::ErrorKind`-to-number mapping, and asserting on that pins which kind a refusal
-  happens to carry rather than anything a client depends on.
+  count cap, not the byte cap. The `frame is not valid from a client` arm — a
+  server-only frame arriving *after* a successful greeting, which is a different
+  function from the ungreeted refusal that is tested, and a different claim: that the
+  session survives a client which misbehaves once attached. And exit codes 126 and
+  127, which are deliberately left: both are `attach`'s mapping of what it met, so
+  reaching either honestly means a real relay — a mode that goes on to serve and so
+  cannot be run to completion by a test that waits for it. What an argument-parsing
+  test could reach is only the `io::ErrorKind`-to-number mapping, and asserting on
+  that pins which kind a refusal happens to carry rather than anything a client
+  depends on.
 - **`MAX_PENDING_READ` has no test and cannot easily have one.** The kernel's unix
   send buffer is roughly 212 KiB, five times tighter than the 1 MiB cap, so on a
   stock host the cap never binds and no socket-level test can pin it. Raising the
@@ -229,7 +225,7 @@ Not backlog — recorded so they are not rediscovered as gaps.
 | Read-only mirrors | Out of scope, [DESIGN.md § 2](DESIGN.md#2-scope) |
 | Cross-device handover | [DESIGN.md § 10](DESIGN.md#10-open-questions), with its three prerequisites |
 | `libvterm` overflow snapshot | [DESIGN.md § 10](DESIGN.md#10-open-questions) |
-| Ring capacity default | [DESIGN.md § 10](DESIGN.md#10-open-questions); `NOMUX_RING_BYTES` makes it tunable, but the default is unchosen. Revisit knowing the memory figure that argues for keeping it small is an overestimate: a ring that size is one allocation large enough to be `mmap`ed and faulted lazily, so a session holds `min(output produced, capacity)` resident, not `capacity`. Eight idle sessions cost eight small rings. What argues for a larger default is the case § 10 does not name — an ordinary twenty-minute disconnect across a build, which overruns 4 MiB and loses the output the reconnect was for |
+| Ring capacity default | [DESIGN.md § 10](DESIGN.md#10-open-questions); `NOMUX_RING_BYTES` makes it tunable, but the default is unchosen. § 10 has why the memory figure that argues for keeping it small overstates what a session holds; what argues for a larger default is the case § 10 does not name — an ordinary twenty-minute disconnect across a build, which overruns 4 MiB and loses the output the reconnect was for |
 | `daemon::run` taking the spawn lock | `attach` holds it across the whole spawn, so a daemon taking it would block on its own parent until that attach times out. Closed from the attach side instead ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)) |
 | Addressing the run files through a validated directory descriptor | There is no `bindat(2)`, so the sockets must resolve by name whatever the check returns ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)) |
 

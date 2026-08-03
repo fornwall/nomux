@@ -228,7 +228,7 @@ sequenceDiagram
   participant C as Client
   participant S as sshd
   participant D as daemon
-  C->>S: exec: exec $p/nomux-$VER attach $ID ; echo "NOMUX-BOOTSTRAP $(uname -s) $(uname -m) $p"
+  C->>S: exec: exec $p/nomux-$VER attach $ID<br/>echo "NOMUX-BOOTSTRAP $(uname -s) $(uname -m) $p"
   S-->>C: NOMUX-BOOTSTRAP Linux aarch64 /home/u/.local/share/nomux
   C->>S: exec: cat to tmp, chmod, mv, then exec nomux-$VER attach $ID
   S->>D: spawn daemon, connect socket
