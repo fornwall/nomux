@@ -58,7 +58,11 @@ jobs:
       # Every tracked `*.sh`, not `scripts/*.sh`: the prek hook matches the path
       # suffix wherever it lands, and the gate that runs on a `--no-verify` commit is
       # the wrong one to have checking less than the local hook does.
+      # `shell: bash` for the `-o pipefail` it brings: the default `bash -e {0}` has
+      # none, so a failing `git ls-files` would be masked by the zero `xargs` exits
+      # when handed nothing, and the step would pass having checked no files.
       - run: git ls-files -z '*.sh' | xargs -0 -r shellcheck --shell=sh
+        shell: bash
 
       - run: cargo fmt --all --check
 
@@ -76,7 +80,7 @@ jobs:
       # nextest cannot run doctests.
       - run: cargo test --locked --doc --workspace
 
-  # Its own job: the script rebuilds the whole workspace under
+  # Its own job: the script rebuilds `nomux` and its session tests under
   # `--cfg nomux_fault_injection`, which shares no artifacts with the job above, and
   # keeping it parallel leaves it off the critical path.
   takeover-guard:
@@ -115,20 +119,56 @@ jobs:
       # file, so this job and a laptop build use one compiler and their sizes are
       # comparable against a baseline recorded by it. A literal here would let the two
       # drift, which is how a local run comes to fail on growth nobody introduced.
+      #
+      # A plain assignment rather than `echo "...=$(cat ...)"`, because the default
+      # shell is `bash -e` without `pipefail`: a failing substitution inside `echo`
+      # does not fail `echo`, so a renamed or missing file left this step green with
+      # an empty value — for the one file that names the release compiler. `set -e`
+      # does fail an assignment whose substitution failed.
+      #
+      # An output rather than $GITHUB_ENV, because $GITHUB_ENV would put NOMUX_NIGHTLY
+      # in the environment of every later step, including the build. That variable is
+      # the script's override, and IMPLEMENTATION.md § 8 says a release may not take
+      # it. As an output it reaches only the step below, so build-release.sh reads
+      # scripts/nightly-version itself — the same branch a laptop build takes.
       - name: Read the pinned release nightly
-        run: echo "NOMUX_NIGHTLY=$(cat scripts/nightly-version)" >> "$GITHUB_ENV"
+        id: nightly
+        run: |
+          nightly=$(cat scripts/nightly-version)
+          # Checked rather than passed on, because two readers parse this file and
+          # they parse it differently: build-release.sh takes it whole with `cat`,
+          # while $GITHUB_OUTPUT is line-oriented, so a second line would install one
+          # compiler and build with another. Empty is the same class of problem from
+          # the other side — `cat` succeeds on an empty file, so the assignment above
+          # cannot catch it, and the failure surfaces a step later as a rustup usage
+          # error about a file this step has already read. One plain toolchain name
+          # is all either reader accepts; anything else stops here, next to the file.
+          case "$nightly" in
+              '' | *[!A-Za-z0-9._-]*)
+                  echo "scripts/nightly-version names the release compiler and must" >&2
+                  echo "  hold one plain toolchain name; it holds: '$nightly'" >&2
+                  exit 1
+                  ;;
+          esac
+          echo "version=$nightly" >> "$GITHUB_OUTPUT"
 
       # The shipping build rebuilds std with panics compiled out, which needs a
       # nightly compiler plus its sources (IMPLEMENTATION.md § 8).
+      #
+      # Through `env:` and a quoted expansion, not `${{ }}` spliced into the script:
+      # on a pull request the file's contents are the contributor's, and a value
+      # interpolated into `run:` is executed rather than passed.
       - name: Install the release nightly with the musl targets
+        env:
+          RELEASE_NIGHTLY: ${{ steps.nightly.outputs.version }}
         run: >
-          rustup toolchain install "$NOMUX_NIGHTLY" --profile minimal --no-self-update
+          rustup toolchain install "$RELEASE_NIGHTLY" --profile minimal --no-self-update
           --component rust-src
           --target x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,armv7-unknown-linux-musleabihf,riscv64gc-unknown-linux-musl
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          key: musl-${{ env.NOMUX_NIGHTLY }}
+          key: musl-${{ steps.nightly.outputs.version }}
 
       # Owns the target list and the size budget; exits non-zero if a binary is over.
       - run: sh scripts/build-release.sh

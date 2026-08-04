@@ -44,14 +44,14 @@ repo=$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo"
 
 # A separate target directory: RUSTFLAGS changes the fingerprint of every crate, so
-# sharing one would rebuild the whole workspace twice on every switch. Absolute, so it
-# does not depend on anyone's working directory.
+# sharing one would rebuild everything twice on every switch. Absolute, so it does not
+# depend on anyone's working directory.
 base_target="${CARGO_TARGET_DIR:-$repo/target}"
 
 log=$(mktemp)
 cleanup() { rm -f "$log"; }
 trap cleanup EXIT
-# INT TERM HUP as well as EXIT: each run rebuilds the whole workspace, so Ctrl-C is an
+# INT TERM HUP as well as EXIT: each run compiles from scratch, so Ctrl-C is an
 # ordinary way to end one, and a shell killed by a signal is not guaranteed to run its
 # EXIT trap. Exiting from the handler keeps an interrupted cargo out of the failure
 # path below; 130 rather than 1, so it is not read as the guard reporting a failure.
@@ -59,10 +59,18 @@ trap 'cleanup; exit 130' INT TERM HUP
 
 # The directory names are kept short on purpose: the integration tests bind unix
 # sockets underneath them, and `sockaddr_un` truncates at 108 bytes.
+#
+# `-p nomux --test session` rather than `--workspace`: the guard is one test in
+# crates/nomux/tests/session.rs, and this runs twice under RUSTFLAGS that share no
+# artifacts, so everything outside that target is compiled twice and run never.
+# `--workspace` also built the chaos, spawn_lock, codec and wire test binaries and
+# proptest with its dependency tree behind them. Narrowing does not lose the daemon:
+# the harness resolves it through `env!("CARGO_BIN_EXE_nomux")`, which cargo defines
+# by building the package's binary for its own integration tests.
 run_with() {
     CARGO_TARGET_DIR="$base_target/fi-$2" \
     RUSTFLAGS="${RUSTFLAGS:-} --cfg $1" \
-        cargo nextest run --locked --workspace -E "test($test_name)" >"$log" 2>&1
+        cargo nextest run --locked -p nomux --test session -E "test($test_name)" >"$log" 2>&1
 }
 
 # Output is captured rather than discarded, and replayed on every failure path. A

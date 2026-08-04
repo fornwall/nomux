@@ -142,8 +142,10 @@ else
     # habit the growth gate exists to prevent — or it masks a real regression under a
     # compiler that happens to have got smaller. One file, read here and by CI, so a
     # laptop and the runner measure the same bytes by construction. It holds the
-    # toolchain name and nothing else: both readers take the file verbatim, so a
-    # comment added to it would become the toolchain name.
+    # toolchain name and nothing else: this reader takes the file verbatim and CI's
+    # round-trips it through the line-oriented $GITHUB_OUTPUT, so a file the two could
+    # read differently — a second line, a comment, surrounding space — is rejected
+    # there rather than installed under one name and measured under another.
     nightly="${NOMUX_NIGHTLY:-}"
     if [ -z "$nightly" ] && [ -r "$nightly_file" ]; then
         nightly=$(cat "$nightly_file")
@@ -178,22 +180,42 @@ else
     esac
 fi
 
+# Flags are joined by U+001F and handed to cargo as CARGO_ENCODED_RUSTFLAGS, not as a
+# space-separated RUSTFLAGS. Cargo splits RUSTFLAGS on whitespace, and three of the
+# flags below interpolate a path — $repo, the sysroot, $CARGO_HOME — so a single space
+# anywhere in any of them split one `--remap-path-prefix=FROM=TO` into two arguments
+# and the build died on `--remap-path-prefix must contain '=' between FROM and TO`.
+# That was the one place the "run from anywhere" promise in the header did not hold.
+# CARGO_ENCODED_RUSTFLAGS splits on the separator alone, so a path may contain
+# anything but that byte.
+#
+# It is all-or-nothing: setting it makes cargo ignore RUSTFLAGS entirely, so every
+# flag has to be here rather than split across the two. And every flag has to be one
+# whole argument, since nothing splits them further: `-Clink-self-contained=yes`, not
+# the `-C link-self-contained=yes` that whitespace splitting used to take apart —
+# passed whole, rustc reads the option name as ` link-self-contained` and refuses it.
+#
+# printf rather than a literal control character in the source, so the byte survives
+# an editor, a diff and a copy-paste; /bin/sh is dash on the runner and this is a
+# POSIX octal escape, not a bashism.
+us=$(printf '\037')
+
 # Every path that could differ between two machines building the same commit. $repo is
 # remapped even though cargo already passes workspace paths relative, so that a future
 # path-dependent dependency cannot quietly reintroduce the problem.
 sysroot=$(rustc --print sysroot)
 remap="--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
-remap="$remap --remap-path-prefix=$sysroot=/rust"
-remap="$remap --remap-path-prefix=$repo=/nomux"
+remap="$remap$us--remap-path-prefix=$sysroot=/rust"
+remap="$remap$us--remap-path-prefix=$repo=/nomux"
 
 # crt-static is explicit because riscv64gc-unknown-linux-musl is the one target of the
 # four whose spec does not default to it. Left alone it links dynamically against
 # libc.so and libgcc_s, which fails outright under rust-lld — and had it linked, it
 # would have produced the one thing this project cannot ship: a binary with runtime
 # dependencies on a host we know nothing about.
-rustflags="-C link-self-contained=yes -C target-feature=+crt-static $remap"
+rustflags="-Clink-self-contained=yes$us-Ctarget-feature=+crt-static$us$remap"
 if [ "$build_std" = 1 ]; then
-    rustflags="$rustflags -Zunstable-options -Cpanic=immediate-abort"
+    rustflags="$rustflags$us-Zunstable-options$us-Cpanic=immediate-abort"
     set -- -Z build-std=std,panic_abort
 else
     set --
@@ -236,7 +258,7 @@ trap 'dist_cleanup; exit 130' INT TERM HUP
 
 for target in $targets; do
     echo "building $target ($toolchain)..." >&2
-    RUSTFLAGS="$rustflags" cargo build --locked --release --target "$target" --bin nomux "$@" >&2
+    CARGO_ENCODED_RUSTFLAGS="$rustflags" cargo build --locked --release --target "$target" --bin nomux "$@" >&2
     cp "${CARGO_TARGET_DIR:-$repo/target}/$target/release/nomux" "$dist/nomux-$target"
 
     # The remap check, actually run. Two clean builds on one machine are

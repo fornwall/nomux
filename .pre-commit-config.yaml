@@ -6,8 +6,9 @@
 # They trigger on Rust sources and on manifests, since the lint configuration
 # itself lives in Cargo.toml.
 #
-# `--locked` on every cargo hook, matching .github/workflows/ci.yml: without it a
-# hook may quietly update Cargo.lock to make itself pass.
+# `--locked` on every compiling cargo hook, matching .github/workflows/ci.yml: without
+# it a hook may quietly update Cargo.lock to make itself pass. `cargo fmt` resolves
+# nothing and rejects the flag outright, so it is the one hook without it.
 repos:
   - repo: local
     hooks:
