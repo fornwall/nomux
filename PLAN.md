@@ -31,9 +31,9 @@ protocol it speaks. Mechanics: [IMPLEMENTATION.md](IMPLEMENTATION.md).
   rather than a hung run, and one test is `#[ignore]`d because it sits out the real
   30 s first-attach reap, which CI covers with `--run-ignored all`. The count is
   whatever `cargo nextest list --workspace` prints; it lives there rather than here,
-  for the same reason the sizes live in `scripts/size-baseline`. What each layer
-  covers, and the two invariants the whole thing exists to protect:
-  [IMPLEMENTATION.md § 9](IMPLEMENTATION.md#9-testing).
+  for the same reason the sizes live in `scripts/size-baseline`. Which layers there
+  are and where each one lives, and the two invariants the whole thing exists to
+  protect: [IMPLEMENTATION.md § 9](IMPLEMENTATION.md#9-testing).
 - **Release** — all four musl targets build reproducibly and inside the size and
   growth gates `scripts/build-release.sh` enforces
   ([IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)). armv7 has by far the least
@@ -60,15 +60,12 @@ than by guessing, and is recorded with what it was measured against.
   closing it: the lock goes as soon as the path exists, and the pidfile is created a
   syscall before it is filled, so the ordinary spawn can be caught holding an empty
   one. Both halves — no file, and a file with nothing in it — are waited out, so only
-  a daemon that stays unpublished past that grace is reported. The third half was the
-  one this argument missed, and is now closed: a pidfile that exists and parses is
-  still not evidence that the number in it is the process behind the socket, since a
-  `SIGKILL`ed daemon leaves its files and the kernel is free to reissue its pid. A
-  `kill` that signals such a number kills a stranger, and used to unlink the live
-  session's files afterwards regardless. It now confirms the session actually stopped
-  before it removes anything, and reports the pid as not the one serving the session
-  otherwise — so § 6.6's "a live session's files are never unlinked" holds without a
-  caveat, and only the identification window above is left.
+  a daemon that stays unpublished past that grace is reported. A pidfile that exists
+  and parses is not evidence either, since a `SIGKILL`ed daemon leaves its files and
+  the kernel is free to reissue its pid — so `kill` confirms the session actually
+  stopped before it removes anything, and otherwise reports the pid as not the one
+  serving the session. § 6.6's "a live session's files are never unlinked" therefore
+  holds without a caveat, and the identification window above is what is left.
 - **The run-directory check costs armv7 66 KiB.** Bisected to `4d5d465`, the commit
   that introduced it, and the jump is that architecture alone: 148,292 → 215,884
   bytes, a 46% step against roughly 6 KiB for the whole branch on each of the other
@@ -77,10 +74,10 @@ than by guessing, and is recorded with what it was measured against.
   in the `open`/`fstat`/`Mode` path as 32-bit ARM codegen renders it. It stays inside the
   budget, so this is a size regression rather than a broken release — but it is very
   nearly a third of the binary users upload over cellular, and armv7 is the target
-  least likely to be on a fast link. It went unnoticed because the release script
-  enforced the cap and not the delta; the 3% gate that now exists would fail the
-  same commit.
-- **An abort still says nothing, and cannot.** The daemon now reports startup failures
+  least likely to be on a fast link. The 3% growth gate
+  ([IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)) is what would fail the same
+  commit today; the cap alone did not.
+- **An abort still says nothing, and cannot.** The daemon reports startup failures
   to the `attach` that spawned it and everything afterwards to syslog, which covers
   every failure it can see coming. An *abort* is not one of those: the shipping build
   is `-Cpanic=immediate-abort` with `strip = "symbols"`, so allocation failure and any
@@ -105,11 +102,11 @@ than by guessing, and is recorded with what it was measured against.
   `connect` to a listener whose backlog is full does not fail, it waits. A daemon that
   has stopped accepting with a full queue therefore parks both modes for as long as it
   stays that way: against a listener that never accepts, with its queue filled, `list`
-  and `kill` both come back only as rc=124 from `timeout`. It is standing rather than
-  new — the probe has been a blocking `connect` since `a886313`, the commit that first
-  wrote this surface — and it is the reason the backlog is the host's ceiling rather
-  than a literal ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)), which is
-  mitigation and not a fix, `somaxconn` being finite. The fix is a non-blocking
+  and `kill` both come back only as rc=124 from `timeout`. It is as old as this
+  surface rather than new — the probe has been a blocking `connect` since `a886313`,
+  the commit that first wrote it — and it is the reason the backlog is the host's
+  ceiling rather than a literal ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)),
+  which is mitigation and not a fix, `somaxconn` being finite. The fix is a non-blocking
   `connect` with a `poll` deadline, read exactly as the blocking one is: anything that
   is not a refusal is a session too alive to unlink.
 - **An id this run directory cannot hold makes its files invisible *and*
@@ -211,10 +208,10 @@ than by guessing, and is recorded with what it was measured against.
   through, for the same reason `nbio::read` is the only raw read in the daemon, and a
   bare `stream.read` added later is what would bring this back.
 - **Collection names the five files it knows, so every name added after it leaks
-  once.** The documentation half of this is done:
-  [IMPLEMENTATION.md § 6.6](IMPLEMENTATION.md#66-frozen-control-surface) now promises
-  the five existing names, their permissions and the pidfile format rather than the
-  layout as a whole, and says what growth costs. The code half is untouched.
+  once.** The documentation half of this is done —
+  [IMPLEMENTATION.md § 6.6](IMPLEMENTATION.md#66-frozen-control-surface) promises the
+  five existing names, their permissions and the pidfile format rather than the layout
+  as a whole, and says what growth costs. The code half is untouched.
   `SessionPaths::removal_order` is five paths and `control::session_id_of` — whose one
   caller is `list` — matches five extensions, so a *binary* older than a name neither
   discovers a session by it nor removes it: one file per collected session for as long
@@ -230,7 +227,7 @@ than by guessing, and is recorded with what it was measured against.
 The four musl targets build, land under the 400 KiB budget, and are byte-reproducible;
 `scripts/build-release.sh` enforces all three. What is left is process rather than code:
 
-- Decide when the pinned nightly moves. It is named once now, in `scripts/nightly-version`, which the build script and CI both read — so a local build and the runner measure the same bytes against a baseline recorded by the same compiler. What is undecided is the *policy*: the toolchain and `scripts/size-baseline` have to move in one commit, because the figures are compiler-dependent and a bump that leaves the baseline behind either fails the 3% gate for no reason or hides a real regression behind a compiler that got smaller.
+- Decide when the pinned nightly moves. It is named once, in `scripts/nightly-version`, which the build script and CI both read — so a local build and the runner measure the same bytes against a baseline recorded by the same compiler. What is undecided is the *policy*: the toolchain and `scripts/size-baseline` have to move in one commit, because the figures are compiler-dependent and a bump that leaves the baseline behind either fails the 3% gate for no reason or hides a real regression behind a compiler that got smaller.
 - Publish the checksums somewhere the client reads, and decide what it does when a host already holds a binary whose hash it no longer recognises. Nothing does this today: `SHA256SUMS` is built and uploaded as a CI artifact, which expires and sits behind a login, and no workflow triggers on a tag.
 
 ## P4 — test depth
@@ -246,27 +243,15 @@ The four musl targets build, land under the 400 KiB budget, and are byte-reprodu
   fixture from the same test — hex per frame, checked in — would let an independent
   implementation be verified against the identical bytes. Until something does, the
   protocol has never met a second implementation.
-- **Four documented numbers and arms still have nothing behind them.** Each was found
-  by reading § 9 against the suite rather than by a failure, and each is cheap except
-  where noted. `MAX_CHANNEL_QUEUE` — an agent channel whose local peer stops reading
-  is closed once its queue passes 256 KiB; `agent_channels_are_capped` covers the
-  count cap, not the byte cap. The 1 GiB ring ceiling — `ring_huge` in
+- **The 1 GiB ring ceiling has nothing behind it.** Found by reading § 9 against the
+  suite rather than by a failure, and cheap. `ring_huge` in
   `a_ring_capacity_the_daemon_cannot_use_falls_back_to_the_default` pins that the
   daemon does not abort on a `NOMUX_RING_BYTES` mistyped upwards, which is what
   `MAX_RING_CAPACITY` exists for, but nothing separates the clamp
   [IMPLEMENTATION.md § 4](IMPLEMENTATION.md#4-ring-buffer) documents from the fallback
   the test is named after. The distinction is already on the wire: a
   `RESUME_FROM_START` greeting is answered with the ring's base, so writing a few MiB
-  past the default and reading `resume_from` back says which capacity was built. The
-  `frame is not valid from a client` arm — a server-only frame arriving *after* a
-  successful greeting, which is a different function from the ungreeted refusal that
-  is tested, and a different claim: that the session survives a client which
-  misbehaves once attached. And exit codes 126 and 127, which are deliberately left:
-  both are `attach`'s mapping of what it met, so reaching either honestly means a real
-  relay — a mode that goes on to serve and so cannot be run to completion by a test
-  that waits for it. What an argument-parsing test could reach is only the
-  `io::ErrorKind`-to-number mapping, and asserting on that pins which kind a refusal
-  happens to carry rather than anything a client depends on.
+  past the default and reading `resume_from` back says which capacity was built.
 - **One arm of the publish grace decides nothing the suite can see.** `kill` waits out a
   `<id>.pid` that is *missing* as well as one that is empty
   ([IMPLEMENTATION.md § 6.6](IMPLEMENTATION.md#66-frozen-control-surface)), and the
