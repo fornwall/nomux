@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/nomux", "crates/nomux-proto"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.97.1"
 license = "Apache-2.0"
@@ -13,7 +13,11 @@ keywords = ["ssh", "terminal", "pty", "session"]
 categories = ["command-line-utilities"]
 
 [workspace.dependencies]
-nomux-proto = { path = "crates/nomux-proto", version = "0.1.0" }
+# The `version` moves with `workspace.package.version` above, and cargo has no way to
+# say so — a path dependency that is also published needs a literal. A stale one is not
+# a silent failure at least: it no longer matches the version the path resolves to, and
+# resolution stops rather than picking something else.
+nomux-proto = { path = "crates/nomux-proto", version = "0.2.0" }
 
 # See IMPLEMENTATION.md § 8 — the cold upload happens over cellular, so size is a
 # correctness-adjacent concern. Target <= 400 KiB per architecture.
