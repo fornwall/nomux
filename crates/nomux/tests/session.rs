@@ -2100,6 +2100,155 @@ fn reconnecting_does_not_raise_the_input_ceiling() {
     );
 }
 
+/// Input already delivered survives the half-close that follows it
+/// (`IMPLEMENTATION.md` § 4.1).
+///
+/// The decode loop stops between frames once the PTY queue is full, and its exit used
+/// to fall straight into the end-of-file test beneath it — so a peer whose write half
+/// had closed was let go of with up to a megabyte of *complete* `Input` frames still
+/// undecoded, which is the one thing § 4.1 says is never stranded in that buffer. The
+/// peer is not gone: the relay shuts its write half down on stdin EOF and goes on
+/// draining output (§ 7), so `nomux attach ID < script.sh` against a child that is
+/// slow to read ran the first megabyte and silently lost the rest.
+///
+/// Sized to the real cap rather than to a knob, there being no `NOMUX_RING_BYTES` for
+/// the input direction. What the child is *given* is what is asserted on, from the far
+/// side of the PTY, because that is the claim: `in_applied` behind it says the daemon
+/// agrees, and is what a reattaching client would resume from.
+#[test]
+fn input_delivered_before_a_half_close_is_applied_rather_than_dropped() {
+    use std::net::Shutdown;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    use rustix::fs::Mode;
+
+    /// More than the megabyte the daemon queues, the megabyte it buffers undecoded
+    /// and the socket buffers between them, so what crosses is bounded by the daemon
+    /// rather than by this.
+    const BLAST: usize = 8 << 20;
+    /// One `Input` frame's payload, well inside `MAX_PAYLOAD`.
+    const CHUNK: usize = 60 * 1024;
+    /// The queue cap of § 4.1. Named because the test means nothing unless more than
+    /// this crossed the socket before the half-close: below it nothing was ever held
+    /// back, and there would have been nothing to strand.
+    const CAP: u64 = 1 << 20;
+
+    let session = Session::start("input_halfclose");
+    let cue = session.root.join("cue");
+    rustix::fs::mkfifoat(rustix::fs::CWD, &cue, Mode::RUSR | Mode::WUSR)
+        .expect("create the FIFO the child waits on");
+
+    let mut client = session.connect();
+    let ok = client.hello(RESUME_FROM_START);
+    // `raw` for the back pressure it keeps (see [`Client::make_ready`]) and `-echo` so
+    // the blast is not echoed back at a peer that never reads. Past the marker the
+    // child never touches its terminal until the cue arrives: the whole line is parsed
+    // before any of it runs, and `read` has the FIFO. Then `cat` drains the terminal
+    // into a file, which is where this side counts what the child was really given.
+    let ready = client.make_ready(
+        "raw -echo",
+        Some("read cue < cue; exec cat > drained"),
+        ok.resume_from,
+    );
+    drop(client);
+
+    // Where each whole frame ends on the wire, against the input offset one past it.
+    // The push below stops wherever the daemon stopped taking, routinely mid-frame,
+    // and a part-frame is owed to nobody — `take_frame` never completes one — so this
+    // is what turns a byte count into the offset the daemon is actually in debt for.
+    let chunk = vec![b'x'; CHUNK];
+    let mut frames = Vec::with_capacity(BLAST + CHUNK);
+    let mut whole = Vec::new();
+    let mut offset = ready.in_offset;
+    while frames.len() < BLAST {
+        Frame::Input {
+            offset,
+            data: &chunk,
+        }
+        .encode(&mut frames)
+        .expect("encode input");
+        offset += CHUNK as u64;
+        whole.push((frames.len(), offset));
+    }
+
+    // A raw socket rather than the harness client, because this has to stop writing
+    // exactly where the daemon stops reading and then half-close on the spot. Three
+    // seconds of a socket that will not take another byte is a daemon that has stopped
+    // rather than one that is busy, which is the same measure the two cap tests above
+    // are built on.
+    let mut blaster = blaster(&session);
+    let sent = push_until_refused(&mut blaster, &frames, Duration::from_secs(3));
+    let (_, applied_end) = whole
+        .iter()
+        .rev()
+        .find(|(through, _)| *through <= sent)
+        .copied()
+        .expect("the daemon took less than a single whole frame");
+    let owed = applied_end - ready.in_offset;
+    // The queue is tested between frames, so it stops at [`CAP`] plus the one frame
+    // that crossed it and never holds more. Anything past that was waiting *outside*
+    // it — in the receive buffer or the socket's — which is what the bug threw away
+    // and so is what has to be there for any of this to be a test.
+    assert!(
+        owed > CAP + CHUNK as u64,
+        "the {owed} bytes of whole frames that reached the daemon all fit in the \
+         {CAP} it queues, so nothing was ever held back outside it and the \
+         half-close below would prove nothing"
+    );
+
+    // The half-close § 7 has the relay make on stdin EOF, arriving while everything
+    // above is still held back. The read half stays open, so this is a peer that is
+    // still there and still owed.
+    blaster
+        .shutdown(Shutdown::Write)
+        .expect("half-close the client the way the relay does");
+
+    // And now the child starts reading, which is what drains the queue and lets the
+    // decode loop through the rest. Opened without blocking so a child that never
+    // reached its own `open` fails here rather than parking this: a FIFO answers
+    // `ENXIO` until a reader is there, and the child counts as one from the moment it
+    // enters the wait.
+    let mut go = None;
+    assert!(
+        poll_until(FRAME_PATIENCE, || {
+            go = fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&cue)
+                .ok();
+            go.is_some()
+        }),
+        "the child never reached the cue it waits on"
+    );
+    go.expect("the FIFO the wait above opened")
+        .write_all(b"go\n")
+        .expect("cue the child");
+
+    let drained = session.root.join("drained");
+    let seen = || fs::metadata(&drained).map_or(0, |meta| meta.len());
+    assert!(
+        poll_until(FRAME_PATIENCE, || seen() >= owed),
+        "the child was given {} of the {owed} bytes this client delivered before it \
+         half-closed: the rest went with the connection",
+        seen()
+    );
+    assert_eq!(
+        seen(),
+        owed,
+        "the child was given a different amount than this client delivered"
+    );
+
+    // The daemon's own accounting, which is what a reattaching client resumes from
+    // (§ 3) — and a connection that is greeted after all this is also proof the
+    // session outlived the peer it stopped reading from.
+    let mut probe = session.connect();
+    assert_eq!(
+        probe.hello(RESUME_FROM_START).in_applied,
+        applied_end,
+        "the daemon applied a different amount than the child was given"
+    );
+}
+
 /// A peer that writes without ever reading is let go of, rather than queued for
 /// without bound (`IMPLEMENTATION.md` § 4.1).
 ///

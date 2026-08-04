@@ -522,34 +522,32 @@ impl Daemon {
         let mut read_buf = vec![0u8; 64 * 1024];
 
         loop {
-            if self.should_stop() {
+            if self.stop_reason().is_some() {
                 return Ok(());
             }
             self.poll_once(&mut read_buf, &mut scratch)?;
-            // Given back at the end of the pass that grew it. `take_frame` copies each
-            // payload in here, so a single large `Input` leaves one `MAX_PAYLOAD` —
-            // 256 KiB — held for the rest of the session, which can be a week, over a
-            // frame nothing will look at again.
-            //
-            // A pass that decoded no frame pays nothing: the capacity is where the
-            // last shrink left it, and `shrink_to` below its own argument makes no
-            // call. A pass that decoded one pays an allocation and a free — and where
-            // the payload is large, on musl's allocator that is an `mmap` and a
-            // `munmap`, so a client streaming full-sized `Input` frames trades two
-            // syscalls a pass for not holding a quarter of a megabyte until the
-            // session ends. The output direction, which is where the volume is, comes
-            // through here without decoding anything.
-            //
-            // `read_buf` is left alone deliberately. It is a fixed 64 KiB that every
-            // pass reads into, so giving it back would be one allocation per pass
-            // rather than one saved.
+            // Given back at the end of the pass that grew it, so that one large
+            // `Input` does not leave a `MAX_PAYLOAD` — 256 KiB — held for a session
+            // that can last a week, over a frame nothing will look at again. Cleared
+            // first because `shrink_to` will not go below the length and `take_frame`
+            // leaves the last payload here: without the clear that quarter megabyte is
+            // retained, which is the case this was written to prevent, and every later
+            // pass hands the allocator the same size again — a `realloc` per pass, in
+            // the loop `watches` had three allocations taken out of. As written, a
+            // pass that decodes nothing reaches the allocator not at all, and one that
+            // decodes pays an allocation and a free however many frames it takes:
+            // `take_frame` clears rather than reallocates, so only a frame larger than
+            // any before it in the same pass grows the buffer again. `read_buf` is
+            // left alone because every pass reads into it, so giving that back would
+            // be an allocation per pass rather than one saved.
+            scratch.clear();
             scratch.shrink_to(0);
         }
     }
 
     /// How long this session may stay clientless before reaping itself.
     ///
-    /// Shared by `should_stop` and `poll_timeout` so the deadline and the wakeup
+    /// Shared by `stop_reason` and `poll_timeout` so the deadline and the wakeup
     /// that enforces it cannot drift apart — a limit nothing wakes up for is
     /// documentation rather than behaviour.
     const fn detach_limit(&self) -> Duration {
@@ -577,7 +575,7 @@ impl Daemon {
     /// When idle reaping falls due, if the session is clientless.
     ///
     /// An `Instant` rather than an `elapsed() >= limit` predicate, and derived rather
-    /// than stored, for the reason [`Daemon::detach_limit`] gives: `should_stop` needs
+    /// than stored, for the reason [`Daemon::detach_limit`] gives: `stop_reason` needs
     /// the rule as a predicate and `poll_timeout` needs it as a duration.
     fn detach_deadline(&self) -> Option<Instant> {
         self.client
@@ -630,10 +628,6 @@ impl Daemon {
         } else {
             None
         }
-    }
-
-    fn should_stop(&self) -> bool {
-        self.stop_reason().is_some()
     }
 
     /// What to ask `poll` about `source`, or `None` where it is not in the set now.
@@ -1049,9 +1043,9 @@ impl Daemon {
         // daemon has not yet noticed is dead (`IMPLEMENTATION.md` § 6.4). It leaves
         // by the same door as any other refusal, which also drops its agent channels
         // — the arriving client knows nothing of them, and their ids are never
-        // reissued. That departure stamps `last_detach`, which is harmless here and
-        // used to need undoing: the idle deadline is armed by `client.is_none()`
-        // rather than by the stamp, and the next line installs the replacement.
+        // reissued. Called unconditionally, because there is usually somebody to
+        // evict and never a way to tell from here; with nobody attached it does
+        // nothing at all.
         self.reject(ErrorCode::Takeover, "another client attached");
         self.client = self.pending.take().map(Attached::new);
         self.on_hello(&hello)?;
@@ -1232,7 +1226,21 @@ impl Daemon {
             // receive buffer, which is capped in its own right, and is picked up on a
             // later pass once the PTY has taken some of the queue.
             if self.input_is_saturated() {
-                break;
+                // Returning rather than breaking, so the end-of-file test below is
+                // skipped. A peer's end of file is not an answer to frames it is
+                // still owed: `attach` shuts its write half down on stdin EOF and
+                // goes on draining output (§ 7), so letting it go here would discard
+                // whatever the receive buffer is holding — up to `MAX_PENDING_READ`,
+                // that being the cap on the buffer the loss comes out of rather than
+                // on the queue that caused it — of complete, already-delivered `Input`
+                // frames, the one thing § 4.1 says is never stranded there.
+                // Nothing wedges. While saturated the client is polled with an empty
+                // mask, and a half-close raises neither `HUP` nor `ERR` — measured on
+                // this kernel — so nothing spins; what re-arms this loop is
+                // `poll_once`'s `has_buffered_input` test, once `write_pty` has taken
+                // some of the queue. A peer that is gone for good still goes, on the
+                // `HUP` a full close reports whatever the mask says.
+                return Ok(());
             }
             let Some(client) = self.client.as_mut() else {
                 return Ok(());
@@ -1582,19 +1590,30 @@ impl Daemon {
     fn reject(&mut self, code: ErrorCode, message: &'static str) {
         if let Some(client) = self.client.take() {
             client.conn.send_last(&Frame::Error { code, message });
+            self.on_detached();
         }
-        self.on_detached();
     }
 
     fn drop_client(&mut self) {
         if let Some(mut client) = self.client.take() {
             drop(client.conn.flush_final());
+            self.on_detached();
         }
-        self.on_detached();
     }
 
     /// Stamps the session clientless. Everything that belonged to the departing
     /// connection went with it when the `Attached` was dropped.
+    ///
+    /// Every caller reaches this having just taken a client out, which is what makes
+    /// the stamp a departure: `read_pending` refuses a takeover on every greeting,
+    /// including the first, where there was nobody to depart. Outside the `if let` it
+    /// pushed `last_detach` forward on those too — and on `shutdown`, which drops a
+    /// client the session may not have. Consistency rather than a defect repaired,
+    /// though: [`Daemon::detach_deadline`] is armed by `client.is_none()`, and the
+    /// replacement goes in on the line after the refusal with no `poll` in between, so
+    /// nothing could ever read the stamp those two left. `forget_all` was a no-op on
+    /// both besides — `Agent::accept` registers no channel unless a greeted client is
+    /// attached, so a clientless session has none to forget.
     ///
     /// The post-exit linger window is untouched, and deliberately so — see
     /// [`Daemon::exit_deadline`], which derives it from the child's departure rather

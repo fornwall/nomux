@@ -75,7 +75,8 @@ extern "C" fn note_stop_signal(_signum: libc::c_int) {
 ///
 /// # Errors
 ///
-/// Fails if the pipe cannot be created or a handler cannot be installed.
+/// Fails only if the pipe cannot be created. Installing the handlers cannot report
+/// anything, for the reason the `SAFETY` note below gives.
 pub(crate) fn arm_stop_signals() -> io::Result<OwnedFd> {
     // `CLOEXEC` so the session's child never inherits either end; `NONBLOCK` so the
     // handler above cannot block on the write.
