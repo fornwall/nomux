@@ -1085,14 +1085,40 @@ builder's home directory 56 times over.
 
 Reproducibility is the producing half of a check whose consuming half does not exist
 yet. **The client is meant to pin a SHA-256 per architecture and verify it after
-upload; nothing does that today** — where `SHA256SUMS` goes once
-`scripts/build-release.sh` has written it, and what is missing before a client could
-read one, is [PLAN.md § P3](PLAN.md#p3--release-process)'s. Release builds must pin a
+upload; nothing does that today.** Where `SHA256SUMS` goes once
+`scripts/build-release.sh` has written it is no longer the open part: a `v*` tag
+publishes it as a release asset beside the four binaries it covers, in the format
+`sha256sum -c` reads, and GitHub computes its own immutable SHA-256 per asset at
+upload time alongside it. What is missing before that check exists is the client, and
+that is [PLAN.md § P3](PLAN.md#p3--release-process)'s. Release builds must pin a
 **dated** nightly regardless, since a floating one moves the bytes that hash would be
 taken over. `scripts/nightly-version` holds the dated name, and `NOMUX_NIGHTLY` in the
 environment overrides that file for a build that is not a release — a one-off against
 a newer compiler, say. A release may not take the override, for the same reason the
-pin is dated at all.
+pin is dated at all. `scripts/size-baseline` records the compiler that measured it, so
+the two are checked against each other rather than merely documented as moving
+together: a tree whose baseline was measured by a compiler other than the one
+`scripts/nightly-version` names is refused, and an overridden build says so and loses
+the growth gate — which could otherwise only report the compiler as a regression.
+
+**Debug companions.** `strip = "symbols"` and `-Cpanic=immediate-abort` are between
+them why an abort says nothing at all, and the `SIGQUIT` core of § 6.5 is what is left
+to read afterwards. A stripped binary gives that core no function names, so the build
+also emits `nomux-<target>.debug` per target — the same build with `-Cstrip=none`,
+carrying `.symtab` and the DWARF the shipping binary drops. They are published beside
+the binaries they describe, with their own `SHA256SUMS.debug`; `SHA256SUMS` names only
+the four that ship, since `sha256sum -c` fails on a file it cannot open and nearly
+everyone downloads only what they run.
+
+A companion is a **second build**, not the shipping binary with symbols added back and
+not the shipping binary stripped afterwards. Stripping does not commute here: rustc
+strips at link time and `llvm-strip` after it, and the two ELFs differ by a couple of
+hundred bytes — so deriving one from the other would change what ships, and what ships
+is what the checksums and the baseline are taken over. Two builds means their
+correspondence is an inference, and a companion whose addresses had moved would name
+the wrong functions rather than none, so the script checks it instead of assuming it:
+identical `.text` at an identical address, per target, per build. That check is what
+`llvm-tools` is installed for.
 
 ## 9. Testing
 

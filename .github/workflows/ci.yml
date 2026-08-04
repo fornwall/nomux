@@ -3,6 +3,12 @@ name: CI
 on:
   push:
     branches: [main]
+    # A `v*` tag is what publishes a release; the `publish` job at the bottom is what
+    # does it, from the artifact the release job built rather than from a build of its
+    # own. Promoting those exact bytes is what makes the published checksums the ones
+    # the size gate and `SHA256SUMS` were computed over — a rebuild would be
+    # byte-identical by § 8, but "would be" is a claim and this is not one.
+    tags: ['v*']
   pull_request:
   # The release job's artifacts expire, and it is the only producer of the
   # per-architecture binaries and their checksums. Without this, getting them back
@@ -153,7 +159,10 @@ jobs:
           echo "version=$nightly" >> "$GITHUB_OUTPUT"
 
       # The shipping build rebuilds std with panics compiled out, which needs a
-      # nightly compiler plus its sources (IMPLEMENTATION.md § 8).
+      # nightly compiler plus its sources (IMPLEMENTATION.md § 8). `llvm-tools` is for
+      # the debug companions: the script checks each one against the binary it
+      # describes with `llvm-objcopy`, and the host's binutils cannot be assumed to
+      # read riscv64 or armv7.
       #
       # Through `env:` and a quoted expansion, not `${{ }}` spliced into the script:
       # on a pull request the file's contents are the contributor's, and a value
@@ -163,7 +172,7 @@ jobs:
           RELEASE_NIGHTLY: ${{ steps.nightly.outputs.version }}
         run: >
           rustup toolchain install "$RELEASE_NIGHTLY" --profile minimal --no-self-update
-          --component rust-src
+          --component rust-src,llvm-tools
           --target x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,armv7-unknown-linux-musleabihf,riscv64gc-unknown-linux-musl
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -174,10 +183,124 @@ jobs:
       - run: sh scripts/build-release.sh
 
       # The checksums are the point of this job — the client pins one per
-      # architecture — so they have to outlive the log they were printed to.
+      # architecture — so they have to outlive the log they were printed to. On a tag
+      # the release below is where they actually land; this keeps every other commit's
+      # set reachable for the ninety days an artifact lasts.
       - uses: actions/upload-artifact@v7
         with:
           name: musl-binaries
           path: target/dist/
           if-no-files-found: error
+
+  # What P3 asked for: the checksums somewhere a client can read them. An artifact
+  # expires after ninety days and sits behind a login; a release asset does neither.
+  #
+  # Its own job for two reasons. It `needs` all three above, so a tag cannot publish a
+  # release whose tests failed — parallel jobs with no dependency would have raced, and
+  # the release build passing says only that the binaries fit, not that they work. And
+  # it is the only job that wants a write token, so it is the only one that gets one;
+  # the other three keep the read-only token the header grants.
+  publish:
+    name: publish the release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [check, takeover-guard, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      # No checkout: everything published is in the artifact, and the tag is named by
+      # the ref rather than read out of the tree.
+      - uses: actions/download-artifact@v7
+        with:
+          name: musl-binaries
+          path: dist
+
+      # The check every download page asks a user to run, run here first — against the
+      # artifact that came back out of the store rather than the one that went in. It
+      # also settles what is present: `sha256sum -c` fails on a file it cannot open, so
+      # a manifest naming something the build did not emit stops here.
+      - name: Verify the artifact against its own checksums
+        working-directory: dist
+        run: |
+          sha256sum -c SHA256SUMS
+          sha256sum -c SHA256SUMS.debug
+
+      # Artifacts do not carry the executable bit, and the step below runs one of these
+      # to ask it its version. It has no bearing on what is published — a release asset
+      # is a plain file and every install path chmods it anyway.
+      - run: chmod +x dist/nomux-*
+
+      # Asked of the artifact rather than read out of Cargo.toml, because the tag's
+      # whole job is to name what these four binaries are, and Cargo.toml is not what
+      # anyone downloads. The musl x86_64 binary is static-pie and the runner is
+      # x86_64, so the one witness to the version that ships can simply be asked.
+      #
+      # Checked before anything is published, because a tag cannot be quietly corrected
+      # afterwards: the sums under `v0.1.0` are what a client pins, and a `v0.2.0`
+      # carrying 0.1.0 binaries is a release that has to be deleted rather than amended.
+      - name: Check the tag names the version the binaries report
+        run: |
+          built=$(dist/nomux-x86_64-unknown-linux-musl --version)
+          case "$built" in
+          "nomux ${GITHUB_REF_NAME#v} "*) ;;
+          *)
+              echo "the tag $GITHUB_REF_NAME does not name what the binaries report:" >&2
+              echo "  $built" >&2
+              echo "  move the workspace version in Cargo.toml, or retag." >&2
+              exit 1
+              ;;
+          esac
+
+      # `SHA256SUMS` goes up beside the binaries it covers, in the format `sha256sum -c`
+      # already reads, so verifying needs no API and no tooling. GitHub computes its own
+      # immutable SHA-256 per asset at upload time on top of that, exposed as `digest`
+      # on the releases API — worth having both, since the file is portable and signed
+      # by nothing while the digest is GitHub's and cannot be rewritten afterwards.
+      #
+      # The body carries the sums inline as well, so the number a human is asked to
+      # compare is on the page they are already reading.
+      #
+      # `--verify-tag` so a ref that names no tag fails here rather than creating one
+      # against a commit nobody tagged.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          notes="$RUNNER_TEMP/notes.md"
+          {
+              echo "Static Linux binaries, one per architecture. Verify with:"
+              echo
+              echo '```sh'
+              echo 'sha256sum -c SHA256SUMS'
+              echo '```'
+              echo
+              echo '```'
+              cat dist/SHA256SUMS
+              echo '```'
+              echo
+              echo "### Debug companions"
+              echo
+              echo "\`nomux-<target>.debug\` is the same build unstripped, for reading a"
+              echo "\`SIGQUIT\` core against — the shipping binaries carry no symbols and"
+              echo "abort without a message. Nothing needs them to run nomux. Their own"
+              echo "sums are in \`SHA256SUMS.debug\`."
+              echo
+              echo '```'
+              cat dist/SHA256SUMS.debug
+              echo '```'
+          } > "$notes"
+          # Exactly what the two manifests name, rather than a `dist/nomux-*` glob that
+          # would happen to sweep the companions in beside the binaries. The build
+          # script makes the same distinction for the same reason — the two sets are
+          # checksummed separately and a glob does not know which is which — and a
+          # release that carried a file no manifest covers would be a release nobody
+          # could verify.
+          mapfile -t assets < <(awk '{print "dist/" $2}' dist/SHA256SUMS dist/SHA256SUMS.debug)
+          gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --notes-file "$notes" \
+              --verify-tag \
+              "${assets[@]}" dist/SHA256SUMS dist/SHA256SUMS.debug
 

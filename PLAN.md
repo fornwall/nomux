@@ -39,15 +39,18 @@ protocol it speaks. Mechanics: [IMPLEMENTATION.md](IMPLEMENTATION.md).
   ([IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)). armv7 has by far the least
   headroom, for the reason in P1. The sizes live in `scripts/size-baseline`, which a
   build writes.
-- **Not started** — the release process of P3, and the client, which is a separate
-  repository and whose server-side contract is the last section of this file.
+- **Partly done** — P3's publishing half: a `v*` tag builds, checks and publishes a
+  release, so what is left there is the policy question rather than the plumbing.
+- **Not started** — the client, which is a separate repository and whose server-side
+  contract is the last section of this file.
 
 ## P1 — known gaps
 
 Six, and in the first two the honest answer is a known cost rather than a missing line
-of code; the third is a gap nothing can close, the fourth a limit nobody has built
-yet, the fifth the one wait on the control surface that has no bound, and the sixth a
-hole in that surface's own promise. Each was found by review or by measurement rather
+of code; the third is a gap that cannot be closed from inside the process, the fourth a
+limit nobody has built yet, the fifth the one wait on the control surface that has no
+bound, and the sixth a hole in that surface's own promise. Each was found by review or
+by measurement rather
 than by guessing, and is recorded with what it was measured against.
 
 - **A hand-started daemon has a bind-to-publish window.** `attach` holds the spawn
@@ -77,23 +80,29 @@ than by guessing, and is recorded with what it was measured against.
   least likely to be on a fast link. The 3% growth gate
   ([IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)) is what would fail the same
   commit today; the cap alone did not.
-- **An abort still says nothing, and cannot.** The daemon reports startup failures
-  to the `attach` that spawned it and everything afterwards to syslog, which covers
-  every failure it can see coming. An *abort* is not one of those: the shipping build
-  is `-Cpanic=immediate-abort` with `strip = "symbols"`, so allocation failure and any
-  surviving panic produce no message, no location and no symbol to forward. What is
-  left is the `SIGQUIT` core § 6.5 preserves — and nothing publishes unstripped
-  binaries for it to be read against, so today that core names no functions. Publishing
-  them beside `SHA256SUMS`, keyed by the same hash, is the cheap half of the answer and
-  belongs with the P3 release work.
+- **An abort still says nothing from inside the process.** The daemon reports startup
+  failures to the `attach` that spawned it and everything afterwards to syslog, which
+  covers every failure it can see coming. An *abort* is not one of those: the shipping
+  build is `-Cpanic=immediate-abort` with `strip = "symbols"`, so allocation failure and
+  any surviving panic produce no message, no location and no symbol to forward. What is
+  left is the `SIGQUIT` core § 6.5 preserves, and that core can now be read: every
+  release publishes `nomux-<target>.debug`, the same build unstripped, with its own
+  `SHA256SUMS.debug` ([IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)). It names
+  functions rather than lines — the release profile carries no debuginfo for nomux's
+  own code, so the companion's DWARF describes `std` and its `.symtab` describes the
+  rest. Giving it lines as well means `debug = 1` in the release profile, which is a
+  change to what the shipping build compiles and has not been made. What remains
+  unfixable from inside is the message itself: an immediate abort has nowhere to write
+  it.
 - **Nothing bounds how many sessions one host will run.** The cap of eight is enforced
   client-side ([DESIGN.md § 5.1](DESIGN.md#51-identity)) and the daemon knows nothing
   of its siblings, so two devices on one account give sixteen and a client bug gives no
   limit at all. Each session is a daemon, a login shell and whatever that shell started,
   held for seven days. On a shared build host the only bound in the system is on the far
-  side of a boundary this repository cannot see. The daemon already reads the run
-  directory in `list`; counting entries at startup and refusing past a generous ceiling
-  would put a floor under it without the client's cooperation.
+  side of a boundary this repository cannot see. The binary already reads the run
+  directory in `list` (`control.rs`), though the daemon itself does not; counting
+  entries at startup and refusing past a generous ceiling would put a floor under it
+  without the client's cooperation.
 - **The liveness probe is the one call on the escape hatch with no deadline.** Every
   other wait `list` and `kill` make is bounded — the spawn lock, the publish grace, the
   two signal graces
@@ -224,11 +233,15 @@ than by guessing, and is recorded with what it was measured against.
 
 ## P3 — release process
 
-The four musl targets build, land under the 400 KiB budget, and are byte-reproducible;
-`scripts/build-release.sh` enforces all three. What is left is process rather than code:
+The four musl targets build and land under the 400 KiB budget, which
+`scripts/build-release.sh` enforces along with the growth gate. Reproducibility it
+enforces in the only way a single machine can — by grepping each artifact for the
+builder's paths, since two clean builds on one machine are byte-identical whether or
+not those paths were remapped ([IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)).
+What is left is process rather than code:
 
-- Decide when the pinned nightly moves. It is named once, in `scripts/nightly-version`, which the build script and CI both read — so a local build and the runner measure the same bytes against a baseline recorded by the same compiler. What is undecided is the *policy*: the toolchain and `scripts/size-baseline` have to move in one commit, because the figures are compiler-dependent and a bump that leaves the baseline behind either fails the 3% gate for no reason or hides a real regression behind a compiler that got smaller.
-- Publish the checksums somewhere the client reads, and decide what it does when a host already holds a binary whose hash it no longer recognises. Nothing does this today: `SHA256SUMS` is built and uploaded as a CI artifact, which expires and sits behind a login, and no workflow triggers on a tag.
+- Decide when the pinned nightly moves. It is named once, in `scripts/nightly-version`, which the build script and CI both read — so a local build and the runner measure the same bytes against a baseline recorded by the same compiler. The *consistency* is no longer a rule anyone has to remember: `scripts/size-baseline` records the compiler that measured it, and a build whose compiler does not match that line is refused, or, under `NOMUX_NIGHTLY` and `NOMUX_STABLE_STD`, says so and loses the growth gate. What is still undecided is the *policy* — when to take a newer compiler at all, given that the toolchain and the baseline then move in one commit.
+- Decide what the client does when a host already holds a binary whose hash it no longer recognises. The publishing half of this is done: a `v*` tag promotes the artifact the release build produced into a GitHub release carrying the four binaries beside `SHA256SUMS`, so the sums are permanent and public and in the format `sha256sum -c` reads, rather than only the ninety-day artifact behind a login they were before. GitHub computes its own immutable SHA-256 per asset at upload time as well, exposed as `digest` on the releases API, which covers the same bytes with something nobody can rewrite after the fact. The unstripped companions of P1 ride along, with their own `SHA256SUMS.debug`. What is missing is the consuming half: nothing in the client reads any of it, so § 8's "verify it after upload" is still unwritten, and so is the answer to the question this bullet opens with.
 
 ## P4 — test depth
 
@@ -243,8 +256,8 @@ The four musl targets build, land under the 400 KiB budget, and are byte-reprodu
   fixture from the same test — hex per frame, checked in — would let an independent
   implementation be verified against the identical bytes. Until something does, the
   protocol has never met a second implementation.
-- **The 1 GiB ring ceiling has nothing behind it.** Found by reading § 9 against the
-  suite rather than by a failure, and cheap. `ring_huge` in
+- **The 1 GiB ring ceiling is exercised but never told apart from the default.** Found
+  by reading § 9 against the suite rather than by a failure, and cheap. `ring_huge` in
   `a_ring_capacity_the_daemon_cannot_use_falls_back_to_the_default` pins that the
   daemon does not abort on a `NOMUX_RING_BYTES` mistyped upwards, which is what
   `MAX_RING_CAPACITY` exists for, but nothing separates the clamp

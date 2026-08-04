@@ -170,7 +170,7 @@ message carries the seed that produced it.
 The four shipping binaries come from one script:
 
 ```sh
-sh scripts/build-release.sh     # → target/dist/ plus SHA256SUMS
+sh scripts/build-release.sh     # → target/dist/, SHA256SUMS, debug companions
 ```
 
 It builds every musl target, prints a size table with the change against the
@@ -183,7 +183,7 @@ panics compiled out, which needs nightly and its sources:
 
 ```sh
 nightly=$(cat scripts/nightly-version)
-rustup toolchain install "$nightly" --component rust-src
+rustup toolchain install "$nightly" --component rust-src,llvm-tools
 rustup target add --toolchain "$nightly" \
   x86_64-unknown-linux-musl \
   aarch64-unknown-linux-musl \
@@ -194,9 +194,44 @@ rustup target add --toolchain "$nightly" \
 Why the standard library is rebuilt at all, why `scripts/nightly-version` pins a
 dated nightly rather than a floating one, and what `NOMUX_STABLE_STD=1`,
 `NOMUX_NIGHTLY` and `NOMUX_UPDATE_BASELINE=1` are for are
-[IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)'s; when that pin moves, and what
-becomes of `SHA256SUMS` after the build writes it, are
+[IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)'s; when that pin moves is
 [PLAN.md § P3](PLAN.md#p3--release-process)'s.
+
+`llvm-tools` is for the debug companions below; `NOMUX_SKIP_DEBUG=1` builds only the
+four that ship, for a run that just wants the size table.
+
+Pushing a `v*` tag runs that same build on CI and publishes a release from it: the
+four binaries, and `SHA256SUMS` beside them. Verify a download against the file
+rather than by eye:
+
+```sh
+sha256sum -c SHA256SUMS
+```
+
+GitHub computes its own SHA-256 for every release asset at upload time and shows it
+in the UI, `gh release view` and the releases API, so the sums can be checked twice
+over. The tag has to name the version the binaries report — CI asks the built binary
+and fails the release if the two disagree — and what a *client* should do with these
+sums, which is the half that does not exist yet, is
+[PLAN.md § P3](PLAN.md#p3--release-process)'s.
+
+### Debug companions
+
+The shipping binaries are stripped and abort without a message, so the `SIGQUIT` core
+they leave behind names no functions on its own. Each release carries
+`nomux-<target>.debug` for that: the same build unstripped, with the symbols and DWARF
+the shipping binary drops, and its own `SHA256SUMS.debug`. Nothing needs one to *run*
+nomux — they are for reading a core:
+
+```sh
+gdb nomux-x86_64-unknown-linux-musl.debug core
+```
+
+`SHA256SUMS` deliberately names only the four binaries that ship, because
+`sha256sum -c` fails on a file it cannot open and nearly everyone downloads only what
+they run. Why a companion is a second build rather than the shipping binary stripped
+afterwards, and how the two are checked against each other, is
+[IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)'s.
 
 ## Diagnostics
 
