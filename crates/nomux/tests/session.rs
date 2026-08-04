@@ -26,29 +26,49 @@ use std::{fs, thread};
 
 use nomux_proto::{
     ErrorCode, Frame, FrameType, HEADER_LEN, HELLO_AGENT_FORWARD, HELLO_REPAINT_CTRL_L, Hello,
-    MAX_AGENT_CHANNELS, PROTOCOL_VERSION, RESUME_FROM_START, WinSize, decode_header,
+    Linger, MAX_AGENT_CHANNELS, PROTOCOL_VERSION, RESUME_FROM_START, WinSize, decode_header,
 };
 
 use harness::{
-    Client, Reaper, Rng, Session, Spawned, accept_within, collect, control, has_unread_bytes,
-    hello_frame, join_before, nomux, nomux_with_shell, poll_by, poll_until, push_until_refused,
-    read_uninterrupted, reconnect_until_gap, run_root, shrink_send_buffer, stderr, stdout,
-    succeeded, wait_for, while_nothing_forks, write_frame,
+    Client, Reaper, Rng, Session, Spawned, accept_within, collect, control, daemon_reaper,
+    has_unread_bytes, hello_frame, join_before, nomux, nomux_with_shell, poll_by, poll_until,
+    process_alive, process_state, push_until_refused, read_uninterrupted, reconnect_until_gap,
+    run_root, shrink_send_buffer, stderr, stdout, succeeded, wait_for, while_nothing_forks,
+    write_frame,
 };
 
-#[test]
-fn runs_a_shell_and_streams_its_output() {
-    let (_session, mut client, ok) = Session::attached("basic");
-    assert_eq!(ok.protocol, PROTOCOL_VERSION);
-    assert!(!ok.gap);
-
-    client.input(0, b"echo NOMUX-ALPHA\n");
-    client.read_until("NOMUX-ALPHA", ok.resume_from);
-}
+/// How long a test waits for a *sequence* of frames the daemon owes it.
+///
+/// The same fifteen seconds the harness allows a single frame, spent on the whole
+/// loop rather than on each frame in it. That is the only spelling that bounds
+/// anything: patience taken per frame renews itself on every one that arrives, so a
+/// daemon dribbling output is never late by that measure and the loop runs until
+/// nextest's kill, which cannot say which wait never ended (`Client::frame_before`).
+/// It is one value rather than one per site for the harness's reason — every wait
+/// here is on a daemon that is either about to answer or never going to.
+const FRAME_PATIENCE: Duration = Duration::from_secs(15);
 
 #[test]
 fn output_resumes_contiguously_after_a_reconnect() {
     let (session, mut client, ok) = Session::attached("resume");
+    // The two fields of the greeting that are the daemon's own answer rather than a
+    // function of what this client asked for, checked here because this is the first
+    // `HelloOk` in the suite from a session that has one: nothing else asserts either
+    // against a running daemon, so a daemon reporting a revision it does not speak —
+    // or a linger state it made up — would be caught only by the client, which is a
+    // separate codebase.
+    assert_eq!(
+        ok.protocol, PROTOCOL_VERSION,
+        "the daemon must greet at the revision this build speaks"
+    );
+    assert_eq!(
+        ok.linger,
+        linger_on_this_host(),
+        "the daemon must report a linger state it detected the way § 6.2 says, rather \
+         than a default — it is what the client warns the user about, and see \
+         `linger_on_this_host` for the part of that this can and cannot say"
+    );
+    assert!(!ok.gap, "a fresh session has dropped nothing");
 
     let first = b"echo NOMUX-BEFORE\n";
     client.input(0, first);
@@ -73,6 +93,92 @@ fn output_resumes_contiguously_after_a_reconnect() {
     client.read_until("NOMUX-AFTER", ok.resume_from);
 }
 
+/// What `linger::detect` must answer on the host this test is running on, worked out
+/// from the same two paths it stats (`IMPLEMENTATION.md` § 6.2).
+///
+/// What the comparison buys, stated exactly, because it is less than a second opinion
+/// and more than nothing. It establishes that the daemon puts a *detected* state into
+/// `HelloOk` rather than a constant: the field is asserted nowhere else against a
+/// running daemon — the suite's only other mentions of it are `HelloOk`s the tests
+/// build themselves — so a daemon answering `Unknown` for everything short of an
+/// enabled marker passed every test in the workspace, measured. It does
+/// *not* establish that § 6.2's rules are the right ones, because it applies the same
+/// rules: this is a transcription of `detect` rather than an independent oracle, and a
+/// misreading shared by both sides is invisible here. Where the classification itself
+/// is pinned against written-down inputs is `linger.rs`'s own unit tests.
+///
+/// Two things soften it further, and both are the host's rather than the code's. Where
+/// there is no `logind` — a container, a BSD — both sides answer `Unknown` before
+/// reading anything, and the assertion holds whatever the daemon makes of the marker.
+/// A host that resolves no login name lands in that same soft case, which is why the
+/// fallback below is included rather than left out. So this is a real check on the
+/// machines that have a marker directory to disagree about and a name to look up in
+/// it, and a tautology on the rest; there is no arrangement of a filesystem the test
+/// is allowed to make that would change that.
+///
+/// The rules, as § 6.2 gives them: no `logind` is `Unknown` and not "no marker,
+/// therefore disabled", the marker's absence is a definite `Disabled`, and anything
+/// else about the lookup is `Unknown`.
+fn linger_on_this_host() -> Linger {
+    if !Path::new("/run/systemd/system").is_dir() {
+        return Linger::Unknown;
+    }
+    let Some(user) = login_name() else {
+        return Linger::Unknown;
+    };
+    match fs::metadata(Path::new("/var/lib/systemd/linger").join(user)) {
+        Ok(_) => Linger::Enabled,
+        Err(err) if err.kind() == ErrorKind::NotFound => Linger::Disabled,
+        Err(_) => Linger::Unknown,
+    }
+}
+
+/// The name [`linger_on_this_host`] joins onto the linger directory, resolved in the
+/// order `linger::username` resolves it.
+///
+/// The password database first, because it is authoritative; `$USER` — then
+/// `$LOGNAME` — second, for a directory-backed account with no line in
+/// `/etc/passwd`. The fallback is half the logic and the half a host in CI is most
+/// likely to take, so leaving it out would leave this comparing `Unknown` against
+/// `Unknown` and calling it a pass.
+///
+/// Read as bytes for the reason `passwd::lookup` gives: one Latin-1 name in
+/// somebody else's GECOS field would otherwise fail the decode of the whole file and
+/// silently move this to the fallback.
+fn login_name() -> Option<String> {
+    let uid = rustix::process::getuid().as_raw();
+    let from_passwd = fs::read("/etc/passwd").ok().and_then(|database| {
+        database
+            .split(|byte| *byte == b'\n')
+            .find_map(|line| {
+                let mut fields = line.split(|byte| *byte == b':');
+                let name = fields.next()?;
+                let _password = fields.next()?;
+                if str::from_utf8(fields.next()?).ok()?.parse::<u32>().ok()? != uid {
+                    return None;
+                }
+                str::from_utf8(name).ok()
+            })
+            .map(str::to_owned)
+    });
+    from_passwd
+        .or_else(|| {
+            std::env::var("USER")
+                .or_else(|_| std::env::var("LOGNAME"))
+                .ok()
+        })
+        // A name usable as a path traversal is refused rather than joined onto a
+        // system directory, which is the one thing `linger::username` does beyond
+        // choosing between its two sources.
+        .filter(|name| {
+            !name.is_empty()
+                && !name.contains('/')
+                && !name.contains('\0')
+                && name != "."
+                && name != ".."
+        })
+}
+
 /// A client claiming output the session never produced is clamped down to the end of
 /// the stream rather than believed (`IMPLEMENTATION.md` § 4.2).
 ///
@@ -83,16 +189,27 @@ fn output_resumes_contiguously_after_a_reconnect() {
 /// the session looks dead: no output at all until the child happens to write enough
 /// to catch up. Nothing is reported as a gap either, because nothing was dropped —
 /// there was never anything there.
+///
+/// The end of the stream is *known* here rather than bracketed, which is what makes
+/// the clamp falsifiable: a window a megabyte wide is satisfied by a daemon that
+/// clamped to any number at all between the two, and the one number § 4.2 names is
+/// the end. Two things buy it. `-echo` puts the line discipline's copy of the command
+/// line off the stream, so the read below stops at the child's own output rather than
+/// at the echo with the output still to come; and `printf` without a newline makes
+/// that output the last byte the child writes, against an empty `PS1` that follows it
+/// with nothing. So the offset the read returns is where the stream ends, and the
+/// daemon has to answer with it exactly.
 #[test]
 fn an_out_offset_past_the_end_of_the_stream_is_clamped_rather_than_believed() {
     /// Comfortably past anything a shell echoing one line has ever written.
     const FAR: u64 = 1 << 20;
 
     let (session, mut client, ok) = Session::attached("clamp_high");
+    let ready = client.make_ready("-echo", None, ok.resume_from);
 
-    let first = b"echo NOMUX-BEFORE-CLAMP\n";
-    client.input(0, first);
-    let (_, end) = client.read_until("NOMUX-BEFORE-CLAMP", ok.resume_from);
+    let first = b"printf NOMUX-BEFORE-CLAMP\n";
+    client.input(ready.in_offset, first);
+    let (_, end) = client.read_until("NOMUX-BEFORE-CLAMP", ready.offset);
     drop(client);
 
     let mut client = session.connect();
@@ -101,20 +218,22 @@ fn an_out_offset_past_the_end_of_the_stream_is_clamped_rather_than_believed() {
         !resumed.gap,
         "nothing was dropped, so nothing may be reported as a gap"
     );
-    // Pinned from below as well as from above. Clamping to the ring's *base* rather
-    // than to its end also satisfies an upper bound, also reports no gap, and also
-    // leaves the read at the end of this test finding its marker — in a stream it
-    // simply receives again from the start.
-    assert!(
-        (end..end + FAR).contains(&resumed.resume_from),
-        "an out_offset past the end of the stream must be clamped to the end of it: \
-         resumed from {} against the {end} already received and the {} claimed",
+    // An equality rather than an upper bound, and pinned from below for the same
+    // reason it is pinned from above: clamping to the ring's *base* also comes in
+    // under anything claimed, also reports no gap, and also leaves the read at the
+    // end of this test finding its marker — in a stream it simply receives again
+    // from the start.
+    assert_eq!(
         resumed.resume_from,
+        end,
+        "an out_offset past the end of the stream must be clamped to the end of it, \
+         which is the {end} bytes this client has already been handed against the {} \
+         it claimed",
         end + FAR
     );
     assert_eq!(
         resumed.in_applied,
-        first.len() as u64,
+        ready.in_offset + first.len() as u64,
         "the session's input position must survive a client claiming output it \
          never received"
     );
@@ -378,7 +497,7 @@ fn plant_blob(
 /// `next_frame` renews its patience on every frame that arrives, so a daemon
 /// handing over a byte every fourteen seconds is never late by that measure and the
 /// read has no bound at all — it would run until nextest's kill, which is exactly
-/// the failure `join_within` and `.config/nextest.toml` are written to avoid.
+/// the failure `join_before` and `.config/nextest.toml` are written to avoid.
 #[expect(
     clippy::panic,
     reason = "clippy.toml's allow-panic-in-tests reaches `#[test]` bodies, not the \
@@ -942,7 +1061,7 @@ fn frames_a_client_may_not_send_are_refused_and_the_connection_closed() {
                     in_applied: 0,
                     win: harness::WIN,
                     gap: false,
-                    linger: nomux_proto::Linger::Unknown,
+                    linger: Linger::Unknown,
                     agent: false,
                 }));
             },
@@ -1162,8 +1281,20 @@ fn the_exit_status_arrives_after_the_final_output() {
     let mut client = session.connect();
     let resumed = client.hello(RESUME_FROM_START);
     let mut seen = Vec::new();
+    // One deadline for the whole replay rather than one per frame: `next_frame` takes
+    // a fresh patience on every frame it is asked for, so a daemon handing one over
+    // just inside it is never late and a loop over it has no bound at all — see
+    // `Client::frame_before`, which is where this one comes from.
+    let deadline = Instant::now() + FRAME_PATIENCE;
+    let awaiting = "the child's last output and then its exit status";
     loop {
-        let (ty, payload) = client.next_frame();
+        let (ty, payload) = client.frame_before(deadline, awaiting).unwrap_or_else(|| {
+            panic!(
+                "the exit status never arrived; {} bytes of output before it: {:?}",
+                seen.len(),
+                String::from_utf8_lossy(&seen)
+            )
+        });
         match Frame::decode(ty, &payload).expect("decode") {
             Frame::Output { data, .. } => seen.extend_from_slice(data),
             Frame::Exit { status, kind } => {
@@ -1214,8 +1345,15 @@ fn a_child_killed_by_a_signal_is_reported_as_signalled_rather_than_as_a_status()
 
     client.input(0, b"kill -9 $$\n");
 
+    // One deadline for the whole loop rather than a fresh one per frame, which is no
+    // bound at all: the echo of the command line arrives as several frames, and each
+    // of them would renew the patience for the fate this is waiting on.
+    let deadline = Instant::now() + FRAME_PATIENCE;
+    let awaiting = "the fate of a child that killed itself with SIGKILL";
     let ended = loop {
-        let (ty, payload) = client.next_frame();
+        let (ty, payload) = client
+            .frame_before(deadline, awaiting)
+            .unwrap_or_else(|| panic!("timed out waiting for {awaiting}"));
         match Frame::decode(ty, &payload).expect("decode") {
             Frame::Exit { status, kind } => break (status, kind),
             Frame::Output { .. } | Frame::InputAck { .. } | Frame::Pong { .. } => {}
@@ -1278,8 +1416,17 @@ fn a_synthesised_exit_status_is_sent_when_it_is_collected_rather_than_when_the_l
     );
     let began = Instant::now();
 
+    // One deadline for the whole wait rather than a fresh one per frame, as everywhere
+    // else that loops on frames: the shell's own output arrives ahead of the `exec`
+    // and each frame of it would renew the patience for the `Exit` behind them. Far
+    // above `BOUND`, so what decides this test is still the measurement below — this
+    // only replaces a hang with a sentence.
+    let deadline = Instant::now() + FRAME_PATIENCE;
+    let awaiting = "the status of a child that closed the terminal without exiting";
     let (elapsed, status, kind) = loop {
-        let (ty, payload) = client.next_frame();
+        let (ty, payload) = client
+            .frame_before(deadline, awaiting)
+            .unwrap_or_else(|| panic!("timed out waiting for {awaiting}"));
         match Frame::decode(ty, &payload).expect("decode") {
             Frame::Exit { status, kind } => break (began.elapsed(), status, kind),
             Frame::Output { .. } | Frame::InputAck { .. } | Frame::Pong { .. } => {}
@@ -1432,30 +1579,6 @@ fn child_of(parent: u32) -> Option<u32> {
     None
 }
 
-/// A guard that collects the daemon `id` published a pidfile for, however this test
-/// ends.
-///
-/// For the two tests here that bring a session up through `nomux attach` rather than
-/// through [`Session`], which kills its own child on drop. The daemon such an attach
-/// spawns has `setsid`ed away, so killing the relay does not reach it and no
-/// [`Spawned`] covers it: it is collected by an explicit `nomux kill` further down,
-/// and a panic before that line skips it. What is left behind then holds its run
-/// directory for the whole 30-second first-attach timeout, and the *next* run's
-/// `sweep_finished_runs` deletes that directory out from under it — the pid in its
-/// name having gone with this process. `spawn_lock.rs` documents the same hazard at
-/// the one place it meets it; these are the other two.
-fn daemon_reaper(root: &Path, id: &str) -> Reaper {
-    let pid_file = root.join("nomux").join(format!("{id}.pid"));
-    wait_for(&pid_file);
-    Reaper(
-        fs::read_to_string(&pid_file)
-            .expect("read the pidfile")
-            .trim()
-            .parse()
-            .expect("the pidfile holds a pid"),
-    )
-}
-
 /// Ids are opaque per-tab identifiers, so the label is the only thing that makes a
 /// session recognisable to a human after the client loses its state.
 #[test]
@@ -1476,7 +1599,7 @@ fn a_label_survives_into_list() {
     // said what it is called, which prints `labelled\t?\t` and fails on the label.
     wait_for(&root.join("nomux").join("labelled.label"));
     // And the pidfile is already there, being one step earlier in that same order.
-    let _reaper = daemon_reaper(&root, "labelled");
+    let (_pid, _reaper) = daemon_reaper(&root, "labelled");
 
     let listed = stdout(&control(&root, &["list"]));
 
@@ -1768,7 +1891,7 @@ fn attach_spawns_a_daemon_for_a_session_that_does_not_exist_yet() {
     // all. That case is the one the assertion at the foot of this test is about, and
     // it is reported here instead: a leak is not possible where there is nothing to
     // leak, and "the daemon never created relay_probe.pid" says the same thing.
-    let _reaper = daemon_reaper(&root, "relay_probe");
+    let (_pid, _reaper) = daemon_reaper(&root, "relay_probe");
 
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut seen = Vec::new();
@@ -2250,8 +2373,19 @@ fn a_child_that_exits_with_input_still_queued_delivers_its_last_output_in_full()
 
     let mut seen: Vec<u8> = Vec::new();
     let mut offset = ready.offset;
+    // The burst arrives as dozens of frames, so patience per frame would bound none
+    // of it; one deadline for the collection is what makes a daemon that stops
+    // halfway through fail here rather than run until nextest's kill.
+    let deadline = Instant::now() + FRAME_PATIENCE;
+    let awaiting = "the child's last output and the exit behind it";
     let ended = loop {
-        let (ty, payload) = client.next_frame();
+        let (ty, payload) = client.frame_before(deadline, awaiting).unwrap_or_else(|| {
+            panic!(
+                "only {} of the {BURST} bytes the child wrote on its way out arrived, \
+                 and no Exit behind them",
+                seen.len()
+            )
+        });
         match Frame::decode(ty, &payload).expect("decode frame") {
             Frame::Output { offset: at, data } => {
                 assert_eq!(
@@ -2752,15 +2886,7 @@ fn an_agent_channel_whose_queue_outgrows_the_cap_is_closed_alone() {
     let (session, mut client, ok) = Session::attached_with("agent_queue", HELLO_AGENT_FORWARD);
     let ready = client.make_ready("-echo", None, ok.resume_from);
 
-    // How much a unix socket on this host takes from a peer that has stopped
-    // reading, measured rather than assumed for the reason
-    // `a_closed_agent_channel_whose_peer_stopped_reading_leaves_the_daemon_asleep`
-    // gives: the limit is a sysctl away from any number written here.
-    let capacity = {
-        let (mut probe, _other_end) = UnixStream::pair().expect("a socketpair to measure");
-        probe.set_nonblocking(true).expect("stop blocking");
-        push_until_refused(&mut probe, &vec![0u8; 8 << 20], Duration::from_millis(100))
-    };
+    let capacity = socket_capacity();
 
     // The bystander, opened first so that it is unambiguously live before anything
     // goes wrong on the other channel.
@@ -2893,16 +3019,7 @@ fn a_closed_agent_channel_whose_peer_stopped_reading_leaves_the_daemon_asleep() 
     // markers below be read one after the other from a stream that joins up.
     let ready = client.make_ready("-echo", None, ok.resume_from);
 
-    // How much a unix socket on this host takes from a peer that has stopped reading.
-    // Measured rather than assumed: the limit is the *sender's* send buffer, which is
-    // a sysctl away from any number written down here, and everything below turns on
-    // sending more than it. Asking a socketpair is asking the same kernel the same
-    // question — nothing about the pair the daemon accepts is different.
-    let capacity = {
-        let (mut probe, _other_end) = UnixStream::pair().expect("a socketpair to measure");
-        probe.set_nonblocking(true).expect("stop blocking");
-        push_until_refused(&mut probe, &vec![0u8; 8 << 20], Duration::from_millis(100))
-    };
+    let capacity = socket_capacity();
 
     let mut agent = session.connect_agent();
     let chan = client.next_chan(FrameType::AgentOpen);
@@ -3328,7 +3445,6 @@ fn a_daemon_nobody_ever_attaches_to_reaps_itself() {
     let detached_at = Instant::now();
 
     let unattached = Session::start("unattached");
-    assert!(unattached.socket.exists());
 
     assert!(
         poll_until(Duration::from_secs(45), || !unattached.socket.exists()),
@@ -3395,13 +3511,7 @@ fn a_daemon_that_reaps_itself_removes_its_run_files() {
     client.drain_available();
     drop(client);
 
-    assert!(
-        poll_until(Duration::from_secs(15), || !pid_file.exists()
-            && !session.socket.exists()),
-        "run files outlived the daemon: socket={} pid={}",
-        session.socket.exists(),
-        pid_file.exists()
-    );
+    assert_run_files_removed(&session, Duration::from_secs(15), "daemon");
 }
 
 /// `SIGTERM` must leave through the shutdown path, not the default disposition.
@@ -3424,19 +3534,7 @@ fn a_daemon_that_reaps_itself_removes_its_run_files() {
 fn a_signalled_daemon_collects_a_process_that_ignores_sighup() {
     let (session, mut client, ok) = Session::attached("sigterm");
 
-    // The marker trails the pid so that seeing it proves the digits already
-    // arrived, and the arithmetic keeps it out of the line discipline's echo of the
-    // command itself — which would otherwise match first, carrying `$!` unexpanded.
-    client.input(
-        0,
-        b"set +m; trap '' HUP; sleep 300 & echo \"$!-NOMUX-ORPHAN-$((6*7))\"\n",
-    );
-    let (seen, _) = client.read_until("-NOMUX-ORPHAN-42", ok.resume_from);
-    let orphan = trailing_pid(&seen, "-NOMUX-ORPHAN-42")
-        .unwrap_or_else(|| panic!("no background pid in the transcript: {seen:?}"));
-    // Everything below is an assertion about a process that is deliberately in
-    // nobody's reach: if one of them fires, `sleep 300` outlives the whole suite.
-    let _collected = Reaper(orphan);
+    let (orphan, _collected) = background_ignoring_sighup(&mut client, ok.resume_from);
     assert!(
         process_alive(orphan),
         "the backgrounded process was gone before the session ended"
@@ -3450,7 +3548,6 @@ fn a_signalled_daemon_collects_a_process_that_ignores_sighup() {
 
     let daemon = rustix::process::Pid::from_raw(session.child.id().cast_signed())
         .expect("the daemon's own pid");
-    let pid_file = session.pid_file();
     // Signalled directly rather than through `nomux kill`, which unlinks the run
     // files itself and would answer the question for the daemon.
     rustix::process::kill_process(daemon, rustix::process::Signal::TERM)
@@ -3458,13 +3555,7 @@ fn a_signalled_daemon_collects_a_process_that_ignores_sighup() {
 
     // Inside the two seconds `nomux kill` allows before `SIGKILL`, with room for a
     // loaded machine: an overrun there is this same bug wearing a hat.
-    assert!(
-        poll_until(Duration::from_secs(10), || !pid_file.exists()
-            && !session.socket.exists()),
-        "run files outlived the signalled daemon: socket={} pid={}",
-        session.socket.exists(),
-        pid_file.exists()
-    );
+    assert_run_files_removed(&session, Duration::from_secs(10), "signalled daemon");
 
     assert!(
         poll_until(Duration::from_secs(10), || !process_alive(orphan)),
@@ -3519,21 +3610,9 @@ fn a_signalled_daemon_with_a_quiet_child_does_not_wait_out_the_grace_period() {
     // Set up together, and signalled together below, so the two measurements meet
     // the same machine.
     let (mut stubborn, mut client, ok) = Session::attached("slowkill");
-    // The shape `a_signalled_daemon_collects_a_process_that_ignores_sighup` uses,
-    // and for the same reason: an *ignored* `SIGHUP` survives `exec` where a trapped
-    // one is reset, so this is a process the daemon's first reach cannot collect and
-    // must wait out. `set +m` keeps it in the shell's own group, which is what
-    // `Pty::terminate` signals.
-    client.input(
-        0,
-        b"set +m; trap '' HUP; sleep 300 & echo \"$!-NOMUX-ORPHAN-$((6*7))\"\n",
-    );
-    let (seen, _) = client.read_until("-NOMUX-ORPHAN-42", ok.resume_from);
-    let orphan = trailing_pid(&seen, "-NOMUX-ORPHAN-42")
-        .unwrap_or_else(|| panic!("no background pid in the transcript: {seen:?}"));
-    // Deliberately in nobody's reach until the daemon collects it, so nothing else
-    // would clean it up if an assertion below fired first.
-    let _collected = Reaper(orphan);
+    // A process the daemon's first reach cannot collect and has to wait out, which is
+    // the whole of what the grace period below is being charged for.
+    let (_orphan, _collected) = background_ignoring_sighup(&mut client, ok.resume_from);
 
     let (mut quiet, mut settled, ok) = Session::attached("fastkill");
     // So the measurement covers a session with a live shell in it, rather than the
@@ -3564,6 +3643,79 @@ fn a_signalled_daemon_with_a_quiet_child_does_not_wait_out_the_grace_period() {
          still there. Load: {load}",
         stubborn.saturating_sub(quiet)
     );
+}
+
+/// Backgrounds a process the session's own hangup cannot collect, and hands back its
+/// pid and a guard for it.
+///
+/// `trap '' HUP` before the fork, because an *ignored* disposition is inherited
+/// through `exec` where a trapped one is reset — which is what puts this process
+/// beyond the `SIGHUP` the kernel delivers to the foreground group when the PTY
+/// master closes, and so makes it the case that only a real shutdown path collects.
+///
+/// `set +m` is what puts it where reaping can see it at all: an interactive shell
+/// gives every job a process group of its own and nothing in the session signals
+/// those, while with job control off the job stays in the shell's group, which is
+/// what `Pty::terminate` signals and what a script's background processes do anyway.
+///
+/// The marker trails the pid so that seeing it proves the digits already arrived, and
+/// the arithmetic keeps it out of the line discipline's echo of the command itself —
+/// which would otherwise match first, carrying `$!` unexpanded.
+///
+/// The [`Reaper`] comes back with it because everything either caller then asserts is
+/// about a process deliberately in nobody's reach: if one of those assertions fires,
+/// `sleep 300` outlives the whole suite.
+///
+/// Sent at input offset 0, which both callers can do because this is the first thing
+/// either of them puts into its session.
+#[expect(
+    clippy::panic,
+    reason = "clippy.toml's allow-panic-in-tests reaches `#[test]` bodies, not the \
+              helpers an integration test crate keeps beside them"
+)]
+fn background_ignoring_sighup(client: &mut Client, from: u64) -> (u32, Reaper) {
+    client.input(
+        0,
+        b"set +m; trap '' HUP; sleep 300 & echo \"$!-NOMUX-ORPHAN-$((6*7))\"\n",
+    );
+    let (seen, _) = client.read_until("-NOMUX-ORPHAN-42", from);
+    let orphan = trailing_pid(&seen, "-NOMUX-ORPHAN-42")
+        .unwrap_or_else(|| panic!("no background pid in the transcript: {seen:?}"));
+    (orphan, Reaper(orphan))
+}
+
+/// Waits `within` for the daemon to take its run files away, and says which of them
+/// is still there when it does not.
+///
+/// `shutdown` unlinks what the session published on its way out, so the files
+/// outliving the process is the visible symptom of a shutdown that did not run to
+/// completion — `list` then reports a session nobody can attach to until something
+/// else garbage-collects it. Both files, because either one left behind is that
+/// symptom, and the message names both rather than the first to be looked at.
+///
+/// `within` is the caller's because the two shutdowns are different waits: one has a
+/// linger window to expire first, the other starts the moment the signal lands.
+/// `describing` is what tells the two failures apart.
+fn assert_run_files_removed(session: &Session, within: Duration, describing: &str) {
+    let pid_file = session.pid_file();
+    assert!(
+        poll_until(within, || !pid_file.exists() && !session.socket.exists()),
+        "run files outlived the {describing}: socket={} pid={}",
+        session.socket.exists(),
+        pid_file.exists()
+    );
+}
+
+/// How much a unix socket on this host takes from a peer that has stopped reading.
+///
+/// Measured rather than assumed: the limit is the *sender's* send buffer, which is a
+/// sysctl away from any number written down here, and both callers turn on sending
+/// more than it. Asking a socketpair is asking the same kernel the same question —
+/// nothing about the pair the daemon accepts is different.
+fn socket_capacity() -> usize {
+    let (mut probe, _other_end) = UnixStream::pair().expect("a socketpair to measure");
+    probe.set_nonblocking(true).expect("stop blocking");
+    push_until_refused(&mut probe, &vec![0u8; 8 << 20], Duration::from_millis(100))
 }
 
 /// Signals a daemon and reports how long it took to leave.
@@ -3640,23 +3792,6 @@ fn cpu_ticks(pid: u32) -> u32 {
         .into_iter()
         .filter_map(|field| stat_field(pid, field))
         .sum()
-}
-
-/// The single-letter run state `/proc` reports for `pid`, or `None` once it is gone.
-///
-/// Read from after the parenthesised command name for the reason [`stat_field`]
-/// gives: the name can contain a space or a bracket, and counting from the front
-/// stops working the moment it does.
-fn process_state(pid: u32) -> Option<char> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let (_, tail) = stat.rsplit_once(')')?;
-    tail.trim_start().chars().next()
-}
-
-/// Whether `pid` is still a process rather than gone or a zombie awaiting its
-/// parent. A collected process group reaches one of the latter two promptly.
-fn process_alive(pid: u32) -> bool {
-    process_state(pid).is_some_and(|state| state != 'Z')
 }
 
 /// Regression: a reconnect racing with in-flight input must not discard it.
@@ -3970,7 +4105,7 @@ fn assert_relay_moves_bulk(
     let downlink = join_before(downlink, deadline, "stdout reader");
 
     // Killed before its stderr is read to the end. Every wait above goes through
-    // `join_within` so that a stalled relay fails rather than hangs, and this read
+    // `join_before` so that a stalled relay fails rather than hangs, and this read
     // has no deadline of its own: a relay that had closed both data directions but
     // not exited would park the run here until nextest's own kill, with nothing to
     // point at. By this line the three joins have established that both directions
@@ -4435,7 +4570,7 @@ fn relay_onto_a_socket_over(
     );
     // `accept` hands back a socket with no deadline of its own, and the bulk tests
     // read it to end of file — so a relay that stalled would park a test thread for
-    // ever. The timeout turns that into the named failure `join_within` reports.
+    // ever. The timeout turns that into the named failure `join_before` reports.
     peer.set_read_timeout(Some(RELAY_PATIENCE))
         .expect("a peer the test must not park on");
     (child, peer, listener)

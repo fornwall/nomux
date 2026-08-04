@@ -35,8 +35,8 @@ use std::time::Duration;
 use nomux_proto::PROTOCOL_VERSION;
 
 use harness::{
-    Reaper, Spawned, collect, control, nomux, nomux_with_shell, poll_until, run_root, stderr,
-    stdout, succeeded, wait_for, while_nothing_forks,
+    Reaper, Spawned, collect, control, daemon_reaper, nomux, nomux_with_shell, poll_until,
+    process_alive, run_root, stderr, stdout, succeeded, wait_for, while_nothing_forks,
 };
 
 /// A `list` that finds the spawn lock held leaves the whole entry alone, and
@@ -168,19 +168,11 @@ fn an_attach_re_takes_a_spawn_lock_that_was_collected() {
     drop(lock);
 
     wait_for(&session.socket());
-    // The daemon this attach spawned has `setsid`ed away, so killing the relay does
-    // not reach it: without this it outlives the test by its whole 30-second
-    // first-attach timeout, holding a run directory that the *next* run's sweep
-    // deletes out from under it. Every other test here that brings a session up
-    // collects it; this one is the exception, and a `Reaper` covers a failing
-    // assertion below as well as a passing one.
-    wait_for(&session.pid_path());
-    let pid = fs::read_to_string(session.pid_path())
-        .expect("read the pidfile")
-        .trim()
-        .parse()
-        .expect("the pidfile holds a pid");
-    let _reaper = Reaper(pid);
+    // Every other test here that brings a session up collects it with an explicit
+    // `nomux kill`; this one is the exception, and the guard covers a failing
+    // assertion below as well as a passing one. See [`daemon_reaper`] for what a
+    // daemon left running costs the next run.
+    let (_pid, _reaper) = daemon_reaper(&session.root, &session.id);
 
     assert!(
         session.lock_path().exists(),
@@ -313,14 +305,17 @@ fn a_daemon_that_cannot_bind_says_so_even_when_it_has_to_fork() {
     );
 }
 
-/// The lock a `kill` creates is one the *next* process must be able to open, so it
-/// is created at exactly `0600` however lax or strict the caller's umask is.
+/// A spawn lock nobody can open does not take the control surface with it: the dead
+/// session behind it is still collected.
 ///
-/// Left to the umask, a single `umask 0200` login publishes `<id>.lock` at `0400`
-/// — and from then on nothing can open it `O_RDWR`, so no attach can serialise
-/// against another and neither `list` nor `kill` can collect the session. A dead
-/// session becomes uncollectable for good, which is the one outcome § 6.6 exists
-/// to rule out.
+/// The mode a lock is *created* at is
+/// [`the_lock_and_the_pidfile_are_created_at_0600_whatever_the_umask`]'s business.
+/// This is what one already at `0400` costs — a file left by an older release, or by
+/// a login under `umask 0200`. `list` opens `<id>.lock` `O_RDWR` to serialise against
+/// an attach, and a caller that skipped every entry whose lock it could not open
+/// would leave that session on disk for good, which is the one outcome § 6.6 exists
+/// to rule out. So the entry is collected anyway: what the lock stands between is a
+/// spawn and a collection, and there is no spawn here to lose a race with.
 #[test]
 fn an_unopenable_spawn_lock_does_not_take_the_control_surface_with_it() {
     let session = StaleSession::create("lk4");
@@ -335,9 +330,63 @@ fn an_unopenable_spawn_lock_does_not_take_the_control_surface_with_it() {
          {:?}",
         entries(&session.dir)
     );
+}
 
-    // And the fresh one a later session creates is openable by whoever comes next.
-    let session = StaleSession::create("lk5");
+/// The lock and the pidfile are created at exactly `0600`, however lax or strict the
+/// umask of whoever created them was (`rundir::with_umask`).
+///
+/// `open(2)` subtracts the caller's umask from the mode it is given, which makes that
+/// argument an upper bound rather than a request — and every mode in `rundir` is
+/// exact. Left to the umask, a single `umask 0200` login publishes `<id>.lock` at
+/// `0400`, and from then on nothing can open it `O_RDWR`: no attach can serialise
+/// against another, and neither `list` nor `kill` can take the lock they must hold
+/// before they unlink anything (§ 6.6), so a dead session becomes uncollectable for
+/// good. `<id>.pid` at `0400` is the milder version of the same fault — it is
+/// rewritten rather than only read, and a mode a file keeps is one `write_private`
+/// removes it to be rid of.
+///
+/// `0377` is the umask because it is the strictest one that still leaves a mode to
+/// observe: it takes `0600` down to `0400`, which is precisely the login above, and a
+/// suppression that did nothing would be visible as that number rather than as an
+/// absence. The attach takes the lock and the daemon it forks publishes the pidfile,
+/// so one hostile umask reaches both files through both processes.
+#[test]
+fn the_lock_and_the_pidfile_are_created_at_0600_whatever_the_umask() {
+    let session = StaleSession::empty("lk5");
+    let mut command = nomux_with_shell(&session.root, &["attach", "lk5"]);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    // SAFETY: the closure runs in the forked child before exec, so it must be
+    // async-signal-safe. `umask` is, and nothing here allocates or takes a lock.
+    unsafe {
+        command.pre_exec(|| {
+            libc::umask(0o377);
+            Ok(())
+        });
+    }
+    let started = collect(&mut command);
+    succeeded(&started, "attach failed under a hostile umask");
+    let (_pid, _reaper) = daemon_reaper(&session.root, "lk5");
+
+    for path in [session.lock_path(), session.pid_path()] {
+        let mode = fs::metadata(&path)
+            .unwrap_or_else(|err| panic!("stat {}: {err}", path.display()))
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode,
+            0o600,
+            "{} was created at {mode:o} rather than the 600 the layout fixes, so it \
+             was the caller's umask that decided",
+            path.display()
+        );
+    }
+
+    // And what that mode is for: the next process can still take the lock and read
+    // the pid, which is the whole of what `kill` needs to establish (§ 6.6).
     succeeded(&session.run(&["kill", "lk5"]), "kill failed");
 }
 
@@ -503,9 +552,9 @@ fn kill_leaves_a_live_session_alone_when_nothing_will_say_which_process_it_is() 
 ///
 /// The two live numbers do not cancel out: where they disagree, the tie is broken by
 /// asking each candidate what it *is*, since only one of them runs `nomux daemon
-/// <id>`. The bystander below is live and is a `sleep`, so the socket wins and the
-/// session is stopped — which is the whole point of the change, and what refusing
-/// instead would have thrown away.
+/// <id>`. The stranger [`assert_told_from_a_stranger`] plants is live and is a
+/// `sleep`, so the socket wins and the session is stopped — which is the whole point
+/// of the change, and what refusing instead would have thrown away.
 #[test]
 fn kill_signals_the_process_the_socket_names_rather_than_the_pidfile() {
     let session = LiveSession::create("lk11");
@@ -519,8 +568,30 @@ fn kill_signals_the_process_the_socket_names_rather_than_the_pidfile() {
         "a connection must name the process that called `listen` on the socket"
     );
 
-    // A process of the user's with nothing to do with the session, and a pidfile that
-    // names it.
+    assert_told_from_a_stranger(
+        &session.run.root,
+        "lk11",
+        session.pid,
+        "answering on its own socket",
+    );
+}
+
+/// Plants a live stranger's pid in `<id>.pid` and asserts that both modes still see
+/// through it to `daemon`.
+///
+/// Every test about a daemon that is hard to identify ends in the same four
+/// assertions, because the tie the socket and the file are in is broken the same way
+/// each time — by asking each candidate what it is (`control::daemon_of`). So the
+/// stranger must survive, `kill` must report success, `list` must print the pid it
+/// would act on rather than the one in the file, and the daemon must be the process
+/// that actually went. `describing` says which session this was: it is all that
+/// distinguishes one of these failures from another.
+///
+/// A `sleep 300` is the stranger because it is unmistakably not a `nomux daemon`, and
+/// its fate is read before anything is asserted — a failing assertion would otherwise
+/// leave it behind as well, though [`Spawned`] collects it either way.
+fn assert_told_from_a_stranger(root: &Path, id: &str, daemon: u32, describing: &str) {
+    let pid_path = root.join("nomux").join(format!("{id}.pid"));
     let mut bystander = Spawned::spawn(
         Command::new("sleep")
             .arg("300")
@@ -528,32 +599,32 @@ fn kill_signals_the_process_the_socket_names_rather_than_the_pidfile() {
             .stdout(Stdio::null())
             .stderr(Stdio::null()),
     );
-    fs::write(session.pid_path(), format!("{}\n", bystander.id()))
-        .expect("plant a reissued pid in the pidfile");
+    fs::write(&pid_path, format!("{}\n", bystander.id())).expect("plant a stranger's pid");
 
-    let listed = stdout(&session.run.run(&["list"]));
-    let killed = session.run.run(&["kill", "lk11"]);
-    // Read before anything is asserted, so a failure cannot also leave the bystander
-    // behind — and `Spawned` collects it either way.
+    let listed = stdout(&control(root, &["list"]));
+    let killed = control(root, &["kill", id]);
     let survived = bystander.is_running();
     drop(bystander);
 
     assert!(
         survived,
-        "kill signalled an unrelated process of the user's: {:?}",
+        "a `sleep` was taken for the daemon of a session {describing}: {:?}",
         stderr(&killed)
+    );
+    succeeded(
+        &killed,
+        &format!("a daemon {describing} was not recognised as one"),
     );
     assert_eq!(
         listed.trim_end().split('\t').nth(1),
-        Some(session.pid.to_string().as_str()),
-        "list must show the pid kill would act on, not the one in the file: {listed:?}"
+        Some(daemon.to_string().as_str()),
+        "list must name the daemon {describing}, not the pid planted in its file: \
+         {listed:?}"
     );
-    succeeded(&killed, "kill could not stop the session");
     assert!(
-        poll_until(Duration::from_secs(10), || !process_alive(session.pid)),
-        "kill reported success with the daemon it was asked to stop still running \
-         as pid {}",
-        session.pid
+        poll_until(Duration::from_secs(10), || !process_alive(daemon)),
+        "kill reported success with the daemon {describing} still running as pid \
+         {daemon}"
     );
 }
 
@@ -617,47 +688,9 @@ fn a_daemon_started_from_a_long_path_is_still_told_from_a_stranger() {
         &started,
         "the deeply installed binary failed to start a session",
     );
-    let pid_path = root.join("nomux").join("lk19.pid");
-    wait_for(&pid_path);
-    let daemon: u32 = fs::read_to_string(&pid_path)
-        .expect("read the pidfile")
-        .trim()
-        .parse()
-        .expect("the pidfile holds a pid");
-    let _reaper = Reaper(daemon);
+    let (daemon, _reaper) = daemon_reaper(&root, "lk19");
 
-    let mut bystander = Spawned::spawn(
-        Command::new("sleep")
-            .arg("300")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()),
-    );
-    fs::write(&pid_path, format!("{}\n", bystander.id())).expect("plant a stranger's pid");
-
-    let listed = stdout(&control(&root, &["list"]));
-    let killed = control(&root, &["kill", "lk19"]);
-    let survived = bystander.is_running();
-    drop(bystander);
-
-    assert!(
-        survived,
-        "a `sleep` was taken for the session's daemon: {:?}",
-        stderr(&killed)
-    );
-    succeeded(
-        &killed,
-        "a daemon started from a long path was not recognised as one",
-    );
-    assert_eq!(
-        listed.trim_end().split('\t').nth(1),
-        Some(daemon.to_string().as_str()),
-        "list must name the daemon it identified, not the planted pid: {listed:?}"
-    );
-    assert!(
-        poll_until(Duration::from_secs(10), || !process_alive(daemon)),
-        "kill reported success with the daemon still running as pid {daemon}"
-    );
+    assert_told_from_a_stranger(&root, "lk19", daemon, "started from a long path");
 }
 
 /// Regression: a daemon is still recognised when its command line is long *behind*
@@ -685,46 +718,13 @@ fn a_daemon_started_with_an_over_long_label_is_still_told_from_a_stranger() {
             .stderr(Stdio::piped()),
     );
     succeeded(&started, "a session with a very long label failed to start");
-    let pid_path = root.join("nomux").join("lk20.pid");
-    wait_for(&pid_path);
-    let daemon: u32 = fs::read_to_string(&pid_path)
-        .expect("read the pidfile")
-        .trim()
-        .parse()
-        .expect("the pidfile holds a pid");
-    let _reaper = Reaper(daemon);
+    let (daemon, _reaper) = daemon_reaper(&root, "lk20");
 
-    let mut bystander = Spawned::spawn(
-        Command::new("sleep")
-            .arg("300")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()),
-    );
-    fs::write(&pid_path, format!("{}\n", bystander.id())).expect("plant a stranger's pid");
-
-    let listed = stdout(&control(&root, &["list"]));
-    let killed = control(&root, &["kill", "lk20"]);
-    let survived = bystander.is_running();
-    drop(bystander);
-
-    assert!(
-        survived,
-        "a `sleep` was taken for the session's daemon: {:?}",
-        stderr(&killed)
-    );
-    succeeded(
-        &killed,
-        "a daemon whose label ran past the command-line buffer was not recognised",
-    );
-    assert_eq!(
-        listed.trim_end().split('\t').nth(1),
-        Some(daemon.to_string().as_str()),
-        "list must name the daemon it identified, not the planted pid: {listed:?}"
-    );
-    assert!(
-        poll_until(Duration::from_secs(10), || !process_alive(daemon)),
-        "kill reported success with the daemon still running as pid {daemon}"
+    assert_told_from_a_stranger(
+        &root,
+        "lk20",
+        daemon,
+        "started with a label past the command-line buffer",
     );
 }
 
@@ -759,13 +759,7 @@ fn kill_prefers_the_pidfile_when_the_socket_names_a_process_that_is_not_the_daem
             .stderr(Stdio::piped()),
     );
     succeeded(&other, "the second daemon failed to start");
-    wait_for(&session.run.dir.join("lk18b.pid"));
-    let creator: u32 = fs::read_to_string(session.run.dir.join("lk18b.pid"))
-        .expect("read the second pidfile")
-        .trim()
-        .parse()
-        .expect("the pidfile holds a pid");
-    let _reaper = Reaper(creator);
+    let (creator, _reaper) = daemon_reaper(&session.run.root, "lk18b");
 
     fs::rename(session.run.dir.join("lk18b.sock"), session.run.socket())
         .expect("move the second daemon's socket over this session's");
@@ -1396,16 +1390,11 @@ impl LiveSession {
                 .stderr(Stdio::piped()),
         );
         succeeded(&started, "attach failed");
-        wait_for(&run.pid_path());
-        let pid = fs::read_to_string(run.pid_path())
-            .expect("read the pidfile")
-            .trim()
-            .parse()
-            .expect("the pidfile holds a pid");
+        let (pid, reaper) = daemon_reaper(&run.root, id);
         Self {
             run,
             pid,
-            _reaper: Reaper(pid),
+            _reaper: reaper,
         }
     }
 
@@ -1618,27 +1607,6 @@ fn is_flock(line: &str, state: Flock, dev: u64, ino: u64) -> bool {
         && line
             .split_whitespace()
             .any(|field| names_the_file(field, dev, ino))
-}
-
-/// Whether `pid` is still a process rather than gone or a zombie nobody has
-/// collected.
-///
-/// A zombie counts as gone because it has already run its `exit`, which is the whole
-/// of what a `kill` has to establish — and it is a state this cannot rule out by
-/// waiting: the daemon asked about here `setsid`ed away, so whoever reaps it is init
-/// rather than anything in this process, and inside a container that may be a pid 1
-/// that never calls `wait`.
-fn process_alive(pid: u32) -> bool {
-    // Read from after the parenthesised command name, because counting fields from
-    // the front stops working the moment a command name contains a space or a
-    // bracket. A process that is gone has no `stat` to read, which is the answer.
-    fs::read_to_string(format!("/proc/{pid}/stat"))
-        .ok()
-        .and_then(|stat| {
-            let (_, tail) = stat.rsplit_once(')')?;
-            tail.trim_start().chars().next()
-        })
-        .is_some_and(|state| state != 'Z')
 }
 
 /// Whether a `/proc/locks` field is the `MAJOR:MINOR:INODE` of one file.

@@ -92,25 +92,21 @@ pub(crate) fn poll_by(deadline: Instant, mut condition: impl FnMut() -> bool) ->
     }
 }
 
-/// Joins `handle`, failing rather than parking if it will not come back.
+/// Joins `handle` against a deadline the caller shares between several waits,
+/// failing rather than parking if it will not come back.
 ///
 /// The relay tests move megabytes on four threads at once, and a relay that stalls in
 /// either direction would otherwise hang the whole run: `JoinHandle::join` has no
 /// deadline, and the guard in `.config/nextest.toml` can only kill the process
 /// without saying which wait never ended.
-pub(crate) fn join_within<T>(handle: thread::JoinHandle<T>, within: Duration, what: &str) -> T {
-    join_before(handle, Instant::now() + within, what)
-}
-
-/// [`join_within`] against a deadline the caller shares between several waits.
 ///
-/// A test that joins four threads one after another with a bound each is bounded by
-/// the *sum* of them, which is how the relay tests came to allow themselves two
-/// minutes against a runner that kills at forty seconds — so a relay that stalled in
-/// the last direction was killed by nextest with nothing to point at, which is the
-/// exact failure `join_within` exists to prevent. One deadline for the sequence
-/// keeps the promise the individual bounds were written to make. [`poll_by`] is the
-/// same argument for conditions.
+/// The deadline is the caller's rather than a bound per join, because a test that
+/// joins four threads one after another with a bound each is bounded by the *sum* of
+/// them — which is how the relay tests came to allow themselves two minutes against a
+/// runner that kills at forty seconds, so a relay that stalled in the last direction
+/// was killed by nextest with nothing to point at, the exact failure this exists to
+/// prevent. One deadline for the sequence keeps the promise the individual bounds
+/// were written to make. [`poll_by`] is the same argument for conditions.
 pub(crate) fn join_before<T>(handle: thread::JoinHandle<T>, deadline: Instant, what: &str) -> T {
     let remaining = deadline.saturating_duration_since(Instant::now());
     assert!(
@@ -578,6 +574,56 @@ pub(crate) fn wait_for(path: &Path) {
         "the daemon never created {}",
         path.display()
     );
+}
+
+/// Waits for the daemon `id` published a pidfile under `root` for, and hands back
+/// its pid alongside a guard that collects it however the test ends.
+///
+/// For every test that brings a session up through `nomux attach` or `nomux daemon`
+/// rather than through [`Session`], which kills its own child on drop. The daemon
+/// such a spawn produces has `setsid`ed away, so killing the relay does not reach it
+/// and no [`Spawned`] covers it: it is collected by an explicit `nomux kill` further
+/// down, and a panic before that line skips it. What is left behind then holds its
+/// run directory for the whole 30-second first-attach timeout, and the *next* run's
+/// [`sweep_finished_runs`] deletes that directory out from under it — the pid in its
+/// name having gone with this process. `PLAN.md` § P2 records the same shape of
+/// hazard for `flock`.
+///
+/// The number comes back with the guard because most callers go on to assert
+/// something about that process: which pid `list` printed, or that `kill` really
+/// stopped it.
+pub(crate) fn daemon_reaper(root: &Path, id: &str) -> (u32, Reaper) {
+    let pid_file = root.join("nomux").join(format!("{id}.pid"));
+    wait_for(&pid_file);
+    let pid: u32 = fs::read_to_string(&pid_file)
+        .expect("read the pidfile")
+        .trim()
+        .parse()
+        .expect("the pidfile holds a pid");
+    (pid, Reaper(pid))
+}
+
+/// The single-letter run state `/proc` reports for `pid`, or `None` once it is gone.
+///
+/// Read from after the parenthesised command name, because counting fields from the
+/// front stops working the moment a command name contains a space or a bracket — and
+/// `sh` starting `a b )` is enough.
+pub(crate) fn process_state(pid: u32) -> Option<char> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, tail) = stat.rsplit_once(')')?;
+    tail.trim_start().chars().next()
+}
+
+/// Whether `pid` is still a process rather than gone or a zombie nobody has
+/// collected.
+///
+/// A zombie counts as gone because it has already run its `exit`, which is the whole
+/// of what a `kill` has to establish — and it is a state a test cannot rule out by
+/// waiting: a daemon that `setsid`ed away is reaped by init rather than by anything
+/// in this process, and inside a container that may be a pid 1 that never calls
+/// `wait`. A collected process group reaches one of those two states promptly.
+pub(crate) fn process_alive(pid: u32) -> bool {
+    process_state(pid).is_some_and(|state| state != 'Z')
 }
 
 /// Waits for a daemon to be *answering* on `path`, rather than merely to have made

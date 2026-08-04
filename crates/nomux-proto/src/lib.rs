@@ -23,8 +23,11 @@ pub use frame::{
 /// owns why it was there and is where it comes back.
 ///
 /// The number itself is pinned against `IMPLEMENTATION.md` § 2.2 by
-/// `the_protocol_revision_is_the_number_the_document_gives`, since the vectors that
-/// would otherwise notice a change spell it out as a literal.
+/// `the_frozen_numbers_are_the_ones_the_document_gives`. The handshake vectors spell
+/// it out as a literal rather than symbolically, and
+/// `the_handshake_vectors_are_written_at_the_revision_this_build_speaks` is what
+/// holds those two together — so a bump has to move the constant, the vectors and the
+/// document, in that order of complaint.
 pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Fixed frame header size, so reads are a two-stage `read_exact`.

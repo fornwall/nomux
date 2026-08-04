@@ -571,35 +571,21 @@ fn every_hello_ok_flag_is_pinned_in_both_states() {
     }
 }
 
-/// The protocol revision is the number § 2.2 gives, and it is the one the
-/// handshake vectors carry.
+/// The revision the handshake vectors are written at is the one this build speaks.
 ///
-/// [`PROTOCOL_VERSION`] was the last wire constant nothing here compared against
-/// the document, and this file is why: the six handshake vectors write the revision
-/// out as a literal, the way everything else in them is written out, so the
-/// constant could be moved to any number at all and every test in the workspace
-/// stayed green — measured at 4, which passed 132 of 132. Every other use compares
-/// it to itself, `session.rs` asserting a `HelloOk` carries what this crate put
-/// there and `spawn_lock.rs` formatting it into the string it then looks for.
+/// The six of them write it out as a literal, the way everything else in them is
+/// written out from § 2.2 — which is what makes them a check on the document rather
+/// than on the encoder, and equally what would let them go on passing at a revision
+/// the daemon refuses. That refusal is the failure the daemon is built to make loud:
+/// it turns away a `Hello` whose `protocol` is not [`PROTOCOL_VERSION`], so a client
+/// built from a § 2.2 written at one number, against a daemon speaking another, is
+/// stopped at the handshake with every vector here still green.
 ///
-/// The failure that hides behind that is the one the daemon is built to make loud:
-/// it refuses a `Hello` whose `protocol` is not this number, so a client written
-/// from § 2.2 would be turned away at the handshake, and the table it was written
-/// from would be right.
-///
-/// Beside the handshake rather than beside the § 2.1 limits, which is where
-/// [`the_length_field_is_a_u24_past_its_low_byte`] keeps `MAX_PAYLOAD`'s pin: the
-/// revision is not a bound on anything, it is the first field of two frames, and
-/// the vectors are where it is spent. The second assertion is what that placement
-/// buys — the literals stay hand-written from the document, and are now checked to
-/// be the number the code will accept rather than merely a number.
+/// [`the_frozen_numbers_are_the_ones_the_document_gives`] holds the constant against
+/// the document; this holds the literals against the constant. Between them the
+/// vectors carry the number the code will accept rather than merely a number.
 #[test]
-fn the_protocol_revision_is_the_number_the_document_gives() {
-    assert_eq!(
-        PROTOCOL_VERSION, 3,
-        "IMPLEMENTATION.md § 2.2 puts the current revision at 3"
-    );
-
+fn the_handshake_vectors_are_written_at_the_revision_this_build_speaks() {
     for vector in vectors() {
         let carried = match vector.frame {
             Frame::Hello(hello) => hello.protocol,
@@ -664,22 +650,17 @@ fn error_codes_are_the_numbers_the_table_gives_them() {
 /// Every vector above carries a payload shorter than 256 bytes, so the top two
 /// bytes of its length are always zero — and an encoder that computed `len`
 /// correctly and then wrote only its low byte would satisfy all sixteen of them.
-/// The § 2.1 cap is the other half of the same gap: `MAX_PAYLOAD` is the one wire
-/// constant nothing here compares against the document, and `oversized_payload_is_
-/// rejected` in the crate holds at whatever value it happens to have. A client
-/// built from § 2.1 sending a legal 256 KiB frame would collect `Error{Protocol}`,
-/// and nothing in the tree would have said so.
+/// The § 2.1 cap is the other half of the same gap: only a payload at the cap
+/// produces a length that reaches the top byte at all, so the largest legal frame is
+/// the one case that can show the field is three bytes wide rather than two.
+/// [`the_frozen_numbers_are_the_ones_the_document_gives`] is where `MAX_PAYLOAD`
+/// itself is held against § 2.1; this is where its encoding is.
 ///
 /// These payloads are built rather than written out, which is why they sit here
 /// instead of in the table above. The bytes being asserted are still only the
 /// header, and still hand-written from the document.
 #[test]
 fn the_length_field_is_a_u24_past_its_low_byte() {
-    assert_eq!(
-        MAX_PAYLOAD, 262_144,
-        "IMPLEMENTATION.md § 2.1 caps a payload at 256 KiB"
-    );
-
     // `Output` is a u64 offset followed by the bytes, so the payload runs 8 longer
     // than the data: 308 == 0x00_01_34 reaches the middle byte, and the largest
     // legal payload is 0x04_00_00, which is the only value that reaches the top one.
@@ -713,27 +694,72 @@ fn the_length_field_is_a_u24_past_its_low_byte() {
     }
 }
 
-/// The other two frozen numbers, held against the document rather than themselves.
+/// Every frozen number, held against the document rather than against itself.
 ///
-/// Both are asserted elsewhere only through the constant: `session_ids_accept_
-/// minted_forms` takes a `MAX_SESSION_ID_LEN`-long id and
-/// `session_ids_reject_oversized_and_non_ascii` takes one byte more, and that pair
-/// passes for *any* value the constant might hold. So does every agent-channel test,
-/// which counts to `MAX_AGENT_CHANNELS` and asks for one more. That is the hole the
-/// assertion above closed for `MAX_PAYLOAD`, left open for these.
+/// One table, because these are the four numbers a second implementation reads out
+/// of the document rather than out of this crate. Two of them are asserted elsewhere
+/// only *through* the constant, so those assertions pass at whatever value it happens
+/// to hold: `session_ids_accept_minted_forms` takes a `MAX_SESSION_ID_LEN`-long id
+/// against a sibling that takes one byte more, and every agent-channel test counts to
+/// `MAX_AGENT_CHANNELS` and asks for one more. Measured, both moved at once — 64 to
+/// 48 and 8 to 6: 156 of 157 tests in the workspace passed, and this was the one that
+/// did not.
 ///
-/// It matters because the far end is a separate codebase built from the document:
-/// § 6.3 fixes the id at 64 bytes and says "Both ends validate: the client before
-/// minting", so a re-tune here mints ids the daemon refuses — and § 6.7 fixes the
-/// channel cap at 8, which is what a client sizes its own table against.
+/// The other two are already held against a hand-written literal somewhere, and are
+/// here for the citation rather than for the arithmetic. The handshake vectors write
+/// `PROTOCOL_VERSION` out as `3` and
+/// [`the_handshake_vectors_are_written_at_the_revision_this_build_speaks`] compares
+/// them; the largest legal frame in
+/// [`the_length_field_is_a_u24_past_its_low_byte`] encodes its length as the literal
+/// `0x04_00_00`. So moving either constant alone already fails. What those two cannot
+/// see is the edit that moves the constant *and* the literals together, which is
+/// exactly what a revision bump or a re-tune of the cap looks like — and which is a
+/// change to the wire that § 2.1 and § 2.2 have not been told about.
+///
+/// It matters because the far end is a separate codebase built from the document. A
+/// client whose § 2.2 disagrees is turned away at the handshake; one built from § 2.1
+/// sending a legal 256 KiB frame collects `Error{Protocol}`; § 6.3 fixes the id at 64
+/// bytes and says "Both ends validate: the client before minting", so a re-tune here
+/// mints ids the daemon refuses; and § 6.7 fixes the channel cap at 8, which is what
+/// a client sizes its own table against.
+///
+/// The numbers are written out by hand, since they have to come from the document
+/// rather than from the code under test, and every row carries the section it was
+/// read from — that citation is the whole difference between a failure here and one
+/// answered by editing the expectation.
 #[test]
-fn the_frozen_limits_are_the_numbers_the_document_gives() {
-    assert_eq!(
-        MAX_SESSION_ID_LEN, 64,
-        "IMPLEMENTATION.md § 6.3 caps a session id at 64 bytes"
-    );
-    assert_eq!(
-        MAX_AGENT_CHANNELS, 8,
-        "IMPLEMENTATION.md § 6.7 caps a session at 8 concurrent agent channels"
-    );
+fn the_frozen_numbers_are_the_ones_the_document_gives() {
+    let documented: [(&str, u64, u64, &str); 4] = [
+        (
+            "PROTOCOL_VERSION",
+            u64::from(PROTOCOL_VERSION),
+            3,
+            "§ 2.2 puts the current revision at 3",
+        ),
+        (
+            "MAX_PAYLOAD",
+            u64::from(MAX_PAYLOAD),
+            262_144,
+            "§ 2.1 caps a payload at 256 KiB",
+        ),
+        (
+            "MAX_SESSION_ID_LEN",
+            u64::try_from(MAX_SESSION_ID_LEN).expect("a byte count fits in a u64"),
+            64,
+            "§ 6.3 caps a session id at 64 bytes",
+        ),
+        (
+            "MAX_AGENT_CHANNELS",
+            u64::from(MAX_AGENT_CHANNELS),
+            8,
+            "§ 6.7 caps a session at 8 concurrent agent channels",
+        ),
+    ];
+
+    for (name, held, expected, section) in documented {
+        assert_eq!(
+            held, expected,
+            "{name} is {held}, and IMPLEMENTATION.md {section}"
+        );
+    }
 }
