@@ -40,7 +40,7 @@ jobs:
     # would otherwise hold the runner for the six-hour default.
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # Bare `toolchain install` reads rust-toolchain.toml, so the 1.97.1 pin and
       # its components stay stated in exactly one place.
@@ -88,7 +88,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install the pinned toolchain
         run: rustup toolchain install --profile minimal --no-self-update
@@ -113,7 +113,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # Read rather than repeated here: scripts/build-release.sh defaults to the same
       # file, so this job and a laptop build use one compiler and their sizes are
