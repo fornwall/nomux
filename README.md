@@ -1,5 +1,5 @@
 > [!WARNING]
-> **Experimental.** nomux is AI-generated and has not seen real world usage.
+> **Experimental.** This project is AI-generated and has not seen real world usage.
 
 # nomux
 
