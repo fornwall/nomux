@@ -230,13 +230,14 @@ pub(crate) fn list() -> io::Result<()> {
 /// Fails if the session id is invalid, if the run directory is not this user's
 /// alone (§ 6.3), if the spawn lock could not be taken within [`SPAWN_LOCK_GRACE`]
 /// — see [`hold_spawn_lock`] — if the session is alive but will not say which
-/// process it is, if its two witnesses name two live processes and neither of them
-/// is this session's daemon (both are [`resolve`]), if it goes on answering after
-/// both signals, which means the pid that was signalled is not the process serving
-/// it, or if one of the five files will not go once it has stopped — the one refusal
-/// here that is not about establishing anything, since the session really did end
-/// (see [`SessionPaths::unlink_all_locked`]). A session that is already gone is not
-/// an error — the postcondition is "no such session", which already holds.
+/// process it is, if the one live process a lone `<id>.pid` names is positively not
+/// this session's daemon, if its two witnesses name two live processes and which of
+/// them serves cannot be settled (all three are [`resolve`]), if it goes on answering
+/// after both signals, which means the pid that was signalled is not the process
+/// serving it, or if one of the five files will not go once it has stopped — the one
+/// refusal here that is not about establishing anything, since the session really did
+/// end (see [`SessionPaths::unlink_all_locked`]). A session that is already gone is
+/// not an error — the postcondition is "no such session", which already holds.
 pub(crate) fn kill(session_id: &str) -> io::Result<()> {
     let paths = SessionPaths::new(session_id)?;
     // The same check `list` makes, and this is where it bites hardest: the two
@@ -401,11 +402,24 @@ fn resolve(paths: &SessionPaths) -> io::Result<Target> {
                 return chosen(paths, named, filed)
                     .map(Target::Daemon)
                     .ok_or_else(|| {
-                        // Nothing came back, so either there was no witness at all or the
-                        // two could not be reconciled — and the two read very differently
-                        // to whoever has to act on them.
+                        // Nothing came back, so either no witness survived being asked
+                        // or the two could not be reconciled — and the three read very
+                        // differently to whoever has to act on them.
                         match (named, filed) {
                             (Some(named), Some(filed)) => disagreement(paths, named, filed),
+                            // A live number in the file that [`chosen`] still refused,
+                            // which is the one answer [`is_daemon_for`] gives that rules
+                            // a lone candidate out. Nothing here is a file to repair, so
+                            // the pid is what the sentence is about.
+                            (None, Some(filed)) => unreadable(
+                                paths,
+                                &format!(
+                                    "it names pid {filed}, which is not a `nomux daemon \
+                                     {id}` process",
+                                    filed = filed.as_raw_nonzero(),
+                                    id = paths.id(),
+                                ),
+                            ),
                             _ => unreadable(paths, &unusable(body)),
                         }
                     });
@@ -518,6 +532,17 @@ fn extant(pid: i32) -> Option<rustix::process::Pid> {
 /// recommends no repair for an unreconciled session and a user who wants to act then
 /// asks `list` what to signal. A column that answered from the file alone would hand
 /// them the stranger's.
+///
+/// A witness the *other* one does not contradict is still asked what it is where it is
+/// the file's, which is not the same courtesy as the tie-break in [`serving`] and is
+/// owed for a reason of its own. `SO_PEERCRED` names nobody wherever the peer sits in a
+/// pid namespace this process cannot see (see [`peer_pid`]), and the number the daemon
+/// wrote in *its* namespace means nothing in this one either — so `<id>.pid` alone is a
+/// number nothing has ever tied to this session, and `nomux kill` run inside a
+/// container over a run directory shared with the outside signals whichever bystander
+/// happens to wear it. Only a positive "it is not" refuses: "could not tell" passes,
+/// for [`is_daemon_for`]'s reason and § 6.6's — the file is the half § 6.2's fork
+/// leaves right, and an unread `/proc` is no ground for ruling it out.
 fn chosen(
     paths: &SessionPaths,
     named: Option<rustix::process::Pid>,
@@ -525,7 +550,8 @@ fn chosen(
 ) -> Option<rustix::process::Pid> {
     match (named, filed) {
         (Some(named), Some(filed)) if named != filed => serving(paths, named, filed),
-        (Some(pid), _) | (None, Some(pid)) => Some(pid),
+        (Some(pid), _) => Some(pid),
+        (None, Some(pid)) => (is_daemon_for(pid, paths.id()) != Some(false)).then_some(pid),
         (None, None) => None,
     }
 }
@@ -644,9 +670,15 @@ fn disagreement(
 
 /// What is wrong with a pidfile body that yielded no pid, in the terms of the repair.
 ///
-/// The two are not the same fault and do not read the same way: a body that reached
-/// the bound holds what may be a perfectly good number with the end of it unread, so
-/// quoting it alone would show the user a pid and call it unusable.
+/// The three are not the same fault and do not read the same way, and the middle one is
+/// not a file to repair at all. A body that reached the bound holds what may be a
+/// perfectly good number with the end of it unread, so quoting it alone would show the
+/// user a pid and call it unusable — a file to repair, but not by reading the pid out
+/// of the quotation. A body that parsed perfectly well and yielded nothing is the
+/// daemon that died without unlinking (§ 6.6): the file is exactly what its author
+/// meant it to be and the *number* is what has gone stale, so reporting it as garbage
+/// sends whoever reads it to look for a corruption that is not there. Only the third —
+/// bytes that are no pid at all — is a body whose contents are the fault.
 fn unusable(body: &[u8]) -> String {
     let quoted = String::from_utf8_lossy(body);
     if body.len() >= MAX_PID_LEN {
@@ -654,6 +686,8 @@ fn unusable(body: &[u8]) -> String {
             "it runs past the {MAX_PID_LEN} bytes a pidfile may be, so any number in it \
              is cut off rather than read; it begins {quoted:?}"
         )
+    } else if let Some(pid) = parse_pid(body) {
+        format!("pid {pid} names no process this user can signal")
     } else {
         format!("it holds {quoted:?}")
     }
@@ -686,11 +720,12 @@ fn unreadable(paths: &SessionPaths, problem: &str) -> io::Error {
 /// under an attach is how two of them end up each holding a lock of their own, and
 /// the entry stays collectable for as long as it stays dead.
 ///
-/// `None` from [`SessionPaths::try_lock_spawn`] means somebody holds it and nothing
-/// else. A host that cannot lock at all hands back a claim anyway and collection goes
-/// ahead, per § 6.3: an entry that stopped being collectable because of the mutex
-/// protecting it would be a garbage collector that leaks under exactly the conditions
-/// it exists for.
+/// `None` from [`SessionPaths::try_lock_spawn`] is somebody else holding it, or this
+/// process momentarily unable to ask; either reading is answered by leaving the entry
+/// for the next pass, which is what waiting for it would have come to anyway. A host
+/// that cannot lock at all hands back a claim anyway and collection goes ahead, per
+/// § 6.3: an entry that stopped being collectable because of the mutex protecting it
+/// would be a garbage collector that leaks under exactly the conditions it exists for.
 fn collect(paths: &SessionPaths) {
     let Some(lock) = paths.try_lock_spawn() else {
         return;

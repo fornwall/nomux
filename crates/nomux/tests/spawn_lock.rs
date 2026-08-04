@@ -848,6 +848,144 @@ fn a_pidfile_whose_number_is_cut_off_by_the_read_is_refused_rather_than_signalle
     );
 }
 
+/// Regression: `<id>.pid` alone is not a number to signal until it has been asked what
+/// it is.
+///
+/// The tie-break in `control::serving` ran only where *both* witnesses named a live
+/// process, so a lone file witness went straight to `SIGTERM` and then `SIGKILL` with
+/// nobody having asked whether it was a `nomux daemon <id>`. `control::peer_pid` states
+/// the opposite as the contract: the kernel writes 0 into `SO_PEERCRED`'s pid field for
+/// a peer whose pid does not map into the reader's namespace, and the pidfile the
+/// daemon wrote in *its* namespace means nothing in this one either, so it is left "to
+/// `resolve` to refuse". It was not refused. `nomux kill` run inside a container that
+/// shares a run directory with a daemon started outside it terminated whichever process
+/// inside happened to wear the outside number.
+///
+/// A socket at mode 0 stands in for the namespace and reaches the same state through
+/// the same branch — a `connect` that failed for a reason which is not death, so the
+/// session is unmistakably alive and the socket names nobody — without an `unshare`.
+/// That is also why this stands down as root, where a mode keeps nobody out of their
+/// own socket.
+///
+/// `list` is asserted beside it because the two weigh the same witnesses the same way
+/// (§ 6.6): a column that still printed the stranger would be the escape hatch handing
+/// a user the pid to signal by hand, at the moment `kill` has just declined to.
+#[test]
+fn a_lone_pidfile_naming_a_live_stranger_is_refused_rather_than_signalled() {
+    if rustix::process::getuid().is_root() {
+        return;
+    }
+    let session = LiveSession::create("lk21");
+    let before = entries(&session.run.dir);
+    let mut bystander = Spawned::spawn(
+        Command::new("sleep")
+            .arg("300")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    );
+    let stranger = bystander.id();
+    fs::write(session.pid_path(), format!("{stranger}\n")).expect("plant a stranger's pid");
+    fs::set_permissions(session.run.socket(), fs::Permissions::from_mode(0o000))
+        .expect("shut the socket");
+
+    let killed = session.run.run(&["kill", "lk21"]);
+    let listed = stdout(&session.run.run(&["list"]));
+    let survived = bystander.is_running();
+    let left = entries(&session.run.dir);
+    // The other direction, and what keeps the check from being a refusal of every lone
+    // file witness: § 6.2's fork leaves the socket naming an exited creator and the
+    // file naming the daemon that serves, and such a session must still resolve to it.
+    // `list` is what can say so while the socket is shut, since `kill` cannot watch a
+    // socket it may not connect to stop answering.
+    fs::write(session.pid_path(), format!("{}\n", session.pid)).expect("republish the pid");
+    let identified = stdout(&session.run.run(&["list"]));
+    fs::set_permissions(session.run.socket(), fs::Permissions::from_mode(0o600))
+        .expect("restore the socket");
+    drop(bystander);
+    fs::remove_file(session.pid_path()).expect("take the planted pidfile away");
+    succeeded(&session.run.run(&["kill", "lk21"]), "kill failed");
+
+    assert!(
+        survived,
+        "the only witness there was got signalled without being asked what it is: \
+         {:?}",
+        stderr(&killed)
+    );
+    assert!(
+        !killed.status.success(),
+        "a live session whose one witness is positively not its daemon is not one to \
+         unlink"
+    );
+    assert!(
+        stderr(&killed).contains(&format!(
+            "it names pid {stranger}, which is not a `nomux daemon lk21` process"
+        )),
+        "the refusal must say which number it would not signal and what is wrong with \
+         it, rather than blaming a file that holds exactly what it should: {:?}",
+        stderr(&killed)
+    );
+    assert_eq!(
+        listed.trim_end().split('\t').nth(1),
+        Some("?"),
+        "list must not hand back the number kill has just declined to act on: \
+         {listed:?}"
+    );
+    assert_eq!(
+        identified.trim_end().split('\t').nth(1),
+        Some(session.pid.to_string().as_str()),
+        "a lone file witness that *is* this session's daemon must still be taken, or \
+         § 6.2's fork leaves a healthy session unidentifiable: {identified:?}"
+    );
+    assert_eq!(left, before, "not one of the files was kill's to remove");
+}
+
+/// Regression: a well-formed pidfile whose process is gone is reported as a stale
+/// number, not as a corrupt file.
+///
+/// The refusal is built from the *bytes* of the body, and `control::unusable` had a
+/// branch for a body running past the bound and one for everything else — so
+/// `999999999\n`, which is exactly the pidfile § 6.6 describes, came back as `it holds
+/// "999999999\n"`. That sends the reader to repair a file that is already correct, when
+/// what has happened is the ordinary one: a daemon died without unlinking, and the
+/// number it published names nothing this user can signal. There is no file to mend and
+/// a session to collect, and only one of those two sentences says so.
+///
+/// The socket is shut for the truncated pidfile's reason — a witness that answers makes
+/// the file irrelevant, and this is a test about what the file's own refusal says.
+#[test]
+fn a_pidfile_whose_process_is_gone_is_not_reported_as_a_corrupt_file() {
+    if rustix::process::getuid().is_root() {
+        return;
+    }
+    let session = LiveSession::create("lk22");
+    fs::write(session.pid_path(), "999999999\n").expect("plant a number that names nothing");
+    fs::set_permissions(session.run.socket(), fs::Permissions::from_mode(0o000))
+        .expect("shut the socket");
+
+    let killed = session.run.run(&["kill", "lk22"]);
+    fs::set_permissions(session.run.socket(), fs::Permissions::from_mode(0o600))
+        .expect("restore the socket");
+    fs::remove_file(session.pid_path()).expect("take the planted pidfile away");
+    succeeded(&session.run.run(&["kill", "lk22"]), "kill failed");
+
+    assert!(
+        !killed.status.success(),
+        "a live session with no witness left is not one to unlink"
+    );
+    assert!(
+        stderr(&killed).contains("999999999 names no process"),
+        "the refusal must say the number is stale rather than that the file is: {:?}",
+        stderr(&killed)
+    );
+    assert!(
+        !stderr(&killed).contains("it holds"),
+        "a pidfile holding exactly what the layout says must not be called corrupt: \
+         {:?}",
+        stderr(&killed)
+    );
+}
+
 /// Regression: `list` answers from a bounded prefix of `<id>.pid`.
 ///
 /// The escape hatch has to keep working on any host, which it would not if a file

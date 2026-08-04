@@ -499,15 +499,23 @@ impl SessionPaths {
     ///
     /// # Errors
     ///
-    /// Reports [`io::ErrorKind::ResourceBusy`] if the file at that path was
-    /// replaced under this one more often than [`LOCK_ATTEMPTS`] allows for. A
-    /// host that cannot provide the lock at all is not an error — see
-    /// [`SpawnLock`].
+    /// Reports [`io::ErrorKind::ResourceBusy`] for the two ways a blocking acquire
+    /// comes back empty-handed: the file at that path was replaced under this one more
+    /// often than [`LOCK_ATTEMPTS`] allows for, or the descriptors and lock records it
+    /// takes to ask have run out (see [`Self::acquire`]). Neither is the caller's fault
+    /// and neither says the lock is free, which is why the message names both rather
+    /// than the first alone. A *host* that cannot provide the lock at all is still not
+    /// an error — see [`SpawnLock`].
     pub(crate) fn lock_spawn(&self) -> io::Result<SpawnLock> {
         self.acquire(FlockOperation::LockExclusive).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::ResourceBusy,
-                format!("the spawn lock for session {} kept being removed", self.id),
+                format!(
+                    "the spawn lock for session {} could not be taken: it kept being \
+                     removed, or the descriptors and lock records it takes to hold one \
+                     have run out",
+                    self.id
+                ),
             )
         })
     }
@@ -515,24 +523,33 @@ impl SessionPaths {
     /// Takes the spawn lock if it is free this instant, for callers with better
     /// things to do than wait.
     ///
-    /// `None` means one thing only: somebody else is holding it. Everything that
-    /// is not a refusal by another process comes back as a [`SpawnLock`], which is
-    /// the whole of the policy — a caller that skipped on every failure would skip
-    /// on a lock file it cannot open, and `list` would then stop collecting dead
-    /// sessions on that host without ever saying why.
+    /// `None` is "not this time" and nothing more — the three readings
+    /// [`Self::acquire`] lists: somebody else is holding it, the file at the path kept
+    /// being replaced under the call, or the descriptors and lock records it takes to
+    /// ask have momentarily run out. Everything that is a property of the *host* rather
+    /// than of this moment comes back as a [`SpawnLock`], which is the whole of the
+    /// policy — a caller that skipped on every failure would skip on a lock file nobody
+    /// can open, and `list` would then stop collecting dead sessions on that host
+    /// without ever saying why.
     pub(crate) fn try_lock_spawn(&self) -> Option<SpawnLock> {
         self.acquire(FlockOperation::NonBlockingLockExclusive)
     }
 
     /// Locks `<id>.lock` and confirms that what got locked is still that file.
     ///
-    /// `None` is "not this time": either somebody else is holding the lock, or the
-    /// file at the path was replaced under this call more often than
-    /// [`LOCK_ATTEMPTS`] allows for. Every other way this can fail to produce a lock
-    /// hands back [`SpawnLock::unavailable`] instead. The two readings need not be
-    /// told apart, because every caller answers them the same way — wait, skip, or
-    /// refuse — and `lock_spawn` uses the blocking operation, so *its* `None` can
-    /// only ever be the second.
+    /// `None` is "not this time": somebody else is holding the lock, the file at the
+    /// path was replaced under this call more often than [`LOCK_ATTEMPTS`] allows for,
+    /// or the descriptors and lock records it takes to ask have run out.
+    /// [`SpawnLock::unavailable`] is kept for the failures that say the *file* cannot
+    /// be locked by anybody — a mode nobody can open, a read-only or full run
+    /// directory, an `flock` the filesystem rejects outright — because those are the
+    /// only ones [`SpawnLock`]'s argument for proceeding without a lock holds for.
+    /// `EMFILE` is not one of them: a process at its `RLIMIT_NOFILE` cannot open
+    /// `<id>.lock` while another process holds it perfectly well, and a daemon's
+    /// shutdown that read that as "there is no lock here" would go on to unlink the
+    /// five files of the session an attach was spawning into the same id. The readings
+    /// that remain need not be told apart, because every caller answers them the same
+    /// way — wait, skip, or refuse.
     fn acquire(&self, operation: FlockOperation) -> Option<SpawnLock> {
         let path = self.lock();
         for _ in 0..LOCK_ATTEMPTS {
@@ -548,8 +565,13 @@ impl SessionPaths {
                     Mode::from_bits_truncate(FILE_MODE),
                 )
             });
-            let Ok(fd) = opened else {
-                return Some(SpawnLock::unavailable());
+            let fd = match opened {
+                Ok(fd) => fd,
+                // Out of descriptors is the one `open` failure that says nothing about
+                // the file, so it is answered as a lock somebody else holds rather than
+                // as a host with none to give.
+                Err(rustix::io::Errno::MFILE | rustix::io::Errno::NFILE) => return None,
+                Err(_) => return Some(SpawnLock::unavailable()),
             };
             loop {
                 match rustix::fs::flock(&fd, operation) {
@@ -557,7 +579,21 @@ impl SessionPaths {
                     // the lock; ask again.
                     Err(rustix::io::Errno::INTR) => {}
                     Ok(()) => break,
-                    Err(rustix::io::Errno::WOULDBLOCK) => return None,
+                    // `ENOLCK` is `EMFILE`'s counterpart one syscall later — the kernel
+                    // out of room for a lock record, on a file that locks perfectly well
+                    // for whoever already has one — so it is answered the same way as
+                    // the lock that is simply taken.
+                    //
+                    // It has a second reading this cannot tell from the first: a mount
+                    // whose `flock` goes to a lock manager that is not answering says
+                    // `ENOLCK` too, and that one *is* a host with no lock to give.
+                    // Settled toward `None` because that is the reading that claims
+                    // nothing — the § 6.3 argument below is only entitled to proceed
+                    // where no other process here can be holding the lock, and out of
+                    // lock records is exactly the state that does not establish it. What
+                    // it costs a host where it never clears is an `attach` that reports
+                    // this rather than one that spawns a second daemon into the same id.
+                    Err(rustix::io::Errno::WOULDBLOCK | rustix::io::Errno::NOLCK) => return None,
                     Err(_) => return Some(SpawnLock::unavailable()),
                 }
             }
@@ -661,13 +697,19 @@ impl SessionPaths {
 /// lock there is.
 ///
 /// It also stands for the *absence* of a lock, on a host that has none to give —
-/// `<id>.lock` cannot be opened, or the filesystem does not implement `flock`, or
-/// the run directory is read-only or over quota. Proceeding without one there is
-/// deliberate, and § 6.3 gives the argument: a lock this process cannot obtain by
-/// any means is one no other process here can be holding either, since every one of
-/// them reaches it through [`SessionPaths::acquire`], on the same file, under the
-/// same uid — so refusing would buy nothing and would cost the § 6.6 escape hatch
+/// `<id>.lock` is at a mode nobody can open, or the filesystem rejects `flock` on it
+/// outright, or the run directory is read-only or over quota. Proceeding without one
+/// there is deliberate, and § 6.3 gives the argument: a lock this process cannot
+/// obtain by any means is one no other process here can be holding either, since every
+/// one of them reaches it through [`SessionPaths::acquire`], on the same file, under
+/// the same uid — so refusing would buy nothing and would cost the § 6.6 escape hatch
 /// its ability to collect a session that is genuinely dead.
+///
+/// What that argument rests on is a failure of the *file*, which is why running out of
+/// descriptors or of lock records is not one: at `RLIMIT_NOFILE` the `open` fails while
+/// the lock is exactly where it always was and somebody else may be holding it.
+/// [`SessionPaths::acquire`] answers those with `None` instead, and says there why
+/// `ENOLCK` goes with them even though one of its two readings belongs here.
 #[derive(Debug)]
 pub(crate) struct SpawnLock {
     /// The locked descriptor: `close(2)` on it is what releases the lock, so it is

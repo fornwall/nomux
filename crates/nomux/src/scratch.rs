@@ -73,7 +73,22 @@ impl Drop for Scratch {
 /// planted in place of a run directory is removed as the link it is and whatever it
 /// points at is left alone. Which is the same promise `ensure_dir_at` makes, and it
 /// would be an odd thing for the test's own cleanup to break.
+///
+/// The recursion got that from `read_dir` for nothing; the entry point has to buy it,
+/// because `set_permissions` is `chmod(2)`, which follows, and Linux has no `lchmod`
+/// to reach for instead. Both callers hand this a path somebody else may have replaced
+/// — `Scratch::new` under a shared sticky `/tmp`, and `sweep_finished_runs` over every
+/// `nomux-<dead-pid>-*` entry it finds there — so without the check a link planted at
+/// one of those names is a `chmod` of whatever it points at. As an ordinary user that
+/// fails `EPERM` on somebody else's file; as root, which `rundir`'s tests treat as a
+/// supported way to run this suite, it succeeds.
 fn make_removable(dir: &Path) {
+    // `symlink_metadata`, so the answer is about the name rather than about what it
+    // resolves to — and anything that is not a directory of ours has neither a mode
+    // worth repairing nor entries to recurse into.
+    if !fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir()) {
+        return;
+    }
     drop(fs::set_permissions(
         dir,
         fs::Permissions::from_mode(REMOVABLE),
@@ -111,5 +126,61 @@ fn sweep_finished_runs() {
             make_removable(&path);
             drop(fs::remove_dir_all(&path));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The permission bits as they are on disk, never as a symlink pointing at the
+    /// file would report them.
+    fn mode_of(path: &Path) -> u32 {
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    /// Both directions of the guard at the top of [`make_removable`], because either
+    /// one alone is a fault: a `chmod` that follows a link is somebody else's file at
+    /// [`REMOVABLE`], and a guard that turns any of them away is a scratch directory
+    /// left behind on every run that fails.
+    ///
+    /// The recursion gets the first half from `read_dir`, which reports a link's own
+    /// type. The entry point cannot: `set_permissions` is `chmod(2)`, which follows,
+    /// and both callers hand it a path somebody else may have replaced — `Scratch::new`
+    /// under a shared sticky `/tmp`, and [`sweep_finished_runs`] over every
+    /// `nomux-<dead-pid>-*` name it finds there.
+    #[test]
+    fn make_removable_repairs_a_directory_and_does_not_follow_a_link_to_one() {
+        let root = Scratch::new("scratch-make-removable");
+
+        let victim = root.join("victim");
+        fs::write(&victim, b"not ours to chmod").expect("plant a file of somebody's");
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o644)).expect("at its own mode");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&victim, &link).expect("plant a link where a run dir goes");
+
+        // A real directory, shut the way the mode tests leave one — and shut from the
+        // inside out, since the outer one has to be open to create the inner.
+        let dir = root.join("dir");
+        let nested = dir.join("nested");
+        fs::create_dir_all(&nested).expect("create a directory and one under it");
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o300)).expect("shut the inner");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o300)).expect("shut the outer");
+
+        make_removable(&link);
+        make_removable(&dir);
+
+        assert_eq!(
+            mode_of(&victim),
+            0o644,
+            "the mode belongs to what the link points at, which this was never asked \
+             to touch"
+        );
+        assert_eq!(mode_of(&dir), REMOVABLE, "a directory of ours is repaired");
+        assert_eq!(
+            mode_of(&nested),
+            REMOVABLE,
+            "and so is one under it, or `remove_dir_all` cannot empty the parent"
+        );
     }
 }
