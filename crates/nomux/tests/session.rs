@@ -3446,7 +3446,19 @@ const WINCHED: &str = "NOMUX-42-WINCHED";
 /// three. One marker, printed by the subshell itself, is the shape with no race in
 /// it: reaching it proves the `stty` in front of it took effect *and* that the trap
 /// is armed, which is what the two markers were separately for.
-fn repaint_transcript(name: &str, flags: u16) -> String {
+///
+/// `owed` names the marker this policy is obliged to produce, when the fence at the
+/// end cannot bound it. The `Ctrl-L` half needs nothing: the daemon writes the
+/// keystroke to the PTY and `cat` hands it back, so it travels the same path as the
+/// fence behind it and is already read by the time the fence arrives. The `SIGWINCH`
+/// half does not travel that path at all — the marker is printed by a *second*
+/// process that `TIOCSWINSZ` has merely made runnable, and nothing orders it against
+/// `cat` echoing the fence. Reading to the fence and then asking whether the marker
+/// is there measures which of the two the scheduler happened to pick first, which on
+/// an idle machine is the subshell and on a loaded one is `cat`: it passed forty runs
+/// here and failed in CI. § 4.3 obliges the repaint to happen, not to beat an
+/// unrelated round trip back, so what the wait is for is that it arrives at all.
+fn repaint_transcript(name: &str, flags: u16, owed: Option<&str>) -> String {
     /// The child echoes far more than this, so what the client comes back to is a
     /// gap by construction.
     const RING: usize = 1024;
@@ -3514,10 +3526,28 @@ fn repaint_transcript(name: &str, flags: u16) -> String {
          keystrokes may"
     );
 
-    // A fence bounds the wait: whatever the repaint was going to be has been
-    // echoed by the time this comes back.
+    // A fence bounds the wait for everything the repaint puts through the PTY, which
+    // the child echoes back ahead of it.
     client.input(in_offset, b"FENCE\n");
-    let (transcript, _) = client.read_past_gaps("FENCE", resumed.resume_from);
+    let (mut transcript, _) = client.read_past_gaps("FENCE", resumed.resume_from);
+
+    // What the fence cannot bound is waited for on its own — see above. Offsets stop
+    // mattering here: the reads that own contiguity are behind us, and all this is
+    // after is whether the marker comes at all. Collected rather than asserted on, so
+    // that the verdict stays with the test, which is the only place that can say what
+    // its absence would mean.
+    if let Some(owed) = owed {
+        let deadline = Instant::now() + FRAME_PATIENCE;
+        while !transcript.contains(owed) {
+            let Some((ty, payload)) = client.frame_before(deadline, "the repaint § 4.3 owes")
+            else {
+                break;
+            };
+            if let Frame::Output { data, .. } = Frame::decode(ty, &payload).expect("decode frame") {
+                transcript.push_str(&String::from_utf8_lossy(data));
+            }
+        }
+    }
     transcript
 }
 
@@ -3534,7 +3564,7 @@ fn repaint_transcript(name: &str, flags: u16) -> String {
 /// exists to prevent.
 #[test]
 fn a_gap_repaints_with_ctrl_l_only_when_the_client_asks() {
-    let asked = repaint_transcript("repaint_ctrl_l", HELLO_REPAINT_CTRL_L);
+    let asked = repaint_transcript("repaint_ctrl_l", HELLO_REPAINT_CTRL_L, None);
     assert!(
         asked.contains('\u{c}'),
         "no Ctrl-L reached the child: {asked:?}"
@@ -3545,7 +3575,7 @@ fn a_gap_repaints_with_ctrl_l_only_when_the_client_asks() {
          an editor gets both a redraw it did not want and a keystroke: {asked:?}"
     );
 
-    let default = repaint_transcript("repaint_winch", 0);
+    let default = repaint_transcript("repaint_winch", 0, Some(WINCHED));
     assert!(
         default.contains(WINCHED),
         "the gap was reported and the child was never told the terminal had \

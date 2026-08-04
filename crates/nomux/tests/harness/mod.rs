@@ -665,7 +665,12 @@ pub(crate) struct Ready {
 /// What the shell is asked to say once the terminal is configured, and what that
 /// becomes once it has. The arithmetic is the point of both: see
 /// [`Client::make_ready`].
-const READY_ECHO: &str = "echo \"NOMUX-$((6*7))-READY\"";
+///
+/// `printf` rather than `echo`, and with no newline behind the marker, so that the
+/// marker is the *last* thing the setup line puts on the stream — which is what makes
+/// [`Ready::offset`] one past the marker rather than one past whatever the daemon
+/// read with it. See [`Client::make_ready`] for what a terminator behind it costs.
+const READY_ECHO: &str = "printf \"NOMUX-$((6*7))-READY\"";
 const READY_MARKER: &str = "NOMUX-42-READY";
 
 impl Client {
@@ -730,6 +735,18 @@ impl Client {
     /// away. It is built out of `$((6*7))` because the line discipline echoes the
     /// command line itself before any of it runs — that echo carries the arithmetic
     /// unexpanded, so it cannot be what satisfies the wait.
+    ///
+    /// Nothing may follow the marker on that line, which is why [`READY_ECHO`] is a
+    /// `printf` with no newline in it. [`Ready::offset`] is one past the frame the
+    /// marker completed in rather than one past the marker, so a terminator behind it
+    /// is only accounted for when the daemon happened to read it in the same pass —
+    /// and the PTY makes that a race rather than a rule, since the master can be woken
+    /// between the line and the `\r\n` that `onlcr` expands behind it. What is left
+    /// over is two bytes at an offset the caller never hears about, which the next
+    /// [`Client::next_of`] drops as the session's own chatter; the read after *that*
+    /// starts two bytes short and fails the contiguity assertion in
+    /// [`Client::read_until`], accusing the daemon of a hole in a stream that never
+    /// had one. CI saw exactly that: a frame at 57 where 55 was expected.
     ///
     /// Sent at input offset 0: a session that is not ready yet has had nothing else
     /// sent to it.
