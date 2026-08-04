@@ -31,7 +31,7 @@ env:
   RUST_BACKTRACE: 1
 
 # Third-party actions are pinned to a commit, not to a tag: the release job below
-# builds the four binaries whose SHA-256 the client is designed to pin, and a tag is a
+# builds the binaries whose SHA-256 the client is designed to pin, and a tag is a
 # mutable pointer in someone else's repository. The version rides in the trailing
 # comment, since the SHA does not say which one it is. The `actions/*` steps stay on
 # their major tag deliberately — GitHub's own, inside a trust boundary the job is
@@ -173,7 +173,7 @@ jobs:
         run: >
           rustup toolchain install "$RELEASE_NIGHTLY" --profile minimal --no-self-update
           --component rust-src,llvm-tools
-          --target x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,armv7-unknown-linux-musleabihf,riscv64gc-unknown-linux-musl
+          --target x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -232,7 +232,7 @@ jobs:
       - run: chmod +x dist/nomux-*
 
       # Asked of the artifact rather than read out of Cargo.toml, because the tag's
-      # whole job is to name what these four binaries are, and Cargo.toml is not what
+      # whole job is to name what these binaries are, and Cargo.toml is not what
       # anyone downloads. The musl x86_64 binary is static-pie and the runner is
       # x86_64, so the one witness to the version that ships can simply be asked.
       #

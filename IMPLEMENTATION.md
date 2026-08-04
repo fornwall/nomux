@@ -1019,24 +1019,24 @@ Targets:
 | --- | --- |
 | `x86_64-unknown-linux-musl` | Most servers |
 | `aarch64-unknown-linux-musl` | ARM servers, Apple-silicon VMs, most SBCs |
-| `armv7-unknown-linux-musleabihf` | Older SBCs |
-| `riscv64gc-unknown-linux-musl` | Emerging |
 
-`ppc64le` / `s390x` are deliberately omitted until asked for.
+`armv7` and `riscv64gc` shipped through 0.1.0 and were dropped in 0.2.0: nobody asked
+for either, and each was a cross build, a baseline entry and a companion to carry.
+`ppc64le` / `s390x` are deliberately omitted on the same terms — until asked for.
 
-`scripts/build-release.sh` builds all four, writes `SHA256SUMS`, and exits non-zero
+`scripts/build-release.sh` builds both, writes `SHA256SUMS`, and exits non-zero
 if any binary misses the budget. It also holds each size against the per-target
 baseline recorded in `scripts/size-baseline`, prints the signed delta beside the
 size, and fails a target that has grown more than 3% against it — the cap alone passed
-a commit that grew armv7 by nearly half in one step, since the result still fitted it.
+a commit that grew armv7 by nearly half in one step, back when armv7 shipped, since
+the result still fitted it.
 Sizes are not repeated here: `scripts/size-baseline` is what a build writes and what
 the gate reads, and every prose copy of those numbers has gone stale at least once.
-armv7 still carries that regression against the other three
-([PLAN.md § P1](PLAN.md#p1--known-gaps)). `NOMUX_UPDATE_BASELINE=1` rewrites the
+`NOMUX_UPDATE_BASELINE=1` rewrites the
 baseline from that build and skips the growth gate, which puts an accepted size change
 in the diff a reviewer reads.
 
-**No cross toolchain.** `rust-lld` links all four, including the host target, and
+**No cross toolchain.** `rust-lld` links both, including the host target, and
 each `rust-std` component ships the musl CRT objects and `libc.a` beside it in
 `self-contained/`. So `rustup target add` is the entire setup: no gcc, no zig, no
 sysroot. This works because the tree is pure Rust — rustix is on its `linux_raw`
@@ -1045,9 +1045,9 @@ alternative and rejected: it produces binaries 8–19% smaller than `rust-lld` a
 rust's bundled musl, but its own musl version is not pinned by
 `rust-toolchain.toml`, which works directly against the reproducibility requirement
 below. It remains the fallback for the day a dependency needs a real C compiler.
-`riscv64gc-unknown-linux-musl` is the one target of the four whose spec does not
-default to `crt-static`; left alone it attempts a dynamic link and fails on
-`-lgcc_s`.
+`crt-static` is passed explicitly rather than left to each target's spec: both musl
+targets default to it, but `riscv64gc` did not while it shipped, and left alone it
+attempted a dynamic link and failed on `-lgcc_s`.
 
 Size matters because the cold upload happens over cellular. Release profile:
 `opt-level = "z"`, `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`,
@@ -1059,10 +1059,8 @@ Size matters because the cold upload happens over cellular. Release profile:
 | --- | --- |
 | `x86_64-unknown-linux-musl` | 493 KiB |
 | `aarch64-unknown-linux-musl` | 440 KiB |
-| `armv7-unknown-linux-musleabihf` | 472 KiB |
-| `riscv64gc-unknown-linux-musl` | 442 KiB |
 
-Every stable figure is over the 400 KiB budget, armv7 included. Re-measure with
+Both stable figures are over the 400 KiB budget. Re-measure with
 `NOMUX_STABLE_STD=1 sh scripts/build-release.sh` rather than trusting the table.
 
 The panic machinery — formatting, backtrace symbolisation, `gimli`, `addr2line` —
@@ -1087,7 +1085,7 @@ Reproducibility is the producing half of a check whose consuming half does not e
 yet. **The client is meant to pin a SHA-256 per architecture and verify it after
 upload; nothing does that today.** Where `SHA256SUMS` goes once
 `scripts/build-release.sh` has written it is no longer the open part: a `v*` tag
-publishes it as a release asset beside the four binaries it covers, in the format
+publishes it as a release asset beside the binaries it covers, in the format
 `sha256sum -c` reads, and GitHub computes its own immutable SHA-256 per asset at
 upload time alongside it. What is missing before that check exists is the client, and
 that is [PLAN.md § P3](PLAN.md#p3--release-process)'s. Release builds must pin a
@@ -1107,7 +1105,7 @@ to read afterwards. A stripped binary gives that core no function names, so the 
 also emits `nomux-<target>.debug` per target — the same build with `-Cstrip=none`,
 carrying `.symtab` and the DWARF the shipping binary drops. They are published beside
 the binaries they describe, with their own `SHA256SUMS.debug`; `SHA256SUMS` names only
-the four that ship, since `sha256sum -c` fails on a file it cannot open and nearly
+the ones that ship, since `sha256sum -c` fails on a file it cannot open and nearly
 everyone downloads only what they run.
 
 A companion is a **second build**, not the shipping binary with symbols added back and

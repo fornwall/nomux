@@ -158,7 +158,7 @@ sh scripts/verify-takeover-guard.sh               # rebuilds under fault injecti
 ```
 
 CI runs a third thing that is in neither list: the whole musl release build below.
-It needs a nightly compiler and four cross targets installed, which makes it the one
+It needs a nightly compiler and the two musl targets installed, which makes it the one
 check the local hooks genuinely cannot stand in for.
 
 The chaos suite picks its disconnect points from a fixed seed, so a failure
@@ -167,7 +167,7 @@ message carries the seed that produced it.
 
 ## Release builds
 
-The four shipping binaries come from one script:
+The two shipping binaries come from one script:
 
 ```sh
 sh scripts/build-release.sh     # → target/dist/, SHA256SUMS, debug companions
@@ -177,7 +177,7 @@ It builds every musl target, prints a size table with the change against the
 per-target baseline in `scripts/size-baseline`, and fails a binary that misses either
 the size budget or the growth gate — both numbers are in
 [IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build). There is no cross toolchain to
-install — `rust-lld` links all four and each `rust-std` component carries its own
+install — `rust-lld` links both and each `rust-std` component carries its own
 musl objects — but the shipping configuration rebuilds the standard library with
 panics compiled out, which needs nightly and its sources:
 
@@ -186,9 +186,7 @@ nightly=$(cat scripts/nightly-version)
 rustup toolchain install "$nightly" --component rust-src,llvm-tools
 rustup target add --toolchain "$nightly" \
   x86_64-unknown-linux-musl \
-  aarch64-unknown-linux-musl \
-  armv7-unknown-linux-musleabihf \
-  riscv64gc-unknown-linux-musl
+  aarch64-unknown-linux-musl
 ```
 
 Why the standard library is rebuilt at all, why `scripts/nightly-version` pins a
@@ -198,10 +196,10 @@ dated nightly rather than a floating one, and what `NOMUX_STABLE_STD=1`,
 [PLAN.md § P3](PLAN.md#p3--release-process)'s.
 
 `llvm-tools` is for the debug companions below; `NOMUX_SKIP_DEBUG=1` builds only the
-four that ship, for a run that just wants the size table.
+two that ship, for a run that just wants the size table.
 
 Pushing a `v*` tag runs that same build on CI and publishes a release from it: the
-four binaries, and `SHA256SUMS` beside them. Verify a download against the file
+two binaries, and `SHA256SUMS` beside them. Verify a download against the file
 rather than by eye:
 
 ```sh
@@ -227,7 +225,7 @@ nomux — they are for reading a core:
 gdb nomux-x86_64-unknown-linux-musl.debug core
 ```
 
-`SHA256SUMS` deliberately names only the four binaries that ship, because
+`SHA256SUMS` deliberately names only the binaries that ship, because
 `sha256sum -c` fails on a file it cannot open and nearly everyone downloads only what
 they run. Why a companion is a second build rather than the shipping binary stripped
 afterwards, and how the two are checked against each other, is

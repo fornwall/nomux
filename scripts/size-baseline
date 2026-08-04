@@ -17,5 +17,3 @@
 # one without the other is the mistake both exist to make visible.
 x86_64-unknown-linux-musl             162888
 aarch64-unknown-linux-musl            153096
-armv7-unknown-linux-musleabihf        223876
-riscv64gc-unknown-linux-musl          133840

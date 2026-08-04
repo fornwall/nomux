@@ -1,9 +1,9 @@
-# Cross-linking for the four shipping targets (IMPLEMENTATION.md § 8).
+# Cross-linking for the two shipping targets (IMPLEMENTATION.md § 8).
 #
 # `rust-lld` is the whole cross toolchain. The tree is pure Rust — rustix runs on
 # its linux_raw backend, so nothing here compiles or links a C object — and every
 # rust-std component ships the musl CRT objects and libc.a beside it in
-# `lib/self-contained/`. So the four cross builds need no gcc, no zig, no sysroot:
+# `lib/self-contained/`. So the cross build needs no gcc, no zig, no sysroot:
 # `rustup target add` is the entire setup. rustc resolves the bare name `rust-lld`
 # out of its own sysroot, so it does not have to be on $PATH.
 #
@@ -23,10 +23,4 @@
 linker = "rust-lld"
 
 [target.aarch64-unknown-linux-musl]
-linker = "rust-lld"
-
-[target.armv7-unknown-linux-musleabihf]
-linker = "rust-lld"
-
-[target.riscv64gc-unknown-linux-musl]
 linker = "rust-lld"

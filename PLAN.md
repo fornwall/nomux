@@ -34,11 +34,10 @@ protocol it speaks. Mechanics: [IMPLEMENTATION.md](IMPLEMENTATION.md).
   for the same reason the sizes live in `scripts/size-baseline`. Which layers there
   are and where each one lives, and the two invariants the whole thing exists to
   protect: [IMPLEMENTATION.md § 9](IMPLEMENTATION.md#9-testing).
-- **Release** — all four musl targets build reproducibly and inside the size and
+- **Release** — both musl targets build reproducibly and inside the size and
   growth gates `scripts/build-release.sh` enforces
-  ([IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)). armv7 has by far the least
-  headroom, for the reason in P1. The sizes live in `scripts/size-baseline`, which a
-  build writes.
+  ([IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)). The sizes live in
+  `scripts/size-baseline`, which a build writes.
 - **Partly done** — P3's publishing half: a `v*` tag builds, checks and publishes a
   release, so what is left there is the policy question rather than the plumbing.
 - **Not started** — the client, which is a separate repository and whose server-side
@@ -46,10 +45,10 @@ protocol it speaks. Mechanics: [IMPLEMENTATION.md](IMPLEMENTATION.md).
 
 ## P1 — known gaps
 
-Six, and in the first two the honest answer is a known cost rather than a missing line
-of code; the third is a gap that cannot be closed from inside the process, the fourth a
-limit nobody has built yet, the fifth the one wait on the control surface that has no
-bound, and the sixth a hole in that surface's own promise. Each was found by review or
+Five, and in the first the honest answer is a known cost rather than a missing line
+of code; the second is a gap that cannot be closed from inside the process, the third a
+limit nobody has built yet, the fourth the one wait on the control surface that has no
+bound, and the fifth a hole in that surface's own promise. Each was found by review or
 by measurement rather
 than by guessing, and is recorded with what it was measured against.
 
@@ -69,17 +68,6 @@ than by guessing, and is recorded with what it was measured against.
   stopped before it removes anything, and otherwise reports the pid as not the one
   serving the session. § 6.6's "a live session's files are never unlinked" therefore
   holds without a caveat, and the identification window above is what is left.
-- **The run-directory check costs armv7 66 KiB.** Bisected to `4d5d465`, the commit
-  that introduced it, and the jump is that architecture alone: 148,292 → 215,884
-  bytes, a 46% step against roughly 6 KiB for the whole branch on each of the other
-  three. Ruled out by probe: the two dynamic error messages (168 bytes) and the
-  `fchmod` repair (120 bytes). Removing the check recovers all of it, so the cost is
-  in the `open`/`fstat`/`Mode` path as 32-bit ARM codegen renders it. It stays inside the
-  budget, so this is a size regression rather than a broken release — but it is very
-  nearly a third of the binary users upload over cellular, and armv7 is the target
-  least likely to be on a fast link. The 3% growth gate
-  ([IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)) is what would fail the same
-  commit today; the cap alone did not.
 - **An abort still says nothing from inside the process.** The daemon reports startup
   failures to the `attach` that spawned it and everything afterwards to syslog, which
   covers every failure it can see coming. An *abort* is not one of those: the shipping
@@ -233,7 +221,7 @@ than by guessing, and is recorded with what it was measured against.
 
 ## P3 — release process
 
-The four musl targets build and land under the 400 KiB budget, which
+Both musl targets build and land under the 400 KiB budget, which
 `scripts/build-release.sh` enforces along with the growth gate. Reproducibility it
 enforces in the only way a single machine can — by grepping each artifact for the
 builder's paths, since two clean builds on one machine are byte-identical whether or
@@ -241,7 +229,7 @@ not those paths were remapped ([IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-buil
 What is left is process rather than code:
 
 - Decide when the pinned nightly moves. It is named once, in `scripts/nightly-version`, which the build script and CI both read — so a local build and the runner measure the same bytes against a baseline recorded by the same compiler. The *consistency* is no longer a rule anyone has to remember: `scripts/size-baseline` records the compiler that measured it, and a build whose compiler does not match that line is refused, or, under `NOMUX_NIGHTLY` and `NOMUX_STABLE_STD`, says so and loses the growth gate. What is still undecided is the *policy* — when to take a newer compiler at all, given that the toolchain and the baseline then move in one commit.
-- Decide what the client does when a host already holds a binary whose hash it no longer recognises. The publishing half of this is done: a `v*` tag promotes the artifact the release build produced into a GitHub release carrying the four binaries beside `SHA256SUMS`, so the sums are permanent and public and in the format `sha256sum -c` reads, rather than only the ninety-day artifact behind a login they were before. GitHub computes its own immutable SHA-256 per asset at upload time as well, exposed as `digest` on the releases API, which covers the same bytes with something nobody can rewrite after the fact. The unstripped companions of P1 ride along, with their own `SHA256SUMS.debug`. What is missing is the consuming half: nothing in the client reads any of it, so § 8's "verify it after upload" is still unwritten, and so is the answer to the question this bullet opens with.
+- Decide what the client does when a host already holds a binary whose hash it no longer recognises. The publishing half of this is done: a `v*` tag promotes the artifact the release build produced into a GitHub release carrying the shipping binaries beside `SHA256SUMS`, so the sums are permanent and public and in the format `sha256sum -c` reads, rather than only the ninety-day artifact behind a login they were before. GitHub computes its own immutable SHA-256 per asset at upload time as well, exposed as `digest` on the releases API, which covers the same bytes with something nobody can rewrite after the fact. The unstripped companions of P1 ride along, with their own `SHA256SUMS.debug`. What is missing is the consuming half: nothing in the client reads any of it, so § 8's "verify it after upload" is still unwritten, and so is the answer to the question this bullet opens with.
 
 ## P4 — test depth
 

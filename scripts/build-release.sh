@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds the four shipping binaries and the checksums the client pins them by, and an
+# Builds the two shipping binaries and the checksums the client pins them by, and an
 # unstripped companion per target for a core dump to be read against.
 #
 # The companion is a second build with `-Cstrip=none` rather than the shipping binary
@@ -9,7 +9,7 @@
 # ships, and what ships is what the checksums are taken over. The two builds are
 # checked against each other instead — identical `.text` at an identical address is
 # what makes the companion's symbols describe the binary someone actually ran.
-# `NOMUX_SKIP_DEBUG=1` builds only the four that ship.
+# `NOMUX_SKIP_DEBUG=1` builds only the two that ship.
 #
 # nomux uploads itself over whatever link the user's ssh session is riding, so the
 # binary is on the critical path of every cold start and IMPLEMENTATION.md § 8 caps
@@ -17,10 +17,11 @@
 # non-zero if any binary misses it, because a release that blows the budget is a
 # regression in the one number users feel.
 #
-# The cap on its own is not enough, which is what the armv7 regression taught: one
-# commit grew that binary 46% and nothing said a word, because the result still fitted
-# the cap comfortably. A number is only watched if something compares it to what it
-# was. So the script also keeps a per-target baseline in scripts/size-baseline, prints
+# The cap on its own is not enough, which is what a regression on armv7 taught back
+# when it was one of the shipping targets: one commit grew that binary 46% and nothing
+# said a word, because the result still fitted the cap comfortably. A number is only
+# watched if something compares it to what it was. So the script also keeps a
+# per-target baseline in scripts/size-baseline, prints
 # the signed delta against it beside every size, and fails a build that grows a target
 # by more than 3%. A shrink never fails, however large. When the growth is intended,
 # NOMUX_UPDATE_BASELINE=1 rewrites the baseline from this build and skips the gate —
@@ -56,21 +57,19 @@ max_bytes=409600 # 400 KiB
 # Growth past 3% of the baseline fails the build. The threshold has to sit above
 # ordinary drift and well below a regression, and there is a wide gap between the two:
 # a compiler bump or a handful of new match arms moves these binaries by hundreds of
-# bytes, a few tenths of a percent of the smallest of them, while the armv7 jump this
-# gate exists to catch was 46%. Three percent is around 4 KiB on x86_64 — loose enough
+# bytes, a few tenths of a percent of the smallest of them, while the jump this gate
+# was written for was 46%. Three percent is around 4 KiB on x86_64 — loose enough
 # that no honest commit trips it and nobody learns to rerun with the escape hatch out
 # of habit, tight enough that nothing on the scale of a real regression gets through.
 max_growth_pct=3
 
 targets='x86_64-unknown-linux-musl
-aarch64-unknown-linux-musl
-armv7-unknown-linux-musleabihf
-riscv64gc-unknown-linux-musl'
+aarch64-unknown-linux-musl'
 
 repo=$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)
 # Most of what this script depends on is resolved from the working directory rather
 # than from $repo: cargo finds the workspace and reads .cargo/config.toml — where
-# rust-lld is pinned for all four targets — by walking up from where it was started,
+# rust-lld is pinned for both targets — by walking up from where it was started,
 # rustup reads rust-toolchain.toml the same way, and the copy out of $repo/target
 # below assumes cargo wrote there. From a subdirectory of the tree that walk still
 # lands on the right files; from another crate's directory it lands on that crate and
@@ -86,8 +85,8 @@ update_baseline="${NOMUX_UPDATE_BASELINE:-0}"
 # produces no message, no location and no symbol — what is left is the `SIGQUIT` core
 # of IMPLEMENTATION.md § 6.5, and without these it names no functions — PLAN.md § P1.
 # On by default so that a laptop build produces what the release publishes;
-# NOMUX_SKIP_DEBUG=1 is for a run that only wants the size table, since this doubles
-# the four cross builds into eight.
+# NOMUX_SKIP_DEBUG=1 is for a run that only wants the size table, since it doubles the
+# number of builds.
 companions=1
 if [ "${NOMUX_SKIP_DEBUG:-0}" = 1 ]; then
     companions=0
@@ -105,8 +104,8 @@ if [ "$update_baseline" = 1 ] && [ "${NOMUX_STABLE_STD:-0}" = 1 ]; then
 fi
 
 # Read the baseline before building rather than when the table is printed. Parsing it
-# is the one part of this script that a typo can break, and discovering that after four
-# cross-compiles have run is discovering it twenty minutes too late. Comments and blank
+# is the one part of this script that a typo can break, and discovering that after the
+# cross-compiles have run is discovering it too late. Comments and blank
 # lines are dropped here so nothing downstream has to think about them, and anything
 # that is not a target and a byte count is an error rather than a silently ignored line
 # — a baseline that quietly holds no entry for a target is a gate that passes everything.
@@ -114,7 +113,7 @@ baselines=''
 if [ ! -e "$baseline_file" ] && [ "$update_baseline" != 1 ]; then
     # Refused rather than treated as "no baseline yet". A missing file used to leave
     # every target `new`, print a note to stderr and exit 0 — so the one gate standing
-    # between the tree and another armv7-shaped regression turned itself off if the
+    # between the tree and another regression of that shape turned itself off if the
     # file was renamed, moved, or lost in a bad merge, and the build stayed green while
     # it did. Creating a baseline is a deliberate act, and it already has a flag.
     echo "missing ${baseline_file#"$repo"/}, which is the growth gate's only reference." >&2
@@ -136,7 +135,7 @@ if [ -e "$baseline_file" ]; then
 fi
 # A file that exists and holds no entries is refused for the same reason a missing one
 # is, and it is the likelier accident of the two: a merge that keeps the comment header
-# and drops the four data lines leaves something that parses cleanly, passes every
+# and drops the data lines leaves something that parses cleanly, passes every
 # check above, and reports every target as `new` — the gate present, running, and
 # unable to fail. Nothing tells that apart from a first build except this check.
 if [ -z "$baselines" ] && [ "$update_baseline" != 1 ]; then
@@ -276,22 +275,23 @@ us=$(printf '\037')
 # path-dependent dependency cannot quietly reintroduce the problem.
 sysroot=$(rustc --print sysroot)
 # Beside the toolchain's own `rust-lld`, so it is the same LLVM that did the linking
-# and it reads every target the four cross builds emit. Resolved after the toolchain is
+# and it reads every target the cross builds emit. Resolved after the toolchain is
 # chosen, since that is what decides which one this is.
 objcopy="$(rustc --print target-libdir)/../bin/llvm-objcopy"
 # Its own target directory: the companion differs from the shipping build by a rustc
 # flag, so sharing one would make each build invalidate the other's cache and turn
-# every one of the eight into a cold one.
+# every one of them into a cold one.
 companion_dir="${CARGO_TARGET_DIR:-$repo/target}/companion"
 remap="--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
 remap="$remap$us--remap-path-prefix=$sysroot=/rust"
 remap="$remap$us--remap-path-prefix=$repo=/nomux"
 
-# crt-static is explicit because riscv64gc-unknown-linux-musl is the one target of the
-# four whose spec does not default to it. Left alone it links dynamically against
-# libc.so and libgcc_s, which fails outright under rust-lld — and had it linked, it
-# would have produced the one thing this project cannot ship: a binary with runtime
-# dependencies on a host we know nothing about.
+# crt-static is stated rather than left to each target's spec to default to. Both musl
+# targets here do default to it, so this is belt and braces — but it was not always
+# true of every target this script has built, and the failure it prevents is the one
+# thing this project cannot ship: a binary with runtime dependencies on a host we know
+# nothing about. A spec that changed under us would otherwise say so at a user's shell
+# rather than here.
 rustflags="-Clink-self-contained=yes$us-Ctarget-feature=+crt-static$us$remap"
 if [ "$build_std" = 1 ]; then
     rustflags="$rustflags$us-Zunstable-options$us-Cpanic=immediate-abort"
@@ -322,8 +322,8 @@ if [ "$build_std" = 1 ] && [ ! -e "$sysroot/lib/rustlib/src/rust/library/std/Car
 fi
 
 # `llvm-objcopy` is what compares the two builds below, and it ships with the
-# toolchain rather than with the host: the four targets include riscv64 and armv7, and
-# a host binutils that cannot read those is the ordinary case rather than the odd one.
+# toolchain rather than with the host: one of the two targets is cross-compiled, and a
+# host binutils that cannot read aarch64 is the ordinary case rather than the odd one.
 if [ "$companions" = 1 ] && [ ! -x "$objcopy" ]; then
     echo "the debug companions need llvm-objcopy to be checked against the" >&2
     echo "  binaries they describe." >&2
@@ -336,11 +336,11 @@ rm -rf "$dist"
 mkdir -p "$dist"
 
 # A run that dies partway must not leave something that looks like release output.
-# Between here and the checksums below, target/dist holds some of the four binaries
+# Between here and the checksums below, target/dist holds some of the binaries
 # and no SHA256SUMS, and nothing in it says which — an upload step, or a person
 # coming back to it an hour later, cannot tell it from a complete set. So it is
 # cleared on the way out instead, on a signal as well as on a failed command: these
-# are four cross builds and Ctrl-C is an ordinary way to end one, and a shell killed
+# are cross builds and Ctrl-C is an ordinary way to end one, and a shell killed
 # by a signal is not guaranteed to run its EXIT trap at all.
 dist_cleanup() { rm -rf "$dist"; }
 trap dist_cleanup EXIT
@@ -416,7 +416,7 @@ for target in $targets; do
 done
 
 # Emitted in `sha256sum -c` format so a verifier needs no bespoke tooling, and naming
-# the four shipping binaries and nothing else. `sha256sum -c` fails on a file it cannot
+# the shipping binaries and nothing else. `sha256sum -c` fails on a file it cannot
 # open, so folding the companions in here would break the check for everyone who
 # downloaded only what they run — which is nearly everyone. They get a file of their
 # own, in the same format, read the same way. Listed target by target rather than by
