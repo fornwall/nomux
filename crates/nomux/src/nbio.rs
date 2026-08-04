@@ -26,9 +26,7 @@ use rustix::io::Errno;
 /// Reads into `buf`, retrying a call a signal interrupted.
 ///
 /// The retry is the whole of it. `EINTR` says a signal arrived and says nothing
-/// about the descriptor, so it is never news to a caller. Everything else is passed
-/// through untouched, including the zero that means end of file and the `EAGAIN`
-/// that emphatically does not.
+/// about the descriptor, so it is never news to a caller.
 pub(crate) fn read(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<usize, Errno> {
     loop {
         match rustix::io::read(fd, &mut *buf) {

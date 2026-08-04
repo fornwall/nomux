@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use rustix::event::PollFlags;
 use rustix::pipe::SpliceFlags;
 
-use crate::rundir::SessionPaths;
+use crate::rundir::{SessionPaths, nothing_is_listening};
 
 /// How long to wait for a freshly spawned daemon to bind its socket.
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -70,7 +70,7 @@ fn connect_or_spawn(paths: &SessionPaths, label: Option<&str>) -> io::Result<Uni
     paths.ensure_dir()?;
     match UnixStream::connect(paths.socket()) {
         Ok(stream) => return Ok(stream),
-        Err(err) if is_absent(&err) => {}
+        Err(err) if nothing_is_listening(&err) => {}
         Err(err) => return Err(err),
     }
 
@@ -83,7 +83,7 @@ fn connect_or_spawn(paths: &SessionPaths, label: Option<&str>) -> io::Result<Uni
     // Another attach may have created the session while we waited for the lock.
     match UnixStream::connect(paths.socket()) {
         Ok(stream) => return Ok(stream),
-        Err(err) if is_absent(&err) => {}
+        Err(err) if nothing_is_listening(&err) => {}
         Err(err) => return Err(err),
     }
 
@@ -96,7 +96,7 @@ fn connect_or_spawn(paths: &SessionPaths, label: Option<&str>) -> io::Result<Uni
                 await_publication(paths, deadline);
                 return Ok(stream);
             }
-            Err(err) if is_absent(&err) => {
+            Err(err) if nothing_is_listening(&err) => {
                 if Instant::now() >= deadline {
                     let id = paths.id();
                     return Err(io::Error::new(
@@ -135,15 +135,6 @@ fn await_publication(paths: &SessionPaths, deadline: Instant) {
     while !pid.exists() && Instant::now() < deadline {
         std::thread::sleep(PUBLISH_POLL_INTERVAL);
     }
-}
-
-/// Whether the error means "no daemon is listening there", as opposed to a real
-/// failure. A refused connection is a stale socket; the daemon unlinks it on bind.
-fn is_absent(err: &io::Error) -> bool {
-    matches!(
-        err.kind(),
-        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-    )
 }
 
 /// Starts the daemon detached from this process's session.
@@ -261,6 +252,13 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
         if want_stdout {
             fds.push(rustix::event::PollFd::new(&stdout_fd, PollFlags::OUT));
         }
+        // Unreachable, though not because any one entry is always there: dropping the
+        // stdout entry needs `to_stdout.wants_dest()` to be false, and
+        // [`Pump::wants_source`] is exactly `!wants_dest()`, so that same falsity is
+        // what asks the socket for `POLLIN`. Which leaves a socket already closed, and
+        // the `while` condition admits that one only while `to_stdout` has data — which
+        // is `wants_dest()` again. Kept because what it stands between is a `poll` on
+        // an empty set, which blocks for ever.
         if fds.is_empty() {
             break;
         }

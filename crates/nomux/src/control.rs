@@ -13,7 +13,9 @@ use std::{fs, thread};
 
 use nomux_proto::MAX_SESSION_ID_LEN;
 
-use crate::rundir::{SessionPaths, SpawnLock, check_run_dir, read_label, read_prefix, run_dir};
+use crate::rundir::{
+    SessionPaths, SpawnLock, check_run_dir, nothing_is_listening, read_label, read_prefix, run_dir,
+};
 
 /// How long a terminated daemon has to exit before it is killed outright.
 const TERM_GRACE: Duration = Duration::from_secs(2);
@@ -227,17 +229,13 @@ pub(crate) fn list() -> io::Result<()> {
 ///
 /// # Errors
 ///
-/// Fails if the session id is invalid, if the run directory is not this user's
-/// alone (§ 6.3), if the spawn lock could not be taken within [`SPAWN_LOCK_GRACE`]
-/// — see [`hold_spawn_lock`] — if the session is alive but will not say which
-/// process it is, if the one live process a lone `<id>.pid` names is positively not
-/// this session's daemon, if its two witnesses name two live processes and which of
-/// them serves cannot be settled (all three are [`resolve`]), if it goes on answering
-/// after both signals, which means the pid that was signalled is not the process
-/// serving it, or if one of the five files will not go once it has stopped — the one
-/// refusal here that is not about establishing anything, since the session really did
-/// end (see [`SessionPaths::unlink_all_locked`]). A session that is already gone is
-/// not an error — the postcondition is "no such session", which already holds.
+/// Fails on an invalid session id, on a run directory that is not this user's alone
+/// (§ 6.3), and on the states § 6.6 lists behind a non-zero `kill`: the spawn lock
+/// still held at [`SPAWN_LOCK_GRACE`] (see [`hold_spawn_lock`]), the three ways
+/// [`resolve`] cannot identify a live session, a session still answering after both
+/// signals, and an unlink that failed over a session that did stop (see
+/// [`SessionPaths::unlink_all_locked`]). A session that is already gone is not an
+/// error — the postcondition is "no such session", which already holds.
 pub(crate) fn kill(session_id: &str) -> io::Result<()> {
     let paths = SessionPaths::new(session_id)?;
     // The same check `list` makes, and this is where it bites hardest: the two
@@ -354,36 +352,14 @@ enum Target {
 /// `SIGKILL`, an OOM kill, a crash — leaves its pidfile behind, and the kernel
 /// reuses pids, so signalling one read off disk without checking is how `nomux
 /// kill` ends up terminating an unrelated process of the user's. The socket is the
-/// authority on whether the daemon is still there.
+/// authority on whether the daemon is still there, and [`daemon_of`] is what makes
+/// it name *which* process that is.
 ///
-/// It says *which* process it is, too, wherever it will: the connection that just
-/// answered carries the pid in [`daemon_of`], and nothing at a filename can forge
-/// that.
-///
-/// Both sources are consulted rather than one preferred outright, because each is
-/// the only account of a state the other cannot describe. The socket names nobody
-/// during the bind-to-publish window, or where a `connect` failed for a reason that
-/// is not death, or where the peer is in a pid namespace this process cannot see
-/// (see [`peer_pid`]) — and `<id>.pid` is what is left there. The *file* names the
-/// wrong process where a dead daemon's number outlived it and the kernel handed that
-/// number to somebody else. Neither is the senior witness: § 6.2 forks *after* the
-/// bind, so on a daemon built before that changed the socket names the half that
-/// left and the file names the half that serves.
-///
-/// So each is discarded when it names no process at all, which settles both of the
-/// ordinary shapes, and a disagreement that survives that is put to [`serving`],
-/// which asks the two candidates what they are rather than inferring it. Only where
-/// *that* cannot answer is the session refused, exactly as a pid that cannot be read
-/// is refused.
-///
-/// The other direction is § 6.6's rule that a live session's files are never
-/// unlinked: a socket that answers and no pid to be had either way is an **error**,
-/// never a "no such session". There is exactly one benign reason for that state,
-/// which is the daemon's own bind-to-publish window, so a pidfile that is *missing
-/// or still empty* is waited out for [`PUBLISH_GRACE`] — even when the socket has
-/// already named somebody, since a second witness one interval away is worth more
-/// than the interval — and anything else is settled at once, since waiting cannot
-/// change it.
+/// The two witnesses are then weighed as § 6.6 weighs them, neither senior: each is
+/// discarded where it names no live process, a disagreement between two live numbers
+/// goes to [`serving`], and a live session neither will identify is refused rather
+/// than reported as gone. [`PUBLISH_GRACE`] covers the one state that is waited out
+/// instead of settled at once.
 ///
 /// # Errors
 ///
@@ -558,22 +534,12 @@ fn chosen(
 
 /// Which of two live candidates is this session's daemon, where that can be settled.
 ///
-/// The two witnesses disagree only when a number has been reissued, and from outside
-/// the two ways that happens look identical: the socket names an exited creator whose
-/// number came round again — § 6.2 forks *after* the bind, so a daemon built before
-/// that changed is served by the heir the pidfile names — or the file holds a dead
-/// daemon's number that now belongs to a stranger while the socket names the live one.
-/// Guessing between them signals somebody's process either way, so the tie is settled
-/// by asking each candidate what it *is*: this session's daemon runs `nomux daemon
-/// <id>`, and no reissued number wears that by accident.
-///
-/// Both wearing it is § 6.2's fork and nothing else — one image, two halves — and
-/// there the file is the answer by construction, since `write_pid` runs after the fork
-/// in the half that survives it. Neither wearing it is not a tie to break, and neither
-/// is a candidate that could not be *asked*: both refuse. Those two are kept apart in
-/// [`is_daemon_for`] rather than folded together, because "it is not the daemon" and
-/// "I could not tell" differ in the direction they are wrong — the first, said of a
-/// daemon, is what strands a healthy session.
+/// Guessing between the two shapes a reissued number comes in would signal somebody's
+/// process either way, so the tie is settled by asking each candidate what it *is*:
+/// this session's daemon runs `nomux daemon <id>`, and no reissued number wears that
+/// by accident. § 6.6 has those two shapes, why both candidates wearing it is § 6.2's
+/// fork and the file is then right by construction, and why a candidate that could not
+/// be asked refuses rather than counts — which is [`is_daemon_for`]'s `Option`.
 ///
 /// This identifies the process rather than the *fd*, which is the stronger question
 /// and the more expensive one — `/proc/<pid>/fd` carries a socket's `sockfs` inode,
@@ -645,10 +611,8 @@ fn is_daemon_for(pid: rustix::process::Pid, id: &str) -> Option<bool> {
 /// The refusal to act when neither live candidate is this session's daemon.
 ///
 /// It prints both numbers and what each of them came from, because that is the whole
-/// of what is known and the user is the only one who can look further. It recommends
-/// nothing: the repair that suggests itself — remove the pidfile and let the socket
-/// decide — is the catastrophic one exactly half the time, since the number the
-/// socket carries is the one that may have been reissued.
+/// of what is known and the user is the only one who can look further, and it
+/// recommends nothing, for § 6.6's reason.
 fn disagreement(
     paths: &SessionPaths,
     named: rustix::process::Pid,
@@ -767,16 +731,9 @@ fn session_id_of(path: &Path) -> Option<String> {
 fn liveness(paths: &SessionPaths) -> Liveness {
     match UnixStream::connect(paths.socket()) {
         Ok(answered) => Liveness::Alive(Some(answered)),
-        Err(err)
-            if matches!(
-                err.kind(),
-                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
-            ) =>
-        {
-            Liveness::Stale
-        }
-        // Anything else — `EACCES`, a descriptor limit — is not evidence of death
-        // either, so it is alive with nothing to ask. Never unlink on a guess.
+        Err(err) if nothing_is_listening(&err) => Liveness::Stale,
+        // Not evidence of death, per the predicate above, so this is alive with
+        // nothing to ask rather than a guess to unlink on.
         Err(_) => Liveness::Alive(None),
     }
 }

@@ -18,12 +18,9 @@ pub(crate) struct Ring {
 impl Ring {
     /// Creates a ring retaining at most `capacity` bytes, and never fewer than one.
     ///
-    /// The clamp rather than an assertion, in a binary built `panic = "abort"` whose
-    /// whole purpose is not to lose the user's session to a process that stopped.
-    /// `daemon::ring_capacity` already filters zero — and must keep doing so, since
-    /// it falls back to the 4 MiB default where this would clamp to a one-byte ring
-    /// that makes every write a gap — so this is the unreachable case answered
-    /// without an abort site rather than with one.
+    /// Unreachable — `daemon::ring_capacity` filters zero, and says why it must go on
+    /// doing so — but clamped rather than asserted, since an abort site in a
+    /// `panic = "abort"` binary costs the user's session.
     #[must_use]
     pub(crate) fn new(capacity: usize) -> Self {
         let capacity = capacity.max(1);

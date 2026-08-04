@@ -17,9 +17,15 @@ use nomux_proto::{Frame, FrameType, HEADER_LEN, Header, MAX_PAYLOAD, decode_head
 /// a gap, never a blocked child.
 const MAX_PENDING_WRITE: usize = 1 << 20;
 
-/// Queue size at which a client is treated as gone rather than slow. Well clear of
-/// [`MAX_PENDING_WRITE`] plus one output chunk, so only unanswered control frames
-/// can reach it.
+/// Queue size at which a client is treated as gone rather than slow.
+///
+/// A second bound is needed because [`MAX_PENDING_WRITE`] does not cover everything:
+/// the frames that *answer* a client — an `InputAck` per `Input`, a `Pong` per `Ping`
+/// — are not optional and are queued regardless, so a peer that writes without ever
+/// reading grows this queue without bound (`IMPLEMENTATION.md` § 4.1). Well clear of
+/// [`MAX_PENDING_WRITE`] plus one output chunk, so only those unanswered control
+/// frames can reach it, and dropping such a client costs a working one nothing since
+/// reattaching replays from the ring.
 const ABANDON_PENDING_WRITE: usize = 8 << 20;
 
 /// Stop reading from the socket once this much undecoded input is already buffered.
@@ -140,12 +146,8 @@ impl Conn {
 
     /// Whether this peer has stopped reading altogether.
     ///
-    /// [`Conn::is_write_saturated`] holds back output, but the control frames that
-    /// answer a client — an `InputAck` per `Input`, a `Pong` per `Ping` — are not
-    /// optional and are queued regardless. A peer that writes without ever reading
-    /// therefore grows this queue without bound, and past this point it is not slow,
-    /// it is gone: dropping it costs a working client nothing, since reattaching
-    /// replays from the ring.
+    /// Past [`ABANDON_PENDING_WRITE`] it is not slow but gone; that constant says why
+    /// [`Conn::is_write_saturated`] cannot be the only bound.
     #[must_use]
     pub(crate) const fn is_write_hopeless(&self) -> bool {
         self.tx.len() - self.tx_pos >= ABANDON_PENDING_WRITE
@@ -153,16 +155,13 @@ impl Conn {
 
     /// Queues a frame, discarding the encode result.
     ///
-    /// Every caller here chunks to at most [`MAX_PAYLOAD`] and passes flags this
-    /// crate defines, so the encode failures — an oversized payload, an undefined
-    /// flag bit, a `TERM` this side would not accept back — are all unreachable.
-    fn send(&mut self, frame: &Frame<'_>) {
+    /// Every caller in this module chunks to at most [`MAX_PAYLOAD`], and every caller
+    /// in the daemon queues a control frame, whose size is fixed and small; both pass
+    /// flags this crate defines. So the encode failures — an oversized payload, an
+    /// undefined flag bit, a `TERM` this side would not accept back — are all
+    /// unreachable.
+    pub(crate) fn send(&mut self, frame: &Frame<'_>) {
         let _ = frame.encode(&mut self.tx);
-    }
-
-    /// Queues a control frame, whose size is fixed and small.
-    pub(crate) fn send_control(&mut self, frame: &Frame<'_>) {
-        self.send(frame);
     }
 
     /// Queues raw output bytes as one or more `Output` frames, splitting at
@@ -312,7 +311,7 @@ impl Conn {
     pub(crate) fn send_last(mut self, frame: &Frame<'_>) {
         self.tx.clear();
         self.tx_pos = 0;
-        self.send_control(frame);
+        self.send(frame);
         drop(self.flush_final());
     }
 

@@ -1,22 +1,16 @@
 //! Whether this session survives the user's last logout.
 //!
-//! `systemd-logind` with `KillUserProcesses=yes` kills every process in the user's
-//! slice at logout, daemon included, and no amount of double-forking evades it
-//! (`IMPLEMENTATION.md` § 6.2). The only fix is `loginctl enable-linger`, which is
-//! the user's to run. So the daemon detects the state, reports it in `HelloOk`, and
-//! does nothing else about it.
+//! `IMPLEMENTATION.md` § 6.2 has most of it: why `loginctl enable-linger` is the only
+//! fix and the user's to run, why the two files below are read instead of asking
+//! `loginctl`, and what the marker's absence means. What it does not say is the
+//! mechanism, and the mechanism is what rules out doing anything here rather than
+//! reporting: `KillUserProcesses=yes` kills every process in the user's *slice* at
+//! logout, daemon included, and no amount of double-forking evades it. So the daemon
+//! detects the state, reports it in `HelloOk`, and does nothing else about it.
 //!
-//! Detection reads the filesystem rather than asking `loginctl show-user -p
-//! Linger`, as the design sketches, because this runs on the path that starts a
-//! session: `loginctl` is a D-Bus round trip that can block for its full 25-second
-//! timeout on a busy or broken bus, which would outlast the client's spawn
-//! deadline and turn "linger is off" into "the session would not start". The files
-//! below are what `logind` itself reads, so the answer is the same one `loginctl`
-//! prints.
-//!
-//! Two `stat`s and one read of `/etc/passwd`. All three are local files that cannot
-//! block on anything but the disk, which is the property that matters here; the
-//! count is not — see [`username`] for the order the last two are consulted in.
+//! Two `stat`s and one read of `/etc/passwd` — all local files that cannot block on
+//! anything but the disk, which is the property the choice turns on rather than the
+//! count. [`username`] has the order the last two are consulted in.
 
 use std::fs;
 use std::io;

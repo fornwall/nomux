@@ -44,10 +44,11 @@ const RING_BYTES_ENV: &str = "NOMUX_RING_BYTES";
 
 /// Largest ring this daemon will honour, whatever [`RING_BYTES_ENV`] asks for.
 ///
-/// The number matters less than the fact that there is one: `VecDeque::with_capacity`
-/// answers a request it cannot serve by aborting the process, so without a ceiling the
-/// promise below holds for a value that is mistyped but not for one that is mistyped
-/// upwards.
+/// `VecDeque::with_capacity` answers a request it cannot serve by aborting the
+/// process, so a value mistyped *upwards* costs the session rather than the tuning.
+/// The ceiling bounds that mistake without removing it: a gigabyte is itself more
+/// than many hosts can allocate, so what this buys is that the damage stops growing
+/// with the number of digits somebody typed, not that the abort is out of reach.
 const MAX_RING_CAPACITY: usize = 1 << 30;
 
 /// Resolves the ring capacity, honouring [`RING_BYTES_ENV`].
@@ -159,15 +160,9 @@ const FAULT_SETTLE: Duration = Duration::from_millis(20);
 /// Stop accepting client input once this much is already queued for a PTY that is
 /// not taking it.
 ///
-/// The mirror of the output direction's budget, and for the same reason: the socket
-/// stops being drained, the bytes wait in the kernel's buffer, and the peer blocks
-/// on them. Neither of the cheaper answers is available here — `in_applied` is
-/// authoritative and exactly-once (`IMPLEMENTATION.md` § 3), so a byte cannot be
-/// dropped once acknowledged, and refusing one with an `InputGap` would tell a
-/// well-behaved client it had skipped ahead when it had not.
-///
-/// A ceiling rather than a limit, by one frame: the cap is tested between frames, so
-/// the last one decoded can carry the queue up to `MAX_PAYLOAD` past it.
+/// `IMPLEMENTATION.md` § 4.1 has the argument: why neither of the cheaper answers is
+/// available in this direction, and why the queue overshoots by the one frame that
+/// crossed the cap.
 const MAX_PENDING_INPUT: usize = 1 << 20;
 
 /// The attached client, and the state that means nothing without one.
@@ -422,28 +417,32 @@ fn bind_socket(paths: &SessionPaths) -> io::Result<UnixListener> {
                 format!("session {} is already running", paths.id()),
             ));
         }
-        Err(err) if err.kind() == io::ErrorKind::ConnectionRefused => {
-            // Forced here because there is nowhere else it can be forced from: the
-            // probe above and the removal below are two syscalls on one name, with
-            // nothing in between for another process to be scheduled into, so the
-            // test for losing that race has to be inside the window. Compiled out of
-            // every build but this crate's own unit tests.
-            #[cfg(test)]
-            tests::collect_the_stale_socket(&path);
-            // A collection decides on the same evidence one `connect` earlier
-            // (§ 6.6), so losing the race to remove this file is ordinary rather than
-            // exceptional — and the file being gone is the state this call exists to
-            // reach. Propagating that `ENOENT` turns a session that is perfectly
-            // startable into one that refuses to start, over a socket that is gone
-            // either way. Absence is success here for the same reason it is in the
-            // arm below.
-            if let Err(err) = fs::remove_file(&path)
-                && err.kind() != io::ErrorKind::NotFound
-            {
-                return Err(err);
+        // Nothing is listening either way — the same predicate, and so the same
+        // evidence, that a collection decides on one `connect` earlier (§ 6.6). Split
+        // inside rather than into two arms because only the refused half leaves a
+        // socket file behind to replace, and an absent name must not be unlinked on
+        // the chance that somebody has just created one there.
+        Err(err) if crate::rundir::nothing_is_listening(&err) => {
+            if err.kind() == io::ErrorKind::ConnectionRefused {
+                // Forced here because there is nowhere else it can be forced from: the
+                // probe above and the removal below are two syscalls on one name, with
+                // nothing in between for another process to be scheduled into, so the
+                // test for losing that race has to be inside the window. Compiled out
+                // of every build but this crate's own unit tests.
+                #[cfg(test)]
+                tests::collect_the_stale_socket(&path);
+                // Losing the race to remove this file is ordinary rather than
+                // exceptional, and the file being gone is the state this call exists
+                // to reach. Propagating that `ENOENT` turns a session that is
+                // perfectly startable into one that refuses to start, over a socket
+                // that is gone either way.
+                if let Err(err) = fs::remove_file(&path)
+                    && err.kind() != io::ErrorKind::NotFound
+                {
+                    return Err(err);
+                }
             }
         }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => return Err(err),
     }
 
@@ -602,7 +601,7 @@ impl Daemon {
     /// `Input` — and a session with nobody attached simply has nowhere to put them.
     fn tell_client(&mut self, frame: &Frame<'_>) {
         if let Some(client) = self.client.as_mut() {
-            client.conn.send_control(frame);
+            client.conn.send(frame);
         }
     }
 
@@ -632,12 +631,8 @@ impl Daemon {
 
     /// What to ask `poll` about `source`, or `None` where it is not in the set now.
     ///
-    /// Exhaustive over [`Source`] on purpose, and that is the whole of its second
-    /// job: a variant added to that enum cannot get past this match without being
-    /// classified, and it cannot be *registered* without being listed in
-    /// [`SINGLE_SOURCES`], which is what sizes the arrays [`Daemon::watches`] fills.
-    /// The two together are why a source added later cannot cost an agent channel its
-    /// slot.
+    /// Exhaustive over [`Source`] on purpose: that is the half of [`SINGLE_SOURCES`]'s
+    /// invariant this function carries.
     fn watch_for(&self, source: Source) -> Option<(BorrowedFd<'_>, PollFlags)> {
         match source {
             // Out of the set while an `accept` that failed is being waited out, which
@@ -662,15 +657,9 @@ impl Daemon {
             }
             Source::Client => {
                 let client = self.client.as_ref()?;
-                // Held out of `POLLIN` while the PTY queue is full, which is § 4.1's
-                // back pressure: the bytes wait in the kernel's socket buffer where
-                // the peer blocks on them, the same argument the agent channels make
-                // below. Nothing can wedge, because a non-empty queue is exactly what
-                // puts the master in the set asking for `POLLOUT`, and draining it
-                // re-arms this on the pass after. This holds back the *socket* only;
-                // what bounds the queue is `read_client` declining to decode past the
-                // cap, since the takeover path reaches that loop without passing
-                // through here at all.
+                // Held out of `POLLIN` while the PTY queue is full — § 4.1's back
+                // pressure, of which this is only the throttling half: what *bounds*
+                // the queue is `read_client` declining to decode past the cap.
                 let mut flags = if self.input_is_saturated() {
                     PollFlags::empty()
                 } else {
@@ -696,10 +685,9 @@ impl Daemon {
             }
             Source::Pending => Some((self.pending.as_ref()?.stream().as_fd(), PollFlags::IN)),
             Source::AgentListener => Some((self.agent.as_ref()?.listener(), PollFlags::IN)),
-            // Never asked for: `watches` walks [`SINGLE_SOURCES`], and the channels
-            // come from the agent's own table with a mask that depends on the channel
-            // rather than on the session. The arm is here for the exhaustiveness the
-            // rest of this function exists to get.
+            // Never asked for — `watches` takes the channels from the agent's own
+            // table, with a mask that depends on the channel — and here only for the
+            // exhaustiveness above.
             Source::AgentChannel(_) => None,
         }
     }
@@ -725,11 +713,11 @@ impl Daemon {
     ) -> usize {
         let mut len = 0;
         let mut watch = |source, fd, flags| {
-            // Through `get_mut` rather than by index. It cannot be reached — the
-            // budget is [`SINGLE_SOURCES`] long plus the cap `Agent::accept` enforces,
-            // and those are the only two things that push here — so this is about what
-            // an unreachable state may cost: a wakeup missed rather than a write past
-            // the end of the caller's frame.
+            // Through `get_mut` rather than by index. It cannot be reached — the budget
+            // is [`POLL_SLOTS`], which is [`SINGLE_SOURCES`] long plus the cap
+            // `Agent::accept` enforces, and those are the only two things that push here
+            // — so this is only about what the unreachable state may cost: a wakeup
+            // missed rather than a write past the end of the caller's frame.
             if let (Some(slot), Some(entry)) = (sources.get_mut(len), fds.get_mut(len)) {
                 *slot = source;
                 *entry = PollFd::from_borrowed_fd(fd, flags);
@@ -1163,18 +1151,15 @@ impl Daemon {
     /// an `Exit` frame is a promise that the session's output is finished — and while
     /// the slave is still held it plainly is not.
     ///
-    /// What it costs is the child's pid, and that is worth writing down here because
-    /// nothing else in this file says it. A zombie holds its number reserved; reaping
+    /// What it costs is the child's pid: a zombie holds its number reserved, reaping
     /// releases it, and `Pty::terminate` still reaches for the session by that raw
-    /// number when the daemon eventually stops. Between the two, the kernel is free to
-    /// reissue it — so `terminate` has to establish that the pid it is about to signal
-    /// is still the child, by the start time in `/proc/<pid>/stat` rather than by
-    /// asking whether *something* with that number is alive, which a stranger answers
-    /// just as well. That check is what this call makes load-bearing: before it the
-    /// reap happened at end of file and `shutdown` followed within [`EXIT_LINGER`],
-    /// five seconds; now it can happen on any pass, and the gap runs to
-    /// [`IDLE_TIMEOUT`] with no client attached and to the whole life of the session
-    /// with one, since `stop_deadline` is then `None` and nothing is counting.
+    /// number when the daemon stops — [`Pty::pid_reissued`] is the guard, and says why
+    /// asking whether *something* holds the number is not one. This call is what makes
+    /// that guard load-bearing. Before it the reap happened at end of file and
+    /// `shutdown` followed within [`EXIT_LINGER`], five seconds; now it can happen on
+    /// any pass, so the window runs to [`IDLE_TIMEOUT`] with no client attached and to
+    /// the whole life of the session with one, `stop_deadline` being `None` then and
+    /// nothing counting.
     fn collect_status(&mut self) {
         if self.exited.is_some() {
             return;
@@ -1218,13 +1203,9 @@ impl Daemon {
         }
 
         loop {
-            // The cap that actually bounds the queue (§ 4.1). Holding the client out
-            // of the poll set only throttles the one caller that arrives through it;
-            // the takeover path reaches this loop twice without passing through the
-            // poll set at all, and a connection promoted with a megabyte already
-            // buffered would otherwise decode all of it. What is left stays in the
-            // receive buffer, which is capped in its own right, and is picked up on a
-            // later pass once the PTY has taken some of the queue.
+            // The cap that actually bounds the queue (§ 4.1), and the reason it is
+            // enforced here rather than only in the poll set: the takeover path
+            // reaches this loop twice without passing through the poll set at all.
             if self.input_is_saturated() {
                 // Returning rather than breaking, so the end-of-file test below is
                 // skipped. A peer's end of file is not an answer to frames it is
@@ -1459,7 +1440,7 @@ impl Daemon {
             if client.sent_through < base {
                 // Overflowed while this client was slow or away: the stream is
                 // discontinuous and the client must reset its emulator.
-                client.conn.send_control(&Frame::Gap {
+                client.conn.send(&Frame::Gap {
                     new_base_offset: base,
                 });
                 client.sent_through = base;
@@ -1491,7 +1472,7 @@ impl Daemon {
             && client.sent_through >= end
             && let Some((status, kind)) = exited
         {
-            client.conn.send_control(&Frame::Exit { status, kind });
+            client.conn.send(&Frame::Exit { status, kind });
             client.exit_sent = true;
         }
         // Outside the borrow above, because the repaint may write to the PTY queue

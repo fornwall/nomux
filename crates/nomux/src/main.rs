@@ -25,7 +25,7 @@ mod syslog;
 
 use std::env;
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 /// `EX_USAGE`: malformed invocation. The one code borrowed from `sysexits.h`, and
@@ -206,18 +206,13 @@ fn parse_session_args(
 
 /// Maps a fallible operation onto an exit code, reporting failure on stderr.
 ///
-/// The whole of the `daemon`, `list` and `kill` table in `IMPLEMENTATION.md` § 10:
-/// zero where the postcondition holds, 64 for a command line that could not have
-/// named a session, and 1 for everything else. The coarseness of that last one is
-/// deliberate and § 10 argues it — the states behind it want different responses
-/// from a caller, but the one worth acting on is "is the session still alive", and
-/// `list` answers that better than a status byte can.
+/// The whole of the `daemon`, `list` and `kill` table in `IMPLEMENTATION.md` § 10,
+/// including why the last row is deliberately coarse.
 ///
 /// `InvalidInput` is `EX_USAGE` here for the reason the `attach` arm above gives:
 /// [`rundir::SessionPaths::new`] is the crate's only source of it, so it always means
-/// a session id that could never have named a session — a malformed command line
-/// rather than an operation that failed. Answering that with 1 from `kill` and 64
-/// from `attach` made one mistake look like two different things.
+/// a session id that could never have named a session, rather than an operation that
+/// failed.
 fn report(result: std::io::Result<()>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -265,16 +260,15 @@ fn print_probe() -> ExitCode {
 /// Resolves the install directory, matching the shell precedence in
 /// `IMPLEMENTATION.md` § 5.
 ///
-/// Each source must be *absolute*, which is [`rundir::run_dir`]'s rule and is here
-/// for a reason of its own: this path is what § 5.2 uploads a binary to and § 5.1
-/// `exec`s, over an exec channel whose working directory is nobody's to predict. An
-/// empty value is not absolute either, so this is the whole of the check — and where
-/// neither source passes it, there is no answer rather than a relative one.
+/// Each source must be *absolute*, which is [`rundir::absolute_env`]'s rule and is
+/// here for a reason of its own: this path is what § 5.2 uploads a binary to and
+/// § 5.1 `exec`s, over an exec channel whose working directory is nobody's to
+/// predict. Where neither source passes the rule there is no answer rather than a
+/// relative one.
 fn install_dir() -> Option<PathBuf> {
-    let absolute = |value: &OsString| Path::new(value).is_absolute();
-    let base = match env::var_os("XDG_DATA_HOME").filter(absolute) {
+    let base = match rundir::absolute_env("XDG_DATA_HOME") {
         Some(data) => PathBuf::from(data),
-        None => PathBuf::from(env::var_os("HOME").filter(absolute)?).join(".local/share"),
+        None => PathBuf::from(rundir::absolute_env("HOME")?).join(".local/share"),
     };
     Some(base.join("nomux"))
 }

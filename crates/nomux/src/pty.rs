@@ -331,13 +331,12 @@ impl Pty {
 
     /// Whether `raw` has been handed to somebody else since the child was spawned.
     ///
-    /// Both reaches in [`Pty::terminate`] address the child by number — a pgid and a
-    /// session id are pids — and the liveness probe above them can only ask whether
-    /// *something* is there, never whether it is ours. The daemon reaps the child on
-    /// every pass, so the number can be free for as long as the session then runs,
-    /// and a stranger who took it and called `setsid` answers that probe exactly as
-    /// the child would have. The start time is what tells them apart: pids are
-    /// reissued, and start times are not reissued with them.
+    /// The other half of [`Pty::terminate`]'s guard, which argues the two reaches by
+    /// number. The daemon reaps the child on every pass, so the number can be free for
+    /// as long as the session then runs, and a stranger who took it and called
+    /// `setsid` answers the liveness probe there exactly as the child would have. The
+    /// start time is what tells them apart: pids are reissued, and start times are not
+    /// reissued with them.
     ///
     /// A *missing* `/proc/<raw>` is deliberately not a reissue, and that is the case
     /// this turns on rather than an oversight. No task holds the number, so it

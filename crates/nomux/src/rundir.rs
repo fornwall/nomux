@@ -99,38 +99,58 @@ const MAX_LABEL_LEN: usize = 256;
 /// path itself — the figure std checks before it will build the address at all.
 const SUN_PATH_MAX: usize = 107;
 
+/// Whether a failed `connect` to a session socket means nothing is listening there.
+///
+/// The one predicate behind every such decision in this binary, because § 6.3 is what
+/// requires the three to agree — everything from the daemon's probe to its pidfile
+/// decides on the evidence `list` and `kill` decide on: `control::liveness` collects a
+/// dead session on it (§ 6.6), `attach::connect_or_spawn` starts a daemon on it, and
+/// `daemon::bind_socket` replaces a stale socket on it — a collection deciding one
+/// `connect` earlier than the bind it races. A socket file outlives the process that
+/// bound it, so `ECONNREFUSED` is a dead daemon and a name that is not there at all is
+/// the same answer one syscall sooner. Anything else — `EACCES`, a descriptor limit —
+/// is not evidence of death and must never license an unlink; § 6.3 puts that as
+/// "`EACCES` is not staleness".
+pub(crate) fn nothing_is_listening(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+    )
+}
+
+/// The value of environment variable `key`, but only where it names an **absolute**
+/// path.
+///
+/// The rule every directory this binary takes from the environment obeys: a source
+/// that does not name an absolute path is not a source, and an empty value is not
+/// absolute either, so this is the whole of the check. `IMPLEMENTATION.md` § 6.3 has
+/// why — the resolved directory is held for the session's whole life while § 6.2
+/// moves the process to `/` partway through it, so a relative one would mean two
+/// different directories on either side of that.
+///
+/// Shared with `main::install_dir`, which resolves a different directory from
+/// different variables under the same rule.
+pub(crate) fn absolute_env(key: &str) -> Option<std::ffi::OsString> {
+    env::var_os(key).filter(|value| Path::new(value).is_absolute())
+}
+
 /// Resolves the run directory, preferring `XDG_RUNTIME_DIR`.
 ///
-/// `XDG_RUNTIME_DIR` is tmpfs and cleared on last logout unless lingering is
-/// enabled, so the fallback under `XDG_STATE_HOME` is what makes a session outlive
-/// a logout on hosts without linger.
-///
-/// Each source must be *absolute*, which the XDG specification requires anyway and
-/// which this daemon needs for a reason of its own: the resolved directory is held
-/// in a [`SessionPaths`] for the session's whole life, and § 6.2 moves the daemon
-/// to `/` partway through it. A relative path would therefore mean one directory
-/// while the daemon was starting and another one afterwards — the socket bound in
-/// the caller's working directory, the agent socket and the cleanup on exit
-/// looking for it under the root. Refused rather than half-honoured; an empty
-/// value is not absolute either, so this is the whole of the check.
+/// The precedence, and the reason for each half — tmpfs that a last logout clears
+/// against a fallback under `$HOME` that outlives one — are `IMPLEMENTATION.md`
+/// § 6.3's, as is the rule [`absolute_env`] applies to every source.
 ///
 /// # Errors
 ///
 /// Fails when none of `XDG_RUNTIME_DIR`, `XDG_STATE_HOME` or `HOME` names an
 /// absolute path.
 pub(crate) fn run_dir() -> io::Result<PathBuf> {
-    let absolute = |value: &std::ffi::OsString| Path::new(value).is_absolute();
-    if let Some(dir) = env::var_os("XDG_RUNTIME_DIR").filter(absolute) {
+    if let Some(dir) = absolute_env("XDG_RUNTIME_DIR") {
         return Ok(PathBuf::from(dir).join("nomux"));
     }
-    let state = env::var_os("XDG_STATE_HOME")
-        .filter(absolute)
+    let state = absolute_env("XDG_STATE_HOME")
         .map(PathBuf::from)
-        .or_else(|| {
-            env::var_os("HOME")
-                .filter(absolute)
-                .map(|home| PathBuf::from(home).join(".local/state"))
-        })
+        .or_else(|| absolute_env("HOME").map(|home| PathBuf::from(home).join(".local/state")))
         .ok_or_else(|| {
             io::Error::other(
                 "none of XDG_RUNTIME_DIR, XDG_STATE_HOME or HOME names an absolute path",
@@ -349,21 +369,13 @@ impl SessionPaths {
             ));
         }
         let dir = run_dir()?;
-        // A valid id is not enough: `sun_path` is 108 bytes including its
-        // terminator, and a 64-byte id under a deep enough run directory overruns
-        // it. Refused here, where both halves are known, because the alternative is
-        // finding out at `bind` — and the failure that follows is not a session
-        // that did not start but one that can never exist, while `list` and `kill`
-        // read the unbindable address as a *live* session whose files they must not
-        // unlink. That leaves a `<id>.lock` behind on every attempt, from the very
-        // command whose job is to collect it.
-        //
-        // Bounded against `.label`, the longest of the five, so a `.sock` path is a
-        // byte shorter still — which is what lets `control::liveness` read every
-        // `connect` failure it is not told about as a live session rather than as an
-        // address that can never be formed. Both `list` and `kill` reach that code
-        // only through this constructor, so no `SessionPaths` that exists can fail
-        // to build its own socket address.
+        // A valid id is not enough: `sun_path` is 108 bytes including its terminator,
+        // and a 64-byte id under a deep enough run directory overruns it. Why that is
+        // refused here rather than at the `bind` that would meet it, and why the bound
+        // is taken against `.label` — the longest of the five — rather than against
+        // `.sock`, are both § 6.3's. What the early refusal buys this crate is that
+        // `list` and `kill` reach a socket path only through this constructor, so no
+        // `SessionPaths` that exists can fail to build its own address.
         let longest = dir.as_os_str().len() + "/".len() + id.len() + ".label".len();
         if longest > SUN_PATH_MAX {
             return Err(io::Error::new(
@@ -621,13 +633,8 @@ impl SessionPaths {
     /// # Errors
     ///
     /// The first failure that is not an absence, once every path has been tried.
-    /// Absence is success — the five go in one order, and a collection is often
-    /// finishing one that was interrupted — but anything else has to reach `kill`,
-    /// whose exit status is the caller's only account of whether the session went.
-    /// Reporting nothing here is how a read-only run directory, an `EIO` or an
-    /// immutable `<id>.lock` becomes a `kill` that exits 0 having removed nothing,
-    /// and a `<id>.lock` left behind is a session `list` rediscovers and tries to
-    /// collect on every run from then on.
+    /// § 6.6 says why absence is success here and why anything else has to reach
+    /// `kill` rather than be swallowed.
     pub(crate) fn unlink_all_locked(&self, _lock: &SpawnLock) -> io::Result<()> {
         // Every path is attempted before the first failure is returned: they are
         // independent, and stopping at one would leave the rest of a session behind
