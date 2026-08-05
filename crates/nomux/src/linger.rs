@@ -5,12 +5,9 @@
 //! `loginctl`, and what the marker's absence means. What it does not say is the
 //! mechanism, and the mechanism is what rules out doing anything here rather than
 //! reporting: `KillUserProcesses=yes` kills every process in the user's *slice* at
-//! logout, daemon included, and no amount of double-forking evades it. So the daemon
-//! detects the state, reports it in `HelloOk`, and does nothing else about it.
+//! logout, daemon included, and no amount of double-forking evades it.
 //!
-//! Two `stat`s and one read of `/etc/passwd` — all local files that cannot block on
-//! anything but the disk, which is the property the choice turns on rather than the
-//! count. [`username`] has the order the last two are consulted in.
+//! [`username`] has the order the last two sources are consulted in.
 
 use std::fs;
 use std::io;
@@ -41,11 +38,10 @@ pub(crate) fn detect() -> Linger {
 
 /// Classifies one user's linger marker.
 ///
-/// Absence is the answer, not a failure: `logind` creates `LINGER_DIR` lazily, so
-/// a host where nobody lingers has no directory at all. Only a lookup that fails
-/// for a reason *other* than absence — a permission change, a bind mount over the
-/// path — is genuinely unknown, and reporting `Disabled` there would make the
-/// client warn about a session that is in fact safe.
+/// Absence is the answer rather than a failure (`IMPLEMENTATION.md` § 6.2), and
+/// `logind` creates `LINGER_DIR` lazily, so a host where nobody lingers has no
+/// directory at all. Only a lookup that fails for some *other* reason — a permission
+/// change, a bind mount over the path — is unknown.
 fn state_of(dir: &Path, user: &str) -> Linger {
     match fs::metadata(dir.join(user)) {
         Ok(_) => Linger::Enabled,
@@ -57,10 +53,9 @@ fn state_of(dir: &Path, user: &str) -> Linger {
 /// The login name, used as a filename component under [`LINGER_DIR`].
 ///
 /// The password database first, because it is authoritative and cannot contain a
-/// name that is not this user's; `$USER` second, for directory-backed accounts
-/// that have no line in `/etc/passwd`. Anything usable as a path traversal is
-/// refused outright — the value would be joined onto a system directory, and a
-/// nonsense answer is better than an interesting one.
+/// name that is not this user's; `$USER` second, for directory-backed accounts that
+/// have no line in `/etc/passwd`. Anything usable as a path traversal is refused
+/// outright — the value is joined onto a system directory.
 fn username() -> Option<String> {
     passwd::current()
         .map(|entry| entry.name)

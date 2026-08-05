@@ -1,31 +1,28 @@
 //! Non-blocking framed connection to a client.
 //!
 //! Reads accumulate until a whole frame is available; writes accumulate until the
-//! socket accepts them. Decoding copies each payload into caller-owned scratch so
-//! the borrow of the receive buffer ends before the frame is handled — cheap,
-//! because the decode direction only ever carries keystrokes and control frames.
-//! The output direction, where volume actually lives, is encoded straight from the
-//! ring.
+//! socket accepts them. Decoding copies each payload into caller-owned scratch so the
+//! borrow of the receive buffer ends before the frame is handled — cheap, because
+//! that direction only ever carries keystrokes and control frames. The output
+//! direction, where volume lives, is encoded straight from the ring.
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 
 use nomux_proto::{Frame, FrameType, HEADER_LEN, Header, MAX_PAYLOAD, decode_header};
 
-/// Stop queueing output once this much is already waiting for a slow client. The
-/// ring keeps absorbing PTY output regardless, so the effect of a stalled client is
-/// a gap, never a blocked child.
+/// Stop queueing output once this much is already waiting for a slow client; the
+/// ring absorbs the PTY regardless, so a stalled client costs a gap and never a
+/// blocked child (`IMPLEMENTATION.md` § 4.1).
 const MAX_PENDING_WRITE: usize = 1 << 20;
 
 /// Queue size at which a client is treated as gone rather than slow.
 ///
-/// A second bound is needed because [`MAX_PENDING_WRITE`] does not cover everything:
-/// the frames that *answer* a client — an `InputAck` per `Input`, a `Pong` per `Ping`
-/// — are not optional and are queued regardless, so a peer that writes without ever
-/// reading grows this queue without bound (`IMPLEMENTATION.md` § 4.1). Well clear of
+/// [`MAX_PENDING_WRITE`] does not cover the frames that *answer* a client, which are
+/// not optional and are queued regardless, so a peer that writes without ever
+/// reading grows this queue without bound (§ 4.1). Well clear of
 /// [`MAX_PENDING_WRITE`] plus one output chunk, so only those unanswered control
-/// frames can reach it, and dropping such a client costs a working one nothing since
-/// reattaching replays from the ring.
+/// frames can reach it.
 const ABANDON_PENDING_WRITE: usize = 8 << 20;
 
 /// Stop reading from the socket once this much undecoded input is already buffered.
@@ -33,17 +30,14 @@ const ABANDON_PENDING_WRITE: usize = 8 << 20;
 /// [`Conn::fill`] loops until `EAGAIN`, and against a peer that keeps writing that
 /// loop has no natural end: every chunk it takes frees exactly that much room in the
 /// kernel's buffer for the peer to refill. The cap turns it back into back pressure,
-/// leaving the bytes where the peer blocks on them — and it is load-bearing rather
-/// than defensive, because nothing empties this buffer while the daemon has stopped
-/// *decoding* for a full PTY queue (`IMPLEMENTATION.md` § 4.1). Without a ceiling the
-/// queue would simply have moved from one `Vec` to another.
+/// leaving the bytes where the peer blocks on them — load-bearing rather than
+/// defensive, because nothing empties this buffer while the daemon has stopped
+/// *decoding* for a full PTY queue (`IMPLEMENTATION.md` § 4.1).
 ///
-/// It has to stay clear of `HEADER_LEN + MAX_PAYLOAD`, which is the one thing it may
-/// not be: a frame that cannot be buffered whole is a frame [`Conn::take_frame`]
-/// never completes, and the connection would then refuse to read the rest of the
-/// frame it is waiting for. The two sides live in different crates, so that
-/// relationship is pinned below as a compile error rather than left to whoever next
-/// raises `MAX_PAYLOAD`.
+/// It has to stay clear of `HEADER_LEN + MAX_PAYLOAD`: a frame that cannot be
+/// buffered whole is a frame [`Conn::take_frame`] never completes. The two sides live
+/// in different crates, so that relationship is pinned below as a compile error
+/// rather than left to whoever next raises `MAX_PAYLOAD`.
 const MAX_PENDING_READ: usize = 1 << 20;
 
 const _: () = assert!(
@@ -53,31 +47,14 @@ const _: () = assert!(
 
 /// Reclaims the consumed prefix of a cursor-and-`Vec` buffer.
 ///
-/// Both directions carry one, and both would otherwise grow without bound across
-/// a long session: neither cursor ever moves backwards, so the bytes below it are
-/// dead the moment they are passed. Draining on every pass would memmove the
-/// remainder for each frame, hence the condition — and the empty case is worth
-/// separating because clearing is free where draining is not.
+/// Both directions carry one, and both would otherwise grow without bound across a
+/// long session: neither cursor ever moves backwards, so the bytes below it are dead
+/// the moment they are passed. The empty case is separated because clearing is free
+/// where draining is not.
 ///
-/// The condition is a *ratio* rather than a number of bytes, because what a
-/// compaction costs is the remainder — the part that stays — and a threshold on the
-/// prefix says nothing about that. Draining a queue of n bytes in c-byte writes at a
-/// fixed 64 KiB threshold moves about n²/2c: every write past the first 64 KiB
-/// memmoves almost the whole queue, so the cost per byte delivered rises with the
-/// queue instead of staying put. It bites precisely where the queue is largest, which
-/// is the replay path — `pump_output` tops the queue back up to
-/// [`MAX_PENDING_WRITE`] after every write, so the remainder never shrinks. Halving
-/// moves at most as many bytes as the compaction retires, the remainder being no
-/// larger than the prefix by the test itself, so each byte pays for one move and is
-/// then gone: O(1) amortised per byte however the writes fall.
-///
-/// It is not free everywhere, and the receive direction is where it is not. There
-/// `fill` reads a chunk and `take_frame` decodes straight through it, so the cursor
-/// reaches the end and the fixed threshold was never met at all — the free `clear`
-/// above took every compaction. Halving instead memmoves each buffer roughly once
-/// before it empties. That is bounded by what a client sends, which is keystrokes
-/// and acknowledgements against a megabyte cap, where the send direction carries the
-/// session's whole output: the trade is deliberate and it is in the right direction.
+/// The condition is a *ratio* rather than a number of bytes, which is what makes the
+/// cost O(1) amortised on the replay path — `IMPLEMENTATION.md` § 4.1 has the
+/// derivation, and the fixed-threshold n²/2c it avoids.
 fn compact(buf: &mut Vec<u8>, pos: &mut usize) {
     if *pos == buf.len() {
         buf.clear();
@@ -155,11 +132,10 @@ impl Conn {
 
     /// Queues a frame, discarding the encode result.
     ///
-    /// Every caller in this module chunks to at most [`MAX_PAYLOAD`], and every caller
-    /// in the daemon queues a control frame, whose size is fixed and small; both pass
-    /// flags this crate defines. So the encode failures — an oversized payload, an
-    /// undefined flag bit, a `TERM` this side would not accept back — are all
-    /// unreachable.
+    /// The encode failures — an oversized payload, an undefined flag bit, a `TERM`
+    /// this side would not accept back — are all unreachable: every caller here
+    /// chunks to at most [`MAX_PAYLOAD`], every caller in the daemon queues a
+    /// fixed-size control frame, and both pass flags this crate defines.
     pub(crate) fn send(&mut self, frame: &Frame<'_>) {
         let _ = frame.encode(&mut self.tx);
     }
@@ -204,9 +180,8 @@ impl Conn {
     ///
     /// The daemon stops decoding while the PTY queue is full (`IMPLEMENTATION.md`
     /// § 4.1), which can leave whole frames here that no second `POLLIN` will ever
-    /// announce — the socket reported them once and has nothing new to say. This is
-    /// what tells the event loop to come back for them once the queue has room,
-    /// instead of waiting for a wakeup that is not coming.
+    /// announce. This is what tells the event loop to come back for them once the
+    /// queue has room, instead of waiting for a wakeup that is not coming.
     #[must_use]
     pub(crate) const fn has_buffered_input(&self) -> bool {
         self.rx_pos < self.rx.len()
@@ -262,18 +237,11 @@ impl Conn {
     ///
     /// Propagates write failures, including the deadline expiring.
     pub(crate) fn flush_final(&mut self) -> io::Result<()> {
-        // Bounded, because the connection being flushed is frequently one that has
-        // stopped reading — that is what a takeover is usually recovering from. An
-        // unbounded blocking write here parks the entire daemon inside the kernel:
-        // no PTY drained, no client served, no reaping, until a peer that may never
-        // read again decides to.
-        //
-        // Against the whole call, not against each `write`. `SO_SNDTIMEO` restarts
-        // per syscall, so a peer reading a trickle keeps resetting it and eight
-        // megabytes — the queue this tolerates before giving up on a client — take
-        // as long as that peer likes. `nomux kill` allows the daemon two seconds to
-        // shut down before `SIGKILL`, and this runs inside them, so an overrun here
-        // is a process group left behind and run files that outlive the session.
+        // Bounded because the peer being flushed has frequently stopped reading
+        // (§ 6.4), and against the whole call rather than each `write` (§ 6.5):
+        // `SO_SNDTIMEO` restarts per syscall, so a peer reading a trickle keeps
+        // resetting it and the eight megabytes this tolerates before giving up on a
+        // client take as long as that peer likes.
         self.stream.set_nonblocking(false)?;
         let deadline = std::time::Instant::now() + FINAL_FLUSH_TIMEOUT;
         while self.tx_pos < self.tx.len() {
@@ -296,12 +264,8 @@ impl Conn {
     }
 
     /// Sends `frame` as the last thing this connection will ever carry, discarding
-    /// anything still queued, then flushes.
-    ///
-    /// Queued output is worthless to a connection that is being closed — a
-    /// reattaching client replays it from the ring anyway — and dropping it keeps
-    /// the final write small enough to complete promptly even against a peer that
-    /// has stopped reading.
+    /// anything still queued — a reattaching client replays it from the ring anyway
+    /// (§ 6.4) — then flushes.
     ///
     /// Consumes the connection, which is what makes "last" true rather than merely
     /// intended: [`Conn::flush_final`] puts the socket back into blocking mode, and
@@ -343,5 +307,574 @@ impl Conn {
 
         compact(&mut self.rx, &mut self.rx_pos);
         Ok(Some(ty))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::ErrorKind;
+    use std::time::Instant;
+
+    use nomux_proto::{
+        ErrorCode, HELLO_AGENT_FORWARD, Hello, HelloOk, Linger, PROTOCOL_VERSION, ProtoError,
+        RESUME_FROM_START, WinSize,
+    };
+
+    use super::*;
+
+    const WIN: WinSize = WinSize {
+        cols: 80,
+        rows: 24,
+        xpixel: 640,
+        ypixel: 480,
+    };
+
+    /// A connection and the far end of its socket, both non-blocking so that neither
+    /// side of a test can park inside the kernel waiting for the other.
+    fn pair() -> (UnixStream, Conn) {
+        let (peer, ours) = UnixStream::pair().expect("a socketpair");
+        peer.set_nonblocking(true).expect("a non-blocking peer");
+        (peer, Conn::new(ours).expect("a connection"))
+    }
+
+    /// A payload whose every byte is a function of its position, so a compaction that
+    /// moved the wrong bytes shows up as a mismatch rather than as zeros.
+    fn bulk(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| u8::try_from(i % 251).unwrap_or(0))
+            .collect()
+    }
+
+    /// One frame of each shape the reassembler has to handle: empty, fixed-size, and
+    /// both variable-length forms.
+    fn samples(payload: &[u8]) -> [Frame<'_>; 7] {
+        [
+            Frame::Detach,
+            Frame::Ping {
+                nonce: 0x0102_0304_0506_0708,
+            },
+            Frame::Resize(WIN),
+            Frame::HelloOk(HelloOk {
+                resume_from: 9,
+                in_applied: 4,
+                win: WIN,
+                linger: Linger::Enabled,
+                agent: true,
+            }),
+            Frame::Hello(Hello {
+                protocol: PROTOCOL_VERSION,
+                flags: HELLO_AGENT_FORWARD,
+                out_offset: RESUME_FROM_START,
+                win: WIN,
+                term: "xterm-256color",
+            }),
+            Frame::Input {
+                offset: 1 << 33,
+                data: payload,
+            },
+            Frame::AgentData {
+                chan: 3,
+                data: &payload[..7],
+            },
+        ]
+    }
+
+    fn encoded(frame: &Frame<'_>) -> Vec<u8> {
+        let mut wire = Vec::new();
+        frame.encode(&mut wire).expect("a valid frame");
+        wire
+    }
+
+    /// Undecoded bytes waiting in the receive buffer.
+    fn buffered(conn: &Conn) -> usize {
+        conn.rx.len() - conn.rx_pos
+    }
+
+    /// Hands every byte of `bytes` to `conn`, filling whenever the kernel's buffer
+    /// fills — a frame at [`MAX_PAYLOAD`] does not fit in one, so the alternative is
+    /// a blocking write with nobody left to unblock it.
+    fn feed(peer: &mut UnixStream, conn: &mut Conn, bytes: &[u8]) {
+        let mut sent = 0;
+        while sent < bytes.len() {
+            match peer.write(&bytes[sent..]) {
+                Ok(0) => panic!("the peer accepted nothing"),
+                Ok(n) => sent += n,
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                    let before = conn.rx.len();
+                    conn.fill().expect("a fill");
+                    assert!(
+                        conn.rx.len() > before,
+                        "neither side can move: {} bytes buffered, {} of {} sent",
+                        buffered(conn),
+                        sent,
+                        bytes.len()
+                    );
+                }
+                Err(err) => panic!("the peer could not write: {err}"),
+            }
+        }
+        conn.fill().expect("a fill");
+    }
+
+    /// Takes one frame and decodes it out of the scratch buffer, as the daemon's
+    /// decode loop does.
+    fn take<'a>(conn: &mut Conn, scratch: &'a mut Vec<u8>) -> Option<Frame<'a>> {
+        let ty = conn.take_frame(scratch).expect("a well-formed header")?;
+        Some(Frame::decode(ty, scratch).expect("a well-formed payload"))
+    }
+
+    /// Reads one bufferful from the peer, treating "nothing there" as zero bytes.
+    fn sip(peer: &mut UnixStream, into: &mut Vec<u8>) -> usize {
+        // On the heap: bigger than a socket buffer, so the slow-peer test empties one
+        // per round, and too big for the stack.
+        let mut buf = vec![0u8; 64 * 1024];
+        match peer.read(&mut buf) {
+            Ok(n) => {
+                into.extend_from_slice(&buf[..n]);
+                n
+            }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => 0,
+            Err(err) => panic!("the peer could not read: {err}"),
+        }
+    }
+
+    /// Reads everything the peer's buffer currently holds.
+    fn drain(peer: &mut UnixStream, into: &mut Vec<u8>) -> usize {
+        let mut total = 0;
+        loop {
+            let n = sip(peer, into);
+            if n == 0 {
+                return total;
+            }
+            total += n;
+        }
+    }
+
+    /// Post-condition of [`compact`]: whatever is dead is smaller than what is live,
+    /// so no buffer carries a prefix bigger than the remainder it is paying to move.
+    fn compacted(len: usize, pos: usize) -> bool {
+        pos == 0 || pos * 2 < len
+    }
+
+    /// A frame handed over one byte at a time must stay invisible until its last
+    /// byte, and arrive byte-identical — the split-read path every real socket takes
+    /// and no integration test reaches.
+    #[test]
+    fn a_frame_arriving_one_byte_at_a_time_completes_only_on_its_last_byte() {
+        let payload = bulk(300);
+        let mut scratch = Vec::new();
+        for frame in samples(&payload) {
+            let wire = encoded(&frame);
+            let (mut peer, mut conn) = pair();
+            for (i, byte) in wire.iter().enumerate() {
+                feed(&mut peer, &mut conn, &[*byte]);
+                if i + 1 == wire.len() {
+                    break;
+                }
+                assert!(
+                    matches!(conn.take_frame(&mut scratch), Ok(None)),
+                    "{frame:?} completed after {} of {} bytes",
+                    i + 1,
+                    wire.len()
+                );
+            }
+            assert_eq!(take(&mut conn, &mut scratch), Some(frame), "{frame:?}");
+            assert_eq!(&scratch[..], &wire[HEADER_LEN..], "payload for {frame:?}");
+            assert!(
+                !conn.has_buffered_input(),
+                "a taken frame must leave nothing"
+            );
+        }
+    }
+
+    /// The same frames split at every possible point into two writes: reassembly
+    /// must not depend on where the boundary landed, header or payload.
+    #[test]
+    fn every_split_point_reassembles_the_same_frame() {
+        let payload = bulk(300);
+        let mut scratch = Vec::new();
+        for frame in samples(&payload) {
+            let wire = encoded(&frame);
+            for split in 1..wire.len() {
+                let (mut peer, mut conn) = pair();
+                feed(&mut peer, &mut conn, &wire[..split]);
+                assert!(
+                    matches!(conn.take_frame(&mut scratch), Ok(None)),
+                    "{frame:?} completed on {split} of {} bytes",
+                    wire.len()
+                );
+                assert_eq!(buffered(&conn), split, "every byte given must be kept");
+
+                feed(&mut peer, &mut conn, &wire[split..]);
+                assert_eq!(
+                    take(&mut conn, &mut scratch),
+                    Some(frame),
+                    "{frame:?} split at {split}"
+                );
+                assert_eq!(&scratch[..], &wire[HEADER_LEN..], "payload at {split}");
+            }
+        }
+    }
+
+    /// A frame at exactly [`MAX_PAYLOAD`], whole and split — the case the const
+    /// assert at the top of this module protects, since a read cap below a whole
+    /// frame is a frame `take_frame` never completes and a connection stuck for good.
+    #[test]
+    fn a_maximum_payload_frame_survives_whole_and_split() {
+        // The 8-byte offset shares the payload, so this is the largest `Output` there
+        // is — and exactly what `send_output` chunks to.
+        let data = bulk(MAX_PAYLOAD as usize - 8);
+        let frame = Frame::Output {
+            offset: 1 << 40,
+            data: &data,
+        };
+        let wire = encoded(&frame);
+        assert_eq!(
+            wire.len(),
+            HEADER_LEN + MAX_PAYLOAD as usize,
+            "the payload must be exactly the maximum for this to test anything"
+        );
+        assert!(
+            MAX_PENDING_READ > wire.len(),
+            "the read cap must have room for a whole frame"
+        );
+
+        let mut scratch = Vec::new();
+        let (mut peer, mut conn) = pair();
+        feed(&mut peer, &mut conn, &wire);
+        assert_eq!(buffered(&conn), wire.len());
+        assert!(!conn.is_read_saturated(), "a whole frame must not saturate");
+        assert_eq!(take(&mut conn, &mut scratch), Some(frame));
+        assert_eq!(&scratch[..], &wire[HEADER_LEN..]);
+
+        for split in [
+            1,
+            HEADER_LEN - 1,
+            HEADER_LEN,
+            HEADER_LEN + 1,
+            wire.len() / 2,
+            wire.len() - 1,
+        ] {
+            let (mut peer, mut conn) = pair();
+            feed(&mut peer, &mut conn, &wire[..split]);
+            assert!(
+                matches!(conn.take_frame(&mut scratch), Ok(None)),
+                "completed on {split} of {} bytes",
+                wire.len()
+            );
+            assert_eq!(buffered(&conn), split, "every byte given must be kept");
+            assert!(
+                !conn.is_read_saturated(),
+                "reading must not stop one byte short of a frame"
+            );
+            feed(&mut peer, &mut conn, &wire[split..]);
+            assert_eq!(take(&mut conn, &mut scratch), Some(frame), "split {split}");
+        }
+    }
+
+    /// `send_output` chunks at exactly [`MAX_PAYLOAD`], so the production path emits
+    /// the largest frame the protocol allows; read back through a second `Conn` it
+    /// has to reassemble into the bytes that went in, contiguously.
+    #[test]
+    fn send_output_chunks_at_exactly_the_maximum_payload() {
+        let chunk = MAX_PAYLOAD as usize - 8;
+        let data = bulk(2 * chunk + 1000);
+        let (peer, ours) = UnixStream::pair().expect("a socketpair");
+        let mut sender = Conn::new(ours).expect("a sender");
+        let mut reader = Conn::new(peer).expect("a reader");
+
+        let end = sender.send_output(7, &data);
+        assert_eq!(end, 7 + data.len() as u64, "the whole slice fits the queue");
+
+        let mut scratch = Vec::new();
+        let mut lens = Vec::new();
+        let mut got = Vec::new();
+        let mut next = 7;
+        while sender.wants_write() || reader.has_buffered_input() {
+            let before = (sender.tx.len() - sender.tx_pos, buffered(&reader));
+            sender.flush_some().expect("a flush");
+            reader.fill().expect("a fill");
+            while let Some(frame) = take(&mut reader, &mut scratch) {
+                let Frame::Output { offset, data } = frame else {
+                    panic!("expected Output, got {frame:?}");
+                };
+                assert_eq!(offset, next, "output offsets must be contiguous");
+                next += data.len() as u64;
+                lens.push(data.len());
+                got.extend_from_slice(data);
+            }
+            assert_ne!(
+                before,
+                (sender.tx.len() - sender.tx_pos, buffered(&reader)),
+                "neither side moved"
+            );
+        }
+
+        assert_eq!(lens, vec![MAX_PAYLOAD as usize - 8, chunk, 1000]);
+        assert!(got == data, "the reassembled stream must be what went in");
+    }
+
+    /// Several whole frames and a partial one in a single read: the trailing bytes
+    /// must be kept for the rest of their frame rather than decoded or dropped.
+    #[test]
+    fn one_read_carrying_several_frames_ends_on_a_partial_one() {
+        let payload = bulk(300);
+        let frames = samples(&payload);
+        let mut wire = Vec::new();
+        for frame in &frames {
+            frame.encode(&mut wire).expect("a valid frame");
+        }
+        let tail_at = wire.len();
+        let tail = Frame::Error {
+            code: ErrorCode::Takeover,
+            message: "another client attached",
+        };
+        tail.encode(&mut wire).expect("a valid frame");
+
+        let (mut peer, mut conn) = pair();
+        let mut scratch = Vec::new();
+        // Three bytes short of even a header, so the cut is inside the fixed part.
+        feed(&mut peer, &mut conn, &wire[..tail_at + 3]);
+        for frame in &frames {
+            assert_eq!(take(&mut conn, &mut scratch).as_ref(), Some(frame));
+        }
+        assert!(
+            matches!(conn.take_frame(&mut scratch), Ok(None)),
+            "three bytes of a header are not a frame"
+        );
+        assert!(conn.has_buffered_input(), "the stump must be kept");
+
+        feed(&mut peer, &mut conn, &wire[tail_at + 3..]);
+        assert_eq!(take(&mut conn, &mut scratch), Some(tail));
+        assert!(!conn.has_buffered_input());
+    }
+
+    /// A header this build cannot parse is reported without being consumed, so the
+    /// caller sees the bytes it is refusing rather than a buffer already advanced
+    /// past them.
+    #[test]
+    fn an_unparseable_header_is_reported_without_consuming_it() {
+        let (mut peer, mut conn) = pair();
+        let mut scratch = Vec::new();
+        feed(&mut peer, &mut conn, &[0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(
+            conn.take_frame(&mut scratch),
+            Err(ProtoError::UnknownFrameType(0x00))
+        );
+        assert_eq!(buffered(&conn), HEADER_LEN, "the bad header must stay put");
+    }
+
+    /// A stream of frames read in chunks that never end on a frame boundary: the
+    /// receive buffer must be compacted back down rather than grow with the session.
+    #[test]
+    fn the_receive_buffer_is_compacted_rather_than_grown() {
+        let payload = bulk(64);
+        let one = encoded(&Frame::Input {
+            offset: 0,
+            data: &payload,
+        });
+        let rounds = 400;
+        let stream: Vec<u8> = one
+            .iter()
+            .copied()
+            .cycle()
+            .take(rounds * one.len())
+            .collect();
+
+        let (mut peer, mut conn) = pair();
+        let mut scratch = Vec::new();
+        let (mut frames, mut halvings, mut high_water) = (0usize, 0usize, 0usize);
+        for chunk in stream.chunks(1000) {
+            feed(&mut peer, &mut conn, chunk);
+            while take(&mut conn, &mut scratch).is_some() {
+                frames += 1;
+                assert!(
+                    compacted(conn.rx.len(), conn.rx_pos),
+                    "{} dead bytes under {} live ones",
+                    conn.rx_pos,
+                    buffered(&conn)
+                );
+                if conn.rx_pos == 0 && !conn.rx.is_empty() {
+                    halvings += 1;
+                }
+                high_water = high_water.max(conn.rx.len());
+            }
+        }
+
+        assert_eq!(frames, rounds, "every frame must come back out");
+        assert!(halvings > 0, "the halving branch never ran");
+        assert!(
+            high_water <= 1000 + 2 * one.len(),
+            "the buffer reached {high_water} bytes over {} read",
+            stream.len()
+        );
+    }
+
+    /// A peer that reads slower than the daemon queues: `flush_some` makes partial
+    /// progress and hands the rest back, the queue is compacted instead of growing
+    /// with the session, and every byte still arrives in order.
+    #[test]
+    fn a_slow_peer_gets_every_byte_and_the_send_queue_stays_bounded() {
+        let payload = bulk(4096);
+        let frame_len = HEADER_LEN + 8 + payload.len();
+        let (mut peer, mut conn) = pair();
+        let (mut expected, mut got) = (Vec::new(), Vec::new());
+        let (mut offset, mut short_writes, mut halvings, mut high_water) = (0u64, 0usize, 0, 0);
+
+        let rounds = 128;
+        for _ in 0..rounds {
+            // Topped back up after every write, which is what the replay path does
+            // and what makes the dead prefix a cost rather than a curiosity.
+            while !conn.is_write_saturated() {
+                let frame = Frame::Output {
+                    offset,
+                    data: &payload,
+                };
+                conn.send(&frame);
+                frame.encode(&mut expected).expect("a valid frame");
+                offset += payload.len() as u64;
+            }
+            conn.flush_some().expect("a flush");
+            assert!(
+                compacted(conn.tx.len(), conn.tx_pos),
+                "{} dead bytes under {} live ones",
+                conn.tx_pos,
+                conn.tx.len() - conn.tx_pos
+            );
+            if conn.tx_pos == 0 && !conn.tx.is_empty() {
+                halvings += 1;
+            }
+            if conn.wants_write() {
+                short_writes += 1;
+            }
+            high_water = high_water.max(conn.tx.len());
+
+            // One bufferful per round, so the socket stays full and the writes stay
+            // short.
+            assert!(sip(&mut peer, &mut got) > 0, "the peer read nothing");
+        }
+
+        while conn.wants_write() {
+            conn.flush_some().expect("a flush");
+            assert!(
+                drain(&mut peer, &mut got) > 0 || !conn.wants_write(),
+                "nothing moved"
+            );
+        }
+        drain(&mut peer, &mut got);
+
+        assert_eq!(
+            short_writes, rounds,
+            "every write here should be a short one"
+        );
+        assert!(halvings > 0, "the halving branch never ran");
+        assert!(
+            high_water < 2 * (MAX_PENDING_WRITE + frame_len),
+            "the queue reached {high_water} bytes over {} written",
+            expected.len()
+        );
+        assert!(got == expected, "every byte must arrive, once and in order");
+        assert!(conn.tx.is_empty(), "a drained queue must be given back");
+    }
+
+    /// A peer that closes mid-frame: the header arrived, the payload never will.
+    /// The half-frame must never be handed over, and the end of file must be
+    /// reported so the daemon lets the connection go instead of waiting for bytes
+    /// nobody will send.
+    #[test]
+    fn an_end_of_file_mid_frame_never_yields_the_frame() {
+        let payload = bulk(100);
+        let wire = encoded(&Frame::Input {
+            offset: 5,
+            data: &payload,
+        });
+        let mut scratch = Vec::new();
+
+        // Once cut inside the payload, once inside the header itself.
+        for split in [HEADER_LEN + 10, HEADER_LEN - 2] {
+            let (mut peer, mut conn) = pair();
+            feed(&mut peer, &mut conn, &wire[..split]);
+            assert!(!conn.is_eof(), "the peer is still there");
+            drop(peer);
+
+            for _ in 0..2 {
+                conn.fill().expect("a fill after the peer closed");
+                assert!(conn.is_eof(), "the close must be reported");
+                assert!(
+                    matches!(conn.take_frame(&mut scratch), Ok(None)),
+                    "a frame whose payload never arrived must not be handed over"
+                );
+                assert_eq!(buffered(&conn), split, "the stump is neither used nor lost");
+            }
+        }
+    }
+
+    /// `send_last` throws the queue away: a client being closed replays from the
+    /// ring anyway, and a small final write is what lets it complete against a peer
+    /// that is barely reading.
+    #[test]
+    fn send_last_replaces_whatever_was_queued() {
+        let payload = bulk(4096);
+        let (mut peer, mut conn) = pair();
+        for i in 0..64u64 {
+            conn.send(&Frame::Output {
+                offset: i * 4096,
+                data: &payload,
+            });
+        }
+        assert!(conn.wants_write(), "there is something to throw away");
+
+        let last = Frame::Error {
+            code: ErrorCode::Takeover,
+            message: "another client attached",
+        };
+        conn.send_last(&last);
+
+        let mut got = Vec::new();
+        drain(&mut peer, &mut got);
+        assert!(
+            got == encoded(&last),
+            "only the last frame may be delivered"
+        );
+    }
+
+    /// `flush_final` against a peer that has stopped reading gives up on its
+    /// deadline. Unbounded, it would park the whole daemon — no PTY drained, no
+    /// reaping — inside a blocking write for as long as that peer likes.
+    #[test]
+    fn flush_final_gives_up_on_a_peer_that_has_stopped_reading() {
+        let payload = bulk(4096);
+        let (_peer, mut conn) = pair();
+        while !conn.is_write_saturated() {
+            conn.send(&Frame::Output {
+                offset: 0,
+                data: &payload,
+            });
+        }
+        // Fill the kernel's buffer first, so it is the deadline that ends the call.
+        conn.flush_some().expect("a flush");
+        assert!(
+            conn.wants_write(),
+            "the socket must be full to test anything"
+        );
+
+        let started = Instant::now();
+        let err = conn
+            .flush_final()
+            .expect_err("a peer that never reads must not be waited on for ever");
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(err.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock),
+            "unexpected {err:?}"
+        );
+        assert!(
+            elapsed >= FINAL_FLUSH_TIMEOUT / 2 && elapsed < FINAL_FLUSH_TIMEOUT * 8,
+            "the deadline is what should have ended this, after {elapsed:?}"
+        );
+        assert!(
+            conn.wants_write(),
+            "the queue is left for the caller to drop"
+        );
     }
 }

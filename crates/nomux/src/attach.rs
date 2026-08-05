@@ -1,9 +1,13 @@
-//! The attach relay.
+//! The relay behind `nomux spawn` and `nomux attach`.
 //!
 //! Deliberately dumb: it moves bytes between stdio and the session socket and
 //! never parses a frame. The protocol lives only in the daemon, so this side never
 //! needs a version bump. It exists for hosts where the client cannot open a
 //! `direct-streamlocal` channel straight to the socket.
+//!
+//! One relay, two ways in ([`Intent`]) — creating a session and joining one are
+//! different acts and now say so, which is the whole of the difference between the
+//! two modes. Everything past the connection is shared.
 
 use std::collections::VecDeque;
 use std::env;
@@ -39,50 +43,133 @@ const PUBLISH_POLL_INTERVAL: Duration = Duration::from_millis(1);
 /// a smaller one buys nothing but extra syscalls.
 const SPLICE_CHUNK: usize = 64 * 1024;
 
-/// Connects to `session_id`, spawning its daemon if absent, then relays stdio.
+/// Whether this invocation may bring the session into being.
 ///
-/// `label` is passed on to a daemon this call creates, and ignored when the
-/// session already exists — the label belongs to the session, not the connection.
+/// The two modes are one relay and two answers to an id nothing is serving, which is
+/// the whole of the distinction (`DESIGN.md` § 5.1): `spawn` creates it, `attach`
+/// refuses. Attach-or-create was one mode with both answers and no way to tell which
+/// it had given — a client reconnecting to a session that had been reaped got a
+/// brand-new shell and no indication that it was not the old one.
+#[derive(Clone, Copy)]
+pub(crate) enum Intent {
+    /// `nomux spawn <id>`: create the session and attach to it, in one exec. Refuses
+    /// an id something is already serving.
+    Create,
+    /// `nomux attach <id>`: relay to a session that exists. Refuses one that does
+    /// not, rather than quietly starting a second.
+    Resume,
+}
+
+/// Reaches the session `session_id` names, per `intent`, and relays stdio to it.
+///
+/// `label` is passed on to a daemon this call creates and is meaningless otherwise —
+/// the label belongs to the session rather than to the connection (§ 6.6), so
+/// [`Intent::Resume`] never carries one and `main` refuses a command line that
+/// offers one.
 ///
 /// # Errors
 ///
 /// Fails if the session cannot be reached or created, or if relaying fails.
-pub(crate) fn run(session_id: &str, label: Option<&str>) -> io::Result<()> {
+pub(crate) fn run(session_id: &str, intent: Intent, label: Option<&str>) -> io::Result<()> {
     let paths = SessionPaths::new(session_id)?;
-    let stream = connect_or_spawn(&paths, label)?;
+    let stream = match intent {
+        Intent::Create => create(&paths, label)?,
+        Intent::Resume => resume(&paths)?,
+    };
     relay(&stream)
 }
 
-/// Connects, spawning the daemon under an exclusive lock if nothing is listening.
+/// Connects to a session that is already there, and refuses to invent one that is not.
+fn resume(paths: &SessionPaths) -> io::Result<UnixStream> {
+    // Checked and never created, which is `list` and `kill`'s rule (§ 6.3) and is
+    // this mode's now that it creates nothing either: being asked to join a session
+    // must not be what brings the directory it would have lived in into existence. A
+    // directory that is not there holds no session, which is the refusal below rather
+    // than a failure of its own.
+    match paths.check_dir() {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Err(no_such_session(paths)),
+        Err(err) => return Err(err),
+    }
+    match UnixStream::connect(paths.socket()) {
+        Ok(stream) => Ok(stream),
+        Err(err) if nothing_is_listening(&err) => Err(no_such_session(paths)),
+        Err(err) => Err(err),
+    }
+}
+
+/// The refusal that replaces the session an attach used to create behind the user's
+/// back.
 ///
-/// The lock serialises concurrent attaches so two clients racing to create the
-/// same session produce one daemon, not two fighting over the socket path. It is
-/// held to the end of the function rather than released after the spawn, because
-/// garbage collection takes the same lock (`IMPLEMENTATION.md` § 6.6): while it
-/// is held, nothing can unlink the socket this is waiting for.
-fn connect_or_spawn(paths: &SessionPaths, label: Option<&str>) -> io::Result<UnixStream> {
+/// Two states reach it and it deliberately does not tell them apart: an id that never
+/// named a session here, and one whose session has been reaped. Neither is
+/// recoverable from and both want the same next command, so the difference would be
+/// resolution nobody can act on — what a client does hold is the id it minted, which
+/// is what makes this a *loud* answer rather than the silent new shell it replaces.
+fn no_such_session(paths: &SessionPaths) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "no session {id}: nothing answers on {sock}. `nomux spawn {id}` starts one, \
+             and `nomux list` says what this host is holding",
+            id = paths.id(),
+            sock = paths.socket().display(),
+        ),
+    )
+}
+
+/// The refusal to create an id something is already serving.
+///
+/// `spawn` is the one mode that says what a session *is*, so meeting a live one is
+/// the client's own state disagreeing with the host's rather than a race to retry —
+/// and the repair is `attach`, which is the command this names.
+fn already_running(paths: &SessionPaths) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "session {id} already exists: something answers on {sock}. `nomux attach {id}` \
+             joins it, and `nomux kill {id}` ends it",
+            id = paths.id(),
+            sock = paths.socket().display(),
+        ),
+    )
+}
+
+/// Creates the session under an exclusive lock, and refuses an id that answers.
+///
+/// The lock serialises concurrent spawns so two clients racing on the same id
+/// produce one daemon, not two fighting over the socket path — and now one refusal
+/// besides, since the loser finds the winner's socket and is told the id is taken.
+/// It is held to the end of the function rather than released after the spawn,
+/// because garbage collection takes the same lock (`IMPLEMENTATION.md` § 6.6): while
+/// it is held, nothing can unlink the socket this is waiting for.
+fn create(paths: &SessionPaths, label: Option<&str>) -> io::Result<UnixStream> {
     // Before the first `connect`, not on the way to spawning a daemon. The socket
     // this is about to hand the user's keystrokes to is a *name* in the run
     // directory (§ 6.3), and where that directory is a symlink into somewhere
     // another user can write, the name is theirs to make: checking only when
-    // nothing answers checks only the case where nothing was planted. It costs the
-    // warm path one `open` and one `fstat`.
+    // nothing answers checks only the case where nothing was planted.
     paths.ensure_dir()?;
     match UnixStream::connect(paths.socket()) {
-        Ok(stream) => return Ok(stream),
+        // Dropped on the spot, which costs the daemon a pending connection that
+        // closes without greeting — the same nothing `list`'s probe costs it (§ 6.4).
+        Ok(_) => return Err(already_running(paths)),
         Err(err) if nothing_is_listening(&err) => {}
         Err(err) => return Err(err),
     }
 
     // `lock_spawn` is where the subtlety lives: a collector may have unlinked
     // `<id>.lock` while this call was blocked on it, and a lock on a file that no
-    // longer has that name is not this mutex — the next attach would create a new
+    // longer has that name is not this mutex — the next spawn would create a new
     // file there and lock that. It checks and goes back for the real one.
     let _spawn_lock = paths.lock_spawn()?;
 
-    // Another attach may have created the session while we waited for the lock.
+    // Another spawn may have created the session while we waited for the lock, and
+    // the loser of that race is refused rather than handed the winner's session: two
+    // tabs both told they created this one is exactly the confusion the split exists
+    // to end.
     match UnixStream::connect(paths.socket()) {
-        Ok(stream) => return Ok(stream),
+        Ok(_) => return Err(already_running(paths)),
         Err(err) if nothing_is_listening(&err) => {}
         Err(err) => return Err(err),
     }
@@ -114,7 +201,7 @@ fn connect_or_spawn(paths: &SessionPaths, label: Option<&str>) -> io::Result<Uni
     }
 }
 
-/// Keeps the spawn lock until the daemon this attach started has published
+/// Keeps the spawn lock until the daemon this spawn started has published
 /// `<id>.pid`.
 ///
 /// This is what makes the lock mean what the rest of the layout assumes it means.
@@ -205,7 +292,14 @@ fn daemon_complaint(stderr: Option<ChildStderr>) -> Option<String> {
     let line = text.lines().find(|line| !line.trim().is_empty())?.trim();
     // The daemon reached this through `main`'s reporter, which prefixes the binary's
     // own name. Keeping it would render as `nomux: ... : nomux: ...`.
-    Some(line.strip_prefix("nomux: ").unwrap_or(line).to_owned())
+    let line = line.strip_prefix("nomux: ").unwrap_or(line);
+    // Escaped, like the pidfile bodies `control` quotes with `{:?}` and for the same
+    // reason: this is another process's stderr on its way to a terminal, where the
+    // `lines` above stops a second line being forged but not an `ESC ]0;` retitling the
+    // window of whoever ran the attach. `escape_debug` spends that only on what a
+    // terminal would act on — printable UTF-8 comes through as itself, so an accent in
+    // the run directory's path still reads as one.
+    Some(line.escape_debug().collect())
 }
 
 /// Moves bytes between stdio and the socket until either side closes.
@@ -509,5 +603,42 @@ impl Pump {
             }
             outcome => outcome.map(|()| true).map_err(Into::into),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::File;
+    use std::io::Write as _;
+
+    use super::{ChildStderr, daemon_complaint};
+
+    /// Reads back what a daemon writing `bytes` to its stderr would be reported as.
+    ///
+    /// The write end is dropped before the read: `daemon_complaint` never waits, so a
+    /// pipe still open at the other end would answer `EAGAIN` and race the test.
+    fn complaint_of(bytes: &[u8]) -> Option<String> {
+        let (read, write) = rustix::pipe::pipe().unwrap();
+        File::from(write).write_all(bytes).unwrap();
+        daemon_complaint(Some(ChildStderr::from(read)))
+    }
+
+    #[test]
+    fn a_complaint_cannot_drive_the_terminal_it_is_printed_to() {
+        assert_eq!(
+            complaint_of(b"nomux: \x1b]0;pwned\x07boom\nsecond line").as_deref(),
+            Some("\\u{1b}]0;pwned\\u{7}boom"),
+            "this reaches `main`'s `eprintln!` verbatim, so it must carry no escape \
+             sequence — nor the daemon's own `nomux: `, nor a second line"
+        );
+    }
+
+    #[test]
+    fn a_legible_complaint_is_left_legible() {
+        assert_eq!(
+            complaint_of("nomux: /hëm/fornwall: permission denied".as_bytes()).as_deref(),
+            Some("/hëm/fornwall: permission denied"),
+            "escaping is for what a terminal acts on, not for every byte above ASCII"
+        );
     }
 }

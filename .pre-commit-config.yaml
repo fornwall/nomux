@@ -25,9 +25,13 @@ repos:
         files: '(\.rs|\.toml)$|^Cargo\.lock$'
         pass_filenames: false
 
+      # `-- -D warnings` rather than a deny in [workspace.lints]: cargo inlines that
+      # table into the published manifest, so a deny there fails a stranger's
+      # `cargo install` on any toolchain newer than the pin. Cargo.toml says it at
+      # length. Here it gates only this tree, which is the whole intent.
       - id: cargo-clippy
         name: cargo clippy
-        entry: cargo clippy --locked --workspace --all-targets
+        entry: cargo clippy --locked --workspace --all-targets -- -D warnings
         language: system
         files: '(\.rs|\.toml)$|^Cargo\.lock$'
         pass_filenames: false

@@ -13,11 +13,7 @@ keywords = ["ssh", "terminal", "pty", "session"]
 categories = ["command-line-utilities"]
 
 [workspace.dependencies]
-# The `version` moves with `workspace.package.version` above, and cargo has no way to
-# say so — a path dependency that is also published needs a literal. A stale one is not
-# a silent failure at least: it no longer matches the version the path resolves to, and
-# resolution stops rather than picking something else.
-nomux-proto = { path = "crates/nomux-proto", version = "0.2.0" }
+nomux-proto = { path = "crates/nomux-proto" }
 
 # See IMPLEMENTATION.md § 8 — the cold upload happens over cellular, so size is a
 # correctness-adjacent concern. Target <= 400 KiB per architecture.
@@ -28,19 +24,31 @@ codegen-units = 1
 panic = "abort"
 strip = "symbols"
 
+# Every lint below stays at "warn". The deny lives in the gates — `RUSTFLAGS: -D
+# warnings` on CI's check job, and `-- -D warnings` on the clippy invocations in
+# .github/workflows/ci.yml and .pre-commit-config.yaml — because a `warnings = "deny"`
+# here escapes the repository. rust-toolchain.toml sits at the workspace root, outside
+# the package directory, so it is not in the published crate; cargo inlines
+# `[lints] workspace = true` into the packaged manifest, which it must or the crate
+# would not resolve standalone. A deny here is therefore what a stranger gets:
+# `cargo install nomux` on any toolchain past the 1.97.1 pin hard-errors on the first
+# default-warn lint rustc adds, as does a build from git without rustup, since
+# Debian's and Fedora's cargo ignore rust-toolchain.toml. `future_incompatible` below
+# is the sharpest edge — that group is designed to gain members every release, and
+# under a blanket deny each new member is an instant build failure. `--cap-lints=warn`
+# does not rescue any of this: it applies to non-local crates only, and the crate
+# being installed is the local one.
+#
+# The gates lose nothing by holding the deny instead. This tree still fails CI and
+# pre-commit on any warning; what changed is that the failure stops at the people who
+# can fix it.
 [workspace.lints.rust]
 # Fault injection for the test suite, never set in a shipped build. Declared so
-# `cfg!` on it is not itself a warning — which, under the blanket deny below,
-# would be an error.
+# `cfg!` on it is not itself a warning — which the gates would turn into an error.
 unexpected_cfgs = { level = "warn", check-cfg = [
     "cfg(nomux_fault_injection)",
     "cfg(nomux_fault_settle)",
 ] }
-# Promotes every lint left at warn level — including rustc's own defaults, such as
-# unused_variables — to a hard error. `priority = 1` makes it the last flag passed
-# to the compiler, so it overrides the warn levels set below rather than being
-# overridden by them. Lints explicitly set to "allow" are unaffected.
-warnings = { level = "deny", priority = 1 }
 missing_docs = "warn"
 missing_debug_implementations = "warn"
 unreachable_pub = "warn"
@@ -68,7 +76,6 @@ panic = "warn"
 todo = "warn"
 unimplemented = "warn"
 indexing_slicing = "warn"
-unwrap_in_result = "warn"
 undocumented_unsafe_blocks = "warn"
 missing_assert_message = "warn"
 allow_attributes = "warn"

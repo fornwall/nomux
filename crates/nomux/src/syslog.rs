@@ -57,10 +57,18 @@ enum Severity {
 /// `busybox syslogd` all fill both in for a message that carries neither.
 fn send(severity: Severity, message: &str) {
     let priority = FACILITY_USER * 8 + severity as u8;
+    // Filtered by the function `list` filters a label with, and applied to the whole
+    // assembled line, which is what makes it enough: the text beside a session id is
+    // usually an `io::Error` carrying the run directory somebody else chose through
+    // `XDG_RUNTIME_DIR`, and the id itself is not always validated either — `daemon::run`
+    // reports a startup failure before anything has looked at its argument, so a
+    // malformed id reaches here verbatim. A newline in a datagram is how one log line
+    // becomes two, the second saying whatever its author wanted; a journal is read on a
+    // terminal, so a bidi override reorders one exactly as it would a listing.
     let line = format!(
         "<{priority}>nomux[{pid}]: {message}",
         pid = std::process::id(),
-        message = sanitize(message),
+        message = crate::rundir::sanitize_text(message),
     );
     if let Ok(socket) = UnixDatagram::unbound() {
         // A full collector must not park the daemon inside a `send`. Dropping the
@@ -80,32 +88,39 @@ pub(crate) fn info(session_id: &str, message: &str) {
     send(Severity::Info, &format!("session {session_id}: {message}"));
 }
 
-/// Flattens anything that would let a message forge a second one.
-///
-/// Applied to the whole assembled line, which is what makes it enough: the text
-/// beside a session id is usually an `io::Error` carrying a path somebody else
-/// chose, and the id itself is not always validated either — `daemon::run` reports
-/// a startup failure before anything has looked at its argument, so a malformed id
-/// reaches here verbatim. A newline in a datagram is how one log line becomes two,
-/// the second one saying whatever its author wanted it to.
-fn sanitize(message: &str) -> String {
-    message
-        .chars()
-        .map(|ch| if ch.is_control() { ' ' } else { ch })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{FACILITY_USER, Severity, sanitize};
+    use super::{FACILITY_USER, Severity};
+    use crate::rundir::{sanitize_label, sanitize_text};
 
     #[test]
     fn control_characters_cannot_forge_a_second_line() {
         assert_eq!(
-            sanitize("one\nfeb 30 host sshd[1]: two\r\tthree"),
-            "one feb 30 host sshd[1]: two  three",
+            sanitize_text("one\nfeb 30 host sshd[1]: two\r\tthree"),
+            "onefeb 30 host sshd[1]: twothree",
             "a newline in a message is how one datagram becomes two log entries"
         );
+    }
+
+    /// The listing and the journal are both read on a terminal, so a line bound for
+    /// one has to be filtered exactly as a label bound for the other is. This is what
+    /// they were not: this module dropped `Cc` alone while `list` had already learnt
+    /// about the bidi overrides, and a run directory named through `XDG_RUNTIME_DIR`
+    /// reaches here inside an `io::Error`.
+    #[test]
+    fn a_log_line_is_filtered_exactly_as_a_label_is() {
+        for message in [
+            "session bad\u{202e}dne: started",
+            "session x: run directory /run/user/1000/\u{e0041}\u{e0042}: it is a symlink",
+            "one\nfeb 30 host sshd[1]: two",
+            "\u{1b}]0;pwned\u{7}",
+        ] {
+            assert_eq!(
+                sanitize_text(message),
+                sanitize_label(message),
+                "one hazard, one filter: {message:?}"
+            );
+        }
     }
 
     #[test]

@@ -22,8 +22,8 @@ separate project — but one written by the same author.
 
 That matters more than it sounds. The two ship as a unit, so:
 
-- The wire protocol is **private**. No negotiation, no extension points, no third-party clients, no stability guarantee. Enums are exhaustive; an unknown value is a bug, not a forward-compatibility case.
-- Behaviour may be split across the boundary wherever it is cheapest, not wherever it is most "correct" for a hypothetical other consumer. Emulator reset on gap recovery lives client-side because the client already has the emulator.
+- The wire protocol is **private**. No negotiation, no extension points, no third-party clients, no stability guarantee. Enums are exhaustive; an unknown value is a bug, not a forward-compatibility case. Nothing is on the wire that nothing reads: a field kept for a hypothetical consumer is bytes on every connection, and there is no such consumer. `nomux-proto` is not published for the same reason — a crates.io version is a stability promise about exactly the thing this bullet says has none.
+- Behaviour may be split across the boundary wherever it is cheapest, not wherever it is most "correct" for a hypothetical other consumer. Emulator reset on gap recovery lives client-side because the client already has the emulator, and the *decision* that there was a gap is a comparison both ends can make ([IMPLEMENTATION.md § 4.2](IMPLEMENTATION.md#42-attach-with-from--base_offset)) rather than a flag the daemon spends a bit on.
 - Version skew has exactly one real case (§6.4), and it is bounded rather than designed around.
 
 Nothing here aims to be a general terminal tool.
@@ -93,7 +93,7 @@ flowchart LR
 
   subgraph server["SSH server"]
     SSHD["sshd"]
-    RELAY["nomux attach<br/>byte relay"]
+    RELAY["nomux spawn / attach<br/>byte relay"]
     DAEMON["nomux daemon<br/>PTY master + ring buffer"]
     CHILD["shell / TUI"]
   end
@@ -105,31 +105,34 @@ flowchart LR
   DAEMON -- "PTY master" --> CHILD
 ```
 
-Five modes of one binary, in four groups — `kill` and `list` are one surface with
-one contract:
+Five modes of one binary, in three groups — `spawn` and `attach` are one relay with
+two answers to an id nothing serves, `kill` and `list` one surface with one contract:
 
 | Mode | Lifetime | Role |
 | --- | --- | --- |
 | `nomux daemon` | Outlives connections | Owns the PTY master, child process, ring buffer, and unix socket. Speaks the wire protocol. |
-| `nomux attach` | One connection | Dumb byte relay between stdio and the unix socket. No protocol awareness. Skipped entirely when `direct-streamlocal` is available. |
-| `nomux probe` | One-shot | Reports OS, architecture, and resolved install path for bootstrap. |
-| `nomux kill` / `nomux list` | One-shot | Frozen control surface. Acts on the run directory — the five files per session listed in [IMPLEMENTATION.md § 6.6](IMPLEMENTATION.md#66-frozen-control-surface) — never on the session protocol, so any build can manage any daemon regardless of version. |
+| `nomux spawn` / `nomux attach` | One connection | Dumb byte relay between stdio and the unix socket. No protocol awareness. Every session is *created* through `spawn`, which creates and attaches in one `exec` (§6.2) and refuses an id something already answers for; `attach` refuses one nothing answers for, and never the reverse (§5.1). `direct-streamlocal` skips the relay on resume, never on creation. |
+| `nomux kill` / `nomux list` | One-shot | Frozen control surface. Acts on the run directory — the `<id>.*` files per session described in [IMPLEMENTATION.md § 6.6](IMPLEMENTATION.md#66-frozen-control-surface) — never on the session protocol, so any build can manage any daemon regardless of version. |
 
-The protocol is spoken end-to-end between the client and the daemon. `attach` is
-deliberately dumb so protocol logic exists in exactly one place.
+The protocol is spoken end-to-end between the client and the daemon. The relay is
+deliberately dumb so protocol logic exists in exactly one place — which is what makes
+the split cheap: the two modes differ in whether they may create the session and in
+nothing else, so neither parses a frame and neither is ever bumped.
 
 ## 5. Session lifecycle
 
 ```mermaid
 stateDiagram-v2
-  [*] --> Spawning: attach, no live socket
+  [*] --> Spawning: spawn, no live socket
   Spawning --> Attached: fork PTY, bind socket
   Attached --> Detached: connection lost / explicit detach
-  Detached --> Attached: resume from offset
-  Attached --> Exiting: child exits
-  Detached --> Exiting: child exits
-  Detached --> Exiting: idle timeout
-  Exiting --> [*]: flush Exit, unlink run files
+  Detached --> Attached: attach, resume from offset
+  Attached --> Ended: child exits, Exit after the last output
+  Detached --> Ended: child exits, status held
+  Ended --> Ended: attach, replay then the status again
+  Detached --> Reaping: idle timeout since the last detach
+  Ended --> Reaping: idle timeout since the last detach
+  Reaping --> [*]: signal whatever is left, unlink run files
 ```
 
 The daemon keeps draining the PTY while detached — otherwise the child blocks on
@@ -144,8 +147,8 @@ id ever shown to the user — they see tabs.
 Consequences:
 
 - The daemon never interprets an id. It is a filename component and nothing else, so it is validated strictly against path traversal (see [IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)).
-- Opaque ids do not survive loss of client state. After a reinstall the daemons are still running but the app no longer knows which tab each was. A human-readable label is therefore stored beside the socket, so `nomux list` stays meaningful and orphans are recoverable rather than anonymous.
-- Concurrency is capped at 8 sessions per host, enforced client-side. The daemon does not enforce it; each daemon owns exactly one PTY and knows nothing of its siblings.
+- Opaque ids do not survive loss of client state. After a reinstall the daemons are still running but the app no longer knows which tab each was. A human-readable label is therefore stored beside the socket, so `nomux list` stays meaningful and orphans are recoverable rather than anonymous. It is also why `attach` refuses an id nothing answers for instead of creating one, which is the whole of why it is a separate mode from `spawn` (§4): an id outliving what it names is the ordinary failure here rather than an exotic one, and a mode that answered both cases handed back a brand-new shell with no way to tell it from the one that had held the build. A stale or mistyped id now fails loudly instead.
+- Concurrency is *intended* to cap at 8 sessions per host, and that cap is the client's: it is policy, holdable only by the side that knows a tab was opened — so nothing holds it today, the client being unwritten. What the daemon holds is a backstop rather than a policy. It refuses to start past 64 ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)), eight times the intended figure and deliberately so: what reaches that number is a runaway, not a user who wanted one more terminal. It still knows nothing of its siblings' *state* — it counts names in a directory, which is the whole of what one daemon can learn about the others without becoming a supervisor.
 
 Rejected alternatives: one implicit session per host (survives app reinstall, but no
 second terminal for a build alongside an editor) and user-named sessions (solves
@@ -154,8 +157,29 @@ both, at the cost of the session-list UI this project exists to avoid).
 ### 5.2 Reaping
 
 A detached session exits on its own after a long idle period — 7 days, not
-currently tunable — measured as **time since last detach**. A session that never
-saw its first client is reaped after 30 s instead.
+currently tunable — measured as **time since last detach**, and the child having
+exited is not a second rule beside it. A session that never saw its first client is
+reaped after 30 s instead, which is still what removes a daemon nobody ever reached.
+
+One rule for both repairs an asymmetry. An *idle* session already survived a week
+where an *exited* one survived five seconds, and on the connection profile this
+project exists for — signal lost, radio asleep, reconnect minutes later — five seconds
+is essentially never the window you are in, so a shell that finished while nobody was
+attached took its status with it. Now a client that attaches, collects it and leaves
+gets a fresh week from that departure, and one that never leaves is never reaped,
+which is exactly what a live session already promised. What it collects is what a
+client watching the exit live would have seen — the final output replayed and *then*
+the status — plus the one thing the wire had to learn to carry for it: how long ago
+the child let go, in whole seconds elapsed rather than a timestamp, the daemon having
+no reason to trust a wall clock and the client being able to convert against its own.
+
+Holding it is cheaper than what this design already permits. A session whose child has
+gone holds a daemon and a ring; an idle *live* one holds a daemon, a ring **and** a
+login shell with everything it started — so 64 of the former sit below the 64 of the
+latter the backstop above already allows. Nothing is written down for it either, no
+tombstone and no sixth name in the run directory, because the daemon already holds the
+status, the kind, the final output and the ring in memory, and the five-second window
+was the only thing that ever threw them away.
 
 Output volume is not usable as the signal: it cannot distinguish a multi-hour build
 that must survive from a `tail -f` that could run forever, and a shell sitting at a
@@ -200,12 +224,15 @@ Consequences:
 - The protocol gains sub-channels ([IMPLEMENTATION.md § 6.7](IMPLEMENTATION.md#67-agent-forwarding)). This is the one place the design multiplexes, and it is a deliberate, bounded exception.
 - It works **without** `ForwardAgent`, bypassing a deliberate user decision. So it is opt-in per host, off by default, never enabled silently.
 - Because the client sees every request, it *can* prompt per signature or name the asking session — something plain `ssh -A` can never do.
+- What it **loses** is OpenSSH's destination constraints. `ssh-add -h` binds a key to a hop, and `ssh(1)` enforces that by sending `session-bind@openssh.com` down each forwarded agent connection. Here the daemon is an opaque byte pipe ([IMPLEMENTATION.md § 6.7](IMPLEMENTATION.md#67-agent-forwarding)) and the client re-originates the request against the real agent, so unless the client synthesises a binding for the hop the session actually sits on, a constrained key is either refused outright or used with its constraint silently not applied. Named because the opt-in above is the compensating control: a user who reasoned that `ssh-add -h` had already made forwarding cheap would be reasoning about `ssh -A`.
 
 ## 6. Connection paths
 
 ### 6.1 Warm resume
 
-Steady state, and the path that runs on every network change:
+Steady state, and the path that runs on every network change. Always a resume: the
+socket *is* the session, so a channel opened straight to it reaches one that already
+exists or nothing at all — creation needs a process, and this path runs none.
 
 ```mermaid
 sequenceDiagram
@@ -214,29 +241,33 @@ sequenceDiagram
   participant D as daemon
   C->>S: direct-streamlocal to $XDG_RUNTIME_DIR/nomux/$ID.sock
   C->>D: Hello{out_offset, cols, rows, TERM}
-  D-->>C: HelloOk{resume_from, gap: false}
+  D-->>C: HelloOk{resume_from == out_offset, so no gap}
   D-->>C: Output[resume_from..end]
   Note over C,D: no process spawned, no shell parsed
 ```
 
 ### 6.2 Cold bootstrap
 
-First contact with a host, or after a version bump:
+First contact with a host, or after a version bump — creation and resume
+respectively, which is the whole of what `$MODE` stands for below: `spawn` for the
+first, `attach` for the second.
 
 ```mermaid
 sequenceDiagram
   participant C as Client
   participant S as sshd
   participant D as daemon
-  C->>S: exec: exec $p/nomux-$VER attach $ID<br/>echo "NOMUX-BOOTSTRAP $(uname -s) $(uname -m) $p"
+  C->>S: exec: exec $p/nomux-$VER $MODE $ID<br/>echo "NOMUX-BOOTSTRAP $(uname -s) $(uname -m) $p"
   S-->>C: NOMUX-BOOTSTRAP Linux aarch64 /home/u/.local/share/nomux
-  C->>S: exec: cat to tmp, chmod, mv, then exec nomux-$VER attach $ID
-  S->>D: spawn daemon, connect socket
-  D-->>C: HelloOk{resume_from: 0}
+  C->>S: exec: cat to tmp, chmod, mv, then exec nomux-$VER $MODE $ID
+  S->>D: start a daemon if creating, then connect the socket
+  D-->>C: HelloOk{resume_from}, 0 where spawn just made the session
 ```
 
 Two round trips cold, zero extra warm — the `exec` replaces the shell on success, so
-the probe line is only reached on failure. Details in
+the probe line is only reached on failure, and `spawn` creates *and* attaches within
+that one `exec` rather than costing a round trip of its own, which is why creating is
+a mode of the relay and not a command run before it. Details in
 [IMPLEMENTATION.md § Bootstrap](IMPLEMENTATION.md#5-bootstrap).
 
 ### 6.3 Gap
@@ -269,8 +300,12 @@ still clean it up — the fallback is never an orphaned shell. See
 [IMPLEMENTATION.md § 6.6](IMPLEMENTATION.md#66-frozen-control-surface).
 
 The daemon carries none of this. It only ever speaks its own version and rejects a
-mismatched `Hello.protocol` outright. All skew handling is client-side, which is where
-it belongs: the daemon is the size-constrained binary being uploaded over cellular.
+mismatched `Hello.protocol` outright — the refusal is the whole of its half, which is
+why `HelloOk` carries no revision of its own: by the time it is sent, the number has
+already been agreed. All skew handling is client-side, which is where it belongs: the
+daemon is the size-constrained binary being uploaded over cellular, and the client
+already knows which revision it opened each session with, the version being in the
+binary's filename.
 
 ## 7. Degradation
 
@@ -283,14 +318,14 @@ plain SSH session and is cached per-host so it is not re-probed on every connect
 | Unknown architecture | Plain SSH. |
 | Exec fails with format error | Retry next-best architecture once, then plain SSH. |
 | Home is `noexec` or read-only | Plain SSH. Detected by exec failing, never by parsing mounts. |
-| `AllowStreamLocalForwarding no` | Warm path unavailable; use the `attach` relay. |
+| `AllowStreamLocalForwarding no` | Warm path unavailable; use the exec relay, `attach` or `spawn` as the session needs. |
 | Restricted shell / no `uname` | Plain SSH. |
 | `KillUserProcesses=yes`, no linger | Daemon dies at logout. Detected and surfaced; session is best-effort. |
 
 ## 8. Security model
 
 - **No new *network* attack surface.** No listening TCP or UDP port, nothing for a firewall to open. Locally there is new surface and it is enumerated below: a unix socket per session, an optional agent socket, and a process that outlives the login. The uploaded binary is not among it — anyone who can write `~/.local/share/nomux/` can already edit `.bashrc`.
-- **That last equivalence is for the same user only.** The install directory is not checked the way the run directory is — no `O_NOFOLLOW`, no uid check, no refusal of a group- or other-writable parent ([IMPLEMENTATION.md § 5.2](IMPLEMENTATION.md#52-upload-and-attach-in-one-round-trip) has the one-liner that creates it; [§ 6.3](IMPLEMENTATION.md#63-socket) has the rigour it lacks). So under a lax umask, or with `$XDG_DATA_HOME` pointed into a shared directory, *another* user can replace the binary that every connection taking the exec path runs ([IMPLEMENTATION.md § 5.1](IMPLEMENTATION.md#51-probe-and-attach-in-one-round-trip)) — which is code execution as the victim, and not something they could already do. Closing it is the client's work, since the client is what sends that command line; recorded here so the rigour of § 6.3 is not read into § 5 by mistake.
+- **That last equivalence is for the same user only.** The install directory is not checked the way the run directory is — no `O_NOFOLLOW`, no uid check, no refusal of a group- or other-writable parent ([IMPLEMENTATION.md § 5.2](IMPLEMENTATION.md#52-upload-and-attach-in-one-round-trip) has the one-liner that creates it; [§ 6.3](IMPLEMENTATION.md#63-socket) has the rigour it lacks). So where it is a directory somebody else can write to — one that already exists at a lax mode, `$XDG_DATA_HOME` pointed into a shared one — *another* user can replace the binary that every connection taking the exec path runs ([IMPLEMENTATION.md § 5.1](IMPLEMENTATION.md#51-probe-and-attach-in-one-round-trip)), which is code execution as the victim and not something they could already do. Not all of that is the client's, though this bullet used to say so: § 5.2 publishes the command line clients copy, so what one command line can hold it now holds — `mkdir -p -m 700` rather than whatever the umask leaves, and an upload that creates its temp file exclusively rather than through a symlink planted at the name. What is left is genuinely the client's, being what no command line does: *check* a directory that already exists, and refuse a parent that is not the user's. Recorded here so the rigour of § 6.3 is not read into § 5 by mistake.
 - **No new secrets.** No keys, no tokens, no crypto. Authentication is the unix socket's filesystem permissions (`0600` in a `0700` directory) plus SSH itself.
 - **No abstract sockets.** They are namespace-scoped, not permission-scoped, and would be reachable by any local user.
 - **Agent forwarding is a real capability expansion — the only one here.** The daemon serves an `ssh-agent` socket of its own, so a session reaches the user's keys on a connection that never set `ForwardAgent`, and only a session created with the flag set gets one. The policy that follows from bypassing that decision, and what it buys back, are §5.4's.

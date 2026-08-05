@@ -3,8 +3,8 @@
 //! One binary, several modes (see `DESIGN.md` § 4):
 //!
 //! - `daemon` owns the PTY master, the child process and the output ring buffer.
-//! - `attach` is a dumb byte relay between stdio and the daemon's unix socket.
-//! - `probe` reports the information the client needs to bootstrap this host.
+//! - `spawn` and `attach` are one dumb byte relay between stdio and the daemon's
+//!   unix socket, differing only in whether they may create the session.
 //! - `list` and `kill` are the frozen, version-independent control surface.
 
 mod agent;
@@ -25,27 +25,28 @@ mod syslog;
 
 use std::env;
 use std::ffi::OsString;
-use std::path::PathBuf;
 use std::process::ExitCode;
 
 /// `EX_USAGE`: malformed invocation. The one code borrowed from `sysexits.h`, and
 /// the only one shared by every mode — `IMPLEMENTATION.md` § 10 has both tables and
 /// says why the rest of that range is left alone.
 const EXIT_USAGE: u8 = 64;
-/// Session exists but is unattachable. The shell's "found but not executable",
-/// applied to a session, since `attach` is what a client runs over an exec channel.
+/// The session is there but this mode cannot have it. The shell's "found but not
+/// executable", applied to a session, since these are what a client runs over an
+/// exec channel: `spawn` found the id already taken, or `attach` found a session it
+/// could not join.
 const EXIT_UNATTACHABLE: u8 = 126;
-/// No such session, and it could not be started. The shell's "not found", for the
-/// reason above.
+/// No such session — `attach` on an id nothing answers for, or a `spawn` whose daemon
+/// never started. The shell's "not found", for the reason above.
 const EXIT_NO_SESSION: u8 = 127;
 
 const USAGE: &str = "\
 usage: nomux <mode> [session-id] [--label <text>]
 
 modes:
-  daemon <session-id>   Own a PTY session (normally spawned by `attach`)
-  attach <session-id>   Relay stdio to a session, spawning it if absent
-  probe                 Report OS, architecture and install path
+  daemon <session-id>   Own a PTY session (normally spawned by `spawn`)
+  spawn <session-id>    Create a session and relay stdio to it; fails if it exists
+  attach <session-id>   Relay stdio to an existing session; fails if it does not
 
 control surface (frozen across versions, see IMPLEMENTATION.md 6.6):
   list                  List sessions in the run directory
@@ -53,8 +54,9 @@ control surface (frozen across versions, see IMPLEMENTATION.md 6.6):
 
 options:
   --label <text>        Display name for `list`, recorded when the session is
-                        created. Advisory: ids are opaque, so this is what makes
-                        an orphaned session recognisable to a human.
+                        created, so `daemon` and `spawn` take it and `attach` does
+                        not. Advisory: ids are opaque, so this is what makes an
+                        orphaned session recognisable to a human.
   --version, -V         Print version and protocol revision
   --help, -h            Print this usage
 ";
@@ -66,7 +68,6 @@ fn main() -> ExitCode {
     };
 
     match mode.to_str() {
-        Some(word @ "probe") => only(args, word, print_probe),
         Some(word @ "list") => only(args, word, || report(control::list())),
         Some(word @ ("--version" | "-V")) => only(args, word, || {
             println!(
@@ -81,6 +82,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }),
         Some("daemon") => run_session_mode(Mode::Daemon, args),
+        Some("spawn") => run_session_mode(Mode::Spawn, args),
         Some("attach") => run_session_mode(Mode::Attach, args),
         Some("kill") => run_session_mode(Mode::Kill, args),
         _ => usage_error(Some(&format!("unknown mode `{}`", mode.display()))),
@@ -111,19 +113,25 @@ fn only(mut args: impl Iterator<Item = OsString>, word: &str, run: fn() -> ExitC
 /// of — the message, the usage, and 64 — is decided once.
 fn usage_error(message: Option<&str>) -> ExitCode {
     if let Some(message) = message {
-        eprintln!("nomux: {message}\n");
+        // Escaped here rather than at each of the five places one is built, because
+        // what every one of them quotes is a word from `argv` — text nothing validated,
+        // on its way to a terminal that would act on an `ESC ]0;` in it. `escape_debug`
+        // leaves printable UTF-8 alone, so an argument in any language still reads as
+        // what was typed.
+        eprintln!("nomux: {}\n", message.escape_debug());
     }
     eprint!("{USAGE}");
     ExitCode::from(EXIT_USAGE)
 }
 
-/// The three modes that take a session id.
+/// The four modes that take a session id.
 ///
 /// An enum rather than the `&str` `main` matched on, so that the dispatch below is
-/// exhaustive and a fourth mode cannot silently fall into a catch-all arm.
+/// exhaustive and a fifth mode cannot silently fall into a catch-all arm.
 #[derive(Clone, Copy)]
 enum Mode {
     Daemon,
+    Spawn,
     Attach,
     Kill,
 }
@@ -133,6 +141,7 @@ impl Mode {
     const fn name(self) -> &'static str {
         match self {
             Self::Daemon => "daemon",
+            Self::Spawn => "spawn",
             Self::Attach => "attach",
             Self::Kill => "kill",
         }
@@ -148,26 +157,55 @@ fn run_session_mode(mode: Mode, args: impl Iterator<Item = OsString>) -> ExitCod
     let Some(session) = session else {
         return usage_error(Some(&format!("`{}` requires a session id", mode.name())));
     };
+    // The label is recorded when the session is created (`IMPLEMENTATION.md` § 6.6),
+    // so it belongs to the two modes that create one. Refused rather than dropped on
+    // the floor: a `--label` on `attach` is a caller that still believes `attach`
+    // might create the session, which is the confusion this split exists to end, and
+    // silence would leave it believing it. `kill` goes on parsing and ignoring one,
+    // because what the frozen escape hatch accepts is not this change's to narrow.
+    if matches!(mode, Mode::Attach) && label.is_some() {
+        return usage_error(Some(
+            "`attach` takes no `--label`: a label is recorded when the session is \
+             created, which `spawn` does",
+        ));
+    }
 
     match mode {
         Mode::Daemon => report(daemon::run(&session, label.as_deref())),
-        Mode::Attach => match attach::run(&session, label.as_deref()) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(err) => {
-                eprintln!("nomux: {err}");
-                ExitCode::from(match err.kind() {
-                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::NotFound => EXIT_NO_SESSION,
-                    // A rejected session id is a malformed command line, not a
-                    // session that resisted attaching: the id could never have named
-                    // one. § 10 gives that `EX_USAGE`, and the distinction is the
-                    // client's to act on — it caches "unattachable" per host and
-                    // would otherwise cache it off its own typo.
-                    std::io::ErrorKind::InvalidInput => EXIT_USAGE,
-                    _ => EXIT_UNATTACHABLE,
-                })
-            }
-        },
+        Mode::Spawn => relayed(attach::run(
+            &session,
+            attach::Intent::Create,
+            label.as_deref(),
+        )),
+        Mode::Attach => relayed(attach::run(&session, attach::Intent::Resume, None)),
         Mode::Kill => report(control::kill(&session)),
+    }
+}
+
+/// Maps the relay's fate onto an exit code, per `IMPLEMENTATION.md` § 10.
+///
+/// Shared by `spawn` and `attach` because the table is one table: the two differ in
+/// which errors they can produce, never in what a given one means. `NotFound` is the
+/// session `attach` refused to invent and `TimedOut` is the daemon `spawn` could not
+/// start — the same "not found", one about a session and one about bringing it into
+/// being — while `AlreadyExists` is the id `spawn` found taken, which falls to the
+/// catch-all beside the permission and protocol refusals that were always there.
+fn relayed(result: std::io::Result<()>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("nomux: {err}");
+            ExitCode::from(match err.kind() {
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::NotFound => EXIT_NO_SESSION,
+                // A rejected session id is a malformed command line, not a session
+                // that resisted attaching: the id could never have named one. § 10
+                // gives that `EX_USAGE`, and the distinction is the client's to act
+                // on — it caches "unattachable" per host and would otherwise cache it
+                // off its own typo.
+                std::io::ErrorKind::InvalidInput => EXIT_USAGE,
+                _ => EXIT_UNATTACHABLE,
+            })
+        }
     }
 }
 
@@ -225,50 +263,4 @@ fn report(result: std::io::Result<()>) -> ExitCode {
             })
         }
     }
-}
-
-/// Emits the bootstrap line the client parses in `IMPLEMENTATION.md` § 5.1.
-///
-/// The architecture is this binary's own compile-time target, so the vocabulary is
-/// Rust's and *not* `uname`'s — lowercase `linux`, and `arm` where `uname -m` says
-/// `armv7l`. That is what the client needs to confirm: not what the host calls
-/// itself, but that the artifact it uploaded runs here. The shell probe in § 5.1
-/// runs before any binary exists and necessarily uses `uname`. Same prefix, two
-/// vocabularies, on purpose.
-///
-/// No install directory means no line at all, and the failure goes to stderr like
-/// any other. § 5.1 has the client read this one line off stdout and then `exec` a
-/// binary at the path in it, so a line naming a path that cannot work is worse than
-/// nothing: it would be uploaded to and `exec`ed against whatever directory the
-/// exec channel happened to start in.
-fn print_probe() -> ExitCode {
-    let Some(dir) = install_dir() else {
-        return report(Err(std::io::Error::other(
-            "neither XDG_DATA_HOME nor HOME names an absolute path, so there is no \
-             install directory to report",
-        )));
-    };
-    println!(
-        "NOMUX-BOOTSTRAP {} {} {}",
-        env::consts::OS,
-        env::consts::ARCH,
-        dir.display()
-    );
-    ExitCode::SUCCESS
-}
-
-/// Resolves the install directory, matching the shell precedence in
-/// `IMPLEMENTATION.md` § 5.
-///
-/// Each source must be *absolute*, which is [`rundir::absolute_env`]'s rule and is
-/// here for a reason of its own: this path is what § 5.2 uploads a binary to and
-/// § 5.1 `exec`s, over an exec channel whose working directory is nobody's to
-/// predict. Where neither source passes the rule there is no answer rather than a
-/// relative one.
-fn install_dir() -> Option<PathBuf> {
-    let base = match rundir::absolute_env("XDG_DATA_HOME") {
-        Some(data) => PathBuf::from(data),
-        None => PathBuf::from(rundir::absolute_env("HOME")?).join(".local/share"),
-    };
-    Some(base.join("nomux"))
 }

@@ -13,20 +13,22 @@ disconnect that outlasts it is reported as an explicit gap rather than silently
 truncated.
 
 ```
-nomux daemon <session-id>   Own a PTY session (normally spawned by `attach`)
-nomux attach <session-id>   Relay stdio to a session, spawning it if absent
-nomux probe                 Report OS, architecture and install path
+nomux daemon <session-id>   Own a PTY session (normally spawned by `spawn`)
+nomux spawn <session-id>    Create a session and relay stdio to it; fails if it exists
+nomux attach <session-id>   Relay stdio to an existing session; fails if it does not
 nomux list                  List sessions in the run directory
 nomux kill <session-id>     Terminate a session and unlink its run files
 
-  --label <text>            Display name for `list`, recorded at session creation.
-                            Honoured by `daemon` and `attach`; `kill` parses it and
-                            ignores it, the label belonging to the session
+  --label <text>            Display name for `list`, recorded when the session is
+                            created, so `daemon` and `spawn` take it and `attach`
+                            refuses one; `kill` parses it and ignores it
   --version, -V             Print version and protocol revision
   --help, -h                Print this usage
 ```
 
-Four properties drive the design:
+Four properties drive the design. They are the system's — this binary and the client
+that pushes and drives it, versioned as one unit — and two of them, the resume path
+and the zero install, are the client's half to hold:
 
 - **Byte-stream replay, not screen-state sync** — no terminal emulator on the server.
 - **Resume over a fresh SSH connection, not a side channel** — inherits ProxyJump, certificates, 2FA, agent forwarding.
@@ -34,12 +36,12 @@ Four properties drive the design:
 - **No new ports, no new crypto** — the only endpoints are unix sockets at `0600` inside a `0700` directory, one per session, plus one more when agent forwarding is enabled.
 
 **There is nothing to run yet.** This repository is the server half. The SSH client
-and terminal emulator that drive it are a separate, unreleased project, and
-`nomux attach` speaks a binary frame protocol over stdio rather than a terminal — so
-without that client there is no way to get a shell out of this. What works standalone
-today is `nomux probe`, `nomux list` and `nomux kill`. The two halves ship as one unit
-and are versioned in lockstep, so the wire protocol is private and carries no
-stability guarantee.
+and terminal emulator that drive it are a separate, unreleased project, and both
+`nomux spawn` and `nomux attach` relay a binary frame protocol over stdio rather than
+driving a terminal — so without that client there is no way to get a shell out of
+this. What works standalone today is `nomux list` and `nomux kill`. The two halves
+ship as one unit and are versioned in lockstep, so the wire protocol is private and
+carries no stability guarantee.
 
 - [DESIGN.md](DESIGN.md) — problem, properties, architecture, security model, prior art.
 - [IMPLEMENTATION.md](IMPLEMENTATION.md) — wire protocol, ring buffer, PTY handling, bootstrap, build.
@@ -64,8 +66,8 @@ sequenceDiagram
   participant S as shell
 
   Note over C,D: sshd opens direct-streamlocal to id.sock where it can
-  Note over C,D: elsewhere nomux attach relays, on every connection
-  C->>D: nothing answers, so spawn one under id.lock
+  Note over C,D: elsewhere nomux spawn or attach relays, on every connection
+  C->>D: nomux spawn, nothing answering, creates one under id.lock
   D->>D: bind id.sock, then SIGHUP to SIG_IGN
   D->>D: getsid, then /dev/tty if it already leads one
   D->>D: setsid, or fork, _exit the parent, then setsid
@@ -90,7 +92,7 @@ sequenceDiagram
     D->>C: Output frames and InputAck
     opt a client may leave, and another arrive
       C--xD: HUP or a half-close
-      C->>D: a later connect, pending again
+      C->>D: a later nomux attach connects, pending again
       C->>D: its Hello takes the session over
     end
     opt once, when the child lets go
@@ -98,16 +100,17 @@ sequenceDiagram
       T-->>D: EIO on the master, taken as end of file
       D->>S: waitpid, retried each pass, invented past 2 s
       D->>C: the rest of the output, then one Exit
-      Note over D: 5 s of linger, still in the loop
+      Note over D: status, ring and daemon held, still in the loop
     end
   end
-  Note over C,D: a stop signal or a week idle reach here with no Exit
+  Note over C,D: a stop signal or a week idle reach here, child gone or not
   D->>S: SIGHUP to the group, then each /proc session member
   D->>S: 500 ms grace, then SIGKILL if still standing
   D->>S: kill and reap the child either way
   opt if id.lock is free
-    D->>D: unlink the five run files, id.lock last
+    D->>D: unlink the run files, id.lock last
   end
+  Note over C,D: a later attach finds nothing and says so, never a fresh shell
 ```
 
 ## Build
@@ -170,7 +173,7 @@ message carries the seed that produced it.
 The two shipping binaries come from one script:
 
 ```sh
-sh scripts/build-release.sh     # → target/dist/, SHA256SUMS, debug companions
+sh scripts/build-release.sh     # → target/dist/ and SHA256SUMS
 ```
 
 It builds every musl target, prints a size table with the change against the
@@ -190,13 +193,13 @@ rustup target add --toolchain "$nightly" \
 ```
 
 Why the standard library is rebuilt at all, why `scripts/nightly-version` pins a
-dated nightly rather than a floating one, and what `NOMUX_STABLE_STD=1`,
-`NOMUX_NIGHTLY` and `NOMUX_UPDATE_BASELINE=1` are for are
+dated nightly rather than a floating one, and what `NOMUX_STABLE_STD=1` and
+`NOMUX_UPDATE_BASELINE=1` are for are
 [IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)'s; when that pin moves is
 [PLAN.md § P3](PLAN.md#p3--release-process)'s.
 
-`llvm-tools` is for the debug companions below; `NOMUX_SKIP_DEBUG=1` builds only the
-two that ship, for a run that just wants the size table.
+`llvm-tools` is for the debug companions below, which `NOMUX_DEBUG=1` asks for;
+without it the run builds only the two that ship.
 
 Pushing a `v*` tag runs that same build on CI and publishes a release from it: the
 two binaries, and `SHA256SUMS` beside them. Verify a download against the file
@@ -233,16 +236,17 @@ afterwards, and how the two are checked against each other, is
 
 ## Diagnostics
 
-A daemon has nowhere to write. It redirects its own stdio to `/dev/null` early on
-purpose — under `attach` those descriptors are the SSH channel carrying the client's
-frame stream, and a diagnostic written there would land in the middle of it — so from
-that point on a failure would be silent. Two things answer that.
+A daemon has nowhere to write. It redirects its own stdio to `/dev/null` as the last
+thing startup does — under the relay those descriptors are the SSH channel carrying
+the client's frame stream, and a diagnostic written there would land in the middle of
+it — so from that point on a failure would be silent. Two things answer that.
 
-A session that fails to *start* reports why at the `attach` that tried to start it,
-which is where the reason is wanted:
+A session that fails to *start* reports why at the `spawn` that tried to start it, and
+an `attach` on an id nothing answers for fails there in the same breath rather than
+inventing a session — both at the caller, which is where the reason is wanted:
 
 ```
-$ nomux attach work
+$ nomux spawn work
 nomux: run directory /run/user/1000/nomux: mode 770 lets other users create
        files in it; expected a directory owned by this user, mode 700
 ```

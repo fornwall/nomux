@@ -15,13 +15,16 @@ Complete and under test on Linux, at the protocol revision
 [IMPLEMENTATION.md § 2.2](IMPLEMENTATION.md#22-messages) states — the number lives
 there, next to the bytes that carry it — and not usable on its own:
 the client that speaks this protocol is a separate, unreleased project, so a clone
-of this repository gives you `probe`, `list`, `kill` and a daemon nothing can hold a
+of this repository gives you `list`, `kill` and a daemon nothing can hold a
 conversation with. What is complete is the whole server half. The daemon owns a PTY,
 a child and a bounded ring buffer; clients resume by absolute byte offset across a
 severed connection, replayed input is trimmed rather than re-applied, and overflow is
 reported as an explicit gap rather than papered over. Agent forwarding proxies
-`ssh-agent` to the client as a sub-channel of the same connection. `attach` spawns a
-daemon on demand and relays bytes to it, knowing nothing of the protocol. `list` and
+`ssh-agent` to the client as a sub-channel of the same connection. `spawn` creates a
+session and `attach` joins one, over a single relay that knows nothing of the
+protocol and refuses to invent a session it was only asked to join. A session
+outlives its child, so the exit status and the last of the output are still there for
+a client that arrives days after the shell finished. `list` and
 `kill` act on the run directory alone, so any build can manage any daemon whatever
 protocol it speaks. Mechanics: [IMPLEMENTATION.md](IMPLEMENTATION.md).
 
@@ -45,20 +48,21 @@ protocol it speaks. Mechanics: [IMPLEMENTATION.md](IMPLEMENTATION.md).
 
 ## P1 — known gaps
 
-Five, and in the first the honest answer is a known cost rather than a missing line
-of code; the second is a gap that cannot be closed from inside the process, the third a
-limit nobody has built yet, the fourth the one wait on the control surface that has no
-bound, and the fifth a hole in that surface's own promise. Each was found by review or
-by measurement rather
-than by guessing, and is recorded with what it was measured against.
+Nine. The first five are this surface's own: a known cost rather than a missing line
+of code, a gap that cannot be closed from inside the process, a limit whose backstop
+landed and whose policy did not, the one wait on the control surface that has no
+bound, and a hole in that surface's own promise. The last four came out of a security
+review, and each is held today by something other than a check — the entry says by
+what. All were found by review or by measurement rather than by guessing, and are
+recorded with what they were measured against.
 
-- **A hand-started daemon has a bind-to-publish window.** `attach` holds the spawn
+- **A hand-started daemon has a bind-to-publish window.** `spawn` holds the spawn
   lock until `<id>.pid` exists, so a session it created is never visible without its
   pidfile. `nomux daemon <id>` run directly answers `connect` from its bind onward
   and publishes the pidfile a few syscalls later, so a `kill` landing in between
   sees a live session it cannot identify. It refuses rather than unlinking, and
   waits the window out, so the outcome is an honest non-zero exit rather than a
-  destroyed session — but the window is still there. `attach` narrows it rather than
+  destroyed session — but the window is still there. `spawn` narrows it rather than
   closing it: the lock goes as soon as the path exists, and the pidfile is created a
   syscall before it is filled, so the ordinary spawn can be caught holding an empty
   one. Both halves — no file, and a file with nothing in it — are waited out, so only
@@ -69,7 +73,7 @@ than by guessing, and is recorded with what it was measured against.
   serving the session. § 6.6's "a live session's files are never unlinked" therefore
   holds without a caveat, and the identification window above is what is left.
 - **An abort still says nothing from inside the process.** The daemon reports startup
-  failures to the `attach` that spawned it and everything afterwards to syslog, which
+  failures to the `spawn` that started it and everything afterwards to syslog, which
   covers every failure it can see coming. An *abort* is not one of those: the shipping
   build is `-Cpanic=immediate-abort` with `strip = "symbols"`, so allocation failure and
   any surviving panic produce no message, no location and no symbol to forward. What is
@@ -82,15 +86,16 @@ than by guessing, and is recorded with what it was measured against.
   change to what the shipping build compiles and has not been made. What remains
   unfixable from inside is the message itself: an immediate abort has nowhere to write
   it.
-- **Nothing bounds how many sessions one host will run.** The cap of eight is enforced
-  client-side ([DESIGN.md § 5.1](DESIGN.md#51-identity)) and the daemon knows nothing
-  of its siblings, so two devices on one account give sixteen and a client bug gives no
-  limit at all. Each session is a daemon, a login shell and whatever that shell started,
-  held for seven days. On a shared build host the only bound in the system is on the far
-  side of a boundary this repository cannot see. The binary already reads the run
-  directory in `list` (`control.rs`), though the daemon itself does not; counting
-  entries at startup and refusing past a generous ceiling would put a floor under it
-  without the client's cooperation.
+- **Nothing bounds how many sessions one host will run** — the *policy* half of it,
+  the backstop having landed. The daemon counts the ids in the run directory at startup
+  and refuses past 64 ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)), which
+  is a floor under a runaway rather than the cap: the cap of eight is client-side
+  ([DESIGN.md § 5.1](DESIGN.md#51-identity)) and the client is unwritten, so two
+  devices on one account still give sixteen and a client bug gives sixty-four. Each
+  session is a daemon and a ring, and — until its shell finishes — that shell and
+  whatever it started, held for seven
+  days, so what is left between the two numbers is on the far side of a boundary this
+  repository cannot see.
 - **The liveness probe is the one call on the escape hatch with no deadline.** Every
   other wait `list` and `kill` make is bounded — the spawn lock, the publish grace, the
   two signal graces
@@ -127,7 +132,7 @@ than by guessing, and is recorded with what it was measured against.
   half has no such answer, and the obvious one is a trap. "No socket address can be
   formed" is not "no live session": it is "liveness cannot be *probed*", and two names
   for one run directory separate them. With a symlink at a 6-byte path pointing at a
-  47-byte one, a session created through the short name — `attach` exits 0, `list`
+  47-byte one, a session created through the short name — `spawn` exits 0, `list`
   through that name shows it, `<id>.sock` is one inode under both names — is a session
   whose `connect` through the long name cannot even be attempted. A `kill` that
   collected by name there would unlink the socket, pidfile and lock of a daemon still
@@ -136,25 +141,66 @@ than by guessing, and is recorded with what it was measured against.
   reachable by a shorter path, and finding it is the work — or leave `kill` refusing
   and say so.
 
+- **A departure costs the daemon half a second, and departures are unlimited.**
+  `Conn::flush_final` puts the socket back into blocking mode and writes against a
+  500 ms deadline, and `drop_client` reaches it on every ordinary departure — a
+  `Frame::Detach`, or the half-close the relay makes on stdin EOF. The bound is per
+  departure and not overall, so one process can greet, never read, wait for the queue
+  to fill, half-close, and come back: half a second a cycle with no PTY drained, no
+  agent channel served and nothing reaped. The socket's `0600` makes that process this
+  uid's, so no boundary is crossed and the session it stalls is the user's own — which
+  is why it is recorded rather than fixed. A budget per daemon rather than per
+  departure closes it, as does a non-blocking final flush with the close deferred
+  behind it.
+- **The signal path re-checks identity by command line, not by start time.** `kill`
+  puts a candidate pid to `/proc/<pid>/cmdline`
+  ([IMPLEMENTATION.md § 6.6](IMPLEMENTATION.md#66-frozen-control-surface)) and
+  re-probes liveness before it escalates, so the window in which a reissued pid takes
+  the signal — screen's CVE-2023-24626 in shape though never in privilege, nothing
+  here being setuid — is down to the interval between the last probe and the
+  `kill_process` after it. `pty::stat_start_time` already reads field 22 of
+  `/proc/<pid>/stat` and `Pty::pid_reissued` already settles the *child's* identity on
+  it, so closing the rest is reusing it in `control::resolve`: a pid whose start time
+  moved is not the daemon that published it, whatever its command line says.
+- **`write_private` unlinks and then writes by name.** `fs::write` follows symlinks
+  and asks for no `O_EXCL`, so what stands between the `remove_file` and the create is
+  the directory it happens in — `0700`, this uid's, checked before any name in it is
+  resolved ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)) — where only this
+  user's own processes can plant anything. Sound as
+  argued, and one call short of not needing the argument: `O_NOFOLLOW | O_EXCL` would
+  also cover the residual case § 6.3 concedes, an attacker-writable *parent* where the
+  whole run directory is swapped after the check. `read_prefix` already opens that way.
+- **Nothing asserts the uid of an accepted connection.** The run directory is `0700`
+  and the socket `0600`, and [SECURITY.md](SECURITY.md) states those as the whole of
+  the authentication deliberately: reaching either already means being the user. It is
+  also the whole of it — `Daemon::accept` reads no credentials — so the swapped run
+  directory above is answered by file modes alone. `control::daemon_of` already makes
+  the `getsockopt(SO_PEERCRED)` call for the pid it wants, so asserting the uid beside
+  it in `accept` is a few lines of defence in depth. shpool, the nearest comparable
+  project, refuses a cross-user connection outright.
+
 ## P2 — structure
 
 - **`Hello.flags` could be unrepresentable rather than merely checked.** `HelloOk`
-  packs typed fields (`gap: bool`, `linger: Linger`, `agent: bool`) through a private
-  `flags()`, so an invalid combination cannot be built; `Hello` exposes a bare `u16`
-  and validates it on both sides instead. Matching `HelloOk` would delete the
-  encode-side check, both accessors, the test that undefined bits are refused *by the
-  encoder*, and the proptest's `any_hello_flags`. It would **not** delete
-  `HELLO_FLAG_BITS`: §2.3 makes an undefined bit a protocol error however the struct
-  is typed, so the decode side keeps the constant and its check either way, exactly as
-  `HelloOk` does today.
+  packs its one typed field (`agent: bool`) through a private `flags()`, so an invalid
+  combination cannot be built; `Hello` exposes a bare `u8` and validates it on both
+  sides instead. Matching `HelloOk` would delete the encode-side check, both
+  accessors, the test that undefined bits are refused *by the encoder*, and the
+  proptest's `any_hello_flags`. It would **not** delete `HELLO_FLAG_BITS`: §2.3 makes
+  an undefined bit a protocol error however the struct is typed, so the decode side
+  keeps the constant and its check either way, exactly as `HelloOk` does today.
 
-  The cost is two adjacent booleans threaded through every `Hello` literal and every
-  test helper that currently forwards a `flags: u16` — a wider reach than it looks,
-  and one where `HELLO_AGENT_FORWARD` presently reads better than a positional
-  `true, false`. Worth doing if a third flag ever lands, but note the shape changes
-  at that point: three booleans is worse than two, so the answer then is one `Copy`
-  `HelloFlags` value with named constructors — a single argument to thread — rather
-  than N adjacent bools.
+  Half of what this used to argue has been overtaken. `HelloOk` no longer packs three
+  fields into a byte: `gap` is derived from `resume_from` and not sent at all, `linger` is
+  a byte of its own, and what is left is one bit — so "match `HelloOk`" is now a much
+  smaller claim than it was, and the `u16` this item was written against is a `u8`.
+  What has not changed is the cost: two adjacent booleans threaded through every
+  `Hello` literal and every test helper that currently forwards a `flags: u8` — a
+  wider reach than it looks, and one where `HELLO_AGENT_FORWARD` reads better than a
+  positional `true, false`. Worth doing if a third flag ever lands, but note the shape
+  changes at that point: three booleans is worse than two, so the answer then is one
+  `Copy` `HelloFlags` value with named constructors — a single argument to thread —
+  rather than N adjacent bools.
 - **A test can hold another test's descriptor without meaning to.** `fork` duplicates
   every open descriptor, and the copy lives until the child reaches `exec` —
   close-on-exec decides when it goes, not whether it is made. Under `cargo test`, where
@@ -204,21 +250,6 @@ than by guessing, and is recorded with what it was measured against.
   and `harness::write_uninterrupted` are what every socket call in the harness goes
   through, for the same reason `nbio::read` is the only raw read in the daemon, and a
   bare `stream.read` added later is what would bring this back.
-- **Collection names the five files it knows, so every name added after it leaks
-  once.** The documentation half of this is done —
-  [IMPLEMENTATION.md § 6.6](IMPLEMENTATION.md#66-frozen-control-surface) promises the
-  five existing names, their permissions and the pidfile format rather than the layout
-  as a whole, and says what growth costs. The code half is untouched.
-  `SessionPaths::removal_order` is five paths and `control::session_id_of` — whose one
-  caller is `list` — matches five extensions, so a *binary* older than a name neither
-  discovers a session by it nor removes it: one file per collected session for as long
-  as the two versions share a host, and an id that is invisible for good where that
-  file is the last one left. It is what `<id>.agent` would have cost had it arrived
-  after a release. Removing and discovering `<id>.*` instead covers every future name
-  at once, and the window for it is closing rather than open: cheap while five names
-  are all there have ever been, impossible once a binary in the wild depends on the
-  enumeration.
-
 ## P3 — release process
 
 Both musl targets build and land under the 400 KiB budget, which
@@ -228,7 +259,7 @@ builder's paths, since two clean builds on one machine are byte-identical whethe
 not those paths were remapped ([IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)).
 What is left is process rather than code:
 
-- Decide when the pinned nightly moves. It is named once, in `scripts/nightly-version`, which the build script and CI both read — so a local build and the runner measure the same bytes against a baseline recorded by the same compiler. The *consistency* is no longer a rule anyone has to remember: `scripts/size-baseline` records the compiler that measured it, and a build whose compiler does not match that line is refused, or, under `NOMUX_NIGHTLY` and `NOMUX_STABLE_STD`, says so and loses the growth gate. What is still undecided is the *policy* — when to take a newer compiler at all, given that the toolchain and the baseline then move in one commit.
+- Decide when the pinned nightly moves. It is named once, in `scripts/nightly-version`, which the build script and CI both read — so a local build and the runner measure the same bytes against a baseline recorded by the same compiler. The *consistency* is no longer a rule anyone has to remember: `scripts/size-baseline` records the compiler that measured it, and a build whose compiler does not match that line is refused, or, under `NOMUX_STABLE_STD`, says so and loses the growth gate. What is still undecided is the *policy* — when to take a newer compiler at all, given that the toolchain and the baseline then move in one commit.
 - Decide what the client does when a host already holds a binary whose hash it no longer recognises. The publishing half of this is done: a `v*` tag promotes the artifact the release build produced into a GitHub release carrying the shipping binaries beside `SHA256SUMS`, so the sums are permanent and public and in the format `sha256sum -c` reads, rather than only the ninety-day artifact behind a login they were before. GitHub computes its own immutable SHA-256 per asset at upload time as well, exposed as `digest` on the releases API, which covers the same bytes with something nobody can rewrite after the fact. The unstripped companions of P1 ride along, with their own `SHA256SUMS.debug`. What is missing is the consuming half: nothing in the client reads any of it, so § 8's "verify it after upload" is still unwritten, and so is the answer to the question this bullet opens with.
 
 ## P4 — test depth
@@ -283,7 +314,7 @@ Not backlog — recorded so they are not rediscovered as gaps.
 | Cross-device handover | [DESIGN.md § 10](DESIGN.md#10-open-questions), with its three prerequisites |
 | `libvterm` overflow snapshot | [DESIGN.md § 10](DESIGN.md#10-open-questions) |
 | Ring capacity default | [DESIGN.md § 10](DESIGN.md#10-open-questions); `NOMUX_RING_BYTES` makes it tunable, but the default is unchosen. § 10 has why the memory figure that argues for keeping it small overstates what a session holds; what argues for a larger default is the case § 10 does not name — an ordinary twenty-minute disconnect across a build, which overruns 4 MiB and loses the output the reconnect was for |
-| `daemon::run` *waiting* for the spawn lock | It takes one without blocking and goes on without one where somebody holds it. Waiting would park the session's own creation behind the `attach` that spawned it, since that attach holds this very lock on its behalf until the pidfile exists ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)) |
+| `daemon::run` *waiting* for the spawn lock | It takes one without blocking and goes on without one where somebody holds it. Waiting would park the session's own creation behind the `spawn` that started it, since that spawn holds this very lock on its behalf until the pidfile exists ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)) |
 | Addressing the run files through a validated directory descriptor | There is no `bindat(2)`, so the sockets must resolve by name whatever the check returns ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)) |
 
 ## Client-side, not this repo
@@ -302,14 +333,14 @@ server-side contract already fixed here.
   protocol revision instead, and keeping every revision ever shipped, removes the failure
   rather than bounding it: revisions are append-only integers and a codec is a few hundred
   lines, which costs an app nothing.
-- Collecting binaries it has uploaded. `install_dir()` is referenced only by `probe`, and
-  nothing in this repository ever unlinks one — so every release leaves another artifact
+- Collecting binaries it has uploaded. Nothing in this repository resolves the install
+  directory or ever unlinks one — so every release leaves another artifact
   in every user's home on every host they have touched, in a directory
   [DESIGN.md § 8](DESIGN.md#8-security-model) already expects file-integrity tooling to
   notice. The client knows the version each session is running, so it has what it needs
   to remove any `nomux-*` that is neither current nor holding a live session.
 - Emulator reset on `gap`, and the 8-sessions-per-host cap.
-- The child's exit status. It arrives in the `Exit` frame; the relay cannot read it without parsing frames, which is exactly what keeps the relay version-independent ([IMPLEMENTATION.md § 10](IMPLEMENTATION.md#10-exit-codes)).
+- The child's exit status. It arrives in the `Exit` frame; the relay cannot read it without parsing frames, which is exactly what keeps the relay version-independent ([IMPLEMENTATION.md § 10](IMPLEMENTATION.md#10-exit-codes)). It now survives the disconnect that used to lose it, the session outliving its child ([IMPLEMENTATION.md § 6.5](IMPLEMENTATION.md#65-shutdown)), and carries `since_exit_secs` beside it — which hands the client a rendering decision it did not have before, since a status collected as it happened and one collected on Thursday for a build that finished on Tuesday are the same two numbers and not the same thing to put in front of a user.
 - Answering agent channels from the key store, and the per-host opt-in that sets `HELLO_AGENT_FORWARD`. The daemon never enables forwarding on its own.
 - Choosing the repaint policy per attach via `HELLO_REPAINT_CTRL_L`; only the client knows whether an editor or a prompt is on screen.
-- Minting `--label` when a session is created, so an orphan is recognisable in `nomux list` after the client loses its state.
+- Minting `--label` on `spawn`, which is the mode that creates and therefore the one that takes it, so an orphan is recognisable in `nomux list` after the client loses its state.

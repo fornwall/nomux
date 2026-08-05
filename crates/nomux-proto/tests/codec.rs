@@ -152,9 +152,9 @@ fn any_bytes() -> impl Strategy<Value = Vec<u8>> {
 ///
 /// Restricted to the two defined bits, because the decoder refuses anything else
 /// by design; undefined bits are covered by the mutation property instead.
-fn any_hello_flags() -> impl Strategy<Value = u16> {
+fn any_hello_flags() -> impl Strategy<Value = u8> {
     (any::<bool>(), any::<bool>()).prop_map(|(agent, ctrl_l)| {
-        u16::from(agent) * HELLO_AGENT_FORWARD + u16::from(ctrl_l) * HELLO_REPAINT_CTRL_L
+        u8::from(agent) * HELLO_AGENT_FORWARD + u8::from(ctrl_l) * HELLO_REPAINT_CTRL_L
     })
 }
 
@@ -172,33 +172,28 @@ fn any_frame() -> impl Strategy<Value = OwnedFrame> {
     // variants all collapse to one shape anyway, so they are built as a single
     // strategy of frames that borrow nothing.
     let copied = prop_oneof![
-        (
-            any::<u16>(),
-            any::<u64>(),
-            any::<u64>(),
-            any_win(),
-            any::<bool>(),
-            linger,
-            any::<bool>(),
-        )
-            .prop_map(
-                |(protocol, resume_from, in_applied, win, gap, linger, agent)| {
-                    Frame::HelloOk(HelloOk {
-                        protocol,
-                        resume_from,
-                        in_applied,
-                        win,
-                        gap,
-                        linger,
-                        agent,
-                    })
-                }
-            ),
+        (any::<u64>(), any::<u64>(), any_win(), linger, any::<bool>(),).prop_map(
+            |(resume_from, in_applied, win, linger, agent)| {
+                Frame::HelloOk(HelloOk {
+                    resume_from,
+                    in_applied,
+                    win,
+                    linger,
+                    agent,
+                })
+            }
+        ),
         any::<u64>().prop_map(|applied_through| Frame::InputAck { applied_through }),
-        any::<u64>().prop_map(|consumed_through| Frame::OutputAck { consumed_through }),
+        Just(Frame::OutputAck),
         any_win().prop_map(Frame::Resize),
         any::<u64>().prop_map(|new_base_offset| Frame::Gap { new_base_offset }),
-        (any::<i32>(), exit_kind).prop_map(|(status, kind)| Frame::Exit { status, kind }),
+        (any::<i32>(), exit_kind, any::<u32>()).prop_map(|(status, kind, since_exit_secs)| {
+            Frame::Exit {
+                status,
+                kind,
+                since_exit_secs,
+            }
+        }),
         Just(Frame::Detach),
         any::<u64>().prop_map(|nonce| Frame::Ping { nonce }),
         any::<u64>().prop_map(|nonce| Frame::Pong { nonce }),

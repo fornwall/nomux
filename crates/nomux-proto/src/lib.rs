@@ -22,13 +22,27 @@ pub use frame::{
 /// `Hello.in_offset` back out, the daemon never having read it — `DESIGN.md` § 10
 /// owns why it was there and is where it comes back.
 ///
+/// Revision 4 took out everything else with no reader. `HelloOk.protocol` could only
+/// ever echo the `Hello.protocol` the daemon had just accepted; `HelloOk.gap` is
+/// [`HelloOk::gap`], a comparison against a number the client sent; and
+/// `OutputAck.consumed_through` was eight bytes the daemon's empty arm never looked
+/// at. It also unpacked [`Linger`] out of `HelloOk`'s flags byte into a byte of its
+/// own — one byte back for about fifty lines of shifting, and the end of a `pub`
+/// `as_byte`/`from_byte` pair that was not the wire form — and narrowed
+/// `Hello.flags` to the `u8` its two bits fit in.
+///
+/// Revision 5 added `Exit.since_exit_secs`, which is what a session outliving its
+/// child made worth carrying: the status a client collects may now be days old rather
+/// than seconds, and "the build finished" and "the build finished on Tuesday" are
+/// different things to show a user.
+///
 /// The number itself is pinned against `IMPLEMENTATION.md` § 2.2 by
 /// `the_frozen_numbers_are_the_ones_the_document_gives`. The handshake vectors spell
 /// it out as a literal rather than symbolically, and
 /// `the_handshake_vectors_are_written_at_the_revision_this_build_speaks` is what
 /// holds those two together — so a bump has to move the constant, the vectors and the
 /// document, in that order of complaint.
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// Fixed frame header size, so reads are a two-stage `read_exact`.
 pub const HEADER_LEN: usize = 4;
@@ -107,7 +121,7 @@ wire_enum! {
     InputAck = 0x04,
     /// PTY output, at an absolute offset in the output stream.
     Output = 0x05,
-    /// Client confirms output consumed. Advisory; never trims the ring.
+    /// Client has consumed output. Advisory, payload-free, and never trims the ring.
     OutputAck = 0x06,
     /// Window size change, applied via `TIOCSWINSZ`.
     Resize = 0x07,
@@ -129,42 +143,6 @@ wire_enum! {
     AgentData = 0x0f,
     /// One agent channel is finished, in either direction.
     AgentClose = 0x10,
-}
-
-/// Maximum session id length, in bytes.
-pub const MAX_SESSION_ID_LEN: usize = 64;
-
-/// Maximum concurrent agent channels per session.
-///
-/// `ssh-agent` exchanges are short and serial in practice; the cap bounds what a
-/// runaway child can force the daemon and client to track.
-pub const MAX_AGENT_CHANNELS: u32 = 8;
-
-/// Returns whether `id` is usable as a session id.
-///
-/// Ids are minted by the client and used directly as filename components, so the
-/// accepted set is deliberately narrow — 1..=64 bytes of `[A-Za-z0-9_-]`
-/// (`IMPLEMENTATION.md` § 6.3) — which makes path traversal impossible by
-/// construction rather than by escaping. An invalid id is a hard error at both ends
-/// and is never sanitised: rewriting one into a valid id would silently attach the
-/// user to the wrong session.
-///
-/// # Examples
-///
-/// ```
-/// use nomux_proto::is_valid_session_id;
-///
-/// assert!(is_valid_session_id("6f1a2b3c-4d5e-6f70-8192-a3b4c5d6e7f8"));
-/// assert!(!is_valid_session_id("../etc/passwd"));
-/// assert!(!is_valid_session_id(""));
-/// ```
-#[must_use]
-pub fn is_valid_session_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= MAX_SESSION_ID_LEN
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
 /// A decoded frame header.
@@ -276,38 +254,6 @@ mod tests {
             decode_header(&[FrameType::Output.as_byte(), 0x04, 0x00, 0x01]),
             Err(ProtoError::PayloadTooLarge(MAX_PAYLOAD + 1))
         );
-    }
-
-    #[test]
-    fn session_ids_accept_minted_forms() {
-        assert!(is_valid_session_id("a"));
-        assert!(is_valid_session_id("6f1a2b3c-4d5e-6f70-8192-a3b4c5d6e7f8"));
-        assert!(is_valid_session_id("tab_7"));
-        assert!(is_valid_session_id(&"x".repeat(MAX_SESSION_ID_LEN)));
-    }
-
-    #[test]
-    fn session_ids_reject_path_traversal() {
-        for id in [
-            "",
-            ".",
-            "..",
-            "/",
-            "a/b",
-            "../etc/passwd",
-            "a.b",
-            "a b",
-            "a\0b",
-        ] {
-            assert!(!is_valid_session_id(id), "should reject {id:?}");
-        }
-    }
-
-    #[test]
-    fn session_ids_reject_oversized_and_non_ascii() {
-        assert!(!is_valid_session_id(&"x".repeat(MAX_SESSION_ID_LEN + 1)));
-        assert!(!is_valid_session_id("café"));
-        assert!(!is_valid_session_id("🦀"));
     }
 
     #[test]

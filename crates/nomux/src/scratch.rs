@@ -6,9 +6,8 @@
 //! (`tests/harness/mod.rs`). Cargo sets that variable for integration tests and
 //! benches only — measured, not assumed: `option_env!` reads `None` from here — so
 //! the unit tests in `src/` have nowhere but `env::temp_dir()`, which is the
-//! developer's ambient `$TMPDIR` shared with everything else on the host. That
-//! makes both halves of the harness's naming argument load-bearing here rather than
-//! merely tidy, and neither of them was done.
+//! developer's ambient `$TMPDIR` shared with everything else on the host. Both
+//! halves of the harness's naming argument are therefore load-bearing here.
 //!
 //! What that cost, measured before this existed: `/tmp/nomux-226959-rundir-symlink`
 //! and `/tmp/nomux-615195-rundir-mode` were still there a day after the run that
@@ -20,10 +19,37 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 /// Mode a directory has to be in before it can be removed: readable to list, and
 /// executable to reach what is listed.
 const REMOVABLE: u32 = 0o700;
+
+/// Serialises everything in this process whose result depends on the umask.
+///
+/// `rundir::with_umask` sets a process-wide umask for the length of one call, which
+/// was sound while nothing in the crate was multi-threaded. `cargo test` is: it runs
+/// these tests as threads in one process, so two of those calls interleave and the
+/// second restores the *first's* mask — leaving the process at `0177` for good, after
+/// which every directory made here is `0600` and nothing can be created under it.
+/// `cargo nextest` gives each test a process and never sees it.
+///
+/// Held by `with_umask` and by every directory this module creates, which is the whole
+/// of what a test process creates whose mode it does not set itself. `#[cfg(test)]`
+/// throughout, so a shipped build carries none of it.
+///
+/// Poisoning is ignored: a taker that panicked was a failing assertion, not a broken
+/// lock, and refusing everyone after it would turn one red test into all of them.
+pub(crate) fn umask_lock() -> MutexGuard<'static, ()> {
+    static UMASK: Mutex<()> = Mutex::new(());
+    UMASK.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Creates `dir` and every parent it needs, under [`umask_lock`].
+fn create_dir(dir: &Path) {
+    let _umask = umask_lock();
+    fs::create_dir_all(dir).expect("create a scratch directory");
+}
 
 /// A directory of this process's own, emptied and removed however the test ends.
 ///
@@ -42,7 +68,7 @@ impl Scratch {
         let dir = std::env::temp_dir().join(format!("nomux-{}-{name}", std::process::id()));
         make_removable(&dir);
         drop(fs::remove_dir_all(&dir));
-        fs::create_dir_all(&dir).expect("create a scratch directory");
+        create_dir(&dir);
         Self(dir)
     }
 
@@ -52,6 +78,16 @@ impl Scratch {
 
     pub(crate) fn join(&self, tail: &str) -> PathBuf {
         self.0.join(tail)
+    }
+
+    /// A directory at `tail`, created the way the root was.
+    ///
+    /// For test bodies that need one of their own: a bare `fs::create_dir_all` in one
+    /// is exactly what [`umask_lock`] exists to stop.
+    pub(crate) fn dir(&self, tail: &str) -> PathBuf {
+        let path = self.join(tail);
+        create_dir(&path);
+        path
     }
 }
 
@@ -69,19 +105,13 @@ impl Drop for Scratch {
 /// rather than at the end of the test body is what makes it happen on the path that
 /// matters — the one where an assertion has already fired.
 ///
-/// Symlinks are not followed: `read_dir` reports a link's own type, so a link
-/// planted in place of a run directory is removed as the link it is and whatever it
-/// points at is left alone. Which is the same promise `ensure_dir_at` makes, and it
-/// would be an odd thing for the test's own cleanup to break.
-///
-/// The recursion got that from `read_dir` for nothing; the entry point has to buy it,
-/// because `set_permissions` is `chmod(2)`, which follows, and Linux has no `lchmod`
-/// to reach for instead. Both callers hand this a path somebody else may have replaced
-/// — `Scratch::new` under a shared sticky `/tmp`, and `sweep_finished_runs` over every
-/// `nomux-<dead-pid>-*` entry it finds there — so without the check a link planted at
-/// one of those names is a `chmod` of whatever it points at. As an ordinary user that
-/// fails `EPERM` on somebody else's file; as root, which `rundir`'s tests treat as a
-/// supported way to run this suite, it succeeds.
+/// Symlinks are not followed, which is the same promise `ensure_dir_at` makes. The
+/// recursion gets that from `read_dir`; the entry point has to buy it, because
+/// `set_permissions` is `chmod(2)`, which follows, and Linux has no `lchmod`. Both
+/// callers hand this a path somebody else may have replaced, so without the check a
+/// link planted at one of those names is a `chmod` of whatever it points at — `EPERM`
+/// as an ordinary user, and successful as root, which `rundir`'s tests treat as a
+/// supported way to run this suite.
 fn make_removable(dir: &Path) {
     // `symlink_metadata`, so the answer is about the name rather than about what it
     // resolves to — and anything that is not a directory of ours has neither a mode
@@ -144,11 +174,9 @@ mod tests {
     /// [`REMOVABLE`], and a guard that turns any of them away is a scratch directory
     /// left behind on every run that fails.
     ///
-    /// The recursion gets the first half from `read_dir`, which reports a link's own
-    /// type. The entry point cannot: `set_permissions` is `chmod(2)`, which follows,
-    /// and both callers hand it a path somebody else may have replaced — `Scratch::new`
-    /// under a shared sticky `/tmp`, and [`sweep_finished_runs`] over every
-    /// `nomux-<dead-pid>-*` name it finds there.
+    /// The paths somebody else may have replaced are `Scratch::new`'s, under a shared
+    /// sticky `/tmp`, and [`sweep_finished_runs`]'s, over every `nomux-<dead-pid>-*`
+    /// name it finds there.
     #[test]
     fn make_removable_repairs_a_directory_and_does_not_follow_a_link_to_one() {
         let root = Scratch::new("scratch-make-removable");
@@ -161,9 +189,8 @@ mod tests {
 
         // A real directory, shut the way the mode tests leave one — and shut from the
         // inside out, since the outer one has to be open to create the inner.
+        let nested = root.dir("dir/nested");
         let dir = root.join("dir");
-        let nested = dir.join("nested");
-        fs::create_dir_all(&nested).expect("create a directory and one under it");
         fs::set_permissions(&nested, fs::Permissions::from_mode(0o300)).expect("shut the inner");
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o300)).expect("shut the outer");
 

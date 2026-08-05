@@ -1,12 +1,9 @@
 //! The two fields of the password database this daemon needs: the user's name and
 //! their login shell.
 //!
-//! Read straight out of `/etc/passwd` rather than through `getpwuid`. In a static
-//! musl binary — which is what ships (`IMPLEMENTATION.md` § 8) — `getpwuid` *is*
-//! this file parser, because NSS modules cannot be loaded into a static
-//! executable. Doing it here keeps the lookup safe, testable and free of an FFI
-//! buffer dance, at the cost of not seeing LDAP or NIS users. Both callers treat a
-//! miss as "fall back", never as an error:
+//! Read straight out of `/etc/passwd` rather than through `getpwuid`, for the reason
+//! `IMPLEMENTATION.md` § 6.1.1 gives. Both callers treat a miss as "fall back",
+//! never as an error:
 //!
 //! - shell selection, where `$SHELL` from the SSH login is the primary source
 //! - the username for the linger check ([`crate::linger`]), where `$USER` is
@@ -27,11 +24,10 @@ const PASSWD: &str = "/etc/passwd";
 pub(crate) struct Entry {
     /// Login name. Text, unlike the shell below, because its one use is as a
     /// filename component that [`crate::linger`] compares against `$USER` — which
-    /// arrives through `env::var` and so could not carry non-UTF-8 bytes either.
-    /// A name outside UTF-8 therefore costs its own line and no other, which is a
-    /// bound worth having rather than a case worth serving: `useradd` holds login
-    /// names to the portable filename character set, and every tool that reads one
-    /// back assumes the same.
+    /// arrives through `env::var` and so could not carry non-UTF-8 bytes either. A
+    /// name outside UTF-8 therefore costs its own line and no other, which `useradd`
+    /// holding login names to the portable filename character set makes a bound
+    /// rather than a case worth serving.
     pub name: String,
     /// Login shell, absent when the field is empty — which conventionally means
     /// `/bin/sh` and is left for the caller to decide.
@@ -50,12 +46,10 @@ pub(crate) fn current() -> Option<Entry> {
 /// Finds the first entry for `uid` in the contents of a password file.
 ///
 /// Parsed as bytes rather than decoded first. `/etc/passwd` has a field structure
-/// but no encoding: GECOS carries people's full names, and one of those written in
-/// Latin-1 is enough to fail a UTF-8 decode of the *whole file*. That failure
-/// would be both global and quiet — one byte anywhere in the file is a miss for
-/// every user on the host, a miss is indistinguishable from "no such uid", and so
-/// everyone silently drops to `/bin/sh` with nothing to say why. Splitting over
-/// bytes keeps a stranger's umlaut out of this user's shell.
+/// but no encoding: one GECOS field written in Latin-1 is enough to fail a UTF-8
+/// decode of the *whole file*, and that failure is global and quiet — a miss is
+/// indistinguishable from "no such uid", so everyone on the host silently drops to
+/// `/bin/sh`.
 ///
 /// Malformed lines are skipped rather than rejected: a database with one bad line
 /// is not a reason to refuse someone a shell.
@@ -70,8 +64,8 @@ fn lookup(contents: &[u8], uid: u32) -> Option<Entry> {
         // 5 the home directory; only the uid and the shell are wanted.
         let _password = fields.next()?;
         // Decoding the uid gives up nothing, a field outside UTF-8 being no more a
-        // number than `notanumber` is. The parse stays strict because anything
-        // that read a malformed field as zero would hand root the broken line.
+        // number than `notanumber` is. Strict, because reading a malformed field as
+        // zero would hand root the broken line.
         if str::from_utf8(fields.next()?).ok()?.parse::<u32>().ok()? != uid {
             return None;
         }
@@ -82,8 +76,8 @@ fn lookup(contents: &[u8], uid: u32) -> Option<Entry> {
         Some(Entry {
             name: name.to_owned(),
             // A shell path is whatever bytes the filesystem holds, so it is handed
-            // back as those rather than through a string it is under no obligation
-            // to be — which would be this same bug one field over.
+            // back as those rather than through a string — which would be this same
+            // bug one field over.
             shell: shell.map(|shell| PathBuf::from(OsStr::from_bytes(shell))),
         })
     })

@@ -1,9 +1,8 @@
 //! Bounded output buffer addressed by absolute stream offset.
 //!
-//! The daemon must keep draining the PTY whether or not a client is attached —
-//! otherwise the child blocks on write and the session looks frozen on reattach.
-//! So when the buffer fills, the oldest bytes are discarded and a gap is recorded.
-//! Losing scrollback is recoverable; a wedged shell is not.
+//! Precedence when it fills: keep draining the PTY, drop the oldest bytes
+//! (`IMPLEMENTATION.md` § 4.1). Losing scrollback is recoverable; a wedged shell
+//! is not.
 
 use std::collections::VecDeque;
 
@@ -18,9 +17,9 @@ pub(crate) struct Ring {
 impl Ring {
     /// Creates a ring retaining at most `capacity` bytes, and never fewer than one.
     ///
-    /// Unreachable — `daemon::ring_capacity` filters zero, and says why it must go on
-    /// doing so — but clamped rather than asserted, since an abort site in a
-    /// `panic = "abort"` binary costs the user's session.
+    /// The clamp is unreachable — `daemon::ring_capacity` filters zero, and says why
+    /// it must go on doing so — but clamping rather than asserting keeps an abort
+    /// site out of a `panic = "abort"` binary.
     #[must_use]
     pub(crate) fn new(capacity: usize) -> Self {
         let capacity = capacity.max(1);
@@ -48,11 +47,10 @@ impl Ring {
     /// Discarding is not reported here; whether a *reader* lost anything is derived
     /// per client from [`Ring::base`], for the reason `IMPLEMENTATION.md` § 4 gives.
     pub(crate) fn push(&mut self, data: &[u8]) {
-        // One number for both sides of the eviction. What must fall out of the
-        // window is `retained + new - capacity` however it splits between the head of
-        // the buffer and the head of this write, and `base` — the offset of the
-        // oldest surviving byte — advances by the whole of it, never by what came off
-        // one side. Counting only one of the two leaves `base` too low.
+        // One number for both sides of the eviction: what falls out of the window is
+        // `retained + new - capacity` however it splits between the buffer's head and
+        // this write's own, and `base` advances by the whole of it. Counting only one
+        // of the two leaves `base` too low.
         let overflow = (self.buf.len() + data.len()).saturating_sub(self.capacity);
         let from_buf = overflow.min(self.buf.len());
         self.base += overflow as u64;
@@ -65,12 +63,12 @@ impl Ring {
     /// underlying deque.
     ///
     /// `from` is clamped to [`Ring::base`], so a caller that has fallen behind
-    /// silently resumes at the oldest retained byte — check [`Ring::base`] first if
-    /// that needs reporting as a gap.
+    /// resumes at the oldest retained byte — check [`Ring::base`] first if that
+    /// needs reporting as a gap.
     ///
-    /// The two stay in stream order and in place: either may be empty, the *first*
-    /// one included once `from` is past the front half, so a caller walking them
-    /// must skip an empty part rather than stop at one.
+    /// The two stay in stream order: either may be empty, the *first* one included
+    /// once `from` is past the front half, so a caller walking them must skip an
+    /// empty part rather than stop at one.
     #[must_use]
     pub(crate) fn slices_from(&self, from: u64) -> [&[u8]; 2] {
         let skip = usize::try_from(from.saturating_sub(self.base)).unwrap_or(usize::MAX);

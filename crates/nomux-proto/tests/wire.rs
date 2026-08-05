@@ -20,8 +20,7 @@
 
 use nomux_proto::{
     ErrorCode, ExitKind, Frame, FrameType, HEADER_LEN, HELLO_AGENT_FORWARD, HELLO_REPAINT_CTRL_L,
-    Hello, HelloOk, Linger, MAX_AGENT_CHANNELS, MAX_PAYLOAD, MAX_SESSION_ID_LEN, PROTOCOL_VERSION,
-    RESUME_FROM_START, WinSize,
+    Hello, HelloOk, Linger, MAX_PAYLOAD, PROTOCOL_VERSION, RESUME_FROM_START, WinSize,
 };
 
 /// Distinct in all four fields on purpose: `cols`, `rows`, `xpixel` and `ypixel`
@@ -52,14 +51,13 @@ struct Vector {
 /// between two fields and do nothing about a swap *inside* one. A flag bit or an
 /// enumerator exercised at a single value is pinned only against being renumbered
 /// wholesale: give `Hello.flags` both of its bits at once and the two constants can
-/// trade places without moving a byte, and the same holds for `HelloOk`'s `gap` and
-/// `agent` bits, which are only ever set together. So each repeat is chosen to
-/// disagree with the ones before it on every bit and every enumerator that has one
-/// — which is what makes § 2.3 a table this file actually checks, rather than one
-/// the codec merely agrees with itself about. Each of the two takes three: [`Linger`]
-/// has three values and [`every_linger_state_has_a_vector`] insists on all of them,
-/// and two `Hello` vectors cannot both show the bits set together and show each of
-/// them clear, which [`every_hello_flag_bit_is_pinned_in_both_states`] insists on.
+/// trade places without moving a byte. So each repeat is chosen to disagree with the
+/// ones before it on every bit and every enumerator that has one — which is what
+/// makes § 2.3 a table this file actually checks, rather than one the codec merely
+/// agrees with itself about. Each of the two takes three: [`Linger`] has three values
+/// and [`every_linger_state_has_a_vector`] insists on all of them, and two `Hello`
+/// vectors cannot both show the bits set together and show each of them clear, which
+/// [`every_hello_flag_bit_is_pinned_in_both_states`] insists on.
 fn vectors() -> Vec<Vector> {
     let mut all = hello_vectors();
     all.extend(hello_ok_vectors());
@@ -72,25 +70,25 @@ fn vectors() -> Vec<Vector> {
 /// The client's opening frame, at three different flag words.
 fn hello_vectors() -> Vec<Vector> {
     vec![
-        // 0x01 Hello: u16 proto, u16 flags, u64 out_offset, winsize, u16 term_len,
+        // 0x01 Hello: u16 proto, u8 flags, u64 out_offset, winsize, u16 term_len,
         // term bytes.
         //
-        // Protocol and flags read alike here, revision 3 and both bits set being
-        // the same number, so this is the one vector where a swap between those two
-        // neighbours moves no byte. The two below, at flags 1 and 0 against the same
-        // revision, are what keep it visible.
+        // The revision is two bytes and the flags one, so the pair are no longer the
+        // same shape and no swap between them is even representable — which is the
+        // §2.3 point that there is no reserved space, made in bytes: two flag bits
+        // live in a byte, not in a word with fourteen spare.
         Vector {
             frame: Frame::Hello(Hello {
-                protocol: 3,
+                protocol: 5,
                 flags: HELLO_AGENT_FORWARD | HELLO_REPAINT_CTRL_L,
                 out_offset: 0x0102_0304_0506_0708,
                 win: WIN,
                 term: "xterm-256color",
             }),
             bytes: &[
-                0x01, 0x00, 0x00, 0x24, // header: type, u24 len = 36
-                0x00, 0x03, // protocol
-                0x00, 0x03, // flags: bit 0 agent forward, bit 1 repaint ctrl-l
+                0x01, 0x00, 0x00, 0x23, // header: type, u24 len = 35
+                0x00, 0x05, // protocol
+                0x03, // flags: bit 0 agent forward, bit 1 repaint ctrl-l
                 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // out_offset
                 0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
                 0x00, 0x0e, // term_len = 14
@@ -104,16 +102,16 @@ fn hello_vectors() -> Vec<Vector> {
         // have", which no other vector shows on the wire.
         Vector {
             frame: Frame::Hello(Hello {
-                protocol: 3,
+                protocol: 5,
                 flags: HELLO_AGENT_FORWARD,
                 out_offset: RESUME_FROM_START,
                 win: WIN,
                 term: "vt100",
             }),
             bytes: &[
-                0x01, 0x00, 0x00, 0x1b, // header: type, u24 len = 27
-                0x00, 0x03, // protocol
-                0x00, 0x01, // flags: bit 0 agent forward, bit 1 clear
+                0x01, 0x00, 0x00, 0x1a, // header: type, u24 len = 26
+                0x00, 0x05, // protocol
+                0x01, // flags: bit 0 agent forward, bit 1 clear
                 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // RESUME_FROM_START
                 0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
                 0x00, 0x05, // term_len = 5
@@ -126,16 +124,16 @@ fn hello_vectors() -> Vec<Vector> {
         // either of the others compares.
         Vector {
             frame: Frame::Hello(Hello {
-                protocol: 3,
+                protocol: 5,
                 flags: 0,
                 out_offset: 0x8182_8384_8586_8788,
                 win: WIN,
                 term: "dumb",
             }),
             bytes: &[
-                0x01, 0x00, 0x00, 0x1a, // header: type, u24 len = 26
-                0x00, 0x03, // protocol
-                0x00, 0x00, // flags: both bits clear
+                0x01, 0x00, 0x00, 0x19, // header: type, u24 len = 25
+                0x00, 0x05, // protocol
+                0x00, // flags: both bits clear
                 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, // out_offset
                 0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
                 0x00, 0x04, // term_len = 4
@@ -145,78 +143,75 @@ fn hello_vectors() -> Vec<Vector> {
     ]
 }
 
-/// The daemon's answer, at three different flags bytes.
+/// The daemon's answer, at all three linger states and both agent states.
 fn hello_ok_vectors() -> Vec<Vector> {
     vec![
-        // 0x02 HelloOk: u16 proto, u64 resume_from, u64 in_applied, winsize,
-        // u8 flags. Note the flags field is a u8 here and a u16 in Hello — the
-        // two handshake frames are deliberately not the same shape. Its 0x0d is
-        // bit 0 gap, bits 1-2 linger = 2 (enabled), bit 3 agent (§ 2.3).
+        // 0x02 HelloOk: u64 resume_from, u64 in_applied, winsize, u8 linger,
+        // u8 flags. It carries no revision — the daemon has already refused a
+        // `Hello.protocol` that is not its own by the time it answers, so a copy here
+        // could only echo the number the client just sent (§ 2.2).
+        //
+        // The last two bytes are one byte each: `linger` is a field of its own rather
+        // than two bits inside `flags`, so its wire form is the discriminant § 2.3
+        // gives it and nothing is shifted.
         Vector {
             frame: Frame::HelloOk(HelloOk {
-                protocol: 3,
                 resume_from: 0x2122_2324_2526_2728,
                 in_applied: 0x3132_3334_3536_3738,
                 win: WIN,
-                gap: true,
                 linger: Linger::Enabled,
                 agent: true,
             }),
             bytes: &[
-                0x02, 0x00, 0x00, 0x1b, // header: type, u24 len = 27
-                0x00, 0x03, // protocol
+                0x02, 0x00, 0x00, 0x1a, // header: type, u24 len = 26
                 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, // resume_from
                 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, // in_applied
                 0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
-                0x0d, // flags
+                0x02, // linger = 2 (enabled)
+                0x01, // flags: bit 0 agent
             ],
         },
-        // 0x02 HelloOk again, disagreeing with the one above on all three of its
-        // flag fields: no gap, linger unknown, agent served. `gap` and `agent`
-        // differ from each other here, which is what separates bit 0 from bit 3 —
-        // set together as they are above, they can be exchanged for free.
+        // 0x02 HelloOk again, at linger unknown with the agent still served. The two
+        // trailing bytes differ from each other in every vector here, which is what
+        // pins their order: exchange the pair and each of the three moves.
         Vector {
             frame: Frame::HelloOk(HelloOk {
-                protocol: 3,
                 resume_from: 0x4142_4344_4546_4748,
                 in_applied: 0x5152_5354_5556_5758,
                 win: WIN,
-                gap: false,
                 linger: Linger::Unknown,
                 agent: true,
             }),
             bytes: &[
-                0x02, 0x00, 0x00, 0x1b, // header: type, u24 len = 27
-                0x00, 0x03, // protocol
+                0x02, 0x00, 0x00, 0x1a, // header: type, u24 len = 26
                 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, // resume_from
                 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, // in_applied
                 0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
-                0x08, // flags: bit 3 agent, gap clear, linger 0 (unknown)
+                0x00, // linger = 0 (unknown)
+                0x01, // flags: bit 0 agent
             ],
         },
         // 0x02 HelloOk a third time, for the one linger value the other two leave
         // out. Reading `Disabled` off the other two — 0 and 2 are pinned, so 1 is
-        // the only number left — is a deduction rather than a test: it says nothing
-        // about which *bits* hold it, and it stops being available the day the field
-        // grows a fourth value. This is also the only vector in the file with bit 3
-        // clear, so `agent` is now pinned in both directions and not just when set.
+        // the only number left — is a deduction rather than a test, and it stops
+        // being available the day the field grows a fourth value. This is also the
+        // only vector in the file with the agent bit clear, so `agent` is pinned in
+        // both directions and not just when set.
         Vector {
             frame: Frame::HelloOk(HelloOk {
-                protocol: 3,
                 resume_from: 0x6162_6364_6566_6768,
                 in_applied: 0x7172_7374_7576_7778,
                 win: WIN,
-                gap: true,
                 linger: Linger::Disabled,
                 agent: false,
             }),
             bytes: &[
-                0x02, 0x00, 0x00, 0x1b, // header: type, u24 len = 27
-                0x00, 0x03, // protocol
+                0x02, 0x00, 0x00, 0x1a, // header: type, u24 len = 26
                 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, // resume_from
                 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, // in_applied
                 0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
-                0x03, // flags: bit 0 gap, linger 1 (disabled), bit 3 clear
+                0x01, // linger = 1 (disabled)
+                0x00, // flags: agent clear
             ],
         },
     ]
@@ -260,15 +255,11 @@ fn stream_vectors() -> Vec<Vector> {
                 0x1b, 0x5b, 0x32, 0x4a,
             ],
         },
-        // 0x06 OutputAck: u64 consumed_through.
+        // 0x06 OutputAck: no payload. What the frame does is arrive (§ 3), so like
+        // `Detach` below it is nothing but its header.
         Vector {
-            frame: Frame::OutputAck {
-                consumed_through: 1,
-            },
-            bytes: &[
-                0x06, 0x00, 0x00, 0x08, //
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-            ],
+            frame: Frame::OutputAck,
+            bytes: &[0x06, 0x00, 0x00, 0x00],
         },
         // 0x07 Resize: winsize, bare.
         Vector {
@@ -294,32 +285,44 @@ fn stream_vectors() -> Vec<Vector> {
 /// Session lifecycle and liveness.
 fn control_vectors() -> Vec<Vector> {
     vec![
-        // 0x09 Exit: i32 status, u8 kind (0 exited, 1 signalled).
+        // 0x09 Exit: i32 status, u8 kind (0 exited, 1 signalled), u32
+        // since_exit_secs. The kind byte sits *between* the two four-byte fields and
+        // does not stop them being exchanged, so the pair are given values that
+        // disagree in every byte here and are all-ones against all-zeros below —
+        // which is the transposition this file exists to catch, at the one place on
+        // this wire where two same-width fields are adjacent but for a byte.
         Vector {
             frame: Frame::Exit {
                 status: 130,
                 kind: ExitKind::Signalled,
+                since_exit_secs: 0x0a0b_0c0d,
             },
             bytes: &[
-                0x09, 0x00, 0x00, 0x05, //
+                0x09, 0x00, 0x00, 0x09, //
                 0x00, 0x00, 0x00, 0x82, // status
                 0x01, // signalled
+                0x0a, 0x0b, 0x0c, 0x0d, // since_exit_secs
             ],
         },
         // The only signed field on the wire, so its two's-complement encoding is
-        // pinned rather than inferred from the positive case above.
+        // pinned rather than inferred from the positive case above. Zero seconds is
+        // the other value worth writing down: it is what a client watching the exit
+        // happen is handed, and the one number that has to mean "now" rather than a
+        // session that ended while nobody was there (§ 6.5).
         Vector {
             frame: Frame::Exit {
                 status: -1,
                 kind: ExitKind::Exited,
+                since_exit_secs: 0,
             },
             bytes: &[
-                0x09, 0x00, 0x00, 0x05, //
+                0x09, 0x00, 0x00, 0x09, //
                 0xff, 0xff, 0xff, 0xff, // status
                 0x00, // exited
+                0x00, 0x00, 0x00, 0x00, // since_exit_secs
             ],
         },
-        // 0x0a Detach: no payload at all, so the frame is its header.
+        // 0x0a Detach: no payload at all either, so the frame is its header.
         Vector {
             frame: Frame::Detach,
             bytes: &[0x0a, 0x00, 0x00, 0x00],
@@ -462,8 +465,7 @@ fn every_exit_kind_has_a_vector() {
 ///
 /// Swept from [`Linger::ALL`], so all three values are written down in bytes: taking
 /// one of them on faith as the number the other two leave over is an argument about
-/// those vectors rather than a check on this one, since it says nothing about *which*
-/// bits of the flags byte carry the field.
+/// those vectors rather than a check on this one.
 #[test]
 fn every_linger_state_has_a_vector() {
     let covered: Vec<Linger> = vectors()
@@ -490,7 +492,7 @@ fn every_linger_state_has_a_vector() {
 /// the reason [`every_frame_type_has_a_vector`] is driven from [`FrameType::ALL`].
 #[test]
 fn every_hello_flag_bit_is_pinned_in_both_states() {
-    let flags: Vec<u16> = vectors()
+    let flags: Vec<u8> = vectors()
         .iter()
         .filter_map(|v| match v.frame {
             Frame::Hello(hello) => Some(hello.flags),
@@ -498,9 +500,9 @@ fn every_hello_flag_bit_is_pinned_in_both_states() {
         })
         .collect();
 
-    for bit in (0..u16::BITS).map(|shift| 1u16 << shift) {
+    for bit in (0..u8::BITS).map(|shift| 1u8 << shift) {
         let defined = Frame::Hello(Hello {
-            protocol: 3,
+            protocol: 5,
             flags: bit,
             out_offset: 0,
             win: WIN,
@@ -513,67 +515,61 @@ fn every_hello_flag_bit_is_pinned_in_both_states() {
         }
         assert!(
             flags.iter().any(|f| f & bit != 0),
-            "no Hello vector sets flag bit {bit:#06x}"
+            "no Hello vector sets flag bit {bit:#04x}"
         );
         assert!(
             flags.iter().any(|f| f & bit == 0),
-            "no Hello vector clears flag bit {bit:#06x}"
+            "no Hello vector clears flag bit {bit:#04x}"
         );
     }
 }
 
-/// Both `HelloOk` flag bits appear set and clear across the vectors.
+/// Every `HelloOk` flag bit appears set and clear across the vectors.
 ///
 /// [`every_hello_flag_bit_is_pinned_in_both_states`] for the other flags field.
-/// The three vectors above do cover all four states today, and say so in their
-/// comments — one of them notes it is "the only vector in the file with bit 3
-/// clear" — but prose is not what fails when an edit drops that vector, and a bit
+/// The three vectors above do cover both states today, and say so in their
+/// comments — one of them notes it is "the only vector in the file with the agent
+/// bit clear" — but prose is not what fails when an edit drops that vector, and a bit
 /// left set in every vector is pinned only against being renumbered wholesale.
 ///
-/// Swept over the two booleans rather than over bit positions, because unlike
-/// `Hello.flags` the field is typed: [`HelloOk`] carries `gap` and `agent` as
-/// `bool`, and `Linger` — which shares the byte and has an `ALL` — is covered by
+/// Swept over the booleans rather than over bit positions, because unlike
+/// `Hello.flags` the field is typed: [`HelloOk`] carries `agent` as a `bool`, and
+/// `Linger` — which is now a byte of its own — is covered by
 /// [`every_linger_state_has_a_vector`].
 #[test]
 fn every_hello_ok_flag_is_pinned_in_both_states() {
-    let mut gap = Vec::new();
     let mut agent = Vec::new();
 
     for vector in vectors() {
         // Destructured exhaustively rather than read field by field, which is what
         // gives this sweep the property the `ALL`-driven ones have for free: a
-        // third bool added to the flags byte stops this file compiling until it is
+        // second bool added to the flags byte stops this file compiling until it is
         // swept here too, instead of going quietly unpinned.
         if let Frame::HelloOk(HelloOk {
-            protocol: _,
             resume_from: _,
             in_applied: _,
             win: _,
-            gap: this_gap,
             linger: _,
             agent: this_agent,
         }) = vector.frame
         {
-            gap.push(this_gap);
             agent.push(this_agent);
         }
     }
 
-    for (name, states) in [("gap", gap), ("agent", agent)] {
-        assert!(
-            states.iter().any(|set| *set),
-            "no HelloOk vector sets the {name} flag"
-        );
-        assert!(
-            states.iter().any(|set| !*set),
-            "no HelloOk vector clears the {name} flag"
-        );
-    }
+    assert!(
+        agent.iter().any(|set| *set),
+        "no HelloOk vector sets the agent flag"
+    );
+    assert!(
+        agent.iter().any(|set| !*set),
+        "no HelloOk vector clears the agent flag"
+    );
 }
 
-/// The revision the handshake vectors are written at is the one this build speaks.
+/// The revision the `Hello` vectors are written at is the one this build speaks.
 ///
-/// The six of them write it out as a literal, the way everything else in them is
+/// The three of them write it out as a literal, the way everything else in them is
 /// written out from § 2.2 — which is what makes them a check on the document rather
 /// than on the encoder, and equally what would let them go on passing at a revision
 /// the daemon refuses. That refusal is the failure the daemon is built to make loud:
@@ -581,24 +577,28 @@ fn every_hello_ok_flag_is_pinned_in_both_states() {
 /// built from a § 2.2 written at one number, against a daemon speaking another, is
 /// stopped at the handshake with every vector here still green.
 ///
+/// `HelloOk` is not swept because it no longer carries a revision: the daemon has
+/// already accepted the client's by the time it answers (§ 2.2).
+///
 /// [`the_frozen_numbers_are_the_ones_the_document_gives`] holds the constant against
 /// the document; this holds the literals against the constant. Between them the
 /// vectors carry the number the code will accept rather than merely a number.
 #[test]
 fn the_handshake_vectors_are_written_at_the_revision_this_build_speaks() {
+    let mut seen = 0;
     for vector in vectors() {
-        let carried = match vector.frame {
-            Frame::Hello(hello) => hello.protocol,
-            Frame::HelloOk(ok) => ok.protocol,
-            _ => continue,
+        let Frame::Hello(hello) = vector.frame else {
+            continue;
         };
+        seen += 1;
         assert_eq!(
-            carried, PROTOCOL_VERSION,
+            hello.protocol, PROTOCOL_VERSION,
             "a handshake vector is written at a revision the daemon would refuse: \
              {:?}",
             vector.frame
         );
     }
+    assert!(seen > 0, "no Hello vector carries a revision to check");
 }
 
 /// The `Error` codes are the numbers § 2.2 gives them.
@@ -696,32 +696,27 @@ fn the_length_field_is_a_u24_past_its_low_byte() {
 
 /// Every frozen number, held against the document rather than against itself.
 ///
-/// One table, because these are the four numbers a second implementation reads out
-/// of the document rather than out of this crate. Two of them are asserted elsewhere
-/// only *through* the constant, so those assertions pass at whatever value it happens
-/// to hold: `session_ids_accept_minted_forms` takes a `MAX_SESSION_ID_LEN`-long id
-/// against a sibling that takes one byte more, and every agent-channel test counts to
-/// `MAX_AGENT_CHANNELS` and asks for one more. Measured, both moved at once — 64 to
-/// 48 and 8 to 6: 156 of 157 tests in the workspace passed, and this was the one that
-/// did not.
-///
-/// The other two are already held against a hand-written literal somewhere, and are
-/// here for the citation rather than for the arithmetic. The handshake vectors write
-/// `PROTOCOL_VERSION` out as `3` and
+/// One table, because these are the numbers a second implementation reads out of the
+/// document rather than out of this crate. Both are already held against a hand-written
+/// literal somewhere, and are here for the citation rather than for the arithmetic. The
+/// `Hello` vectors write `PROTOCOL_VERSION` out as `5` and
 /// [`the_handshake_vectors_are_written_at_the_revision_this_build_speaks`] compares
 /// them; the largest legal frame in
 /// [`the_length_field_is_a_u24_past_its_low_byte`] encodes its length as the literal
 /// `0x04_00_00`. So moving either constant alone already fails. What those two cannot
 /// see is the edit that moves the constant *and* the literals together, which is
-/// exactly what a revision bump or a re-tune of the cap looks like — and which is a
-/// change to the wire that § 2.1 and § 2.2 have not been told about.
+/// exactly what a revision bump looks like — and which is a change to the wire that
+/// § 2.1 and § 2.2 have not been told about.
 ///
 /// It matters because the far end is a separate codebase built from the document. A
 /// client whose § 2.2 disagrees is turned away at the handshake; one built from § 2.1
-/// sending a legal 256 KiB frame collects `Error{Protocol}`; § 6.3 fixes the id at 64
-/// bytes and says "Both ends validate: the client before minting", so a re-tune here
-/// mints ids the daemon refuses; and § 6.7 fixes the channel cap at 8, which is what
-/// a client sizes its own table against.
+/// sending a legal 256 KiB frame collects `Error{Protocol}`.
+///
+/// The id length § 6.3 fixes and the channel cap § 6.7 fixes were rows here too, and
+/// left with the constants: neither is on the wire, and each is now pinned this same
+/// way beside the code that enforces it, by
+/// `rundir::tests::the_session_id_bound_is_the_one_the_document_gives` and
+/// `agent::tests::the_channel_cap_is_the_one_the_document_gives`.
 ///
 /// The numbers are written out by hand, since they have to come from the document
 /// rather than from the code under test, and every row carries the section it was
@@ -729,30 +724,18 @@ fn the_length_field_is_a_u24_past_its_low_byte() {
 /// answered by editing the expectation.
 #[test]
 fn the_frozen_numbers_are_the_ones_the_document_gives() {
-    let documented: [(&str, u64, u64, &str); 4] = [
+    let documented: [(&str, u64, u64, &str); 2] = [
         (
             "PROTOCOL_VERSION",
             u64::from(PROTOCOL_VERSION),
-            3,
-            "§ 2.2 puts the current revision at 3",
+            5,
+            "§ 2.2 puts the current revision at 5",
         ),
         (
             "MAX_PAYLOAD",
             u64::from(MAX_PAYLOAD),
             262_144,
             "§ 2.1 caps a payload at 256 KiB",
-        ),
-        (
-            "MAX_SESSION_ID_LEN",
-            u64::try_from(MAX_SESSION_ID_LEN).expect("a byte count fits in a u64"),
-            64,
-            "§ 6.3 caps a session id at 64 bytes",
-        ),
-        (
-            "MAX_AGENT_CHANNELS",
-            u64::from(MAX_AGENT_CHANNELS),
-            8,
-            "§ 6.7 caps a session at 8 concurrent agent channels",
         ),
     ];
 

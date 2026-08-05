@@ -53,7 +53,7 @@ pub const RESUME_FROM_START: u64 = u64::MAX;
 /// Honoured only by the `Hello` that *creates* the session (`IMPLEMENTATION.md`
 /// § 2.3), and never set silently: it bypasses the user's `ForwardAgent` decision
 /// (`DESIGN.md` § 5.4).
-pub const HELLO_AGENT_FORWARD: u16 = 1 << 0;
+pub const HELLO_AGENT_FORWARD: u8 = 1 << 0;
 
 /// [`Hello::flags`] bit: repaint after a gap by writing `Ctrl-L` to the PTY
 /// instead of the `TIOCSWINSZ` dance.
@@ -61,10 +61,10 @@ pub const HELLO_AGENT_FORWARD: u16 = 1 << 0;
 /// Honoured on every attach (`IMPLEMENTATION.md` § 2.3), and chosen by the client
 /// because only the client knows whether a bare shell prompt or an editor is on the
 /// screen.
-pub const HELLO_REPAINT_CTRL_L: u16 = 1 << 1;
+pub const HELLO_REPAINT_CTRL_L: u8 = 1 << 1;
 
 /// Bits defined in [`Hello::flags`]. Anything else set is a protocol error.
-const HELLO_FLAG_BITS: u16 = HELLO_AGENT_FORWARD | HELLO_REPAINT_CTRL_L;
+const HELLO_FLAG_BITS: u8 = HELLO_AGENT_FORWARD | HELLO_REPAINT_CTRL_L;
 
 /// Refuses a [`Hello::flags`] word carrying a bit this revision does not define.
 ///
@@ -73,7 +73,7 @@ const HELLO_FLAG_BITS: u16 = HELLO_AGENT_FORWARD | HELLO_REPAINT_CTRL_L;
 /// way in: without the encode-side call a caller could build a `Hello` that encodes
 /// cleanly and earns an `Error{Protocol}` from the peer, a bug reported at the wrong
 /// end of the connection, by the process that did nothing wrong.
-const fn checked_hello_flags(flags: u16) -> Result<(), ProtoError> {
+const fn checked_hello_flags(flags: u8) -> Result<(), ProtoError> {
     if flags & !HELLO_FLAG_BITS != 0 {
         return Err(ProtoError::Malformed("undefined Hello flag bits"));
     }
@@ -101,9 +101,15 @@ fn checked_term(term: &str) -> Result<(), ProtoError> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Hello<'a> {
     /// Must equal [`crate::PROTOCOL_VERSION`] or the daemon rejects the connection.
+    ///
+    /// The only field on this wire that survives a revision bump unchanged, and the
+    /// whole of the compatibility story: there is no negotiation, so a mismatch is a
+    /// refusal (`DESIGN.md` § 6.4). [`HelloOk`] carries no answering copy — the
+    /// daemon has already checked this one by the time it replies, so a revision in
+    /// the answer could only ever repeat what the client just said.
     pub protocol: u16,
     /// [`HELLO_AGENT_FORWARD`] and [`HELLO_REPAINT_CTRL_L`].
-    pub flags: u16,
+    pub flags: u8,
     /// Next output byte the client wants, or [`RESUME_FROM_START`].
     pub out_offset: u64,
     /// Terminal dimensions.
@@ -133,11 +139,9 @@ wire_enum! {
     /// The daemon cannot stop `logind` from killing it at logout, so it reports the
     /// state and the client warns (`IMPLEMENTATION.md` § 6.2).
     ///
-    /// Unlike the other closed sets on the wire this one is not a field of its own:
-    /// the values below are the two-bit encoding *unshifted*. The pair of helpers
-    /// under the flags-byte masks below — `as_bits` and `from_flags` — put that
-    /// encoding into its place in [`HelloOk`]'s flags byte and take it back out, so
-    /// where in the byte the field sits is written down in exactly one place.
+    /// A byte of [`HelloOk`] in its own right, like every other closed set here, so
+    /// [`Linger::as_byte`] and [`Linger::from_byte`] are the wire form rather than an
+    /// unshifted half of it.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     Linger: u8, as_byte / from_byte,
     /// Not determined: no `systemd`, or its state is unreadable. Do not warn —
@@ -151,45 +155,20 @@ wire_enum! {
     Enabled = 2,
 }
 
-/// [`HelloOk`] flags bit: output was dropped before `resume_from`.
-const HELLOOK_GAP: u8 = 1 << 0;
-/// Offset of the two-bit [`Linger`] field in [`HelloOk`]'s flags byte.
-const HELLOOK_LINGER_SHIFT: u32 = 1;
-/// Mask of that field.
-const HELLOOK_LINGER_MASK: u8 = 0b11 << HELLOOK_LINGER_SHIFT;
 /// [`HelloOk`] flags bit: this session is serving an agent socket.
-const HELLOOK_AGENT: u8 = 1 << 3;
+const HELLOOK_AGENT: u8 = 1 << 0;
 /// Bits defined in [`HelloOk`]'s flags byte. Anything else set is a protocol error.
-const HELLOOK_FLAG_BITS: u8 = HELLOOK_GAP | HELLOOK_LINGER_MASK | HELLOOK_AGENT;
-
-/// Where in [`HelloOk`]'s flags byte the [`Linger`] field sits, said once — here,
-/// beside the masks of the single bits sharing that byte, rather than split between
-/// the encode and the decode side.
-impl Linger {
-    /// Returns the two-bit wire encoding, already shifted into place.
-    const fn as_bits(self) -> u8 {
-        self.as_byte() << HELLOOK_LINGER_SHIFT
-    }
-
-    /// Parses the two-bit wire encoding out of a flags byte.
-    const fn from_flags(flags: u8) -> Option<Self> {
-        Self::from_byte((flags & HELLOOK_LINGER_MASK) >> HELLOOK_LINGER_SHIFT)
-    }
-}
+const HELLOOK_FLAG_BITS: u8 = HELLOOK_AGENT;
 
 /// Daemon's answer to [`Hello`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HelloOk {
-    /// This daemon's protocol revision.
-    pub protocol: u16,
     /// Offset the daemon will start streaming output from.
     pub resume_from: u64,
     /// Authoritative input offset; the client fast-forwards to this.
     pub in_applied: u64,
     /// The session's current dimensions.
     pub win: WinSize,
-    /// Output was dropped before `resume_from`; the stream is discontinuous.
-    pub gap: bool,
     /// Whether this session survives the user's logout.
     pub linger: Linger,
     /// Whether an agent socket is being served, so the client knows to expect
@@ -199,12 +178,31 @@ pub struct HelloOk {
 }
 
 impl HelloOk {
-    /// Packs the boolean and enum fields into the wire flags byte.
+    /// Whether output was dropped before [`HelloOk::resume_from`], leaving the stream
+    /// discontinuous for a client that asked to resume at `out_offset`.
+    ///
+    /// Derived rather than carried, because `resume_from` already decides it and the
+    /// client already holds the `out_offset` it sent. The daemon's three branches
+    /// (`IMPLEMENTATION.md` § 4.2) each satisfy `gap ⟺ resume_from > out_offset`,
+    /// with `b` the ring's base and `e` its end, `b <= e` by construction:
+    ///
+    /// - `out_offset == u64::MAX`, the "send me whatever you have" sentinel: no gap,
+    ///   and `resume_from = b`, which cannot exceed `u64::MAX`.
+    /// - `out_offset < b`: a gap, and `min(out_offset, e).max(b) = b > out_offset`.
+    /// - `b <= out_offset <= e`: no gap, and `resume_from` is `out_offset` itself.
+    /// - `out_offset > e`: output the session never produced, clamped down to `e`
+    ///   and not a gap, since nothing was dropped — and `e < out_offset`.
+    ///
+    /// An empty ring is the third and fourth cases at `b == e` and needs nothing of
+    /// its own.
+    #[must_use]
+    pub const fn gap(&self, out_offset: u64) -> bool {
+        self.resume_from > out_offset
+    }
+
+    /// Packs the boolean fields into the wire flags byte.
     const fn flags(&self) -> u8 {
-        let mut flags = self.linger.as_bits();
-        if self.gap {
-            flags |= HELLOOK_GAP;
-        }
+        let mut flags = 0;
         if self.agent {
             flags |= HELLOOK_AGENT;
         }
@@ -243,10 +241,12 @@ pub enum Frame<'a> {
         data: &'a [u8],
     },
     /// Advisory acknowledgement of consumed output.
-    OutputAck {
-        /// Exclusive upper bound of consumed output.
-        consumed_through: u64,
-    },
+    ///
+    /// Payload-free: the daemon tracks what it has sent by itself and never trims the
+    /// ring on an ack (`IMPLEMENTATION.md` § 3, § 4), so what this frame does is
+    /// *arrive* — it wakes the loop and lets a replay that stopped on a full socket
+    /// resume. An offset here would be a number with no reader.
+    OutputAck,
     /// New terminal dimensions.
     Resize(WinSize),
     /// Output was discarded by ring overflow.
@@ -260,6 +260,15 @@ pub enum Frame<'a> {
         status: i32,
         /// How it terminated.
         kind: ExitKind,
+        /// Whole seconds since the child let go of the terminal.
+        ///
+        /// Zero for a client watching the exit happen and days for one that arrives
+        /// afterwards, the daemon now outliving its child
+        /// (`IMPLEMENTATION.md` § 6.5). Elapsed rather than a wall-clock stamp: the
+        /// daemon reads a monotonic clock it can trust and never one it cannot, and
+        /// the client converts against its own. Saturates rather than wrapping, at a
+        /// width no session reaches — 136 years.
+        since_exit_secs: u32,
     },
     /// Client is leaving without ending the session.
     Detach,
@@ -309,7 +318,7 @@ impl<'a> Frame<'a> {
             Self::Input { .. } => FrameType::Input,
             Self::InputAck { .. } => FrameType::InputAck,
             Self::Output { .. } => FrameType::Output,
-            Self::OutputAck { .. } => FrameType::OutputAck,
+            Self::OutputAck => FrameType::OutputAck,
             Self::Resize(_) => FrameType::Resize,
             Self::Gap { .. } => FrameType::Gap,
             Self::Exit { .. } => FrameType::Exit,
@@ -380,17 +389,17 @@ impl<'a> Frame<'a> {
                 checked_hello_flags(hello.flags)?;
 
                 out.extend_from_slice(&hello.protocol.to_be_bytes());
-                out.extend_from_slice(&hello.flags.to_be_bytes());
+                out.push(hello.flags);
                 out.extend_from_slice(&hello.out_offset.to_be_bytes());
                 put_win(out, hello.win);
                 out.extend_from_slice(&term_len.to_be_bytes());
                 out.extend_from_slice(hello.term.as_bytes());
             }
             Self::HelloOk(ok) => {
-                out.extend_from_slice(&ok.protocol.to_be_bytes());
                 out.extend_from_slice(&ok.resume_from.to_be_bytes());
                 out.extend_from_slice(&ok.in_applied.to_be_bytes());
                 put_win(out, ok.win);
+                out.push(ok.linger.as_byte());
                 out.push(ok.flags());
             }
             Self::Input { offset, data } | Self::Output { offset, data } => {
@@ -400,20 +409,22 @@ impl<'a> Frame<'a> {
             Self::InputAck {
                 applied_through: value,
             }
-            | Self::OutputAck {
-                consumed_through: value,
-            }
             | Self::Gap {
                 new_base_offset: value,
             }
             | Self::Ping { nonce: value }
             | Self::Pong { nonce: value } => out.extend_from_slice(&value.to_be_bytes()),
             Self::Resize(win) => put_win(out, win),
-            Self::Exit { status, kind } => {
+            Self::Exit {
+                status,
+                kind,
+                since_exit_secs,
+            } => {
                 out.extend_from_slice(&status.to_be_bytes());
                 out.push(kind.as_byte());
+                out.extend_from_slice(&since_exit_secs.to_be_bytes());
             }
-            Self::Detach => {}
+            Self::Detach | Self::OutputAck => {}
             Self::Error { code, message } => {
                 out.extend_from_slice(&code.as_u16().to_be_bytes());
                 out.extend_from_slice(message.as_bytes());
@@ -453,7 +464,7 @@ impl<'a> Frame<'a> {
         let frame = match ty {
             FrameType::Hello => {
                 let protocol = r.u16()?;
-                let flags = r.u16()?;
+                let flags = r.u8()?;
                 checked_hello_flags(flags)?;
                 let out_offset = r.u64()?;
                 let win = r.win()?;
@@ -470,22 +481,20 @@ impl<'a> Frame<'a> {
                 })
             }
             FrameType::HelloOk => {
-                let protocol = r.u16()?;
                 let resume_from = r.u64()?;
                 let in_applied = r.u64()?;
                 let win = r.win()?;
+                let linger = Linger::from_byte(r.u8()?)
+                    .ok_or(ProtoError::Malformed("unknown linger state"))?;
                 let flags = r.u8()?;
                 if flags & !HELLOOK_FLAG_BITS != 0 {
                     return Err(ProtoError::Malformed("undefined HelloOk flag bits"));
                 }
                 Self::HelloOk(HelloOk {
-                    protocol,
                     resume_from,
                     in_applied,
                     win,
-                    gap: flags & HELLOOK_GAP != 0,
-                    linger: Linger::from_flags(flags)
-                        .ok_or(ProtoError::Malformed("unknown linger state"))?,
+                    linger,
                     agent: flags & HELLOOK_AGENT != 0,
                 })
             }
@@ -500,9 +509,7 @@ impl<'a> Frame<'a> {
             FrameType::InputAck => Self::InputAck {
                 applied_through: r.u64()?,
             },
-            FrameType::OutputAck => Self::OutputAck {
-                consumed_through: r.u64()?,
-            },
+            FrameType::OutputAck => Self::OutputAck,
             FrameType::Resize => Self::Resize(r.win()?),
             FrameType::Gap => Self::Gap {
                 new_base_offset: r.u64()?,
@@ -511,6 +518,7 @@ impl<'a> Frame<'a> {
                 status: r.i32()?,
                 kind: ExitKind::from_byte(r.u8()?)
                     .ok_or(ProtoError::Malformed("unknown exit kind"))?,
+                since_exit_secs: r.u32()?,
             },
             FrameType::Detach => Self::Detach,
             FrameType::Ping => Self::Ping { nonce: r.u64()? },
@@ -685,30 +693,12 @@ mod tests {
         );
     }
 
-    /// Every flag combination survives, including the ones the daemon never sends
-    /// together — the packing shares one byte, so a bit that leaks between fields
-    /// would show up here rather than as a mysterious linger warning in the client.
-    #[test]
-    fn hello_ok_flags_are_independent() {
-        for gap in [false, true] {
-            for agent in [false, true] {
-                for linger in Linger::ALL {
-                    round_trip(Frame::HelloOk(HelloOk {
-                        protocol: PROTOCOL_VERSION,
-                        resume_from: 1,
-                        in_applied: 2,
-                        win: WIN,
-                        gap,
-                        linger,
-                        agent,
-                    }));
-                }
-            }
-        }
-    }
-
     /// Each reserved encoding earns its own diagnosis, so the two are not
     /// interchangeable: an undefined bit is one bug, a reserved linger value another.
+    ///
+    /// The two now sit in adjacent bytes rather than in one, so this also pins that
+    /// the decoder reads them apart: a byte offset off by one turns each complaint
+    /// into the other's.
     #[test]
     fn undefined_flag_bits_are_rejected() {
         let mut hello = Vec::new();
@@ -721,8 +711,8 @@ mod tests {
         })
         .encode(&mut hello)
         .unwrap();
-        // `flags` is the second u16 of the payload.
-        hello[HEADER_LEN + 3] = 0x80;
+        // `flags` is the single byte after the u16 protocol.
+        hello[HEADER_LEN + 2] = 0x80;
         assert_eq!(
             Frame::decode(FrameType::Hello, &hello[HEADER_LEN..]),
             Err(ProtoError::Malformed("undefined Hello flag bits"))
@@ -730,28 +720,96 @@ mod tests {
 
         let mut ok = Vec::new();
         Frame::HelloOk(HelloOk {
-            protocol: PROTOCOL_VERSION,
             resume_from: 0,
             in_applied: 0,
             win: WIN,
-            gap: false,
             linger: Linger::Unknown,
             agent: false,
         })
         .encode(&mut ok)
         .unwrap();
+        // The payload ends `.., u8 linger, u8 flags`: reserved bit 1 of the flags
+        // byte, then the reserved linger encoding 3 in the byte before it.
         let flags = ok.len() - 1;
-        // Reserved bit 4, then the reserved linger encoding 0b11.
-        for (byte, complaint) in [
-            (0b1_0000, "undefined HelloOk flag bits"),
-            (0b110, "unknown linger state"),
+        for (at, byte, complaint) in [
+            (flags, 0b10, "undefined HelloOk flag bits"),
+            (flags - 1, 3, "unknown linger state"),
         ] {
-            ok[flags] = byte;
+            let mut mutated = ok.clone();
+            mutated[at] = byte;
             assert_eq!(
-                Frame::decode(FrameType::HelloOk, &ok[HEADER_LEN..]),
+                Frame::decode(FrameType::HelloOk, &mutated[HEADER_LEN..]),
                 Err(ProtoError::Malformed(complaint)),
-                "flags byte {byte:#b} should be refused"
+                "byte {byte:#b} at payload offset {} should be refused",
+                at - HEADER_LEN
             );
+        }
+    }
+
+    /// [`HelloOk::gap`] answers what the flag it replaced carried, on every case
+    /// `IMPLEMENTATION.md` § 4.2 distinguishes.
+    ///
+    /// The flag was computed by the daemon from the client's `out_offset` and the
+    /// ring's base; this derives it from `resume_from`, which the same three branches
+    /// had just set. That they agree is an argument, and this is the argument run
+    /// rather than written down: § 4.2 is transcribed once below, and both answers are
+    /// compared for every ring shape that matters — empty, ordinary, and pressed
+    /// against the top of the offset space — against offsets on both sides of each
+    /// edge, plus the `RESUME_FROM_START` sentinel that is the one `out_offset` value
+    /// meaning something other than an offset.
+    #[test]
+    fn the_derived_gap_agrees_with_the_flowchart_it_replaces() {
+        /// § 4.2's flowchart, for a ring retaining `base..end`.
+        fn flowchart(out_offset: u64, base: u64, end: u64) -> (u64, bool) {
+            if out_offset == RESUME_FROM_START {
+                (base, false)
+            } else if out_offset < base {
+                (base, true)
+            } else {
+                // Clamped at both ends, exactly as `Daemon::on_hello` does it.
+                (out_offset.min(end).max(base), false)
+            }
+        }
+
+        for (base, end) in [
+            // A session nobody has written to, and one that has not overflowed.
+            (0, 0),
+            (0, 16),
+            // A ring that has dropped its head, full and empty.
+            (8, 8),
+            (8, 24),
+            // The top of the offset space, where the sentinel and a real offset are
+            // the closest they can be.
+            (u64::MAX - 4, u64::MAX),
+            (u64::MAX, u64::MAX),
+        ] {
+            for out_offset in [
+                0,
+                base.saturating_sub(1),
+                base,
+                base.saturating_add(1),
+                end.saturating_sub(1),
+                end,
+                end.saturating_add(1),
+                u64::MAX - 1,
+                RESUME_FROM_START,
+            ] {
+                let (resume_from, gap) = flowchart(out_offset, base, end);
+                let ok = HelloOk {
+                    resume_from,
+                    in_applied: 0,
+                    win: WIN,
+                    linger: Linger::Unknown,
+                    agent: false,
+                };
+                assert_eq!(
+                    ok.gap(out_offset),
+                    gap,
+                    "a client resuming at {out_offset} against a ring holding \
+                     {base}..{end} is told to resume at {resume_from}, which § 4.2 \
+                     calls gap={gap}"
+                );
+            }
         }
     }
 
@@ -759,7 +817,7 @@ mod tests {
     fn non_utf8_text_is_rejected() {
         // Hello with term_len 1 and a lone continuation byte: protocol, flags,
         // `out_offset` and the winsize ahead of it.
-        let mut payload = vec![0; 2 + 2 + 8 + 8];
+        let mut payload = vec![0; 2 + 1 + 8 + 8];
         payload.extend_from_slice(&1u16.to_be_bytes());
         payload.push(0x80);
         assert_eq!(
@@ -830,7 +888,7 @@ mod tests {
         let before = buf.len();
         let err = Frame::Hello(Hello {
             protocol: PROTOCOL_VERSION,
-            flags: HELLO_AGENT_FORWARD | 0x8000,
+            flags: HELLO_AGENT_FORWARD | 0x80,
             out_offset: 0,
             win: WIN,
             term: "xterm",
@@ -852,7 +910,7 @@ mod tests {
         let long = "x".repeat(usize::from(u16::MAX) + 1);
         let err = Frame::Hello(Hello {
             protocol: PROTOCOL_VERSION,
-            flags: HELLO_AGENT_FORWARD | 0x8000,
+            flags: HELLO_AGENT_FORWARD | 0x80,
             out_offset: 0,
             win: WIN,
             term: &long,

@@ -52,6 +52,17 @@ pub(crate) const WIN: WinSize = WinSize {
 /// is patience with a slow machine — and that is the same question everywhere.
 const PATIENCE: Duration = Duration::from_secs(15);
 
+/// How long a test waits for a *sequence* of frames the daemon owes it.
+///
+/// The same fifteen seconds [`PATIENCE`] allows a single frame, spent on the whole
+/// loop rather than on each frame in it. That is the only spelling that bounds
+/// anything: patience taken per frame renews itself on every one that arrives, so a
+/// daemon dribbling output is never late by that measure and the loop runs until
+/// nextest's kill, which cannot say which wait never ended ([`Client::frame_before`]).
+/// It is one value rather than one per site for [`PATIENCE`]'s reason — every wait
+/// here is on a daemon that is either about to answer or never going to.
+pub(crate) const FRAME_PATIENCE: Duration = Duration::from_secs(15);
+
 /// How long a socket read blocks before the caller's own deadline is looked at
 /// again.
 ///
@@ -305,7 +316,7 @@ impl Session {
     }
 
     /// [`Session::attached`], with `flags` in the greeting.
-    pub(crate) fn attached_with(name: &str, flags: u16) -> (Self, Client, nomux_proto::HelloOk) {
+    pub(crate) fn attached_with(name: &str, flags: u8) -> (Self, Client, nomux_proto::HelloOk) {
         let session = Self::start(name);
         let mut client = session.connect();
         let ok = client.hello_with(flags, RESUME_FROM_START);
@@ -350,14 +361,14 @@ impl Session {
 /// not.
 pub(crate) fn reconnect_until_gap(
     session: &Session,
-    flags: u16,
+    flags: u8,
     out_offset: u64,
 ) -> (Client, nomux_proto::HelloOk) {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let mut client = session.connect();
         let resumed = client.hello_with(flags, out_offset);
-        if resumed.gap {
+        if resumed.gap(out_offset) {
             return (client, resumed);
         }
         drop(client);
@@ -499,8 +510,9 @@ pub(crate) fn nomux(root: &Path, args: &[&str]) -> Command {
 /// the `attach` it shares the call with is the one under test.
 ///
 /// What is left on [`nomux`] alone is what could not start a shell under any
-/// regression: `list` and `kill`, and a relay onto a socket the test bound itself,
-/// which finds a session already there and so never spawns a daemon.
+/// regression: `list` and `kill`, and an `attach` onto a socket the test bound
+/// itself, which finds a session already there — and which, since the split, could
+/// not have started a daemon even where it did not.
 pub(crate) fn nomux_with_shell(root: &Path, args: &[&str]) -> Command {
     let mut command = nomux(root, args);
     command.env("SHELL", "/bin/sh");
@@ -579,7 +591,7 @@ pub(crate) fn wait_for(path: &Path) {
 /// Waits for the daemon `id` published a pidfile under `root` for, and hands back
 /// its pid alongside a guard that collects it however the test ends.
 ///
-/// For every test that brings a session up through `nomux attach` or `nomux daemon`
+/// For every test that brings a session up through `nomux spawn` or `nomux daemon`
 /// rather than through [`Session`], which kills its own child on drop. The daemon
 /// such a spawn produces has `setsid`ed away, so killing the relay does not reach it
 /// and no [`Spawned`] covers it: it is collected by an explicit `nomux kill` further
@@ -603,15 +615,63 @@ pub(crate) fn daemon_reaper(root: &Path, id: &str) -> (u32, Reaper) {
     (pid, Reaper(pid))
 }
 
-/// The single-letter run state `/proc` reports for `pid`, or `None` once it is gone.
+/// Everything `/proc/<pid>/stat` holds after the parenthesised command name, or
+/// `None` once the process is gone.
 ///
-/// Read from after the parenthesised command name, because counting fields from the
-/// front stops working the moment a command name contains a space or a bracket — and
-/// `sh` starting `a b )` is enough.
-pub(crate) fn process_state(pid: u32) -> Option<char> {
+/// Read from after that name, because counting fields from the front stops working
+/// the moment a command name contains a space or a bracket — and `sh` starting
+/// `a b )` is enough. What is left begins with the single-letter run state, and the
+/// fields [`StatField`] numbers follow it — so [`process_state`] and [`stat_field`]
+/// are one parse asked two questions rather than two copies of the rule above.
+fn stat_after_command(pid: u32) -> Option<String> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let (_, tail) = stat.rsplit_once(')')?;
-    tail.trim_start().chars().next()
+    stat.rsplit_once(')').map(|(_, tail)| tail.to_owned())
+}
+
+/// The single-letter run state `/proc` reports for `pid`, or `None` once it is gone.
+pub(crate) fn process_state(pid: u32) -> Option<char> {
+    stat_after_command(pid)?.trim_start().chars().next()
+}
+
+/// A numeric field of `/proc/<pid>/stat`, by what it means.
+///
+/// Numbered from the run state that follows the command name, which is where
+/// [`stat_after_command`] leaves off.
+#[derive(Clone, Copy)]
+pub(crate) enum StatField {
+    /// The process group the process belongs to.
+    ProcessGroup = 2,
+    /// The session it belongs to, which is its own pid exactly when it leads one.
+    Session = 3,
+    /// Clock ticks spent in user mode.
+    UserTime = 11,
+    /// Clock ticks spent in the kernel on this process's own behalf.
+    SystemTime = 12,
+}
+
+/// Reads one field of `/proc/<pid>/stat`.
+pub(crate) fn stat_field(pid: u32, field: StatField) -> Option<u32> {
+    stat_after_command(pid)?
+        .split_whitespace()
+        .nth(field as usize)?
+        .parse()
+        .ok()
+}
+
+/// How much processor time `pid` has been charged, in the clock ticks `/proc`
+/// counts in.
+///
+/// User and system together, because the two states this has to tell apart are
+/// "asleep in `poll`" and "going round the loop as fast as the scheduler allows",
+/// and the second spends its time on both sides of the syscall boundary. A process
+/// that has gone reports nothing, which reads here as zero — the same answer the
+/// caller's assertion wants, and one no daemon that is still there can produce
+/// falsely, since these counters never go down.
+pub(crate) fn cpu_ticks(pid: u32) -> u32 {
+    [StatField::UserTime, StatField::SystemTime]
+        .into_iter()
+        .filter_map(|field| stat_field(pid, field))
+        .sum()
 }
 
 /// Whether `pid` is still a process rather than gone or a zombie nobody has
@@ -701,7 +761,7 @@ impl Client {
         self.hello_with(0, out_offset)
     }
 
-    pub(crate) fn hello_with(&mut self, flags: u16, out_offset: u64) -> nomux_proto::HelloOk {
+    pub(crate) fn hello_with(&mut self, flags: u8, out_offset: u64) -> nomux_proto::HelloOk {
         self.send(&hello_frame(flags, out_offset));
         match self.next_frame() {
             (FrameType::HelloOk, payload) => {
@@ -1138,7 +1198,7 @@ pub(crate) fn shrink_send_buffer(socket: &UnixStream, bytes: libc::c_int) {
 ///
 /// One literal rather than four, since the three sites that write it straight at a
 /// socket are exactly the ones that would be missed if it ever changed.
-pub(crate) const fn hello_frame(flags: u16, out_offset: u64) -> Frame<'static> {
+pub(crate) const fn hello_frame(flags: u8, out_offset: u64) -> Frame<'static> {
     Frame::Hello(Hello {
         protocol: PROTOCOL_VERSION,
         flags,
@@ -1195,6 +1255,18 @@ pub(crate) fn push_until_refused(
         }
     }
     sent
+}
+
+/// How much a unix socket on this host takes from a peer that has stopped reading.
+///
+/// Measured rather than assumed: the limit is the *sender's* send buffer, which is a
+/// sysctl away from any number written down here, and both callers turn on sending
+/// more than it. Asking a socketpair is asking the same kernel the same question —
+/// nothing about the pair the daemon accepts is different.
+pub(crate) fn socket_capacity() -> usize {
+    let (mut probe, _other_end) = UnixStream::pair().expect("a socketpair to measure");
+    probe.set_nonblocking(true).expect("stop blocking");
+    push_until_refused(&mut probe, &vec![0u8; 8 << 20], Duration::from_millis(100))
 }
 
 /// A child killed and collected when it goes out of scope, however it goes out of

@@ -145,7 +145,7 @@ fn an_escape_heavy_stream_is_byte_exact_across_random_disconnects() {
             client = session.connect();
             let resumed = client.hello(offset);
             assert!(
-                !resumed.gap,
+                !resumed.gap(offset),
                 "nothing should be dropped (seed {chaos_seed})"
             );
             assert_eq!(
@@ -272,12 +272,11 @@ fn overflow_during_disconnects_is_always_reported() {
             resumed.resume_from >= offset,
             "round {round}: the daemon must never rewind (seed {chaos_seed})"
         );
-        assert_eq!(
-            resumed.gap,
-            resumed.resume_from > offset,
-            "round {round}: a moved resume point is exactly what `gap` reports (seed {chaos_seed})"
-        );
-        if resumed.gap {
+        // A moved resume point is exactly what a gap is, which used to be asserted
+        // here against a flag the daemon sent separately. The flag is gone and the
+        // equality is now the definition (`HelloOk::gap`), so what is left to count
+        // is how often it happened.
+        if resumed.gap(offset) {
             gaps += 1;
         }
         offset = resumed.resume_from;

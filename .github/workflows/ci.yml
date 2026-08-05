@@ -45,6 +45,21 @@ jobs:
     # The session tests spawn a real PTY, shells and unix sockets; a wedged child
     # would otherwise hold the runner for the six-hour default.
     timeout-minutes: 20
+    # Where the deny lives, and the reason it is here rather than in
+    # [workspace.lints] is written down in Cargo.toml: cargo inlines that table into
+    # the published manifest, so a deny there is a stranger's build failure on any
+    # toolchain newer than the pin. Here it reaches this job and nothing else.
+    #
+    # Job-level rather than repeated per step, so every cargo invocation below sees
+    # the same value: RUSTFLAGS is part of cargo's fingerprint and of the rust-cache
+    # key, and a step that differed would rebuild the workspace from cold.
+    #
+    # Deliberately not on the release job: scripts/build-release.sh sets
+    # CARGO_ENCODED_RUSTFLAGS, which makes cargo ignore RUSTFLAGS entirely, so a deny
+    # there would be silently absent rather than enforced — and lint gating is this
+    # job's business anyway.
+    env:
+      RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v7
 
@@ -72,9 +87,18 @@ jobs:
 
       - run: cargo fmt --all --check
 
-      # No `-D warnings`: the deny lives in [workspace.lints] in Cargo.toml, which is
-      # where the reason is written down.
-      - run: cargo clippy --locked --workspace --all-targets
+      # `-- -D warnings` on top of the job's RUSTFLAGS: clippy's own lints are emitted
+      # by clippy-driver, and the flags after `--` are the ones it applies to them.
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      # rustdoc has its own lint namespace, so `rustdoc::broken_intra_doc_links` is
+      # reached by neither the clippy run above nor RUSTFLAGS — and this tree links
+      # between items constantly, where a renamed function turns a link into nothing
+      # rather than into an error. `--document-private-items` because the binary crate
+      # is almost entirely private and would otherwise be documented empty. Seconds
+      # against the warm cache: only the workspace crates are rebuilt, their
+      # dependencies having been built by the step above.
+      - run: RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps --document-private-items
 
       # `--run-ignored all`: the one ignored test sits out a real reaping timeout,
       # the 30 s first-attach one. Too slow for a pre-commit hook, exactly what
@@ -93,6 +117,13 @@ jobs:
     name: takeover guard
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # Here too, because this is the only job that compiles the fault-injection code at
+    # all: the check job above never sets those cfgs, so a warning behind one is
+    # otherwise seen by nothing. verify-takeover-guard.sh appends its `--cfg` to an
+    # inherited RUSTFLAGS rather than replacing it, so the deny survives into both of
+    # its runs.
+    env:
+      RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v7
 
@@ -132,11 +163,11 @@ jobs:
       # an empty value — for the one file that names the release compiler. `set -e`
       # does fail an assignment whose substitution failed.
       #
-      # An output rather than $GITHUB_ENV, because $GITHUB_ENV would put NOMUX_NIGHTLY
-      # in the environment of every later step, including the build. That variable is
-      # the script's override, and IMPLEMENTATION.md § 8 says a release may not take
-      # it. As an output it reaches only the step below, so build-release.sh reads
-      # scripts/nightly-version itself — the same branch a laptop build takes.
+      # An output rather than $GITHUB_ENV, which would put the toolchain name in the
+      # environment of every later step including the build, where nothing should be
+      # reading a compiler from anywhere but the pinned file. As an output it reaches
+      # only the step below, so build-release.sh reads scripts/nightly-version itself
+      # — the same branch a laptop build takes.
       - name: Read the pinned release nightly
         id: nightly
         run: |
@@ -180,7 +211,17 @@ jobs:
           key: musl-${{ steps.nightly.outputs.version }}
 
       # Owns the target list and the size budget; exits non-zero if a binary is over.
+      #
+      # The companions are asked for everywhere except a pull request. Building them
+      # doubles the cross builds — a second `-Zbuild-std` fat-LTO link per target —
+      # for artifacts that only the tag path ever publishes, and a PR's expire unread.
+      # `main` and tags still build them, so the script's `.text` correspondence check
+      # between each shipping binary and its companion keeps running on every commit
+      # that could ship, rather than first on the tag that does. `0` rather than an
+      # unset value because the script tests the variable for exactly `1`.
       - run: sh scripts/build-release.sh
+        env:
+          NOMUX_DEBUG: ${{ github.event_name == 'pull_request' && '0' || '1' }}
 
       # The checksums are the point of this job — the client pins one per
       # architecture — so they have to outlive the log they were printed to. On a tag

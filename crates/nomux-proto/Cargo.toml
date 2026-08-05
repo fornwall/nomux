@@ -1,6 +1,15 @@
 [package]
 name = "nomux-proto"
 description = "Wire protocol codec for nomux persistent SSH terminal sessions"
+# Not published. A version on crates.io is a semver promise about the API, and this
+# crate's API *is* the wire format — which DESIGN.md § 2 says is private, unstable and
+# spoken by exactly one client, shipped in lockstep. `PROTOCOL_VERSION` is the real
+# compatibility axis, and it answers a peer rather than a resolver. Publishing also
+# cost the workspace manifest a literal `version` beside the path dependency, since a
+# published path dep needs one, duplicating `workspace.package.version` with nothing
+# keeping the two in step. The crate stays split out for the reason
+# IMPLEMENTATION.md § 1 gives — it is the half that can carry `#![forbid(unsafe_code)]`.
+publish = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
