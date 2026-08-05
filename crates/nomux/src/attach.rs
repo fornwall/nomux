@@ -9,6 +9,7 @@
 
 use std::collections::VecDeque;
 use std::env;
+use std::fs;
 use std::io;
 use std::net::Shutdown;
 use std::os::fd::{AsFd, BorrowedFd};
@@ -20,7 +21,8 @@ use std::time::{Duration, Instant};
 use rustix::event::PollFlags;
 use rustix::pipe::SpliceFlags;
 
-use crate::rundir::{SessionPaths, connect_within, nothing_is_listening};
+use crate::control::{Liveness, liveness};
+use crate::rundir::SessionPaths;
 
 /// How long to wait for a freshly spawned daemon to bind its socket.
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -92,10 +94,10 @@ fn resume(paths: &SessionPaths) -> io::Result<UnixStream> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Err(no_such_session(paths)),
         Err(err) => return Err(err),
     }
-    match connect_within(&paths.socket(), CONNECT_TIMEOUT) {
-        Ok(stream) => Ok(stream),
-        Err(err) if nothing_is_listening(&err) => Err(no_such_session(paths)),
-        Err(err) => Err(err),
+    match liveness(&paths.socket(), CONNECT_TIMEOUT) {
+        Liveness::Alive(stream) => Ok(stream),
+        Liveness::Stale(_) => Err(no_such_session(paths)),
+        Liveness::Unknown(err) => Err(err),
     }
 }
 
@@ -159,39 +161,51 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> io::Result<UnixStream> {
     // waited for it, and the loser of that race is refused rather than handed the
     // winner's session — two tabs both told they created this one is exactly the
     // confusion the split exists to end.
-    match connect_within(&socket, CONNECT_TIMEOUT) {
+    match liveness(&socket, CONNECT_TIMEOUT) {
         // Dropped on the spot, which costs the daemon a pending connection that
         // closes without greeting — the same nothing `list`'s probe costs it (§ 6.4).
-        Ok(_) => return Err(already_running(paths)),
-        Err(err) if nothing_is_listening(&err) => {}
-        Err(err) => return Err(err),
+        Liveness::Alive(_) => return Err(already_running(paths)),
+        Liveness::Stale(_) => {}
+        Liveness::Unknown(err) => return Err(err),
     }
 
-    let complaint = spawn_daemon(paths.id(), label)?;
+    let complaint = spawn_daemon(paths.id(), label).inspect_err(|_| release_lock_name(paths))?;
 
     let deadline = Instant::now() + SPAWN_TIMEOUT;
     loop {
-        match connect_within(&socket, CONNECT_TIMEOUT) {
-            Ok(stream) => {
+        match liveness(&socket, CONNECT_TIMEOUT) {
+            Liveness::Alive(stream) => {
                 await_publication(paths, deadline);
                 return Ok(stream);
             }
-            Err(err) if nothing_is_listening(&err) => {
+            Liveness::Stale(_) => {
                 if Instant::now() >= deadline {
                     let id = paths.id();
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        daemon_complaint(complaint).map_or_else(
-                            || format!("daemon for session {id} did not start"),
-                            |said| format!("daemon for session {id} did not start: {said}"),
-                        ),
-                    ));
+                    let complaint = daemon_complaint(complaint).map_or_else(
+                        || format!("daemon for session {id} did not start"),
+                        |said| format!("daemon for session {id} did not start: {said}"),
+                    );
+                    release_lock_name(paths);
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, complaint));
                 }
                 std::thread::sleep(SPAWN_POLL_INTERVAL);
             }
-            Err(err) => return Err(err),
+            Liveness::Unknown(err) => return Err(err),
         }
     }
+}
+
+/// Gives back the `<id>.lock` this call created, on the way out of a spawn that left no
+/// session behind.
+///
+/// While the lock is still held, and with nothing of ours unlinking after it, which is
+/// `rundir::removal_order`'s ordering seen from the other end. Left behind it is a bare
+/// name `session_id_of` counts as a session, so every spawn refused at § 6.3's ceiling
+/// would raise the count that refused it — the daemon cannot undo that from its side,
+/// this process being the one holding the lock. Never on [`already_running`], where the
+/// name belongs to the session that is there.
+fn release_lock_name(paths: &SessionPaths) {
+    drop(fs::remove_file(paths.lock()));
 }
 
 /// Keeps the spawn lock until the daemon this spawn started has published

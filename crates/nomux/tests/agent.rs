@@ -8,14 +8,15 @@
 
 mod harness;
 
+use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::time::{Duration, Instant};
-use std::{fs, thread};
 
 use nomux_proto::{Frame, FrameType, HELLO_AGENT_FORWARD, RESUME_FROM_START};
 
-use harness::{FRAME_PATIENCE, Session, cpu_ticks, read_uninterrupted, socket_capacity};
+use harness::{
+    SPIN_WINDOW, Session, cpu_ticks, read_uninterrupted, socket_capacity, still_serving,
+};
 
 /// A session created without the flag serves no socket at all: forwarding bypasses
 /// the user's `ForwardAgent` decision, so it must never be on by default.
@@ -104,8 +105,11 @@ fn an_agent_socket_that_cannot_be_bound_leaves_an_honest_flag_and_a_live_session
         "the daemon reported an agent socket it never bound"
     );
 
-    client.input(0, b"echo \"sock=[$SSH_AUTH_SOCK]\"\n");
-    let (seen, _) = client.read_until("sock=[", ok.resume_from);
+    // The default is what makes this a wait the child has to satisfy: `sock=[` is in
+    // the command line the line discipline echoes before any shell reads it, so a
+    // wait for that is over before the expansion happens.
+    client.input(0, b"echo \"sock=[${SSH_AUTH_SOCK:-none}]\"\n");
+    let (seen, _) = client.read_until("none]", ok.resume_from);
     assert!(
         !seen.contains(&session.agent_socket().display().to_string()),
         "the child was pointed at an agent socket the daemon does not serve, so \
@@ -185,6 +189,26 @@ fn agent_channels_are_capped() {
     drop(held);
 }
 
+/// Regression: an id is not reissued once its own channel has closed, so an
+/// `AgentClose` and an `AgentOpen` crossing in flight cannot alias (§ 6.7).
+#[test]
+fn an_agent_channel_id_outlives_the_channel_that_held_it() {
+    let (session, mut client, _) = Session::attached_with("agent_ids", HELLO_AGENT_FORWARD);
+
+    let peer = session.connect_agent();
+    let closed = client.next_chan(FrameType::AgentOpen);
+    drop(peer);
+    assert_eq!(client.next_chan(FrameType::AgentClose), closed);
+
+    let _next = session.connect_agent();
+    assert_ne!(
+        client.next_chan(FrameType::AgentOpen),
+        closed,
+        "the id of a closed channel was reissued, and a client that has not yet read \
+         the AgentClose cannot tell the two apart"
+    );
+}
+
 /// The *per-channel* queue is capped too, and reaching it costs that channel and
 /// nothing else.
 ///
@@ -219,7 +243,7 @@ fn an_agent_channel_whose_queue_outgrows_the_cap_is_closed_alone() {
     const OVERSHOOT: usize = 256 * 1024;
 
     let (session, mut client, ok) = Session::attached_with("agent_queue", HELLO_AGENT_FORWARD);
-    let ready = client.make_ready("-echo", None, ok.resume_from);
+    client.make_ready("-echo", None, ok.resume_from);
 
     let capacity = socket_capacity();
 
@@ -284,26 +308,77 @@ fn an_agent_channel_whose_queue_outgrows_the_cap_is_closed_alone() {
     );
 
     // And the session itself, which is what a client would actually notice losing.
-    client.input(ready.in_offset, b"echo NOMUX-STILL-SERVING\n");
-    client.read_until("NOMUX-STILL-SERVING", ready.offset);
+    still_serving(&mut client, "NOMUX-STILL-SERVING");
 }
 
-/// Ids come from a cursor that only ever moves forward onto an id no live channel
-/// holds, so a channel closing and another opening cannot be confused for one
-/// another. It wraps at `u32::MAX` rather than refusing (§ 6.7); what this pins is
-/// the property that survives the wrap, which is non-aliasing, not the counter.
-#[test]
-fn agent_channel_ids_are_never_reused() {
-    let (session, mut client, _) = Session::attached_with("agent_ids", HELLO_AGENT_FORWARD);
+/// One agent channel the daemon is left holding a queue for, closed by the client
+/// against a peer that has read none of it.
+///
+/// The state both regressions below are about, and the whole of what they share.
+struct Overqueued {
+    session: Session,
+    client: harness::Client,
+    /// The local `ssh-add`'s end of the channel, which has read nothing.
+    peer: UnixStream,
+    /// How much the client pushed at it.
+    sent: usize,
+    /// What a unix socket on this host took of that before it stopped taking any.
+    capacity: usize,
+}
 
-    let mut previous = 0;
-    for round in 0..4 {
-        let agent = session.connect_agent();
-        let chan = client.next_chan(FrameType::AgentOpen);
-        assert!(chan > previous, "round {round}: id {chan} did not advance");
-        previous = chan;
-        drop(agent);
-        assert_eq!(client.next_chan(FrameType::AgentClose), chan);
+/// Builds [`Overqueued`] on a session named `name`.
+///
+/// The queue is what the close has to find for the channel to outlive it, so it is
+/// grown a frame at a time, each fenced by a round trip the daemon can only answer by
+/// having read it: the daemon queues everything it decodes in one pass and writes it
+/// out on the pass after, so handing it the lot at once would take the queue past
+/// `MAX_CHANNEL_QUEUE` and have the channel closed for *that* instead — which looks
+/// nothing like the state these tests are about.
+///
+/// Nothing answers an `AgentClose` — the client closed the channel and has already
+/// forgotten it — so the round trip through the child behind it is what says the
+/// daemon has acted on it, frames being handled in the order they arrive. It is also
+/// the first half of the session still working.
+fn overqueued_then_closed(name: &str) -> Overqueued {
+    /// One `AgentData` frame per round, and small beside `MAX_CHANNEL_QUEUE`: the
+    /// daemon closes a channel whose queue outgrows that, which would take away the
+    /// very state under test.
+    const CHUNK: usize = 32 * 1024;
+    /// How far past what the peer's socket will hold the client sends. It is what is
+    /// left over that the daemon has to keep, and it has to be enough to be certain
+    /// of — but comfortably short of `MAX_CHANNEL_QUEUE`.
+    const OVERSHOOT: usize = 96 * 1024;
+
+    let (session, mut client, ok) = Session::attached_with(name, HELLO_AGENT_FORWARD);
+    // `-echo` so that everything on the output stream is the child answering rather
+    // than the line discipline repeating the question, which is what lets the markers
+    // below be read one after the other from a stream that joins up.
+    client.make_ready("-echo", None, ok.resume_from);
+
+    let capacity = socket_capacity();
+    let peer = session.connect_agent();
+    let chan = client.next_chan(FrameType::AgentOpen);
+
+    let filler = vec![b'k'; CHUNK];
+    let mut sent = 0usize;
+    while sent < capacity + OVERSHOOT {
+        client.send(&Frame::AgentData {
+            chan,
+            data: &filler,
+        });
+        sent += filler.len();
+        client.send(&Frame::Ping { nonce: 0x5EED });
+        drop(client.next_of(FrameType::Pong));
+    }
+
+    client.send(&Frame::AgentClose { chan });
+    still_serving(&mut client, "NOMUX-CLOSE-ACTED-ON");
+    Overqueued {
+        session,
+        client,
+        peer,
+        sent,
+        capacity,
     }
 }
 
@@ -325,71 +400,21 @@ fn agent_channel_ids_are_never_reused() {
 /// Nothing arrives to be asserted about, so the assertion is over a window with a fence
 /// at each end: the close is acted on before the peer goes, and the marker after it can
 /// only be answered by a daemon that has been round its loop since. Every frame in
-/// between is read, and an `AgentClose` among them is the bug.
+/// between is read, and `read_until` fails the test on any that is not the session's
+/// own chatter — an `AgentClose` among them being the bug.
 #[test]
 fn a_failed_write_on_a_closed_agent_channel_is_never_announced() {
-    /// One `AgentData` frame per round, well short of `MAX_CHANNEL_QUEUE`, which the
-    /// daemon would answer by closing the channel and taking the state away.
-    const CHUNK: usize = 32 * 1024;
-    /// How far past what the peer's socket will hold the client sends: what is left
-    /// over is what the daemon still owes when the peer goes.
-    const OVERSHOOT: usize = 96 * 1024;
-
-    let (session, mut client, ok) = Session::attached_with("agent_epipe", HELLO_AGENT_FORWARD);
-    let ready = client.make_ready("-echo", None, ok.resume_from);
-
-    let capacity = socket_capacity();
-    let agent = session.connect_agent();
-    let chan = client.next_chan(FrameType::AgentOpen);
-
-    // A frame at a time, each fenced by a round trip the daemon can only answer by
-    // having read it, so the queue crosses what the socket holds without ever crossing
-    // the cap that would close the channel.
-    let filler = vec![b'e'; CHUNK];
-    let mut sent = 0usize;
-    while sent < capacity + OVERSHOOT {
-        client.send(&Frame::AgentData {
-            chan,
-            data: &filler,
-        });
-        sent += filler.len();
-        client.send(&Frame::Ping { nonce: 0x0C10 });
-        drop(client.next_of(FrameType::Pong));
-    }
-
-    // Nothing answers an `AgentClose`, so the round trip through the child behind it is
-    // what says the daemon has acted on it — and the channel outlives it, since the
-    // queue above is provably more than the peer has taken.
-    client.send(&Frame::AgentClose { chan });
-    let before = b"echo NOMUX-CLOSE-ACTED-ON\n";
-    client.input(ready.in_offset, before);
-    let (_, from) = client.read_until("NOMUX-CLOSE-ACTED-ON", ready.offset);
+    let Overqueued {
+        session: _session,
+        mut client,
+        peer,
+        ..
+    } = overqueued_then_closed("agent_epipe");
 
     // The `ssh-add` on the other end exits with the reply still queued.
-    drop(agent);
+    drop(peer);
 
-    client.input(
-        ready.in_offset + before.len() as u64,
-        b"echo NOMUX-STILL-SERVING\n",
-    );
-    let deadline = Instant::now() + FRAME_PATIENCE;
-    let mut seen = String::new();
-    while !seen.contains("NOMUX-STILL-SERVING") {
-        let (ty, payload) = client
-            .frame_before(deadline, "the session's answer after the peer went")
-            .expect("the daemon went quiet with a failed write still to account for");
-        assert_ne!(
-            ty,
-            FrameType::AgentClose,
-            "the daemon answered a failed write with an AgentClose for channel {chan}, \
-             which the client closed itself and has already forgotten"
-        );
-        if let Ok(Frame::Output { offset, data }) = Frame::decode(ty, &payload)
-            && offset >= from
-        {
-            seen.push_str(&String::from_utf8_lossy(data));
-        }
-    }
+    still_serving(&mut client, "NOMUX-STILL-SERVING");
 }
 
 /// Regression: a channel the client has closed against a peer that stopped reading
@@ -413,77 +438,27 @@ fn a_failed_write_on_a_closed_agent_channel_is_never_announced() {
 /// order of magnitude below one core and cannot be reached by a loaded machine
 /// scheduling a daemon that has nothing to do.
 ///
-/// The window is a wall-clock interval rather than a wait for a condition, since it
-/// *is* the measurement. Everything it needs to be true was established before it
-/// started: the queue is provably non-empty, the close has provably been acted on,
-/// and the drain afterwards proves the channel was still there to be spun on.
+/// Everything [`cpu_ticks`]'s window needs to be true was established before it
+/// starts: the queue is provably non-empty, the close has provably been acted on, and
+/// the drain afterwards proves the channel was still there to be spun on.
 #[test]
 fn a_closed_agent_channel_whose_peer_stopped_reading_leaves_the_daemon_asleep() {
-    /// One `AgentData` frame per round, and small beside `MAX_CHANNEL_QUEUE`: the
-    /// daemon closes a channel whose queue outgrows that, which would take away the
-    /// very state under test.
-    const CHUNK: usize = 32 * 1024;
-    /// How far past what the socket will hold the client sends. It is what is left
-    /// over that the daemon has to keep, and it has to be enough to be certain of —
-    /// but comfortably short of `MAX_CHANNEL_QUEUE`, which the daemon would answer by
-    /// closing the channel rather than holding it.
-    const OVERSHOOT: usize = 96 * 1024;
-    /// How long the daemon is watched for. Long enough that the bug would show up as
-    /// tens of ticks, short enough to keep the suite where it is.
-    const WINDOW: Duration = Duration::from_millis(300);
-    /// Five ticks is 50 ms of processor time against 300 ms of wall clock: a sixth of
-    /// one core, where the bug is a whole one and the fix is exactly zero.
-    const TOLERATED: u32 = 5;
+    /// Five ticks is 50 ms of processor time against [`SPIN_WINDOW`]: a tenth of one
+    /// core, where the bug is a whole one and the fix is exactly zero.
+    const TOLERATED: u64 = 5;
 
-    let (session, mut client, ok) = Session::attached_with("agent_spin", HELLO_AGENT_FORWARD);
-    // `-echo` so that everything on the output stream is the child answering rather
-    // than the line discipline repeating the question, which is what lets the two
-    // markers below be read one after the other from a stream that joins up.
-    let ready = client.make_ready("-echo", None, ok.resume_from);
+    let Overqueued {
+        session,
+        mut client,
+        peer: mut agent,
+        sent,
+        capacity,
+    } = overqueued_then_closed("agent_spin");
 
-    let capacity = socket_capacity();
-
-    let mut agent = session.connect_agent();
-    let chan = client.next_chan(FrameType::AgentOpen);
-
-    // Bytes the test's end of the channel is deliberately never going to read. Past
-    // `capacity` the kernel stops taking them and the rest stays in the daemon's own
-    // queue, which is what the close below has to find for the channel to outlive it.
-    //
-    // A frame at a time, each fenced by a round trip the daemon can only answer by
-    // having read it. The daemon queues everything it decodes in one pass and writes
-    // it out on the pass after, so handing it the lot at once would take the queue
-    // past `MAX_CHANNEL_QUEUE` and have the channel closed for that instead — which
-    // looks nothing like the state this is about and would still leave the daemon
-    // asleep.
-    let filler = vec![b'k'; CHUNK];
-    let mut sent = 0usize;
-    while sent < capacity + OVERSHOOT {
-        client.send(&Frame::AgentData {
-            chan,
-            data: &filler,
-        });
-        sent += filler.len();
-        client.send(&Frame::Ping { nonce: 0x5EED });
-        drop(client.next_of(FrameType::Pong));
-    }
-
-    // Nothing answers an `AgentClose` — the client closed the channel and has already
-    // forgotten it — so the round trip through the child behind it is what says the
-    // daemon has acted on it, frames being handled in the order they arrive. It is
-    // also the first half of the session still working.
-    client.send(&Frame::AgentClose { chan });
-    let before = b"echo NOMUX-CLOSE-ACTED-ON\n";
-    client.input(ready.in_offset, before);
-    let (_, offset) = client.read_until("NOMUX-CLOSE-ACTED-ON", ready.offset);
-
-    let daemon = session.child.id();
-    let began = cpu_ticks(daemon);
-    thread::sleep(WINDOW);
-    let burned = cpu_ticks(daemon).saturating_sub(began);
+    let burned = cpu_ticks(session.child.id());
     assert!(
         burned <= TOLERATED,
-        "the daemon burned {burned} clock ticks in {WINDOW:?} holding one closed \
+        "the daemon burned {burned} clock ticks in {SPIN_WINDOW:?} holding one closed \
          agent channel, with a shell that is doing nothing and a client that is \
          asking for nothing"
     );
@@ -509,9 +484,5 @@ fn a_closed_agent_channel_whose_peer_stopped_reading_leaves_the_daemon_asleep() 
          than the {capacity} bytes already in the kernel could have arrived"
     );
 
-    client.input(
-        ready.in_offset + before.len() as u64,
-        b"echo NOMUX-STILL-SERVING\n",
-    );
-    client.read_until("NOMUX-STILL-SERVING", offset);
+    still_serving(&mut client, "NOMUX-STILL-SERVING");
 }

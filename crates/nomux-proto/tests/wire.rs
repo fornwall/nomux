@@ -40,24 +40,21 @@ struct Vector {
 
 /// Every vector, in discriminant order.
 ///
-/// Split into groups only to keep each list readable; the tests below and
-/// [`every_frame_type_has_a_vector`] treat them as one table.
+/// Split into groups only to keep each list readable; the tests below treat them as
+/// one table.
 ///
 /// Byte patterns are ascending and distinct per field so that a swap between two
 /// same-width neighbours — the failure a round-trip test cannot see — changes the
 /// expected bytes.
 ///
 /// Both handshake frames appear more than once, because distinct values catch a swap
-/// between two fields and do nothing about a swap *inside* one. A flag bit or an
-/// enumerator exercised at a single value is pinned only against being renumbered
-/// wholesale: give `Hello` both of its flags at once and their two bits can trade
-/// places without moving a byte. So each repeat is chosen to disagree with the
-/// ones before it on every bit and every enumerator that has one — which is what
-/// makes § 2.3 a table this file actually checks, rather than one the codec merely
-/// agrees with itself about. Each of the two takes three: [`Linger`] has three values
-/// and [`every_linger_state_has_a_vector`] insists on all of them, and two `Hello`
-/// vectors cannot both show the bits set together and show each of them clear, which
-/// [`every_hello_flag_bit_is_pinned_in_both_states`] insists on.
+/// between two fields and do nothing about a swap *inside* one. So each repeat is
+/// chosen to disagree with the ones before it on every bit and every enumerator that
+/// has one — which is what makes § 2.3 a table this file actually checks, rather than
+/// one the codec merely agrees with itself about. Three of each, which is what
+/// [`the_vectors_pin_every_value_of_every_closed_set`] insists on: [`Linger`] has
+/// three values, and two `Hello` vectors cannot both show the bits set together and
+/// show each of them clear.
 fn vectors() -> Vec<Vector> {
     let mut all = hello_vectors();
     all.extend(hello_ok_vectors());
@@ -414,212 +411,79 @@ fn documented_bytes_decode_to_their_frames() {
     }
 }
 
-/// Every frame type has a vector, so a new one cannot be added without writing
-/// down what it looks like on the wire.
+/// Every closed set on this wire is written down in bytes above, at every value it
+/// has, and the handshake vectors are written at the revision this build speaks.
 ///
-/// Driven from [`FrameType::ALL`], which the discriminant list generates, rather
-/// than from a range of bytes written out here: a hand-written `0x01..=0x10` stops
-/// covering the protocol the moment the protocol grows, and does it quietly, which
-/// is the failure this test exists to prevent.
+/// One pass rather than a test per set: six readings of the one question, which is
+/// what the vectors leave un-pinned.
+///
+/// Swept from each set's `ALL` rather than from a list written out here, which would
+/// stop covering the protocol the moment the protocol grew, and quietly. The two flags
+/// bytes have no `ALL` and are destructured exhaustively instead, for the same
+/// property reached the other way round: a bool added to either stops this file
+/// compiling. Both states of each, because a bit exercised at one value is pinned only
+/// against being renumbered wholesale — give `Hello` both of its flags at once and the
+/// two can trade places without moving a byte. The revision rides along because the
+/// `Hello` vectors write it out as a literal like everything else in them, which is
+/// what makes them a check on the document rather than on the encoder and equally what
+/// would let them pass at one the daemon refuses; `HelloOk` carries none (§ 2.2).
 #[test]
-fn every_frame_type_has_a_vector() {
-    let covered: Vec<FrameType> = vectors().iter().map(|v| v.frame.frame_type()).collect();
+fn the_vectors_pin_every_value_of_every_closed_set() {
+    let mut types = Vec::new();
+    let mut kinds = Vec::new();
+    let mut lingers = Vec::new();
+    let mut hello_flags = Vec::new();
+    let mut agent_flags = Vec::new();
+
+    for Vector { frame, .. } in vectors() {
+        types.push(frame.frame_type());
+        match frame {
+            Frame::Hello(Hello {
+                protocol,
+                agent_forward,
+                repaint_ctrl_l,
+                out_offset: _,
+                win: _,
+                term: _,
+            }) => {
+                assert_eq!(
+                    protocol, PROTOCOL_VERSION,
+                    "a handshake vector is written at a revision the daemon would \
+                     refuse: {frame:?}"
+                );
+                hello_flags.push([agent_forward, repaint_ctrl_l]);
+            }
+            Frame::HelloOk(HelloOk {
+                resume_from: _,
+                in_applied: _,
+                win: _,
+                linger,
+                agent,
+            }) => {
+                lingers.push(linger);
+                agent_flags.push(agent);
+            }
+            Frame::Exit { kind, .. } => kinds.push(kind),
+            _ => {}
+        }
+    }
+
     for ty in FrameType::ALL {
-        assert!(covered.contains(&ty), "{ty:?} has no wire vector");
+        assert!(types.contains(&ty), "{ty:?} has no wire vector");
     }
-}
-
-/// Every `Exit.kind` has a vector, so both are pinned on bytes rather than one
-/// being inferred from the other.
-///
-/// Swept from [`ExitKind::ALL`] for the reason [`every_frame_type_has_a_vector`]
-/// gives: a hand-written list of the kinds to check is a list that stops covering
-/// the set the moment the set grows, and does it in silence.
-#[test]
-fn every_exit_kind_has_a_vector() {
-    let covered: Vec<ExitKind> = vectors()
-        .iter()
-        .filter_map(|v| match v.frame {
-            Frame::Exit { kind, .. } => Some(kind),
-            _ => None,
-        })
-        .collect();
     for kind in ExitKind::ALL {
-        assert!(covered.contains(&kind), "{kind:?} has no wire vector");
+        assert!(kinds.contains(&kind), "{kind:?} has no wire vector");
     }
-}
-
-/// Every `HelloOk.linger` state has a vector.
-///
-/// Swept from [`Linger::ALL`], so all three values are written down in bytes: taking
-/// one of them on faith as the number the other two leave over is an argument about
-/// those vectors rather than a check on this one.
-#[test]
-fn every_linger_state_has_a_vector() {
-    let covered: Vec<Linger> = vectors()
-        .iter()
-        .filter_map(|v| match v.frame {
-            Frame::HelloOk(ok) => Some(ok.linger),
-            _ => None,
-        })
-        .collect();
     for linger in Linger::ALL {
-        assert!(covered.contains(&linger), "{linger:?} has no wire vector");
+        assert!(lingers.contains(&linger), "{linger:?} has no wire vector");
     }
-}
-
-/// Every `Hello` flag appears both set and clear across the vectors.
-///
-/// The sweep the `ALL`-driven ones have, for a closed set with no `ALL` to drive it:
-/// a flag exercised at a single value is pinned only against being renumbered
-/// wholesale, so an encoder that always asserted its bit would move no byte any
-/// other test here compares.
-#[test]
-fn every_hello_flag_bit_is_pinned_in_both_states() {
-    let mut flags = Vec::new();
-
-    for vector in vectors() {
-        // Destructured exhaustively for the reason
-        // [`every_hello_ok_flag_is_pinned_in_both_states`] gives.
-        if let Frame::Hello(Hello {
-            protocol: _,
-            agent_forward,
-            repaint_ctrl_l,
-            out_offset: _,
-            win: _,
-            term: _,
-        }) = vector.frame
-        {
-            flags.push([agent_forward, repaint_ctrl_l]);
+    for (state, verb) in [(true, "sets"), (false, "clears")] {
+        for (bit, name) in [(0, "agent_forward"), (1, "repaint_ctrl_l")] {
+            let pinned = hello_flags.iter().any(|flags| flags[bit] == state);
+            assert!(pinned, "no Hello vector {verb} {name}");
         }
-    }
-
-    for (bit, name) in [(0, "agent_forward"), (1, "repaint_ctrl_l")] {
-        assert!(
-            flags.iter().any(|set| set[bit]),
-            "no Hello vector sets {name}"
-        );
-        assert!(
-            flags.iter().any(|set| !set[bit]),
-            "no Hello vector clears {name}"
-        );
-    }
-}
-
-/// Every `HelloOk` flag appears set and clear across the vectors.
-///
-/// [`every_hello_flag_bit_is_pinned_in_both_states`] for the other flags byte. The
-/// three vectors above do cover both states today and say so in their comments, but
-/// prose is not what fails when an edit drops that vector.
-///
-/// `Linger` is a byte of its own and is covered by
-/// [`every_linger_state_has_a_vector`].
-#[test]
-fn every_hello_ok_flag_is_pinned_in_both_states() {
-    let mut agent = Vec::new();
-
-    for vector in vectors() {
-        // Destructured exhaustively rather than read field by field, which is what
-        // gives this sweep the property the `ALL`-driven ones have for free: a
-        // second bool added to the flags byte stops this file compiling until it is
-        // swept here too, instead of going quietly unpinned.
-        if let Frame::HelloOk(HelloOk {
-            resume_from: _,
-            in_applied: _,
-            win: _,
-            linger: _,
-            agent: this_agent,
-        }) = vector.frame
-        {
-            agent.push(this_agent);
-        }
-    }
-
-    assert!(
-        agent.iter().any(|set| *set),
-        "no HelloOk vector sets the agent flag"
-    );
-    assert!(
-        agent.iter().any(|set| !*set),
-        "no HelloOk vector clears the agent flag"
-    );
-}
-
-/// The revision the `Hello` vectors are written at is the one this build speaks.
-///
-/// The three of them write it out as a literal, the way everything else in them is
-/// written out from § 2.2 — which is what makes them a check on the document rather
-/// than on the encoder, and equally what would let them go on passing at a revision
-/// the daemon refuses. That refusal is the failure the daemon is built to make loud:
-/// it turns away a `Hello` whose `protocol` is not [`PROTOCOL_VERSION`], so a client
-/// built from a § 2.2 written at one number, against a daemon speaking another, is
-/// stopped at the handshake with every vector here still green.
-///
-/// `HelloOk` is not swept because it no longer carries a revision: the daemon has
-/// already accepted the client's by the time it answers (§ 2.2).
-///
-/// [`the_frozen_numbers_are_the_ones_the_document_gives`] holds the constant against
-/// the document; this holds the literals against the constant. Between them the
-/// vectors carry the number the code will accept rather than merely a number.
-#[test]
-fn the_handshake_vectors_are_written_at_the_revision_this_build_speaks() {
-    let mut seen = 0;
-    for vector in vectors() {
-        let Frame::Hello(hello) = vector.frame else {
-            continue;
-        };
-        seen += 1;
-        assert_eq!(
-            hello.protocol, PROTOCOL_VERSION,
-            "a handshake vector is written at a revision the daemon would refuse: \
-             {:?}",
-            vector.frame
-        );
-    }
-    assert!(seen > 0, "no Hello vector carries a revision to check");
-}
-
-/// The `Error` codes are the numbers § 2.2 gives them.
-///
-/// A frame carries one code at a time, so the vector above can pin exactly one of
-/// the five and a table is the only way to reach the rest. Without it, the daemon
-/// and the suite would both name them symbolically and so agree on any renumbering,
-/// while only the client — built from § 2.2 — disagreed.
-///
-/// The numbers are written out by hand because they have to come from the document
-/// rather than from the code under test. *Which* codes the table has to carry does
-/// not: that is swept from [`ErrorCode::ALL`], so a code added to the protocol and
-/// not to this table fails here instead of going quietly unchecked. The two
-/// directions are checked separately for the reason the module doc gives:
-/// `from_u16(as_u16(c)) == c` holds under any renumbering consistent with itself.
-#[test]
-fn error_codes_are_the_numbers_the_table_gives_them() {
-    let documented: [(ErrorCode, u16); 5] = [
-        (ErrorCode::Protocol, 1),
-        (ErrorCode::Takeover, 2),
-        (ErrorCode::Version, 3),
-        (ErrorCode::InputGap, 4),
-        (ErrorCode::Internal, 5),
-    ];
-
-    for (code, number) in documented {
-        assert_eq!(
-            code.as_u16(),
-            number,
-            "{code:?} does not encode to the number IMPLEMENTATION.md § 2.2 gives it"
-        );
-        assert_eq!(
-            ErrorCode::from_u16(number),
-            Some(code),
-            "{number} does not decode to the code IMPLEMENTATION.md § 2.2 gives it"
-        );
-    }
-
-    for code in ErrorCode::ALL {
-        assert!(
-            documented.iter().any(|&(listed, _)| listed == code),
-            "{code:?} is on no line of the table IMPLEMENTATION.md § 2.2 gives"
-        );
+        let pinned = agent_flags.contains(&state);
+        assert!(pinned, "no HelloOk vector {verb} the agent flag");
     }
 }
 
@@ -672,36 +536,53 @@ fn the_length_field_is_a_u24_past_its_low_byte() {
     }
 }
 
-/// Every frozen number, held against the document rather than against itself.
+/// Every number this wire freezes, held against the document rather than against
+/// itself.
 ///
-/// One table, because these are the numbers a second implementation reads out of the
-/// document rather than out of this crate. Both are already held against a hand-written
-/// literal somewhere, and are here for the citation rather than for the arithmetic. The
-/// `Hello` vectors write `PROTOCOL_VERSION` out as `5` and
-/// [`the_handshake_vectors_are_written_at_the_revision_this_build_speaks`] compares
-/// them; the largest legal frame in
-/// [`the_length_field_is_a_u24_past_its_low_byte`] encodes its length as the literal
-/// `0x04_00_00`. So moving either constant alone already fails. What those two cannot
-/// see is the edit that moves the constant *and* the literals together, which is
-/// exactly what a revision bump looks like — and which is a change to the wire that
-/// § 2.1 and § 2.2 have not been told about.
+/// It matters because the far end is a separate codebase built from the document: a
+/// client whose § 2.2 disagrees is turned away at the handshake, and one built from a
+/// § 2.1 sending a legal 256 KiB frame collects `Error{Protocol}`. So the numbers are
+/// written out by hand here, and each carries the section it was read from — that
+/// citation is the whole difference between a failure here and one answered by
+/// editing the expectation.
 ///
-/// It matters because the far end is a separate codebase built from the document. A
-/// client whose § 2.2 disagrees is turned away at the handshake; one built from § 2.1
-/// sending a legal 256 KiB frame collects `Error{Protocol}`.
+/// A frame carries one enumerator at a time, so the vectors above pin one value of
+/// each set and a table is the only way to reach the rest; without it the daemon and
+/// this suite would both name them symbolically and so agree on any renumbering, while
+/// only the client disagreed. Both directions, for the reason the module doc gives:
+/// `from_u16(as_u16(c)) == c` holds under any renumbering consistent with itself. And
+/// *which* values each set has to carry is swept from its `ALL` rather than written
+/// down twice, so one added to the protocol and not to this table fails here.
 ///
-/// Two rows, because only these two are on the wire. The id length § 6.3 fixes and
-/// the channel cap § 6.7 fixes are pinned this same way beside the code that enforces
-/// them, by `rundir::tests::the_session_id_bound_is_the_one_the_document_gives` and
+/// The two scalars are already held against a hand-written literal somewhere — the
+/// `Hello` vectors write `PROTOCOL_VERSION` out as `5`, and the largest legal frame in
+/// [`the_length_field_is_a_u24_past_its_low_byte`] encodes its length as `0x04_00_00`
+/// — so moving either alone already fails. What that cannot see is the edit which
+/// moves the constant *and* the literals together, which is exactly what a revision
+/// bump looks like and is a change to the wire § 2.1 and § 2.2 have not been told
+/// about.
+///
+/// The id length § 6.3 fixes and the channel cap § 6.7 fixes are pinned this same way
+/// beside the code that enforces them, by
+/// `rundir::tests::the_session_id_bound_is_the_one_the_document_gives` and
 /// `agent::tests::the_channel_cap_is_the_one_the_document_gives`.
-///
-/// The numbers are written out by hand, since they have to come from the document
-/// rather than from the code under test, and every row carries the section it was
-/// read from — that citation is the whole difference between a failure here and one
-/// answered by editing the expectation.
 #[test]
 fn the_frozen_numbers_are_the_ones_the_document_gives() {
-    let documented: [(&str, u64, u64, &str); 2] = [
+    /// One closed set, written the way § 2.2 writes it.
+    macro_rules! frozen {
+        ($ty:ty, $to:ident / $from:ident, $($name:ident = $number:literal),+) => {
+            for (value, number) in [$((<$ty>::$name, $number)),+] {
+                assert_eq!(value.$to(), number, "{value:?} is not the § 2.2 number");
+                assert_eq!(<$ty>::$from(number), Some(value), "{number} is not {value:?}");
+            }
+            for value in <$ty>::ALL {
+                let listed = [$(<$ty>::$name),+].contains(&value);
+                assert!(listed, "{value:?} is on no line of § 2.2's table");
+            }
+        };
+    }
+
+    for (name, held, expected, section) in [
         (
             "PROTOCOL_VERSION",
             u64::from(PROTOCOL_VERSION),
@@ -714,12 +595,28 @@ fn the_frozen_numbers_are_the_ones_the_document_gives() {
             262_144,
             "§ 2.1 caps a payload at 256 KiB",
         ),
-    ];
-
-    for (name, held, expected, section) in documented {
+    ] {
         assert_eq!(
             held, expected,
             "{name} is {held}, and IMPLEMENTATION.md {section}"
         );
     }
+
+    frozen!(
+        ErrorCode,
+        as_u16 / from_u16,
+        Protocol = 1,
+        Takeover = 2,
+        Version = 3,
+        InputGap = 4,
+        Internal = 5
+    );
+    frozen!(
+        Linger,
+        as_byte / from_byte,
+        Unknown = 0,
+        Disabled = 1,
+        Enabled = 2
+    );
+    frozen!(ExitKind, as_byte / from_byte, Exited = 0, Signalled = 1);
 }

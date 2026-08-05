@@ -522,6 +522,25 @@ pub(crate) fn session_id_of(path: &Path) -> Option<&str> {
     is_valid_session_id(id).then_some(id)
 }
 
+/// Every distinct session id `dir` holds, and none at all where it cannot be read.
+///
+/// One entry per session, not per file (§ 6.6).
+pub(crate) fn session_ids(dir: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut ids: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            session_id_of(&path).map(str::to_owned)
+        })
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 /// The five names § 6.6 freezes for one session, and the id that finds whatever else
 /// it has.
 #[derive(Debug)]
@@ -625,7 +644,7 @@ impl SessionPaths {
 
     /// `flock` target serialising daemon spawn.
     #[must_use]
-    fn lock(&self) -> PathBuf {
+    pub(crate) fn lock(&self) -> PathBuf {
         self.with_extension("lock")
     }
 

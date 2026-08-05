@@ -17,16 +17,16 @@
 
 mod harness;
 
+use std::fs;
 use std::io::{ErrorKind, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
-use std::{fs, thread};
 
 use nomux_proto::{Frame, FrameType, HEADER_LEN, RESUME_FROM_START, decode_header};
 
 use harness::{
-    FRAME_PATIENCE, Session, cpu_ticks, hello_frame, poll_until, push_until_refused,
-    read_uninterrupted, wait_for, write_frame,
+    FRAME_PATIENCE, SPIN_WINDOW, Session, cpu_ticks, hello_frame, poll_until, push_until_refused,
+    read_uninterrupted, still_serving, wait_for, write_frame,
 };
 
 /// The PTY master is non-blocking, so a child that has stopped reading cannot
@@ -75,8 +75,8 @@ fn a_child_that_stops_reading_input_does_not_wedge_the_daemon() {
     );
 }
 
-/// A client writing faster than the child reads is back-pressured, not buffered
-/// without limit.
+/// A client writing faster than the child reads is back-pressured rather than
+/// buffered without limit, and reconnecting does not raise the ceiling.
 ///
 /// `Conn::rx` and `pending_input` had no cap, so a client could grow the daemon by
 /// however much it cared to send — and the two cheaper answers are both closed off,
@@ -84,58 +84,6 @@ fn a_child_that_stops_reading_input_does_not_wedge_the_daemon() {
 /// dropped once acknowledged, and refusing one with an `InputGap` would accuse a
 /// client that had done nothing wrong. So the daemon stops reading the socket
 /// instead, exactly as the output direction always has.
-///
-/// Measured as bytes the daemon would take, which bounds what it can be holding:
-/// everything it has is a subset of what crossed the socket.
-#[test]
-fn input_the_child_never_reads_is_back_pressured_rather_than_buffered() {
-    /// Comfortably more than every buffer between the two processes put together.
-    const BLAST: usize = 32 << 20;
-    /// Room for a megabyte of queued input, a megabyte of undecoded receive buffer
-    /// and the kernel's socket buffers, and nothing like room for [`BLAST`].
-    const TOLERATED: usize = 8 << 20;
-
-    let (session, mut client, ok) = Session::attached("input_cap");
-
-    // `raw` for the back pressure it keeps (see [`Client::make_ready`]); `sleep`
-    // then holds the terminal without reading a byte of it. No settling sleep is
-    // needed once the marker is back: the whole line is parsed before any of it
-    // runs, so the shell reads nothing more until `sleep 30` returns.
-    let ready = client.make_ready("raw -echo", Some("sleep 30"), ok.resume_from);
-    drop(client);
-
-    // A raw socket rather than the harness client, because the question is how much
-    // the daemon will take before it stops taking.
-    let mut blaster = blaster(&session);
-    let (frames, _) = input_frames(BLAST, ready.in_offset);
-
-    // A second of refusal, which is long enough that a daemon merely busy with
-    // the megabytes it already took would have come back for more. Paid in full on
-    // every run, since a daemon that has stopped never comes back — so it is one
-    // second rather than the three it was, which is the figure
-    // [`a_client_that_never_reads_its_answers_is_dropped_rather_than_queued_for`]
-    // has always used for the same measurement.
-    let sent = push_until_refused(&mut blaster, &frames, Duration::from_secs(1));
-    assert!(
-        sent < TOLERATED,
-        "the daemon took {sent} bytes of input for a child that read none of them"
-    );
-
-    // And it is still serving. A fresh connection is never held back — that is what
-    // keeps `list` and the spawn race working (§ 6.6) — so the handshake it gets
-    // back is both proof the loop is alive and a statement about the input the
-    // daemon really did accept.
-    let mut client = session.connect();
-    let resumed = client.hello(RESUME_FROM_START);
-    let applied = resumed.in_applied.saturating_sub(ready.in_offset);
-    assert!(applied > 0, "the daemon applied none of the input it took");
-    assert!(
-        applied <= sent as u64,
-        "the daemon applied {applied} bytes of input from {sent} bytes of frames"
-    );
-}
-
-/// Reconnecting must not raise the ceiling.
 ///
 /// Holding the client out of the poll set throttles only the reads the poll set
 /// drives, and that is not where the queue grows. The takeover path of § 6.4.1 reaches
@@ -147,8 +95,8 @@ fn input_the_child_never_reads_is_back_pressured_rather_than_buffered() {
 ///
 /// `in_applied` is what is asserted on because it is exactly what the daemon has taken
 /// ownership of (§ 3): every byte queued for the PTY is below it, so a ceiling on it is
-/// a ceiling on the queue. The test above measures one connection and would keep
-/// passing with the cap in either place.
+/// a ceiling on the queue. One connection measured once would keep passing with the cap
+/// in either place, which is what every round after the first is for.
 #[test]
 fn reconnecting_does_not_raise_the_input_ceiling() {
     /// Enough per round that the old growth — a third of a megabyte a takeover —
@@ -157,6 +105,9 @@ fn reconnecting_does_not_raise_the_input_ceiling() {
     /// Linear growth over this many would be a megabyte past the cap and plain in
     /// the total; a ceiling is a ceiling after the second.
     const ROUNDS: usize = 4;
+    /// Room for a megabyte of queued input, a megabyte of undecoded receive buffer
+    /// and the kernel's socket buffers, and nothing like room for [`BLAST`].
+    const TOLERATED: usize = 8 << 20;
 
     let (session, mut client, ok) = Session::attached("input_ceiling");
 
@@ -181,15 +132,27 @@ fn reconnecting_does_not_raise_the_input_ceiling() {
 
         // The socket having refused everything for a quarter of a second is the daemon
         // having stopped taking input, so the ceiling is reached rather than merely
-        // approached — which is what makes the first round a fair baseline. Four
-        // rounds of the second the test above spends would be four seconds of
-        // waiting for a queue that is already full.
-        let _pushed = push_until_refused(&mut blaster, &frames, Duration::from_millis(250));
+        // approached — which is what makes the first round a fair baseline. A quarter
+        // rather than the whole second its neighbours spend, four rounds of which
+        // would be four seconds of waiting for a queue that is already full.
+        let pushed = push_until_refused(&mut blaster, &frames, Duration::from_millis(250));
+        assert!(
+            pushed < TOLERATED,
+            "round {round}: the daemon took {pushed} bytes of input for a child that \
+             read none of them"
+        );
 
         let mut probe = session.connect();
         let applied = probe.hello(RESUME_FROM_START).in_applied;
         drop(probe);
         drop(blaster);
+        // `in_applied` is exactly-once (§ 3) in both directions: a ceiling that only
+        // ever rose would satisfy the equality below by never moving at all.
+        assert!(
+            applied <= resume + pushed as u64,
+            "round {round}: the daemon claims {applied} applied of the {pushed} bytes \
+             offered from {resume}"
+        );
         resume = applied;
 
         let first = *ceiling.get_or_insert(applied);
@@ -631,17 +594,16 @@ fn a_client_that_never_reads_its_answers_is_dropped_rather_than_queued_for() {
     // replays from the ring. Nothing was ever read off this session, so a fresh client
     // driving one command through the shell is the whole of that claim.
     let mut client = session.connect();
-    let ok = client.hello(RESUME_FROM_START);
-    client.input(ok.in_applied, b"echo NOMUX-AFTER-ABANDON\n");
-    client.read_until("NOMUX-AFTER-ABANDON", ok.resume_from);
+    client.hello(RESUME_FROM_START);
+    still_serving(&mut client, "NOMUX-AFTER-ABANDON");
 }
 
 /// At least `at_least` bytes of encoded `Input` frames starting at `from`, and one
 /// past the last input offset they carry.
 ///
-/// Built in full before any of it is sent, because the two tests above measure how
-/// much of a buffer the daemon takes: encoding as they went would have them
-/// measuring this process instead.
+/// Built in full before any of it is sent, because its callers measure how much of a
+/// buffer the daemon takes: encoding as they went would have them measuring this
+/// process instead.
 fn input_frames(at_least: usize, from: u64) -> (Vec<u8>, u64) {
     let chunk = vec![b'x'; 60 * 1024];
     let mut frames = Vec::with_capacity(at_least + chunk.len());
@@ -722,22 +684,10 @@ fn blaster(session: &Session) -> UnixStream {
 /// gives, against the same window and the same tolerance.
 #[test]
 fn a_daemon_that_cannot_accept_stands_back_rather_than_spinning() {
-    /// Long enough that the bug shows up as tens of ticks, short enough to keep the
-    /// suite where it is.
-    ///
-    /// Half a second rather than the 300 ms the agent-channel test above uses,
-    /// because that is what separates the two answers well enough for a threshold to
-    /// sit between them under load. No figure is quoted for the spin: it is whatever
-    /// share of a core the scheduler hands the daemon, and three measurements of it
-    /// spread from the twenties to the forties. What the threshold rests on is the
-    /// other answer, which is not a share of anything — the fixed daemon sleeps
-    /// 100 ms at a time and wakes five times to fail one `accept`, so it measures
-    /// zero, and no amount of load moves zero.
-    const WINDOW: Duration = Duration::from_millis(500);
-    /// Five ticks is 50 ms of processor time against half a second of wall clock: a
-    /// tenth of one core, well under the lowest spin figure seen and unreachable by a
-    /// daemon that is asleep.
-    const TOLERATED: u32 = 5;
+    /// Five ticks is 50 ms of processor time against the half second [`SPIN_WINDOW`]
+    /// covers: a tenth of one core, well under the lowest spin figure seen and
+    /// unreachable by a daemon that is asleep.
+    const TOLERATED: u64 = 5;
 
     let session = Session::start("emfile");
     let daemon = session.child.id();
@@ -759,13 +709,11 @@ fn a_daemon_that_cannot_accept_stands_back_rather_than_spinning() {
     // queued by the listener, and the `accept` that is refused is what leaves it
     // there.
     let starved = UnixStream::connect(&session.socket).expect("knock on the door");
-    let began = cpu_ticks(daemon);
-    thread::sleep(WINDOW);
-    let burned = cpu_ticks(daemon).saturating_sub(began);
+    let burned = cpu_ticks(daemon);
     assert!(
         burned <= TOLERATED,
-        "the daemon burned {burned} clock ticks in {WINDOW:?} failing to accept one \
-         connection, with no client attached and no child running"
+        "the daemon burned {burned} clock ticks in {SPIN_WINDOW:?} failing to accept \
+         one connection, with no client attached and no child running"
     );
 
     // And the listener came back rather than being stood down for good: a backoff

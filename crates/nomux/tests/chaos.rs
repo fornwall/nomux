@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use nomux_proto::{Frame, RESUME_FROM_START};
 
-use harness::{Rng, Session};
+use harness::{Rng, Session, socket_capacity};
 
 /// Iterations of the escape-sequence emitter. Enough output to arrive as many
 /// separate reads, so disconnects land mid-stream rather than between commands.
@@ -79,6 +79,14 @@ fn emitter_command(rounds: u32) -> String {
          $((i%24+1)) $((i%256)) $i; i=$((i+1)); \
          [ $((i%{BURST})) -eq 0 ] && sleep 0.02 2>/dev/null; done; printf 'CHAOS-END'\n"
     )
+}
+
+/// What `yes` writes `since` bytes into its output.
+///
+/// Checking the firehose against position rather than against "a `y` or a newline" is
+/// what catches a byte dropped, duplicated or reordered inside the stream.
+const fn yes_byte(since: u64) -> u8 {
+    if since.is_multiple_of(2) { b'y' } else { b'\n' }
 }
 
 /// Index of the first occurrence of `needle` in `haystack`.
@@ -195,6 +203,10 @@ fn an_escape_heavy_stream_is_byte_exact_across_random_disconnects() {
 /// where you are" and then quietly handed a stream with a hole in it.
 #[test]
 fn overflow_during_disconnects_is_always_reported() {
+    /// `conn::MAX_PENDING_WRITE`, private to the daemon: what § 4.1 has it queue for a
+    /// slow client before it stops adding. Wanted only as an upper bound.
+    const QUEUED: usize = 1 << 20;
+
     let chaos_seed = chaos_seed();
     let session = Session::start_with_ring("chaos_firehose", 32 * 1024);
     let mut client = session.connect();
@@ -212,20 +224,18 @@ fn overflow_during_disconnects_is_always_reported() {
     // with output queued makes the kernel send RST, taking unread input with it —
     // and the test would sit waiting for a firehose that was never started.
     //
-    // Past a gap rather than refusing one, which `read_until` would: the daemon
-    // takes 64 KiB off the PTY in a single pass against the 32 KiB ring above, so
-    // `yes` can overrun this client between the input frame and the first output
-    // frame — and § 9 then *obliges* the daemon to report a `Gap`. Refusing it here
-    // would fail the test for the behaviour it exists to demand. The gap is not
-    // counted: `gaps` below is what the disconnect loop observed, and a setup that
-    // could satisfy the closing assertion on its own would leave that loop proving
-    // nothing. What this waits for is unchanged — a byte the firehose actually
-    // wrote — and the contiguity of everything between gaps is still asserted.
+    // Past a gap rather than refusing one, which `read_until` would: overflow against
+    // the 32 KiB ring is obliged here rather than a surprise (`read_past_gaps`). Neither
+    // counter below sees it, so a setup satisfying them on its own proves nothing.
     let (_, started) = client.read_past_gaps("y", offset);
     offset = started;
 
     let mut rng = Rng::new(chaos_seed);
-    let mut gaps = 0u32;
+    let capacity = socket_capacity();
+    // Two promises, counted apart: § 9 obliges the daemon to announce an overflow to a
+    // client that is *attached*, and to move the resume point of one that comes back.
+    let mut announced_gaps = 0u32;
+    let mut resume_gaps = 0u32;
     let mut received = 0u64;
     let deadline = Instant::now() + PATIENCE;
 
@@ -234,9 +244,16 @@ fn overflow_during_disconnects_is_always_reported() {
             Instant::now() < deadline,
             "firehose stalled (seed {chaos_seed})"
         );
-        // Read a few frames, then vanish for a moment so the ring overflows.
-        for _ in 0..=rng.below(4) {
+        // Read past everything already queued, because § 9's announcement is behind all
+        // of it: the daemon fills `QUEUED` and the socket beneath it, stops adding, and
+        // appends the `Gap` the overflow then owes to the back of that queue. By volume
+        // rather than by frame count, for the reason the sibling test gives; the random
+        // tail keeps the disconnect below off the announcement.
+        let through = QUEUED + capacity + usize::try_from(rng.below(16 * 1024)).unwrap_or(0);
+        let mut read = 0usize;
+        while read < through {
             let (ty, payload) = client.next_frame();
+            read += payload.len();
             match Frame::decode(ty, &payload).expect("decode frame") {
                 Frame::Output { offset: at, data } => {
                     assert_eq!(
@@ -244,12 +261,16 @@ fn overflow_during_disconnects_is_always_reported() {
                         "round {round}: output must be contiguous unless a gap said otherwise \
                          (seed {chaos_seed})"
                     );
+                    let since = at - ready.offset;
+                    let wrong = (data.iter().enumerate())
+                        .position(|(i, byte)| *byte != yes_byte(since + i as u64));
+                    assert!(
+                        wrong.is_none(),
+                        "round {round}: byte {wrong:?} of the frame at {at} is not the one \
+                         the firehose wrote there (seed {chaos_seed})"
+                    );
                     offset += data.len() as u64;
                     received += data.len() as u64;
-                    assert!(
-                        data.iter().all(|byte| *byte == b'y' || *byte == b'\n'),
-                        "round {round}: stream corrupted (seed {chaos_seed})"
-                    );
                 }
                 Frame::Gap { new_base_offset } => {
                     assert!(
@@ -257,7 +278,7 @@ fn overflow_during_disconnects_is_always_reported() {
                         "round {round}: a gap must move the stream forward (seed {chaos_seed})"
                     );
                     offset = new_base_offset;
-                    gaps += 1;
+                    announced_gaps += 1;
                 }
                 Frame::InputAck { .. } | Frame::Pong { .. } => {}
                 other => panic!("round {round}: unexpected {other:?} (seed {chaos_seed})"),
@@ -272,21 +293,23 @@ fn overflow_during_disconnects_is_always_reported() {
             resumed.resume_from >= offset,
             "round {round}: the daemon must never rewind (seed {chaos_seed})"
         );
-        // A moved resume point is exactly what a gap is, which used to be asserted
-        // here against a flag the daemon sent separately. The flag is gone and the
-        // equality is now the definition (`HelloOk::gap`), so what is left to count
-        // is how often it happened.
+        // A moved resume point is exactly what a gap is (`HelloOk::gap`), so what is
+        // left to count is how often it happened.
         if resumed.gap(offset) {
-            gaps += 1;
+            resume_gaps += 1;
         }
         offset = resumed.resume_from;
     }
 
-    assert!(received > 0, "no output at all (seed {chaos_seed})");
     assert!(
-        gaps > 0,
-        "a 32 KiB ring under `yes` should have overflowed at least once (seed {chaos_seed}); \
-         received {received} bytes"
+        announced_gaps > 0,
+        "the daemon never told an attached client it had dropped anything, so § 9's \
+         announcement went untested (seed {chaos_seed}); received {received} bytes"
+    );
+    assert!(
+        resume_gaps > 0,
+        "a 32 KiB ring under `yes` should have overflowed at least once while the \
+         client was away (seed {chaos_seed}); received {received} bytes"
     );
 }
 

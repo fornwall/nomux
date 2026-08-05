@@ -18,7 +18,6 @@ mod harness;
 use std::fs;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::thread;
@@ -27,8 +26,9 @@ use std::time::{Duration, Instant};
 use nomux_proto::{Frame, FrameType, RESUME_FROM_START};
 
 use harness::{
-    Client, FRAME_PATIENCE, Reaper, Rng, Session, Spawned, StatField, control, nomux_with_shell,
-    poll_until, process_alive, process_state, run_root, stat_field, succeeded, wait_for,
+    Client, FRAME_PATIENCE, Reaper, Rng, SPIN_WINDOW, Session, Spawned, StatField, control,
+    cpu_ticks, leads_a_process_group, nomux_with_shell, poll_until, process_alive, process_state,
+    run_root, stat_field, still_serving, succeeded, wait_for,
 };
 
 /// The child's last words come before its status.
@@ -198,12 +198,10 @@ fn a_child_killed_by_a_signal_is_reported_as_signalled_rather_than_as_a_status()
 /// nothing but `/dev/null`.
 #[test]
 fn a_synthesised_exit_status_is_sent_on_the_pass_that_collects_it() {
-    /// Comfortably above `STATUS_GRACE` and nowhere near anything else: 1.5 s of
-    /// slack for a shell to run one `exec` builtin on a loaded machine, against a
-    /// regression that misses this by an hour rather than by a margin. There is no
-    /// upper deadline to sit under any more, so what this number has to be is large
-    /// enough not to fail on load and small enough to be a bound at all.
-    const BOUND: Duration = Duration::from_millis(3500);
+    /// Comfortably above the two-second `STATUS_GRACE`, and nowhere near the hour the
+    /// regression misses this by: large enough not to fail a fork, an exec and a poll
+    /// pass under nextest's full-core parallelism, and small enough to be a bound.
+    const BOUND: Duration = Duration::from_secs(10);
 
     let (_session, mut client, ok) = Session::attached("exit_synthesised");
 
@@ -320,10 +318,9 @@ fn a_shell_that_exits_behind_a_background_job_is_still_reaped() {
 /// user's keystrokes.
 #[test]
 fn the_child_inherits_only_its_stdio() {
-    let (session, mut client, ok) = Session::attached("fds");
-    // Wait for the shell to be up before looking for it.
-    client.input(0, b"echo NOMUX-SPAWNED\n");
-    client.read_until("NOMUX-SPAWNED", ok.resume_from);
+    let (session, mut client, _ok) = Session::attached("fds");
+    // The shell is up once it has run a line, which is what is looked for below.
+    still_serving(&mut client, "NOMUX-SPAWNED");
 
     let shell = shell_of(&session);
     let mut terminals = Vec::new();
@@ -345,6 +342,26 @@ fn the_child_inherits_only_its_stdio() {
         terminals,
         ["0", "1", "2"],
         "the child should hold the slave exactly three times, as its stdio"
+    );
+}
+
+/// The rest of what `Pty::spawn` puts into the child (§ 6.1): a login shell's
+/// `argv[0]`, the terminal the client named, and the session's own id.
+///
+/// Of the five it sets, only `SSH_AUTH_SOCK` was ever checked. Losing `.arg0()`
+/// silently stops `~/.profile` being read for every user, and losing `TERM` breaks
+/// every full-screen program. The format string is echoed by the line discipline
+/// unexpanded, so only the child's own answer can satisfy the read.
+#[test]
+fn the_child_is_a_login_shell_told_its_terminal_and_its_session() {
+    let (session, mut client, ok) = Session::attached("spawn_env");
+    client.input(
+        0,
+        b"printf 'NOMUX-SPAWN[%s|%s|%s]' \"$0\" \"$TERM\" \"$NOMUX_SESSION\"\n",
+    );
+    client.read_until(
+        &format!("NOMUX-SPAWN[-sh|xterm-256color|{}]", session.id),
+        ok.resume_from,
     );
 }
 
@@ -421,7 +438,7 @@ fn child_of(parent: u32) -> Option<u32> {
 /// exit and `read_pty` reaches end of file with nothing outstanding. `pending_input`
 /// has to be non-empty, since the daemon asks for `POLLOUT` only while something is
 /// queued. And the master has to still be *writable*, which rules out the queue
-/// [`input_the_child_never_reads_is_back_pressured_rather_than_buffered`] builds:
+/// `reconnecting_does_not_raise_the_input_ceiling` builds:
 /// input that reached the cap got there by filling the terminal, and a full terminal
 /// never reports `POLLOUT` again.
 ///
@@ -596,61 +613,11 @@ fn the_daemon_releases_its_working_directory_but_the_shell_does_not() {
     client.read_until(home, ok.resume_from);
 }
 
-/// The `daemon` mode detaches itself, rather than trusting whoever started it.
+/// § 6.2's detachment, on the path that needs a fork.
 ///
-/// § 6.2 claims the property for the mode, but `setsid` and the `/dev/null` stdio
-/// lived in `attach::spawn_daemon` alone — so a daemon started any other way kept
-/// the process group and the descriptors it inherited, which for a session meant
-/// dying with the connection that started it. Started here with pipes on purpose,
-/// so what those descriptors point at afterwards is the daemon's own doing.
-///
-/// The pidfile is the other half. The interactive case cannot detach without a
-/// fork, and `nomux kill` reads that file, so the pid in it has to be the one that
-/// survived rather than the one that started.
-#[test]
-fn the_daemon_mode_detaches_itself() {
-    let root = run_root("detach");
-    let child = Spawned::spawn(
-        nomux_with_shell(&root, &["daemon", "detached"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
-    );
-    let pid = child.id();
-    wait_for(&root.join("nomux").join("detached.sock"));
-
-    // The socket is bound before any of the detaching happens — deliberately, so a
-    // session that already exists is still reported with an exit status — so
-    // waiting for it is not barrier enough.
-    // No assertion on the outcome: the reads below are what judge the daemon, and
-    // this only keeps them from judging it before it has finished detaching.
-    poll_until(Duration::from_secs(10), || has_detached(pid));
-
-    // Everything read before the child is killed, so a failing assertion cannot
-    // leave the daemon behind.
-    let detachment = detachment_of(pid);
-    let recorded = fs::read_to_string(root.join("nomux").join("detached.pid"))
-        .ok()
-        .and_then(|text| text.trim().parse::<u32>().ok());
-    drop(child);
-
-    assert_detached(&detachment, Some(pid), "the daemon");
-    assert_eq!(
-        recorded,
-        Some(pid),
-        "the pidfile must name the process that is actually serving"
-    );
-}
-
-/// The other half of § 6.2, which the test above never reaches.
-///
-/// `Command` never calls `setpgid`, so a daemon it starts is not a process-group
-/// leader, `setsid` succeeds outright, and the fork is unreachable from there — which
-/// makes `recorded == pid` true by construction rather than by the pidfile being
-/// written in the right order. Moving `detach_from_login_session` to after
-/// `write_pidfile` leaves that test passing, so it guards nothing. Making the child a
-/// group leader first is what forces the `EPERM` only a fork can answer, and it is
-/// the shape a shell with job control produces.
+/// [`leads_a_process_group`] is what forces the `EPERM` only a fork can answer: a
+/// test that starts a plain daemon goes on passing with `detach_from_login_session`
+/// moved to after `write_pidfile`, so it guards nothing.
 ///
 /// The daemon that survives is in nobody's process group and is nobody's child, so
 /// `wait` collects the process that started and nothing else — it has to be reaped
@@ -663,17 +630,7 @@ fn a_daemon_that_leads_a_process_group_detaches_by_forking() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // SAFETY: the closure runs in the forked child before exec, so it must be
-    // async-signal-safe. `setpgid` is, and nothing here allocates or takes a lock.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
-        });
-    }
+    leads_a_process_group(&mut command);
     let mut starter = Spawned::spawn(&mut command);
     let original_pid = starter.id();
 
@@ -730,52 +687,44 @@ fn a_daemon_that_leads_a_process_group_detaches_by_forking() {
     assert_detached(&detachment, recorded, "the forked child");
 }
 
-/// Regression: a spawn refused at the session ceiling leaves nothing behind, so the
-/// backstop cannot ratchet against itself.
+/// `daemon::MAX_SESSIONS`, which is private to the daemon. The refusal names it, so a
+/// value that drifted apart from this fails on the message rather than silently testing
+/// nothing.
+const CEILING: usize = 64;
+
+/// Turns two different ids away at the ceiling through `mode`, and asserts that neither
+/// refusal left anything in the run directory.
 ///
-/// The daemon takes `<id>.lock` before it counts the ids in the run directory, which is
-/// what § 6.3 asks of it — the count has to happen where nothing else is publishing.
-/// Taking that lock *creates* the file, and `rundir::session_id_of` reads a bare
-/// `<id>.lock` as a session, so a refusal that returned without removing it added a
-/// counted id to the directory. Every rejected spawn of a new id then made the next one
-/// count one higher, and a run directory that started one over the ceiling walked away
-/// from it: 64, 65, 66, with only `nomux list` able to bring it back.
+/// The sessions are planted as `<id>.sock` files rather than started: 64 daemons is 64
+/// shells and 64 rings, and what is being counted is names on disk (§ 6.3).
 ///
 /// Asserted twice over, because either half alone is satisfiable by the bug. That no
 /// `<id>.*` is left is the property; that the *count* has not moved is what it was for,
 /// and it is the one a reader can check against `MAX_SESSIONS` — so the second refusal
 /// has to name a different id from the first, or a lock left behind by the first would
 /// be excluded from the second's count as its own.
-///
-/// The sessions are planted as `<id>.sock` files rather than started: 64 daemons is 64
-/// shells and 64 rings, and what is being counted is names on disk (§ 6.3).
-#[test]
-fn a_spawn_refused_at_the_session_ceiling_leaves_no_lock_behind() {
-    /// `daemon::MAX_SESSIONS`, which is private to the daemon. The refusal names it,
-    /// so a value that drifted apart from this fails on the message rather than
-    /// silently testing nothing.
-    const CEILING: usize = 64;
-
-    let root = run_root("ceiling_lock");
+fn refusals_at_the_session_ceiling_leave_nothing_behind(name: &str, mode: &str, refusal: i32) {
+    let root = run_root(name);
     let dir = root.join("nomux");
     fs::create_dir_all(&dir).expect("create the run directory");
     for n in 0..CEILING {
         fs::write(dir.join(format!("full{n}.sock")), b"").expect("plant a session");
     }
 
-    let ids = ["over1", "over2"];
-    for id in ids {
+    for id in ["over1", "over2"] {
         let refused = harness::collect(
-            nomux_with_shell(&root, &["daemon", id])
+            nomux_with_shell(&root, &[mode, id])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped()),
         );
-        assert!(
-            !refused.status.success(),
-            "a run directory holding {CEILING} sessions took another one"
-        );
         let complaint = harness::stderr(&refused);
+        assert_eq!(
+            refused.status.code(),
+            Some(refusal),
+            "a run directory holding {CEILING} sessions took another one through \
+             `{mode}`: {complaint:?}"
+        );
         assert!(
             complaint.contains(&CEILING.to_string()),
             "the refusal must name the ceiling it is enforcing, or this test is \
@@ -784,8 +733,8 @@ fn a_spawn_refused_at_the_session_ceiling_leaves_no_lock_behind() {
         assert_eq!(
             session_files(&dir, id),
             Vec::<String>::new(),
-            "the refused spawn left files behind, which `list` and this daemon both \
-             read as a session that is there"
+            "the refused `{mode}` left files behind, which `list` and the next daemon \
+             both read as a session that is there"
         );
     }
 
@@ -798,6 +747,41 @@ fn a_spawn_refused_at_the_session_ceiling_leaves_no_lock_behind() {
         "the refusals added ids to a directory that was already full, so the backstop \
          now refuses at {CEILING} minus however many spawns have been turned away"
     );
+}
+
+/// Regression: a spawn refused at the session ceiling leaves nothing behind, so the
+/// backstop cannot ratchet against itself.
+///
+/// The daemon takes `<id>.lock` before it counts the ids in the run directory, which is
+/// what § 6.3 asks of it — the count has to happen where nothing else is publishing.
+/// Taking that lock *creates* the file, and `rundir::session_id_of` reads a bare
+/// `<id>.lock` as a session, so a refusal that returned without removing it added a
+/// counted id to the directory. Every rejected spawn of a new id then made the next one
+/// count one higher, and a run directory that started one over the ceiling walked away
+/// from it: 64, 65, 66, with only `nomux list` able to bring it back.
+#[test]
+fn a_spawn_refused_at_the_session_ceiling_leaves_no_lock_behind() {
+    refusals_at_the_session_ceiling_leave_nothing_behind("ceiling_lock", "daemon", 1);
+}
+
+/// The same property through the mode a user actually runs, where a different process
+/// owns the file.
+///
+/// [`a_spawn_refused_at_the_session_ceiling_leaves_no_lock_behind`] drives `nomux
+/// daemon` directly, so the process that meets the ceiling is the one holding
+/// `<id>.lock` and can unlink what it created. Under `nomux spawn` the lock belongs to
+/// the relay: the daemon it starts finds `try_lock_spawn` refused, and § 6.3 forbids it
+/// to unlink a name another process is holding, so it exits leaving the file there.
+/// Only `attach::create` can take it back, which is the half of the ratchet the test
+/// above cannot reach.
+///
+/// Costs two `attach::SPAWN_TIMEOUT`s. The daemon refuses at once, but nothing on the
+/// socket distinguishes a daemon that refused from one that is slow to bind, so the
+/// relay waits out its deadline and reports § 10's 127 with the daemon's complaint
+/// attached.
+#[test]
+fn a_relay_refused_at_the_session_ceiling_leaves_no_lock_behind() {
+    refusals_at_the_session_ceiling_leave_nothing_behind("ceiling_relay", "spawn", 127);
 }
 
 /// Every file in `dir` belonging to session `id`, by name.
@@ -998,6 +982,9 @@ fn a_session_whose_child_has_exited_keeps_its_files_and_its_status_with_nobody_a
     /// scheduling quantum. It costs the suite about a second of wall clock, nextest
     /// running it alongside everything else.
     const UNATTENDED: Duration = Duration::from_secs(6);
+    /// Five ticks is 50 ms of processor time against the half second [`SPIN_WINDOW`]
+    /// covers: a tenth of a core, unreachable by a daemon that is asleep.
+    const TOLERATED: u64 = 5;
 
     let (session, mut client, _) = Session::attached("outlives_child");
     let shell = shell_of(&session);
@@ -1018,8 +1005,17 @@ fn a_session_whose_child_has_exited_keeps_its_files_and_its_status_with_nobody_a
         "the child never exited, so the wait below is about a session that still has \
          one and says nothing about what happens to a session that does not"
     );
-    thread::sleep(UNATTENDED);
+    // Measured inside the wait rather than beside it, so it costs nothing: this is
+    // exactly the state `Daemon::watches` drops the PTY master for, and without that
+    // filter the master reports `POLLHUP` every pass until the idle timeout.
+    let burned = cpu_ticks(daemon);
+    thread::sleep(UNATTENDED.saturating_sub(SPIN_WINDOW));
 
+    assert!(
+        burned <= TOLERATED,
+        "the daemon burned {burned} clock ticks in {SPIN_WINDOW:?} with its child gone \
+         and nobody attached, which is a core per finished session for up to seven days"
+    );
     assert!(
         process_alive(daemon),
         "the daemon left {UNATTENDED:?} after its child did, so a session outlives \
@@ -1243,11 +1239,10 @@ fn a_signalled_daemon_with_a_quiet_child_does_not_wait_out_the_grace_period() {
     // the whole of what the grace period below is being charged for.
     let (_orphan, _collected) = background_ignoring_sighup(&mut client, ok.resume_from);
 
-    let (mut quiet, mut settled, ok) = Session::attached("fastkill");
+    let (mut quiet, mut settled, _ok) = Session::attached("fastkill");
     // So the measurement covers a session with a live shell in it, rather than the
     // window before the child exists at all.
-    settled.input(0, b"echo NOMUX-READY\n");
-    settled.read_until("NOMUX-READY", ok.resume_from);
+    still_serving(&mut settled, "NOMUX-READY");
 
     let stubborn = time_shutdown(&mut stubborn);
     let quiet = time_shutdown(&mut quiet);

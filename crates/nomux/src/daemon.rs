@@ -24,9 +24,10 @@ use rustix::event::{PollFd, PollFlags, Timespec};
 
 use crate::agent::{self, Agent, MAX_AGENT_CHANNELS};
 use crate::conn::Conn;
+use crate::control::{Liveness, liveness};
 use crate::linger;
 use crate::pty::{self, Pty};
-use crate::rundir::{SessionPaths, session_id_of};
+use crate::rundir::{SessionPaths, session_ids};
 use crate::startup::{arm_stop_signals, leave_login_session, release_startup_state};
 
 /// Default ring capacity. See `DESIGN.md` § 10 — this bounds how long a
@@ -45,14 +46,16 @@ const RING_BYTES_ENV: &str = "NOMUX_RING_BYTES";
 /// tuning (`IMPLEMENTATION.md` § 4).
 const MAX_RING_CAPACITY: usize = 1 << 30;
 
-/// Resolves the ring capacity, honouring [`RING_BYTES_ENV`].
+/// Resolves the ring capacity from what [`RING_BYTES_ENV`] asked for.
+///
+/// Takes the value rather than reading it, so the clamps are reachable from a test
+/// that shares a process with everything else resolving out of the environment.
 ///
 /// Nothing here refuses, per § 4. Zero in particular has to be filtered here rather
 /// than passed on: `Ring::new` clamps it to one byte, and a ring that makes every
 /// write a gap is not a tuning choice — the default is.
-fn ring_capacity() -> usize {
-    std::env::var(RING_BYTES_ENV)
-        .ok()
+fn ring_capacity(requested: Option<&str>) -> usize {
+    requested
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|bytes| *bytes > 0)
         .map_or(DEFAULT_RING_CAPACITY, |bytes| bytes.min(MAX_RING_CAPACITY))
@@ -145,6 +148,13 @@ const SETTLE_BEFORE_POLL: bool = cfg!(nomux_fault_injection) || cfg!(nomux_fault
 /// How long that pause is.
 const FAULT_SETTLE: Duration = Duration::from_millis(20);
 
+/// How long a connection that has not said `Hello` keeps the one pending slot.
+///
+/// The slot is the incumbent's until this passes, so a peer that connects and then says
+/// nothing would otherwise hold it — and with it every later attach — for the life of
+/// the session. Generous against the round trip a relayed `Hello` costs (§ 7).
+const PENDING_HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Stop accepting client input once this much is already queued for a PTY that is
 /// not taking it.
 ///
@@ -162,8 +172,6 @@ const MAX_PENDING_INPUT: usize = 1 << 20;
 #[derive(Debug)]
 struct Attached {
     conn: Conn,
-    /// Set once this connection's `Hello` has been answered.
-    greeted: bool,
     /// Whether this connection has already been told the child exited. Per connection,
     /// and load-bearing now that the session outlives its child (§ 6.5): every attach
     /// after the fact must hear the status again, behind the replay that precedes it.
@@ -184,7 +192,6 @@ impl Attached {
     const fn new(conn: Conn) -> Self {
         Self {
             conn,
-            greeted: false,
             exit_sent: false,
             sent_through: 0,
             repaint_due: false,
@@ -205,9 +212,10 @@ struct Daemon {
     ring: crate::ring::Ring,
     pty: Option<Pty>,
     client: Option<Attached>,
-    /// A connection that has been accepted but has not said `Hello` yet, and so
-    /// has not taken the session over. Usually a liveness probe from `list`.
-    pending: Option<Conn>,
+    /// A connection that has been accepted but has not said `Hello` yet, and so has
+    /// not taken the session over, with the deadline by which it must. Usually a
+    /// liveness probe from `list`.
+    pending: Option<(Conn, Instant)>,
     /// Agent socket and its channels, once a session created with
     /// [`nomux_proto::HELLO_AGENT_FORWARD`] has bound one.
     agent: Option<Agent>,
@@ -280,15 +288,13 @@ fn start(session_id: &str, label: Option<&str>) -> io::Result<()> {
     // Inside that locked region and before the bind, per § 6.3. Taking the lock is what
     // created `<id>.lock`, and `session_id_of` counts a bare one as a session — so a
     // refusal that left it behind would add a counted id on every rejected spawn of a
-    // *new* one, ratcheting this backstop against itself until somebody ran `list`.
-    // Removed only where the lock was taken, that being the only case where this
-    // process created the file, and while it is still held, which is what § 6.3 asks of
-    // that name: whoever locks next creates a fresh one, and no unlink follows this to
-    // land on the session they bring up.
+    // *new* one, ratcheting this backstop against itself. Only where a lock came back,
+    // so this never unlinks a file another process is holding, and while it is still
+    // held, so whoever locks next creates a fresh one that no unlink of ours follows.
     let dir = crate::rundir::run_dir()?;
     if at_session_ceiling(&dir, paths.id()) {
         if publishing.is_some() {
-            drop(fs::remove_file(dir.join(format!("{}.lock", paths.id()))));
+            drop(fs::remove_file(paths.lock()));
         }
         return Err(io::Error::new(
             io::ErrorKind::QuotaExceeded,
@@ -344,7 +350,7 @@ fn start(session_id: &str, label: Option<&str>) -> io::Result<()> {
         listener,
         stop_pipe,
         stopping: false,
-        ring: crate::ring::Ring::new(ring_capacity()),
+        ring: crate::ring::Ring::new(ring_capacity(std::env::var(RING_BYTES_ENV).ok().as_deref())),
         pty: None,
         client: None,
         pending: None,
@@ -396,10 +402,9 @@ fn publish(
     leave_login_session();
     // That process then claims the socket it inherited, for the backlog: `listen`
     // installs one rather than keeping the one in force, so the fork would otherwise
-    // leave the queue at whatever the parent asked for (§ 6.2, § 6.3). It also
-    // re-stamps `SO_PEERCRED`, which nothing reads now that § 6.6 identifies a daemon
-    // from `<id>.pid` alone. A failure is discarded rather than propagated: a queue at
-    // the wrong depth is not a reason to refuse a session that is ready to serve.
+    // leave the queue at whatever the parent asked for (§ 6.2, § 6.3). A failure is
+    // discarded rather than propagated: a queue at the wrong depth is not a reason to
+    // refuse a session that is ready to serve.
     //
     // SAFETY: `listen` is passed a descriptor `listener` owns and keeps open across
     // the call, and a backlog. `UnixListener` has no safe spelling of a second
@@ -428,35 +433,32 @@ fn publish(
 /// to somebody else's run gets destroyed.
 fn bind_socket(paths: &SessionPaths) -> io::Result<UnixListener> {
     let path = paths.socket();
-    match crate::rundir::connect_within(&path, PROBE_TIMEOUT) {
-        Ok(_) => {
+    match liveness(&path, PROBE_TIMEOUT) {
+        Liveness::Alive(_) => {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
                 format!("session {} is already running", paths.id()),
             ));
         }
-        // Nothing is listening either way — the same evidence a collection decides on
-        // one `connect` earlier (§ 6.6). Split inside rather than into two arms because
-        // only the refused half leaves a socket file behind to replace, and an absent
-        // name must not be unlinked on the chance somebody has just created one there.
-        Err(err) if crate::rundir::nothing_is_listening(&err) => {
-            if err.kind() == io::ErrorKind::ConnectionRefused {
-                // Forced here because there is nowhere else it can be forced from: the
-                // probe above and the removal below are two syscalls on one name, so
-                // the test for losing that race has to be inside the window.
-                #[cfg(test)]
-                tests::collect_the_stale_socket(&path);
-                // Losing that race is ordinary, and the file being gone is the state
-                // this call exists to reach: propagating the `ENOENT` would refuse a
-                // perfectly startable session over a socket that is gone either way.
-                if let Err(err) = fs::remove_file(&path)
-                    && err.kind() != io::ErrorKind::NotFound
-                {
-                    return Err(err);
-                }
+        // Only the refused half leaves a socket file behind to replace; an absent name
+        // must not be unlinked on the chance somebody has just created one there.
+        Liveness::Stale(err) if err.kind() == io::ErrorKind::ConnectionRefused => {
+            // Forced here because there is nowhere else it can be forced from: the
+            // probe above and the removal below are two syscalls on one name, so the
+            // test for losing that race has to be inside the window.
+            #[cfg(test)]
+            tests::collect_the_stale_socket(&path);
+            // Losing that race is ordinary, and the file being gone is the state this
+            // call exists to reach: propagating the `ENOENT` would refuse a perfectly
+            // startable session over a socket that is gone either way.
+            if let Err(err) = fs::remove_file(&path)
+                && err.kind() != io::ErrorKind::NotFound
+            {
+                return Err(err);
             }
         }
-        Err(err) => return Err(err),
+        Liveness::Stale(_) => {}
+        Liveness::Unknown(err) => return Err(err),
     }
 
     // Only the socket is replaced when an id is rebound, and a `<id>.pid` outliving it
@@ -477,27 +479,14 @@ fn bind_socket(paths: &SessionPaths) -> io::Result<UnixListener> {
 ///
 /// `IMPLEMENTATION.md` § 6.3 has the policy: why names are counted rather than sockets
 /// probed, why `mine` never counts against itself, and why a directory that cannot be
-/// read is not a refusal. Through [`session_id_of`] because that is the rule `list`
+/// read is not a refusal. Through [`session_ids`] because that is the rule `list`
 /// discovers sessions with (§ 6.6), in the module that owns the layout.
 fn at_session_ceiling(dir: &Path, mine: &str) -> bool {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return false;
-    };
-    let mut ids: Vec<String> = Vec::new();
-    for entry in entries.filter_map(Result::ok) {
-        let path = entry.path();
-        let Some(id) = session_id_of(&path) else {
-            continue;
-        };
-        if id == mine || ids.iter().any(|known| known == id) {
-            continue;
-        }
-        ids.push(id.to_owned());
-        if ids.len() >= MAX_SESSIONS {
-            return true;
-        }
-    }
-    false
+    session_ids(dir)
+        .iter()
+        .filter(|id| id.as_str() != mine)
+        .count()
+        >= MAX_SESSIONS
 }
 
 /// What one entry of the poll set belongs to.
@@ -523,9 +512,8 @@ enum Source {
 /// Every source that appears in the poll set at most once, in the order
 /// [`Daemon::watches`] registers them.
 ///
-/// The list is what registers them — `watches` walks it and asks
-/// [`Daemon::watch_for`] about each — so a seventh source cannot be *polled* without
-/// being added here, which cannot be done without changing the length this declares
+/// The list is what registers them, so a seventh source cannot be *polled* without
+/// being added here — which cannot be done without changing the length this declares,
 /// and so [`POLL_SLOTS`].
 const SINGLE_SOURCES: [Source; 6] = [
     Source::Listener,
@@ -540,20 +528,17 @@ const SINGLE_SOURCES: [Source; 6] = [
 /// channel, which `Agent::accept` caps at [`MAX_AGENT_CHANNELS`].
 const POLL_SLOTS: usize = SINGLE_SOURCES.len() + MAX_AGENT_CHANNELS as usize;
 
-/// What one `poll` came back with: the readiness of each source in the order
-/// [`Daemon::watches`] registered them, and how many of the slots it used.
-type Ready = ([(Source, PollFlags); POLL_SLOTS], usize);
-
 impl Daemon {
     fn event_loop(&mut self) -> io::Result<()> {
         let mut scratch = Vec::new();
         let mut read_buf = vec![0u8; 64 * 1024];
+        let mut ready = Vec::new();
 
         loop {
             if self.stop_reason().is_some() {
                 return Ok(());
             }
-            self.poll_once(&mut read_buf, &mut scratch)?;
+            self.poll_once(&mut read_buf, &mut scratch, &mut ready)?;
             // Given back at the end of the pass that grew it, so that one large
             // `Input` does not leave a `MAX_PAYLOAD` — 256 KiB — held for a session
             // that can last a week. Cleared first because `shrink_to` will not go
@@ -636,16 +621,17 @@ impl Daemon {
     }
 
     /// What to ask `poll` about `source`, or `None` where it is not in the set now.
-    ///
-    /// Exhaustive over [`Source`] on purpose: that is the half of [`SINGLE_SOURCES`]'s
-    /// invariant this function carries.
     fn watch_for(&self, source: Source) -> Option<(BorrowedFd<'_>, PollFlags)> {
         match source {
             // Out of the set while an `accept` that failed is being waited out, which
-            // is the only way to stand back from it ([`ACCEPT_BACKOFF`]).
-            Source::Listener => self
-                .accept_retry
-                .is_none()
+            // is the only way to stand back from it ([`ACCEPT_BACKOFF`]), and while
+            // the one pending slot is taken: a connection left in the backlog waits
+            // there and greets when the slot frees, where one accepted on top of the
+            // incumbent could only be closed unheard — an eviction `attach::relay`
+            // reads as end of file and leaves with a status of 0. Both ways the slot
+            // frees wake the loop up, the pending connection being polled itself and
+            // its deadline being in [`Daemon::poll_timeout`].
+            Source::Listener => (self.accept_retry.is_none() && self.pending.is_none())
                 .then(|| (self.listener.as_fd(), PollFlags::IN)),
             Source::Signal => Some((self.stop_pipe.as_ref()?.as_fd(), PollFlags::IN)),
             // Dropped from the set once the child is gone: the master reports `HUP`
@@ -676,9 +662,7 @@ impl Daemon {
                 // large replay routinely ends a pass with the queue drained and the
                 // ring still ahead. The `OutputAck` that papers over it is advisory
                 // (§ 3), so it cannot be what the loop relies on.
-                if client.conn.wants_write()
-                    || (client.greeted && client.sent_through < self.ring.end())
-                {
+                if client.conn.wants_write() || client.sent_through < self.ring.end() {
                     flags |= PollFlags::OUT;
                 }
                 // Registered even when the mask is empty, since `HUP` and `ERR` are
@@ -687,7 +671,7 @@ impl Daemon {
                 // letting the client go, so it cannot repeat.
                 Some((client.conn.stream().as_fd(), flags))
             }
-            Source::Pending => Some((self.pending.as_ref()?.stream().as_fd(), PollFlags::IN)),
+            Source::Pending => Some((self.pending.as_ref()?.0.stream().as_fd(), PollFlags::IN)),
             // Out of the set on the same terms as the session listener above, and for
             // the same failure.
             Source::AgentListener => {
@@ -704,27 +688,19 @@ impl Daemon {
         }
     }
 
-    /// Everything the poll set watches, in the order it is registered, written into
-    /// `sources` and `fds` in step. Returns how many slots were used.
+    /// Everything the poll set watches, in the order it is registered, into `ready` and
+    /// `fds` in step.
     ///
     /// Named rather than positional because the set is variable-length, and index
-    /// arithmetic there would silently apply one fd's readiness to another. Into the
-    /// caller's arrays rather than a `Vec` because this is the steady-state relay loop
-    /// and the set has a compile-time maximum ([`POLL_SLOTS`]).
-    fn watches<'a>(
-        &'a self,
-        sources: &mut [Source; POLL_SLOTS],
-        fds: &mut [PollFd<'a>; POLL_SLOTS],
-    ) -> usize {
-        let mut len = 0;
+    /// arithmetic there would silently apply one fd's readiness to another.
+    fn watches<'a>(&'a self, ready: &mut Vec<(Source, PollFlags)>, fds: &mut [PollFd<'a>]) {
         let mut watch = |source, fd, flags| {
             // Through `get_mut` rather than by index. The budget cannot be reached, so
             // this is only about what the unreachable state may cost: a wakeup missed
-            // rather than a write past the end of the caller's frame.
-            if let (Some(slot), Some(entry)) = (sources.get_mut(len), fds.get_mut(len)) {
-                *slot = source;
-                *entry = PollFd::from_borrowed_fd(fd, flags);
-                len += 1;
+            // rather than a panic in the event loop.
+            if let Some(slot) = fds.get_mut(ready.len()) {
+                *slot = PollFd::from_borrowed_fd(fd, flags);
+                ready.push((source, PollFlags::empty()));
             }
         };
 
@@ -757,42 +733,52 @@ impl Daemon {
                 }
             }
         }
-        len
     }
 
-    /// Blocks until something in the poll set is ready, and returns what.
+    /// Blocks until something in the poll set is ready, and records what into `ready`.
     ///
     /// Split out so that [`Daemon::poll_once`] is the § 6.4.1 ordering policy and
-    /// nothing else. `None` is the `EINTR` case, which is not an event. Confining the
-    /// borrows of `self` here is what lets the caller take `&mut self` freely while
-    /// handling what this returns, so the readiness comes back by value.
-    fn wait(&self) -> io::Result<Option<Ready>> {
-        let mut sources = [Source::Listener; POLL_SLOTS];
-        let mut fds = std::array::from_fn(|_| {
+    /// nothing else. An empty `ready` is the `EINTR` case, which is not an event.
+    /// Confining the borrows of `self` here is what lets the caller take `&mut self`
+    /// freely while handling what this recorded.
+    fn wait(&self, ready: &mut Vec<(Source, PollFlags)>) -> io::Result<()> {
+        ready.clear();
+        // A fixed frame rather than a `Vec`, this being the steady-state relay loop and
+        // the set having a compile-time maximum. `PollFd` has no vacant spelling, so the
+        // slots past `ready.len()` are seeded with a descriptor of this daemon's own
+        // under an empty mask and never shown to `poll`.
+        let mut fds: [PollFd<'_>; POLL_SLOTS] = std::array::from_fn(|_| {
             PollFd::from_borrowed_fd(self.listener.as_fd(), PollFlags::empty())
         });
-        let len = self.watches(&mut sources, &mut fds);
+        self.watches(ready, &mut fds);
 
         let timeout = self.poll_timeout();
-        match rustix::event::poll(fds.get_mut(..len).unwrap_or(&mut []), Some(&timeout)) {
+        match rustix::event::poll(
+            fds.get_mut(..ready.len()).unwrap_or(&mut []),
+            Some(&timeout),
+        ) {
             Ok(_) => {}
             // A stop signal delivered while blocked here lands as `EINTR`, and
             // `poll` is never restarted whatever the handler's flags say. That
             // costs nothing: the handler wrote its byte before the syscall
             // returned, so coming round the loop finds the pipe readable and
             // the notification outlives being dropped on the floor here.
-            Err(rustix::io::Errno::INTR) => return Ok(None),
+            Err(rustix::io::Errno::INTR) => ready.clear(),
             Err(err) => return Err(err.into()),
         }
 
-        let mut ready = [(Source::Listener, PollFlags::empty()); POLL_SLOTS];
-        for (slot, (source, fd)) in ready.iter_mut().zip(sources.iter().zip(fds.iter())) {
-            *slot = (*source, fd.revents());
+        for ((_, flags), fd) in ready.iter_mut().zip(fds.iter()) {
+            *flags = fd.revents();
         }
-        Ok(Some((ready, len)))
+        Ok(())
     }
 
-    fn poll_once(&mut self, read_buf: &mut [u8], scratch: &mut Vec<u8>) -> io::Result<()> {
+    fn poll_once(
+        &mut self,
+        read_buf: &mut [u8],
+        scratch: &mut Vec<u8>,
+        ready: &mut Vec<(Source, PollFlags)>,
+    ) -> io::Result<()> {
         if SETTLE_BEFORE_POLL {
             std::thread::sleep(FAULT_SETTLE);
         }
@@ -805,12 +791,12 @@ impl Daemon {
                 *retry = None;
             }
         }
-        let Some((ready, used)) = self.wait()? else {
-            return Ok(());
-        };
-        let events = ready.get(..used).unwrap_or(&[]);
+        if self.pending.as_ref().is_some_and(|(_, at)| now >= *at) {
+            self.pending = None;
+        }
+        self.wait(ready)?;
         let revents = |want: Source| {
-            events
+            ready
                 .iter()
                 .find(|(source, _)| *source == want)
                 .map_or(PollFlags::empty(), |(_, flags)| *flags)
@@ -876,7 +862,7 @@ impl Daemon {
             self.read_client(scratch)?;
         }
 
-        for (source, flags) in events {
+        for (source, flags) in ready.iter() {
             if let Source::AgentChannel(id) = *source {
                 self.service_agent_channel(id, *flags, read_buf);
             }
@@ -918,11 +904,16 @@ impl Daemon {
         }
         // A listener is out of the poll set until its own deadline passes
         // (`Daemon::accept`, `Daemon::accept_agent`), so nothing else is left to wake
-        // the loop up and put it back.
-        if let Some(at) = [self.accept_retry, self.agent_accept_retry]
-            .into_iter()
-            .flatten()
-            .min()
+        // the loop up and put it back. A silent pending connection is the same shape:
+        // it is holding the one slot and will never report anything.
+        if let Some(at) = [
+            self.accept_retry,
+            self.agent_accept_retry,
+            self.pending.as_ref().map(|(_, at)| *at),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
         {
             remaining = remaining.min(at.saturating_duration_since(Instant::now()));
         }
@@ -943,10 +934,13 @@ impl Daemon {
     fn accept(&mut self) {
         loop {
             match self.listener.accept() {
-                // One at a time: an unanswered probe is replaced rather than
-                // accumulated, so nobody can queue connections at the daemon.
+                // One at a time: the listener is only in the poll set while the slot is
+                // free ([`Daemon::watch_for`]), so nobody can queue connections at the
+                // daemon and nobody is accepted only to be dropped unheard.
                 Ok((stream, _)) => {
-                    self.pending = Conn::new(stream).ok();
+                    self.pending = Conn::new(stream)
+                        .ok()
+                        .map(|conn| (conn, Instant::now() + PENDING_HELLO_TIMEOUT));
                     return;
                 }
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
@@ -972,7 +966,7 @@ impl Daemon {
         // keeping it separate leaves `scratch` free for the outgoing client's final
         // drain below, which happens while the `Hello` is still borrowed.
         let mut buf = Vec::new();
-        let Some(pending) = self.pending.as_mut() else {
+        let Some((pending, _)) = self.pending.as_mut() else {
             return Ok(());
         };
         if pending.fill().is_err() {
@@ -1027,7 +1021,7 @@ impl Daemon {
         // arriving client knows nothing of them, and their ids are never reissued. With
         // nobody attached this does nothing at all.
         self.reject(ErrorCode::Takeover, "another client attached");
-        self.client = self.pending.take().map(Attached::new);
+        self.client = self.pending.take().map(|(conn, _)| Attached::new(conn));
         self.on_hello(&hello)?;
         // Clients pipeline: input riding behind the `Hello` in the same read is
         // already buffered in the connection that was just promoted.
@@ -1041,7 +1035,7 @@ impl Daemon {
     /// version mismatch is the peer being from another release rather than misbehaving,
     /// and the client acts on the two differently (`DESIGN.md` § 6.4).
     fn reject_pending(&mut self, code: ErrorCode, message: &'static str) {
-        if let Some(pending) = self.pending.take() {
+        if let Some((pending, _)) = self.pending.take() {
             pending.send_last(&Frame::Error { code, message });
         }
     }
@@ -1320,7 +1314,6 @@ impl Daemon {
         let gap = resume_from > hello.out_offset;
         if let Some(client) = self.client.as_mut() {
             client.sent_through = resume_from;
-            client.greeted = true;
             // Re-armed with the other two, because a second `Hello` on an established
             // connection rewinds the stream and asks for it again — and would otherwise
             // wait for ever for an `Exit` that was sent against the offsets it has just
@@ -1347,6 +1340,9 @@ impl Daemon {
     /// `IMPLEMENTATION.md` § 4.3, which has why the choice belongs to the client — the
     /// only side that knows what is on the screen.
     fn repaint(&mut self) {
+        if self.child_gone.is_some() {
+            return;
+        }
         if self.repaint_ctrl_l {
             // Through the same queue as client input rather than written straight to
             // the master, so it cannot overtake keystrokes already accepted or block on
@@ -1400,9 +1396,6 @@ impl Daemon {
         let Some(client) = self.client.as_mut() else {
             return;
         };
-        if !client.greeted {
-            return;
-        }
         if !client.conn.is_write_saturated() && client.sent_through < end {
             if client.sent_through < base {
                 // Overflowed while this client was slow or away: the stream is
@@ -1468,9 +1461,7 @@ impl Daemon {
     ///
     /// The backoff is [`ACCEPT_BACKOFF`]'s, for its reason and with its effect.
     fn accept_agent(&mut self) {
-        // Serving means a client is attached *and* past its `Hello`: a frame sent
-        // before `HelloOk` would arrive ahead of the handshake it answers.
-        let serving = self.client.as_ref().is_some_and(|client| client.greeted);
+        let serving = self.client.is_some();
         let Some(agent) = self.agent.as_mut() else {
             return;
         };
@@ -1755,5 +1746,20 @@ mod tests {
             !at_session_ceiling(&root.join("never-created"), "mine"),
             "a directory that cannot be read is not a reason to refuse a session"
         );
+    }
+
+    /// The two clamps `IMPLEMENTATION.md` § 4 documents, told apart from the fallback
+    /// they share: a value past the ceiling is capped, not defaulted.
+    #[test]
+    fn a_ring_capacity_past_the_ceiling_is_clamped_rather_than_defaulted() {
+        assert_eq!(ring_capacity(Some("99999999999999999")), MAX_RING_CAPACITY);
+        assert_eq!(ring_capacity(Some(" 8192 ")), 8192);
+        for refused in [None, Some("0"), Some("-1"), Some("many")] {
+            assert_eq!(
+                ring_capacity(refused),
+                DEFAULT_RING_CAPACITY,
+                "{refused:?} is not a tuning choice and must fall back"
+            );
+        }
     }
 }

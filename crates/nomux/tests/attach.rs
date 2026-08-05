@@ -33,10 +33,10 @@ use std::{fs, thread};
 use nomux_proto::{Frame, RESUME_FROM_START};
 
 use harness::{
-    Rng, Session, Spawned, accept_within, collect, control, daemon_reaper, has_unread_bytes,
-    hello_frame, join_before, nomux, nomux_with_shell, poll_by, poll_until, process_state,
-    push_until_refused, read_uninterrupted, run_root, shrink_send_buffer, stderr, stdout,
-    succeeded, while_nothing_forks, write_frame,
+    Rng, Session, Spawned, accept_within, collect, control, daemon_reaper, entries,
+    has_unread_bytes, hello_frame, join_before, nomux, nomux_with_shell, poll_by, poll_until,
+    process_state, push_until_refused, read_uninterrupted, run_root, shrink_send_buffer, stderr,
+    stdout, still_serving, succeeded, wedge_socket, while_nothing_forks, write_frame,
 };
 
 /// A run directory that is a symlink is refused, out loud, by every mode that
@@ -296,9 +296,8 @@ fn spawn_refuses_an_id_something_is_already_serving() {
     );
 
     let mut client = session.connect();
-    let ok = client.hello(RESUME_FROM_START);
-    client.input(0, b"echo NOMUX-SURVIVED\n");
-    client.read_until("NOMUX-SURVIVED", ok.resume_from);
+    client.hello(RESUME_FROM_START);
+    still_serving(&mut client, "NOMUX-SURVIVED");
 }
 
 /// `attach` refuses an id nothing answers for instead of inventing a session behind
@@ -383,53 +382,6 @@ fn attach_refuses_an_id_nothing_answers_for_rather_than_inventing_a_session() {
              start: {left:?}"
         );
     }
-}
-
-/// What the run directory holds, or nothing where there is no run directory.
-///
-/// Both readings are the same answer to the same question — which of a session's
-/// five files exist — so the absent directory is folded in here rather than at the
-/// one call site, where it would read as a case to handle rather than as an empty
-/// set.
-fn entries(dir: &std::path::Path) -> Vec<String> {
-    let mut names: Vec<String> = fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .collect();
-    names.sort();
-    names
-}
-
-/// Binds `path` and makes every later `connect` to it wait rather than be answered.
-///
-/// What a daemon whose event loop has stopped calling `accept` looks like from
-/// outside, and the only way to produce it: a backlog of zero still takes one
-/// connection — the kernel refuses at *more* than the backlog, not at it — so one
-/// queued `connect` is the whole wedge. The same two syscalls as `spawn_lock.rs`'s
-/// wedge, which cannot be shared: the harness is what both files import, and this
-/// belongs to neither of them alone.
-///
-/// Both ends are handed back because both are load-bearing: closing the listener
-/// refuses the queue instead of holding it, and closing the queued connection empties
-/// the backlog again.
-fn wedge_socket(path: &std::path::Path) -> (UnixListener, UnixStream) {
-    use std::os::fd::AsRawFd;
-
-    let listener = UnixListener::bind(path).expect("plant a listening socket");
-    // SAFETY: `listen` is passed a descriptor the borrow above keeps open across the
-    // call, and a backlog. `UnixListener` has no safe spelling of a second `listen` —
-    // `bind` chose the backlog and nothing revisits it.
-    let shrunk = unsafe { libc::listen(listener.as_raw_fd(), 0) };
-    assert_eq!(
-        shrunk,
-        0,
-        "shrink the backlog: {}",
-        std::io::Error::last_os_error()
-    );
-    let queued = UnixStream::connect(path).expect("fill the backlog");
-    (listener, queued)
 }
 
 /// Regression: `attach` onto a session socket whose backlog is full gives up on a
@@ -554,11 +506,12 @@ fn spawn_starts_a_daemon_for_a_session_that_does_not_exist_yet() {
         &mut stdin,
         &Frame::Input {
             offset: 0,
-            data: b"echo NOMUX-RELAY\n",
+            data: b"echo NOMUX-$((6*7))-RELAY\n",
         },
     );
     stdin.flush().expect("flush");
 
+    let deadline = Instant::now() + RELAY_PATIENCE;
     // The relay connected before it wrote anything, and `spawn` returns from `create`
     // only once the daemon is answering — which § 6.2 puts one step before the
     // pidfile — so this wait is over before it starts unless no daemon was started at
@@ -567,22 +520,15 @@ fn spawn_starts_a_daemon_for_a_session_that_does_not_exist_yet() {
     // leak, and "the daemon never created relay_probe.pid" says the same thing.
     let (_pid, _reaper) = daemon_reaper(&root, "relay_probe");
 
-    let deadline = Instant::now() + Duration::from_secs(20);
     let mut seen = Vec::new();
-    let found = loop {
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            break false;
-        };
-        match rx.recv_timeout(remaining) {
-            Ok(bytes) => seen.extend_from_slice(&bytes),
-            Err(_) => break false,
+    // A byte pipe, so the marker arrives inside the Output frames unparsed; the
+    // arithmetic is what keeps the echoed command line from satisfying it.
+    let found = poll_by(deadline, || {
+        while let Ok(bytes) = rx.try_recv() {
+            seen.extend_from_slice(&bytes);
         }
-        // The relay is a byte pipe, so the marker appears verbatim inside the
-        // Output frames without needing to parse them here.
-        if String::from_utf8_lossy(&seen).contains("NOMUX-RELAY") {
-            break true;
-        }
-    };
+        String::from_utf8_lossy(&seen).contains("NOMUX-42-RELAY")
+    });
 
     drop(stdin);
     drop(child);

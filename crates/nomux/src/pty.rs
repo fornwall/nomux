@@ -14,7 +14,7 @@ use std::process::{Child, Command, Stdio};
 
 use nomux_proto::WinSize;
 use rustix::fs::{Mode, OFlags};
-use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+use rustix::pty::{OpenptFlags, openpt, ptsname, unlockpt};
 use rustix::termios::{Winsize, tcsetwinsize};
 
 use crate::passwd;
@@ -60,12 +60,11 @@ impl Pty {
     ///
     /// # Errors
     ///
-    /// Propagates failures from `openpt`, `grantpt`, `unlockpt`, opening the slave,
-    /// or spawning the shell.
+    /// Propagates failures from `openpt`, `unlockpt`, opening the slave, or spawning
+    /// the shell.
     pub(crate) fn spawn(config: &Spawn<'_>) -> io::Result<Self> {
         // `CLOEXEC` on both ends, and what it keeps out of the child: § 6.1.
         let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC)?;
-        grantpt(&master)?;
         unlockpt(&master)?;
         let slave_path = ptsname(&master, Vec::new())?;
 

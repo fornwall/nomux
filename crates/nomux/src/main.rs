@@ -53,9 +53,9 @@ control surface (frozen across versions, see IMPLEMENTATION.md 6.6):
 
 options:
   --label <text>        Display name for `list`, recorded when the session is
-                        created, so `daemon` and `spawn` take it and `attach` does
-                        not. Advisory: ids are opaque, so this is what makes an
-                        orphaned session recognisable to a human.
+  --label=<text>        created: `daemon` and `spawn` take it, `kill` ignores it,
+                        `attach` refuses it. Advisory: ids are opaque, so this is
+                        what makes an orphaned session recognisable to a human.
   --version, -V         Print version and protocol revision
   --help, -h            Print this usage
 ";
@@ -204,6 +204,9 @@ fn parse_session_args(
         let text = arg
             .to_str()
             .ok_or_else(|| format!("argument `{}` must be valid UTF-8", arg.display()))?;
+        if label.is_some() && (text == "--label" || text.starts_with("--label=")) {
+            return Err("`--label` is given once: a second would replace the first".to_owned());
+        }
         match text.split_once('=') {
             Some(("--label", value)) => label = Some(value.to_owned()),
             _ if text == "--label" => {

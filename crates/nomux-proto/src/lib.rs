@@ -19,9 +19,8 @@ pub use frame::{
 ///
 /// `IMPLEMENTATION.md` § 2.2 owns the history. The number is held against that
 /// section by `the_frozen_numbers_are_the_ones_the_document_gives` and against the
-/// handshake vectors' literal by
-/// `the_handshake_vectors_are_written_at_the_revision_this_build_speaks`, so a bump
-/// has to move the constant, the vectors and the document.
+/// handshake vectors' literal by `the_vectors_pin_every_value_of_every_closed_set`,
+/// so a bump has to move the constant, the vectors and the document.
 pub const PROTOCOL_VERSION: u16 = 5;
 
 /// Fixed frame header size, so reads are a two-stage `read_exact`.

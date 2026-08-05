@@ -4,15 +4,16 @@
 //! on-disk layout — never a protocol frame, never `PROTOCOL_VERSION`.
 
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::{Duration, Instant};
-use std::{fs, thread};
 
 use rustix::process::{Pid, Signal, kill_process, test_kill_process};
 
 use crate::rundir::{
     MAX_PID_LEN, MAX_SESSION_ID_LEN, SessionPaths, SpawnLock, check_run_dir, connect_within,
-    nothing_is_listening, parse_pid, read_label, read_prefix, run_dir, session_id_of,
+    nothing_is_listening, parse_pid, read_label, read_prefix, run_dir, session_ids,
 };
 
 /// How long a probe of a session socket waits for an answer.
@@ -50,16 +51,24 @@ const PUBLISH_GRACE: Duration = Duration::from_secs(2);
 /// anything but padding.
 const MAX_CMDLINE_LEN: usize = PATH_MAX + 1 + "daemon".len() + 1 + MAX_SESSION_ID_LEN + 1;
 
+const _: () = assert!(
+    MAX_CMDLINE_LEN >= PATH_MAX,
+    "a daemon installed under the longest path this host can name would be read with \
+     its argv[0] cut off, and so be a session `chosen` refuses to name for as long as \
+     it runs"
+);
+
 /// The kernel's longest path, which is what bounds a resolved `argv[0]`.
 const PATH_MAX: usize = 4096;
 
 /// State of one session as seen from the run directory alone.
 #[derive(Debug)]
-enum Liveness {
-    /// A daemon accepted a connection, so a process is serving this socket.
-    Alive,
-    /// The socket exists but nothing is listening; the daemon died.
-    Stale,
+pub(crate) enum Liveness {
+    /// A daemon accepted this connection, so a process is serving the socket.
+    Alive(UnixStream),
+    /// Nothing is listening; the daemon died. Carries the errno, which is what says
+    /// whether a socket file was left behind to replace.
+    Stale(io::Error),
     /// The `connect` failed for a reason that is not death, carrying it.
     ///
     /// § 6.3's "`EACCES` is not staleness": the same conservative answer as
@@ -85,49 +94,24 @@ fn present(checked: io::Result<()>) -> io::Result<bool> {
 ///
 /// # Errors
 ///
-/// Fails if the run directory cannot be read. A missing directory is not an error — no
-/// session has ever been created.
+/// Fails on a run directory that is not this user's alone (§ 6.3). A missing one is not
+/// an error — no session has ever been created.
 pub(crate) fn list() -> io::Result<()> {
     let dir = run_dir()?;
     // § 6.3, before any name in this directory is trusted.
     if !present(check_run_dir(&dir))? {
         return Ok(());
     }
-    let entries = match fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        // Not the absence above: the check has just opened this directory, so this is a
-        // race rather than a state. Same answer either way.
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err),
-    };
-
-    // One entry per session, not per file (§ 6.6), folded by a scan rather than by sorting
-    // and `dedup`ing: `sort_unstable` on a `String` instantiates a quicksort and its
-    // insertion-sort fallback, and taking it out was worth 3 KiB of the § 8 budget on
-    // every target. What it costs back is quadratic in the number of *distinct* ids —
-    // measured at 0.26 s of CPU for 5 000 and 3.35 s for 20 000, against 0.06 s and 0.32 s
-    // for the sort — and is paid at most once, since every id in such a directory that is
-    // not answering is collected below.
-    let mut ids: Vec<String> = Vec::new();
-    for entry in entries.filter_map(Result::ok) {
-        let path = entry.path();
-        if let Some(id) = session_id_of(&path)
-            && !ids.iter().any(|known| known == id)
-        {
-            ids.push(id.to_owned());
-        }
-    }
-
     let stdout = io::stdout();
     let mut out = stdout.lock();
     let mut listening = true;
-    for id in ids {
+    for id in session_ids(&dir) {
         let Ok(paths) = SessionPaths::new(&id) else {
             continue;
         };
         // Only death collects (§ 6.3); a probe that failed for any other reason leaves a
         // session to list.
-        if matches!(liveness(&paths), Liveness::Stale) {
+        if matches!(liveness(&paths.socket(), PROBE_TIMEOUT), Liveness::Stale(_)) {
             collect(&paths);
             continue;
         }
@@ -136,14 +120,8 @@ pub(crate) fn list() -> io::Result<()> {
         if !listening {
             continue;
         }
-        // Read the way `kill` reads it ([`chosen`]), because § 6.6 has the number a user
-        // reads be the number that would be acted on. Every failure prints `?`, where
-        // [`resolve`] keeps the body and reports on it.
         let mut buf = [0u8; MAX_PID_LEN];
-        let filed = read_prefix(&paths.pid(), &mut buf)
-            .ok()
-            .and_then(parse_pid)
-            .and_then(extant);
+        let (filed, _) = pidfile(&paths.pid(), &mut buf).unwrap_or_default();
         let pid = chosen(&paths, filed)
             .map_or_else(|| "?".to_owned(), |pid| pid.as_raw_nonzero().to_string());
         // Sanitised on read as well as on write (§ 6.6): the daemon that wrote it may
@@ -185,9 +163,9 @@ pub(crate) fn kill(session_id: &str) -> io::Result<()> {
         let mut deadline = Instant::now() + TERM_GRACE;
         let mut killed = false;
         loop {
-            match liveness(&paths) {
-                Liveness::Stale => break,
-                Liveness::Alive => {}
+            match liveness(&paths.socket(), PROBE_TIMEOUT) {
+                Liveness::Stale(_) => break,
+                Liveness::Alive(_) => {}
                 // A probe that never reached the socket answers nothing about the daemon,
                 // so it may neither be waited out nor escalated on: the `SIGKILL` below
                 // would go to a number nothing here ties to this session.
@@ -219,11 +197,11 @@ pub(crate) fn kill(session_id: &str) -> io::Result<()> {
     // on (§ 6.6) — where [`collect`] also decides, and the two must agree. What it closes
     // is the daemon somebody started by hand, which § 6.3 lets bind *without* the spawn
     // lock when it cannot take one, and so inside this locked region.
-    match liveness(&paths) {
+    match liveness(&paths.socket(), PROBE_TIMEOUT) {
         // The one *successful* exit from the locked region, and so the one place the files
         // go: already gone, stopped on `SIGTERM` and killed outright all end up here.
-        Liveness::Stale => paths.unlink_all_locked(&lock),
-        Liveness::Alive => Err(bound_since(&paths)),
+        Liveness::Stale(_) => paths.unlink_all_locked(&lock),
+        Liveness::Alive(_) => Err(bound_since(&paths)),
         Liveness::Unknown(err) => Err(unprobeable(&paths, &err)),
     }
 }
@@ -269,13 +247,12 @@ fn hold_spawn_lock(paths: &SessionPaths) -> io::Result<SpawnLock> {
 fn resolve(paths: &SessionPaths) -> io::Result<Option<Pid>> {
     let deadline = Instant::now() + PUBLISH_GRACE;
     loop {
-        if matches!(liveness(paths), Liveness::Stale) {
+        if matches!(liveness(&paths.socket(), PROBE_TIMEOUT), Liveness::Stale(_)) {
             return Ok(None);
         }
         let mut buf = [0u8; MAX_PID_LEN];
-        let waiting_on = match read_prefix(&paths.pid(), &mut buf) {
-            Ok(body) if !body.trim_ascii().is_empty() => {
-                let filed = parse_pid(body).and_then(extant);
+        let waiting_on = match pidfile(&paths.pid(), &mut buf) {
+            Ok((filed, body)) if !body.trim_ascii().is_empty() => {
                 return chosen(paths, filed)
                     .map(Some)
                     .ok_or_else(|| running_but(paths, &unidentified(paths.id(), filed, body)));
@@ -294,6 +271,14 @@ fn resolve(paths: &SessionPaths) -> io::Result<Option<Pid>> {
         }
         thread::sleep(POLL_INTERVAL);
     }
+}
+
+/// The pid a session's pidfile names, and the body it was read from — which
+/// [`unidentified`] reports on and `list` discards. Both modes read it through here,
+/// because § 6.6 has the number a user reads be the number that would be acted on.
+fn pidfile<'a>(path: &Path, buf: &'a mut [u8; MAX_PID_LEN]) -> io::Result<(Option<Pid>, &'a [u8])> {
+    let body = read_prefix(path, buf)?;
+    Ok((parse_pid(body).and_then(extant), body))
 }
 
 /// The published pid, where `/proc` does not rule it out.
@@ -371,7 +356,7 @@ fn names_daemon_for(whole: &[u8], id: &str) -> bool {
         if arg == b"--label" {
             // The value is the next argument, and must not be read as the id.
             args.next();
-        } else if !arg.starts_with(b"--label=") && !arg.starts_with(b"-") {
+        } else if !arg.starts_with(b"-") {
             session.get_or_insert(arg);
         }
     }
@@ -468,7 +453,7 @@ fn collect(paths: &SessionPaths) {
     let Some(lock) = paths.try_lock_spawn() else {
         return;
     };
-    if matches!(liveness(paths), Liveness::Stale) {
+    if matches!(liveness(&paths.socket(), PROBE_TIMEOUT), Liveness::Stale(_)) {
         // Ignored, unlike `kill`: this is opportunistic tidying behind a `list`, with no
         // caller waiting on an answer and nothing lost by trying again.
         drop(paths.unlink_all_locked(&lock));
@@ -479,10 +464,10 @@ fn collect(paths: &SessionPaths) {
 /// outlives the process that bound it.
 ///
 /// Through [`connect_within`], which owns the argument for the deadline.
-fn liveness(paths: &SessionPaths) -> Liveness {
-    match connect_within(&paths.socket(), PROBE_TIMEOUT) {
-        Ok(_) => Liveness::Alive,
-        Err(err) if nothing_is_listening(&err) => Liveness::Stale,
+pub(crate) fn liveness(socket: &Path, within: Duration) -> Liveness {
+    match connect_within(socket, within) {
+        Ok(stream) => Liveness::Alive(stream),
+        Err(err) if nothing_is_listening(&err) => Liveness::Stale(err),
         // Evidence of neither death nor life — see [`Liveness::Unknown`].
         Err(err) => Liveness::Unknown(err),
     }

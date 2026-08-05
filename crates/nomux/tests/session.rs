@@ -9,14 +9,7 @@
 //! here is what those two are made of — resume, gap and ring exactness, the
 //! refusals a connection can earn, the takeover rules, and the repaint a gap owes
 //! the child. The rest of the suite is its own binary: `attach.rs`, `agent.rs`,
-//! `lifecycle.rs` and `flow.rs`.
-//!
-//! Four tests here are about the frozen control surface rather than the protocol —
-//! [`list_and_kill_operate_without_the_protocol`],
-//! [`a_liveness_probe_does_not_evict_the_attached_client`],
-//! [`a_label_survives_into_list`] and [`invalid_session_ids_are_refused`]. They
-//! belong beside the rest of § 6.6 in `spawn_lock.rs`, and are here only because
-//! that file was being changed elsewhere when this one was split.
+//! `lifecycle.rs`, `flow.rs` and `spawn_lock.rs`.
 
 #![allow(
     clippy::expect_used,
@@ -28,9 +21,7 @@
 mod harness;
 
 use std::io::ErrorKind;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
@@ -40,9 +31,8 @@ use nomux_proto::{
 };
 
 use harness::{
-    Client, FRAME_PATIENCE, Rng, Session, Spawned, control, daemon_reaper, hello_frame,
-    nomux_with_shell, poll_until, reconnect_until_gap, run_root, stderr, stdout, succeeded,
-    wait_for,
+    Client, FRAME_PATIENCE, Rng, Session, hello_frame, poll_by, poll_until, reconnect_until_gap,
+    still_serving,
 };
 
 #[test]
@@ -778,35 +768,22 @@ fn an_overflow_that_outruns_an_attached_client_is_reported_as_a_gap_mid_stream()
 /// A `NOMUX_RING_BYTES` the daemon cannot use falls back to the default rather than
 /// refusing to start (`IMPLEMENTATION.md` § 4).
 ///
-/// `Ring::new` asserts its capacity is non-zero, so this does not degrade if the
-/// filter that rejects a zero is ever lost: the daemon aborts before it binds
-/// anything, and every session on a host with that variable exported stops starting
-/// at once. A mistyped tuning variable should never cost somebody their session, so
-/// the value is dropped and the default used.
-///
-/// The third row is the one that is *not* a fallback, and it is here because it is
-/// the same promise reached by the other of the two routes to it. A value mistyped
-/// upwards parses and is positive, so nothing rejects it — `MAX_RING_CAPACITY` caps
-/// it instead, which its own doc gives as the whole reason it exists: without a
-/// ceiling `VecDeque::with_capacity` answers a request it cannot serve by aborting
-/// the process, and the daemon dies before it binds exactly as the zero would have
-/// made it. What the daemon then reserves is a gigabyte of *address space* rather
-/// than of memory — nothing here fills a ring, so the pages are never touched — which
-/// is what makes this row cost no more to run than the two above it.
+/// A mistyped tuning variable should never cost somebody their session, so the value
+/// is dropped and the default used. `Ring::new` clamps rather than asserts — the clamp
+/// exists precisely to keep an abort site out of a `panic = "abort"` binary — so what
+/// a lost filter costs is not a daemon that dies before it binds but a session whose
+/// scrollback is one byte, which the round trip below still catches: nothing about a
+/// one-byte ring lets a marker survive the frame it arrived in.
 #[test]
 fn a_ring_capacity_the_daemon_cannot_use_falls_back_to_the_default() {
-    for (name, value) in [
-        ("ring_zero", "0"),
-        ("ring_garbage", "not-a-number"),
-        ("ring_huge", "99999999999999999"),
-    ] {
+    for (name, value) in [("ring_zero", "0"), ("ring_garbage", "not-a-number")] {
         let session = Session::start_with_raw_ring(name, value);
         let mut client = session.connect();
         let ok = client.hello(RESUME_FROM_START);
 
-        // Serving, rather than merely having bound a socket. The socket is bound
-        // before the ring is built, so a daemon that aborted on the assertion leaves
-        // the file behind and `wait_for` is satisfied by a corpse.
+        // Serving, rather than merely having bound a socket: the socket is bound
+        // before the ring is built, so a daemon that died over one leaves the file
+        // behind and the harness's wait is satisfied by a corpse.
         //
         // The marker carries the case's own name so that the wait names it too: the
         // two rows are otherwise indistinguishable at the point they fail, and
@@ -920,81 +897,6 @@ fn a_second_client_takes_over_and_the_first_is_told_why() {
     second.read_until("NOMUX-TOOK-OVER", ok.resume_from);
 }
 
-/// The frozen control surface reaches a live session through the files on disk
-/// alone (`IMPLEMENTATION.md` § 6.6) — `list` finds it and `kill` stops it.
-///
-/// "Stops it" was the half nobody checked. The assertion was that the socket had
-/// gone, which is a statement about `unlink` and not about the session: a `kill`
-/// that removed the five files and left the daemon running would pass it unchanged,
-/// and § 10's whole contract for `kill` is that a zero status means "there is no
-/// such session". What such a daemon leaves behind is the worst of both — a shell
-/// still holding the user's work, with nothing on disk to attach to it by and
-/// nothing for `list` to report, until the seven-day idle deadline collects it.
-#[test]
-fn list_and_kill_operate_without_the_protocol() {
-    let (mut session, _client, _) = Session::attached("control");
-
-    let listed = stdout(&control(&session.root, &["list"]));
-    assert!(
-        listed.contains(&session.id),
-        "list should report the live session, got {listed:?}"
-    );
-    // One line per session and not per run file: `list` walks a directory holding
-    // several names that lead to this one id, and it is the only thing that folds
-    // them back together.
-    assert_eq!(
-        listed
-            .lines()
-            .filter(|line| line.starts_with(&format!("{}\t", session.id)))
-            .count(),
-        1,
-        "list reported the same session more than once, got {listed:?}"
-    );
-
-    succeeded(
-        &control(&session.root, &["kill", &session.id]),
-        "kill failed",
-    );
-
-    assert!(!session.socket.exists(), "kill must unlink the run files");
-    // `kill` returns once the daemon has stopped answering, so the process is either
-    // already gone or on its way; the wait is for the reaping rather than for the
-    // signal. Collected here as well as asserted, since the harness would otherwise
-    // `SIGKILL` a corpse and learn nothing.
-    assert!(
-        poll_until(Duration::from_secs(10), || session
-            .child
-            .try_wait()
-            .expect("wait for the daemon")
-            .is_some()),
-        "kill removed the session's five files and left the daemon running, so the \
-         user's shell is still there with nothing left on disk to reach it by"
-    );
-}
-
-/// Connecting is not attaching.
-///
-/// The frozen control surface decides whether a daemon is alive by connecting to
-/// its socket (§ 6.6), and so does the spawn race in § 6.3. If the daemon counted
-/// that as a takeover, `nomux list` would evict the user from every session on the
-/// host — and the client is told never to auto-reconnect after `TAKEOVER`, so the
-/// damage would be permanent.
-#[test]
-fn a_liveness_probe_does_not_evict_the_attached_client() {
-    let (session, mut client, ok) = Session::attached("probe");
-
-    // The bare probe, then the real thing.
-    for _ in 0..3 {
-        drop(UnixStream::connect(&session.socket).expect("probe connect"));
-    }
-    assert!(stdout(&control(&session.root, &["list"])).contains(&session.id));
-
-    // `read_until` refuses anything that is not output, so an `Error{TAKEOVER}`
-    // fails this rather than being skipped over.
-    client.input(0, b"echo NOMUX-STILL-ATTACHED\n");
-    client.read_until("NOMUX-STILL-ATTACHED", ok.resume_from);
-}
-
 /// The refusals an *attached* client can earn, and the session surviving each.
 ///
 /// `handle_frame`'s "frame is not valid from a client" arm and both of
@@ -1020,6 +922,12 @@ fn a_liveness_probe_does_not_evict_the_attached_client() {
 /// separates from a frame that was quietly *honoured* — and that a fresh client can
 /// still drive the shell afterwards. A daemon that took the session down with the
 /// misbehaving connection would satisfy the first two.
+///
+/// One session for all five, so each row's misbehaviour lands on a session the rows
+/// before it have already abused — which is strictly stronger than five fresh ones,
+/// and four daemons cheaper. One deadline for the whole table, per
+/// `.config/nextest.toml`: five rows of consecutive fifteen-second waits sum past the
+/// runner's kill, which reports nothing.
 #[test]
 fn frames_a_client_may_not_send_are_refused_and_the_connection_closed() {
     /// One case: what the client puts on the wire, and what the failure says it was.
@@ -1074,15 +982,17 @@ fn frames_a_client_may_not_send_are_refused_and_the_connection_closed() {
         },
     ];
 
+    let session = Session::start("refuse");
+    let deadline = Instant::now() + FRAME_PATIENCE;
+    let mut client = session.connect();
+    let start = client.hello(RESUME_FROM_START).resume_from;
+
     for (round, case) in cases.iter().enumerate() {
-        let session = Session::start(&format!("refuse_{round}"));
-        let mut client = session.connect();
-        let ok = client.hello(RESUME_FROM_START);
         // Greeted *and* serving: the session is created by the first `Hello`, so a
         // round trip through the child is what puts the connection in the state this
-        // is about rather than in the middle of its own handshake.
-        client.input(0, b"echo NOMUX-BEFORE-REFUSAL\n");
-        let (_, offset) = client.read_until("NOMUX-BEFORE-REFUSAL", ok.resume_from);
+        // is about rather than in the middle of its own handshake. A marker of the
+        // round's own, so a row cannot be satisfied by the one before it.
+        still_serving(&mut client, &format!("NOMUX-BEFORE-{round}"));
 
         (case.write)(&mut client);
         client.expect_error_among_output(ErrorCode::Protocol, case.what);
@@ -1091,15 +1001,20 @@ fn frames_a_client_may_not_send_are_refused_and_the_connection_closed() {
 
         // The whole point of refusing on the connection's own terms: the shell is
         // still there, at the offsets it had, for whoever attaches next.
-        let mut fresh = session.connect();
-        let resumed = fresh.hello(offset);
+        client = session.connect();
+        let resumed = client.hello(start);
         assert!(
-            !resumed.gap(offset),
+            !resumed.gap(start),
             "{}: the session lost output while refusing one connection",
             case.what
         );
-        fresh.input(resumed.in_applied, b"echo NOMUX-STILL-SERVING\n");
-        fresh.read_until("NOMUX-STILL-SERVING", resumed.resume_from);
+        still_serving(&mut client, &format!("NOMUX-SERVING-{round}"));
+        assert!(
+            Instant::now() < deadline,
+            "row {round} ({}) left the table past its deadline, so the rest of it \
+             would be decided by nextest's kill rather than by an assertion",
+            case.what
+        );
     }
 }
 
@@ -1224,91 +1139,6 @@ fn a_detach_ends_the_connection_but_not_the_session() {
     );
     client.input(resumed.in_applied, b"echo NOMUX-AFTER-DETACH\n");
     client.read_until("NOMUX-AFTER-DETACH", resumed.resume_from);
-}
-
-/// Ids are opaque per-tab identifiers, so the label is the only thing that makes a
-/// session recognisable to a human after the client loses its state.
-///
-/// Through `spawn` because the label belongs to the session rather than to the
-/// connection (§ 6.6): it is recorded when the session is created, so the two modes
-/// that create one take it and `attach` refuses it outright
-/// ([`version_and_usage_report_what_a_client_keys_off`] in `spawn_lock.rs`).
-#[test]
-fn a_label_survives_into_list() {
-    let root = run_root("label");
-    let relay = Spawned::spawn(
-        nomux_with_shell(
-            &root,
-            &["spawn", "labelled", "--label", "  release build\tx  "],
-        )
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped()),
-    );
-    // The label, not the socket. The daemon publishes in the order bind, pidfile,
-    // label (§ 6.2), and the assertion below reads the last two — so waiting on the
-    // first would let `list` run against a session that is answering and has not
-    // said what it is called, which prints `labelled\t?\t` and fails on the label.
-    wait_for(&root.join("nomux").join("labelled.label"));
-    // And the pidfile is already there, being one step earlier in that same order.
-    let (_pid, _reaper) = daemon_reaper(&root, "labelled");
-
-    let listed = stdout(&control(&root, &["list"]));
-
-    // Both collected before the assertions below, so a failure about the label does
-    // not also leave a session behind.
-    drop(relay);
-    drop(control(&root, &["kill", "labelled"]));
-
-    let line = listed
-        .lines()
-        .find(|line| line.starts_with("labelled\t"))
-        .unwrap_or_else(|| panic!("session missing from list: {listed:?}"));
-    let label = line.split('\t').nth(2).expect("label column");
-    assert_eq!(
-        label, "release buildx",
-        "label should be trimmed and stripped of control characters"
-    );
-}
-
-/// An id that could never have named a session is a malformed command line rather
-/// than a session that would not have us.
-///
-/// Through `spawn`, which is the mode with something to lose by getting the order
-/// wrong: it is the one that goes on to `ensure_dir`, so a refusal that came after
-/// the directory was created would be a bad id bringing a run directory into
-/// existence — and `../escape` would bring it into existence somewhere the caller
-/// did not name. `attach` reaches the same refusal through the same
-/// `SessionPaths::new` and creates nothing either way, so it is the weaker of the two
-/// spellings.
-#[test]
-fn invalid_session_ids_are_refused() {
-    // A run directory of its own even though nothing should ever be created in it:
-    // the refusal is what is under test, and a regression that got as far as the
-    // filesystem would otherwise leave its mess where every other test lives.
-    let root = run_root("bad_ids");
-    for id in ["../escape", "with/slash", "with space"] {
-        let output = control(&root, &["spawn", id]);
-        // The exit status, not merely a non-zero one: § 10 gives a malformed
-        // invocation `EX_USAGE`, and the distinction is the whole behaviour. A client
-        // caches "unattachable" per host on 126, so an id that could never have named
-        // a session must not come back wearing that number.
-        assert_eq!(
-            output.status.code(),
-            Some(64),
-            "id {id:?} should be refused as EX_USAGE, got {:?}",
-            output.status
-        );
-        assert!(
-            stderr(&output).contains("invalid session id"),
-            "id {id:?} should be rejected by name"
-        );
-    }
-    assert!(
-        !root.join("nomux").exists(),
-        "an id that could never have named a session brought the run directory it \
-         would have lived in into existence"
-    );
 }
 
 /// What the child prints when the terminal it is on changes size. See
@@ -1555,6 +1385,9 @@ fn a_sustained_overflow_repaints_when_the_client_catches_up_rather_than_per_gap(
     /// whatever had been written when the test looked.
     const FENCE: &[u8] = b"FENCE\n";
 
+    // One deadline for the four consecutive waits below rather than one each, which
+    // would bound only their sum — see `.config/nextest.toml`.
+    let deadline = Instant::now() + FRAME_PATIENCE;
     let session = Session::start_with_ring("repaint_storm", RING);
     let mut client = session.connect();
     let ok = client.hello_with(HELLO_REPAINT_CTRL_L, RESUME_FROM_START);
@@ -1589,7 +1422,6 @@ fn a_sustained_overflow_repaints_when_the_client_catches_up_rather_than_per_gap(
     // daemon's queue dip below its cap, which is what lets the next pass notice that
     // the ring has moved on and report a gap. That dip is the whole recurrence — the
     // defect answers each one with a repaint.
-    let deadline = Instant::now() + FRAME_PATIENCE;
     let mut offset = resumed.resume_from;
     let mut gaps = 0;
     while gaps < GAPS {
@@ -1624,7 +1456,7 @@ fn a_sustained_overflow_repaints_when_the_client_catches_up_rather_than_per_gap(
     // queued the marker above is the pass that found this client caught up.
     client.input(ready.in_offset, FENCE);
     let record = session.root.join("record");
-    let fenced = poll_until(FRAME_PATIENCE, || {
+    let fenced = poll_by(deadline, || {
         fs::read(&record).is_ok_and(|seen| position(&seen, FENCE).is_some())
     });
     assert!(

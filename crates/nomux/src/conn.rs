@@ -16,11 +16,9 @@ use nomux_proto::{Frame, FrameType, HEADER_LEN, Header, MAX_PAYLOAD, decode_head
 /// blocked child (`IMPLEMENTATION.md` § 4.1).
 const MAX_PENDING_WRITE: usize = 1 << 20;
 
-/// Queue size at which a client is treated as gone rather than slow.
-///
-/// The second of § 4.1's two bounds, and the one [`MAX_PENDING_WRITE`] cannot be:
-/// the frames that *answer* a client are not optional and are queued regardless of
-/// it, so a peer that writes without ever reading grows this queue without bound.
+/// Queue size at which a client is treated as gone rather than slow: the frames that
+/// *answer* a client are queued regardless of [`MAX_PENDING_WRITE`], so a peer that
+/// writes without ever reading grows this queue without bound (§ 4.1).
 const ABANDON_PENDING_WRITE: usize = 8 << 20;
 
 /// Stop reading from the socket once this much undecoded input is already buffered.
@@ -37,17 +35,27 @@ const _: () = assert!(
     "MAX_PENDING_READ must have room for a whole frame, or take_frame never completes one"
 );
 
+/// Capacity an emptied buffer keeps rather than hold one paste's peak for a week.
+///
+/// Above one PTY read and its framing — `daemon.rs` reads 64 KiB a pass — because a
+/// floor below that reallocates the send queue down and back up on every pass of a
+/// busy session, which is the one path this must cost nothing on.
+const RETAINED_CAPACITY: usize = 128 * 1024;
+
 /// Reclaims the consumed prefix of a cursor-and-`Vec` buffer.
 ///
 /// Both directions carry one, and both would otherwise grow without bound across a
 /// long session: neither cursor ever moves backwards, so the bytes below it are dead
 /// the moment they are passed. The empty case is separated because clearing is free
-/// where draining is not, and the condition is a *ratio* rather than a number of
-/// bytes, which is what makes the cost O(1) amortised on the replay path
-/// (`IMPLEMENTATION.md` § 4.1 has the derivation).
+/// where draining is not, and the surviving case moves on a *ratio* rather than at a
+/// fixed number of bytes: draining a queue of `n` bytes in `c`-byte writes at a fixed
+/// threshold moves about `n²/2c`, so the cost per byte delivered rises with the queue.
+/// Halving instead moves at most as many bytes as the compaction retires, which is
+/// O(1) amortised however the writes fall.
 fn compact(buf: &mut Vec<u8>, pos: &mut usize) {
     if *pos == buf.len() {
         buf.clear();
+        buf.shrink_to(RETAINED_CAPACITY);
         *pos = 0;
     } else if *pos * 2 >= buf.len() {
         buf.drain(..*pos);
@@ -259,10 +267,9 @@ impl Conn {
     /// anything still queued — a reattaching client replays it from the ring anyway
     /// (§ 6.4) — then flushes.
     ///
-    /// Consumes the connection, which is what makes "last" true rather than merely
-    /// intended: [`Conn::flush_final`] returns on its timeout path with the queue
-    /// untouched and the socket back in blocking mode, and handing that to a
-    /// non-blocking event loop is the one mistake available here.
+    /// Consumed rather than borrowed because [`Conn::flush_final`] returns on its
+    /// timeout path with the queue untouched and the socket back in blocking mode,
+    /// which no event loop may be handed.
     pub(crate) fn send_last(mut self, frame: &Frame<'_>) {
         self.tx.clear();
         self.tx_pos = 0;
@@ -764,6 +771,31 @@ mod tests {
         );
         assert!(got == expected, "every byte must arrive, once and in order");
         assert!(conn.tx.is_empty(), "a drained queue must be given back");
+    }
+
+    /// Regression: [`RETAINED_CAPACITY`] below one PTY read reallocated the send queue
+    /// down and straight back up on every pass of a session that was merely busy.
+    #[test]
+    fn a_queue_that_drains_every_pass_is_never_reallocated() {
+        let payload = bulk(64 * 1024);
+        let (mut peer, mut conn) = pair();
+        let mut got = Vec::new();
+        let mut settled = 0;
+        for round in 0..8u64 {
+            conn.send(&Frame::Output {
+                offset: round * payload.len() as u64,
+                data: &payload,
+            });
+            while conn.wants_write() {
+                conn.flush_some().expect("a flush");
+                drain(&mut peer, &mut got);
+            }
+            if round == 0 {
+                settled = conn.tx.capacity();
+                assert!(settled > 0, "a queue that carried a frame has a capacity");
+            }
+            assert_eq!(conn.tx.capacity(), settled, "reallocated on pass {round}");
+        }
     }
 
     /// A peer that closes mid-frame: the header arrived, the payload never will.

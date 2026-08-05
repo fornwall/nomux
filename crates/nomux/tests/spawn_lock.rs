@@ -21,7 +21,6 @@
 
 mod harness;
 
-use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -35,8 +34,9 @@ use std::time::{Duration, Instant};
 use nomux_proto::PROTOCOL_VERSION;
 
 use harness::{
-    Reaper, Spawned, collect, control, daemon_reaper, nomux, nomux_with_shell, poll_by, poll_until,
-    process_alive, run_root, stderr, stdout, succeeded, while_nothing_forks,
+    Reaper, Session, Spawned, collect, control, daemon_reaper, entries, leads_a_process_group,
+    nomux, nomux_with_shell, poll_by, poll_until, process_alive, run_root, stderr, stdout,
+    succeeded, wait_for, wedge_socket, while_nothing_forks,
 };
 
 /// How long any one test here may spend waiting, across every wait it makes.
@@ -52,9 +52,16 @@ const PATIENCE: Duration = Duration::from_secs(30);
 
 /// A `list` that finds the spawn lock held leaves the whole entry alone, and
 /// collects it on the next pass once the lock is free.
+///
+/// The two planted names are a later version's sixth file (`rundir::session_id_of`),
+/// one on this session and one that is the whole of an id: the sweep has to reach both
+/// through a name this build never wrote, and [`collected_within`] asks for an empty
+/// directory rather than for the five.
 #[test]
 fn a_held_spawn_lock_survives_a_concurrent_list() {
     let session = StaleSession::create("lk1");
+    fs::write(session.dir.join("lk1.journal"), b"").expect("plant a later version's file");
+    fs::write(session.dir.join("lk2.journal"), b"").expect("plant an id that is nothing else");
     let lock = session.hold_lock();
 
     let listed = session.run(&["list"]);
@@ -111,8 +118,9 @@ fn kill_refuses_to_leave_a_locked_session_behind() {
     let lock = session.hold_lock();
 
     let killed = session.run(&["kill", "lk2"]);
-    assert!(
-        !killed.status.success(),
+    assert_eq!(
+        killed.status.code(),
+        Some(1),
         "kill claimed success for a session it could not remove: {:?}",
         stderr(&killed)
     );
@@ -252,33 +260,6 @@ fn a_daemon_holds_the_spawn_lock_while_it_claims_the_id() {
     );
 }
 
-/// Binds `path` and makes every later `connect` to it wait rather than be answered.
-///
-/// What a daemon whose event loop has stopped draining looks like from outside, and
-/// the only way to produce it: a backlog of zero still takes one connection — the
-/// kernel refuses at *more* than the backlog, not at it — so one queued `connect` is
-/// the whole wedge, and every one after it waits for an `accept` that is never coming.
-///
-/// Both are handed back because both are load-bearing: closing the listener refuses
-/// the queue instead of holding it, and closing the queued connection empties the
-/// backlog again.
-fn wedge_socket(path: &Path) -> (UnixListener, UnixStream) {
-    let listener = UnixListener::bind(path).expect("plant a listening socket");
-    // SAFETY: `listen` is passed a descriptor the borrow above keeps open across the
-    // call, and a backlog. `UnixListener` has no safe spelling of a second `listen` —
-    // `bind` chose the backlog and nothing revisits it — and rustix's would mean
-    // adding its `net` feature to the whole crate for one line of one test.
-    let shrunk = unsafe { libc::listen(listener.as_raw_fd(), 0) };
-    assert_eq!(
-        shrunk,
-        0,
-        "shrink the backlog: {}",
-        std::io::Error::last_os_error()
-    );
-    let queued = UnixStream::connect(path).expect("fill the backlog");
-    (listener, queued)
-}
-
 /// Regression: a session socket whose backlog is full does not park the escape hatch.
 ///
 /// An `AF_UNIX` `connect` to a listener that has stopped calling `accept` *blocks*
@@ -315,8 +296,9 @@ fn the_control_surface_does_not_park_on_a_socket_whose_backlog_is_full() {
         "a session that would not answer is still a session, and nothing named a pid \
          for it"
     );
-    assert!(
-        !killed.status.success(),
+    assert_eq!(
+        killed.status.code(),
+        Some(1),
         "kill claimed to have removed a session it never established the state of"
     );
     assert!(
@@ -348,10 +330,8 @@ fn the_control_surface_does_not_park_on_a_socket_whose_backlog_is_full() {
 /// `bind` does not follow it, finds the name taken and answers `EADDRINUSE`. No race,
 /// no timing, and the errno arrives strictly between the two.
 ///
-/// `setpgid` in the child is what forces the fork, and it is the same device
-/// `a_daemon_that_leads_a_process_group_detaches_by_forking` uses: `Command` never
-/// makes a process group leader, so without it `setsid` succeeds outright and this
-/// test would pass against the ordering it exists to catch.
+/// [`leads_a_process_group`] is what forces the fork, the same device
+/// `a_daemon_that_leads_a_process_group_detaches_by_forking` uses.
 #[test]
 fn a_daemon_that_cannot_bind_says_so_even_when_it_has_to_fork() {
     let session = StaleSession::empty("lkc");
@@ -363,21 +343,12 @@ fn a_daemon_that_cannot_bind_says_so_even_when_it_has_to_fork() {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // SAFETY: the closure runs in the forked child before exec, so it must be
-    // async-signal-safe. `setpgid` is, and nothing here allocates or takes a lock.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
-        });
-    }
+    leads_a_process_group(&mut command);
     let started = collect(&mut command);
 
-    assert!(
-        !started.status.success(),
+    assert_eq!(
+        started.status.code(),
+        Some(1),
         "a daemon that never bound its socket reported success: {:?}",
         stderr(&started)
     );
@@ -577,65 +548,259 @@ fn skip_as_root(why: &str) -> bool {
     root
 }
 
-/// `kill` never unlinks a live session's files when nothing will say which process
-/// is serving it.
+/// One way `<id>.pid` stops naming the daemon, and what that earns. See
+/// [`a_live_session_its_pidfile_cannot_identify_is_refused_and_left_alone`].
+struct Unidentified {
+    id: &'static str,
+    /// Whether the row needs a live process of this test's own for the file to
+    /// appear to name.
+    stranger: bool,
+    /// Makes the file useless, handing back whatever must stay open for it to stay
+    /// that way.
+    plant: fn(&LiveSession, u32) -> Vec<File>,
+    /// What the refusal must say of what it read.
+    says: fn(u32) -> String,
+    /// What it must not say.
+    never: fn(u32) -> Option<String>,
+    /// Puts a writable regular file back at the path.
+    repair: fn(&LiveSession),
+    /// Stands down as root, where a mode keeps nobody out of their own file.
+    needs_modes: bool,
+}
+
+/// The five states `<id>.pid` can be in that never resolve themselves. An *absent*
+/// pidfile is the daemon's bind-to-publish window and is waited out, and an empty one
+/// is that window a syscall later; a file the caller may not open, one that is not a
+/// file at all, one that runs past the bytes a pidfile may be, one naming a live
+/// process that is positively not the daemon, and one naming a process that is gone
+/// are none of the three, now or ever.
+fn unidentified_pidfiles() -> [Unidentified; 5] {
+    [
+        Unidentified {
+            id: "lk6",
+            stranger: false,
+            plant: |session, _| {
+                fs::set_permissions(session.pid_path(), fs::Permissions::from_mode(0o000))
+                    .expect("hide the pidfile");
+                Vec::new()
+            },
+            says: |_| "Permission denied".to_owned(),
+            never: |_| None,
+            repair: |session| {
+                fs::set_permissions(session.pid_path(), fs::Permissions::from_mode(0o600))
+                    .expect("restore the pidfile");
+            },
+            needs_modes: true,
+        },
+        // `read_prefix` opens `O_NONBLOCK` so a FIFO cannot park the escape hatch, and
+        // then took the one read it got — but only a regular file answers a read with
+        // "this is all of it", so a writer that has delivered `12345` of `1234567`
+        // hands back a whole, plausible, live pid. The reader is what lets the
+        // writer's `open` return, so the bytes are in the pipe before `kill` opens it.
+        Unidentified {
+            id: "lk31",
+            stranger: true,
+            plant: |session, stranger| {
+                fs::remove_file(session.pid_path()).expect("take the real pidfile away");
+                rustix::fs::mknodat(
+                    rustix::fs::CWD,
+                    session.pid_path(),
+                    rustix::fs::FileType::Fifo,
+                    rustix::fs::Mode::from_bits_truncate(0o600),
+                    0,
+                )
+                .expect("plant a FIFO where the pidfile should be");
+                let reading = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(session.pid_path())
+                    .expect("hold the FIFO open for reading");
+                let mut writing = OpenOptions::new()
+                    .write(true)
+                    .open(session.pid_path())
+                    .expect("open the FIFO for writing");
+                writing
+                    .write_all(stranger.to_string().as_bytes())
+                    .expect("deliver a prefix of the number");
+                vec![reading, writing]
+            },
+            says: |_| "is not a regular file".to_owned(),
+            never: |stranger| Some(format!("names pid {stranger}")),
+            repair: |session| {
+                fs::remove_file(session.pid_path()).expect("take the FIFO away");
+            },
+            needs_modes: false,
+        },
+        // The check that a number is a `nomux daemon <id>` ran only where a *second*
+        // witness named a live process too, so a file standing alone went straight to
+        // `SIGTERM`: `nomux kill` inside a container sharing a run directory with a
+        // daemon outside it terminated whichever process inside wore the number.
+        Unidentified {
+            id: "lk21",
+            stranger: true,
+            plant: |session, stranger| {
+                fs::write(session.pid_path(), format!("{stranger}\n"))
+                    .expect("plant a stranger's pid");
+                Vec::new()
+            },
+            says: |stranger| {
+                format!("it names pid {stranger}, which is not a `nomux daemon lk21` process")
+            },
+            // Nobody asks who is on the other end of a `connect`, so no number may be
+            // offered as though the socket had named one.
+            never: |_| Some("socket names".to_owned()),
+            repair: |_| {},
+            needs_modes: false,
+        },
+        // `read_prefix` takes the 32 bytes § 6.6 allows and no more, so a number padded
+        // to straddle that bound comes back as a smaller, plausible, live pid — here
+        // the stranger's own. A body that reached the bound is refused as one whose end
+        // was never seen, rather than parsed or quoted back as a pid.
+        Unidentified {
+            id: "lk17",
+            stranger: true,
+            plant: |session, stranger| {
+                let digits = stranger.to_string();
+                fs::write(
+                    session.pid_path(),
+                    format!("{}{digits}0\n", " ".repeat(32 - digits.len())),
+                )
+                .expect("plant a pidfile the read cannot see the end of");
+                Vec::new()
+            },
+            says: |_| "is cut off rather than read".to_owned(),
+            never: |stranger| Some(format!("names pid {stranger}")),
+            repair: |_| {},
+            needs_modes: false,
+        },
+        // `999999999\n` is exactly the pidfile § 6.6 describes, and past any `pid_max`
+        // a kernel hands out. The refusal used to quote the body back — sending the
+        // reader to repair a file that is already correct, where what has happened is
+        // a daemon that died without unlinking.
+        Unidentified {
+            id: "lk22",
+            stranger: false,
+            plant: |session, _| {
+                fs::write(session.pid_path(), "999999999\n")
+                    .expect("plant a number that names nothing");
+                Vec::new()
+            },
+            says: |_| "999999999 names no process".to_owned(),
+            never: |_| Some("it holds".to_owned()),
+            repair: |_| {},
+            needs_modes: false,
+        },
+    ]
+}
+
+/// A live session whose `<id>.pid` will not identify it keeps every one of its files,
+/// and the refusal says which way the file failed.
 ///
-/// The socket is unmistakably there, so there is a daemon holding the user's shell.
-/// Unlinking there takes that daemon's socket away without stopping it: the session
-/// answers nothing, appears in no listing, and the id is free for a second daemon to
-/// bind over. So this is an error, and the files stay exactly as they were until
-/// somebody can say which process to signal.
+/// [`unidentified_pidfiles`]'s five causes against one postcondition (§ 6.6). The
+/// socket answers throughout, so there is a daemon holding the user's shell: unlinking
+/// takes its socket away without stopping it, the session then appears in no listing,
+/// and the id is free for a second daemon to bind over. A probe that failed as well is
+/// [`kill_reports_a_socket_it_could_not_probe_rather_than_a_session_that_outlived_sigkill`]'s
+/// subject.
 ///
-/// `<id>.pid` is the whole of that answer (§ 6.6), so hiding it behind a mode of zero is
-/// all it takes. What that produces is the one unreadable state that never resolves
-/// itself: an *absent* pidfile is the daemon's bind-to-publish window and is waited out,
-/// an empty one is that window a syscall later, and a body that parses is something to
-/// report on — a file the caller may not open is none of the three, now or ever. The
-/// socket is deliberately left answering, so the session is unmistakably alive and the
-/// missing answer is the only thing under test; a probe that failed as well is the
-/// neighbour below's subject.
+/// The postcondition is the same every row: `kill` exits 1, whatever number the file
+/// appeared to name is not signalled, `list` prints `?` rather than handing a user the
+/// pid `kill` has just declined to act on, and not one of the files moves. Each row
+/// then republishes the real pid, which is the other direction and what keeps this from
+/// being a refusal of every file witness — a file that *does* name this session's
+/// daemon must still be taken, or § 6.2's fork leaves a healthy session unidentifiable.
 #[test]
-fn kill_leaves_a_live_session_alone_when_nothing_will_say_which_process_it_is() {
-    if skip_as_root("a mode keeps nobody out of their own pidfile, so it is read and acted on") {
-        return;
+fn a_live_session_its_pidfile_cannot_identify_is_refused_and_left_alone() {
+    for case in unidentified_pidfiles() {
+        if case.needs_modes
+            && skip_as_root(
+                "a mode keeps nobody out of their own pidfile, so it is read and acted on",
+            )
+        {
+            continue;
+        }
+        let session = LiveSession::create(case.id);
+        let before = entries(&session.run.dir);
+        let mut bystander = case.stranger.then(sleeper);
+        let stranger = bystander.as_ref().map_or(0, |sleeping| sleeping.id());
+        let held = (case.plant)(&session, stranger);
+
+        let killed = session.run.run(&["kill", case.id]);
+        let listed = stdout(&session.run.run(&["list"]));
+        let left = entries(&session.run.dir);
+        let survived = bystander.as_mut().is_none_or(Spawned::is_running);
+        drop(bystander);
+        drop(held);
+
+        // Repaired before the assertions, since the file is the only witness there is
+        // and this session has to go.
+        (case.repair)(&session);
+        fs::write(session.pid_path(), format!("{}\n", session.pid)).expect("republish the pid");
+        let identified = stdout(&session.run.run(&["list"]));
+        let collected = session.run.run(&["kill", case.id]);
+
+        let id = case.id;
+        let said = stderr(&killed);
+        assert!(
+            survived,
+            "{id}: the one candidate there was got signalled without being asked what \
+             it is: {said:?}"
+        );
+        assert_eq!(
+            killed.status.code(),
+            Some(1),
+            "{id}: a live session its one witness cannot identify is not one to unlink"
+        );
+        assert!(
+            said.contains(&(case.says)(stranger)),
+            "{id}: the refusal must say of the file what was actually established, \
+             since that is the whole of what anyone can repair: {said:?}"
+        );
+        if let Some(never) = (case.never)(stranger) {
+            assert!(
+                !said.contains(&never),
+                "{id}: the refusal claimed {never:?}, which is not what was read: \
+                 {said:?}"
+            );
+        }
+        assert_eq!(
+            listed.trim_end().split('\t').nth(1),
+            Some("?"),
+            "{id}: list must not hand back the number kill has just declined to act \
+             on: {listed:?}"
+        );
+        assert_eq!(
+            left, before,
+            "{id}: not one of the files was kill's to remove"
+        );
+        assert_eq!(
+            identified.trim_end().split('\t').nth(1),
+            Some(session.pid.to_string().as_str()),
+            "{id}: a lone file witness that *is* this session's daemon must still be \
+             taken, or § 6.2's fork leaves a healthy session unidentifiable: \
+             {identified:?}"
+        );
+        succeeded(
+            &collected,
+            &format!("{id}: kill failed once the session could be identified again"),
+        );
+        assert!(
+            entries(&session.run.dir).is_empty(),
+            "{id}: kill must unlink every one of the session's files"
+        );
     }
-    let session = LiveSession::create("lk6");
-    let before = entries(&session.run.dir);
-    fs::set_permissions(session.pid_path(), fs::Permissions::from_mode(0o000))
-        .expect("hide the pidfile");
+}
 
-    let killed = session.run.run(&["kill", "lk6"]);
-    // Repaired before the assertions, since the collection at the end has to be able to
-    // identify the daemon it is asked to stop.
-    fs::set_permissions(session.pid_path(), fs::Permissions::from_mode(0o600))
-        .expect("restore the pidfile");
-
-    assert!(
-        !killed.status.success(),
-        "kill claimed to have removed a session it left running"
-    );
-    assert!(
-        stderr(&killed).contains("is running"),
-        "the refusal must say the session is still there: {:?}",
-        stderr(&killed)
-    );
-    assert!(session.is_alive(), "the daemon must still be reachable");
-    assert_eq!(
-        entries(&session.run.dir),
-        before,
-        "not one of the five files was kill's to remove"
-    );
-
-    // Repaired, the same command works: the refusal is about what could be read, not
-    // about the session.
-    succeeded(
-        &session.run.run(&["kill", "lk6"]),
-        "kill failed once the session could be identified again",
-    );
-    assert!(
-        entries(&session.run.dir).is_empty(),
-        "kill must unlink all five files"
-    );
+/// A live process of this test's own that nothing may signal, for the pidfiles made to
+/// appear to name one.
+fn sleeper() -> Spawned {
+    Spawned::spawn(
+        Command::new("sleep")
+            .arg("300")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
 }
 
 /// Regression: a socket `kill` could not probe is reported as one, rather than as a
@@ -681,8 +846,9 @@ fn kill_reports_a_socket_it_could_not_probe_rather_than_a_session_that_outlived_
         fs::Permissions::from_mode(0o600),
     ));
 
-    assert!(
-        !killed.status.success(),
+    assert_eq!(
+        killed.status.code(),
+        Some(1),
         "kill claimed a postcondition it could not see: {:?}",
         stdout(&killed)
     );
@@ -706,119 +872,22 @@ fn kill_reports_a_socket_it_could_not_probe_rather_than_a_session_that_outlived_
     drop(session.run.run(&["kill", "lk25"]));
 }
 
-/// Asserts that both modes read `<id>.pid` and arrive at `daemon`.
-///
-/// Every test about a daemon that is hard to identify ends in the same three
-/// assertions, because there is one witness now and one thing standing between the
-/// number in it and a signal — `is_daemon_for`, asking that number what it is. So
-/// `list` must print the pid the file names rather than `?`, `kill` must report
-/// success, and the daemon must be the process that actually went. `describing` says
-/// which session this was: it is all that distinguishes one of these failures from
-/// another.
-///
-/// Nothing is planted and nothing is taken away: what these tests make hard to read is
-/// the *command line*, and the pidfile the daemon published itself is what carries the
-/// question to it.
-fn assert_identified_as_its_daemon(root: &Path, id: &str, daemon: u32, describing: &str) {
-    let listed = stdout(&control(root, &["list"]));
-    let killed = control(root, &["kill", id]);
-
-    succeeded(
-        &killed,
-        &format!("a daemon {describing} was not recognised as one"),
-    );
-    assert_eq!(
-        listed.trim_end().split('\t').nth(1),
-        Some(daemon.to_string().as_str()),
-        "list must name the daemon {describing} rather than give up on it: {listed:?}"
-    );
-    assert!(
-        poll_until(Duration::from_secs(10), || !process_alive(daemon)),
-        "kill reported success with the daemon {describing} still running as pid \
-         {daemon}"
-    );
-}
-
-/// Regression: a daemon is still recognised when the path it was started from is long.
-///
-/// The one witness there is gets asked what it is by reading `/proc/<pid>/cmdline`,
-/// and that read is bounded like every other one here. Bounded at the wrong size it
-/// answers "not this daemon" for a daemon whose `argv[0]` runs past the buffer —
-/// `spawn` starts it from `env::current_exe()` resolved, and § 5.2 installs under a
-/// directory the *client* names — which is not a harmless answer: it is the one that
-/// leaves a healthy session refused for as long as it runs, its own pidfile being all
-/// there is to identify it by.
-///
-/// So the buffer is sized past any path the kernel will resolve, and a read that fills
-/// it says "cannot tell" rather than "no". The binary here is copied somewhere that
-/// puts the whole command line past 512 bytes — a deep install rather than an absurd
-/// one, and a twelfth of what the kernel allows: the daemon must still be picked out
-/// of the number it published for itself.
-#[test]
-fn a_daemon_started_from_a_long_path_is_still_recognised_as_one() {
-    let root = run_root("lk19");
-    let mut deep = root.clone();
-    for _ in 0..6 {
-        deep.push("d".repeat(100));
-    }
-    fs::create_dir_all(&deep).expect("create the deep install directory");
-    let exe = deep.join("nomux");
-    // Under the fork gate, and not for tidiness: this is `ETXTBSY` waiting to
-    // happen. Another test's `Command::spawn` forking between the `open` inside
-    // `fs::copy` and the `close` that ends it leaves the forked child holding a
-    // *writable* descriptor onto this file until it `exec`s, and the kernel refuses
-    // to execute a file anybody has open for writing — so the `Command::new(&exe)`
-    // a few lines down fails with `ExecutableFileBusy`. Measured at one run in
-    // fifteen under `cargo test --test spawn_lock`, and invisible under nextest,
-    // which gives each test a process of its own and so has never shown it in CI.
-    // `PLAN.md` § P2 records the same hazard for `flock`; [`while_nothing_forks`]
-    // is the seam that already exists for it.
-    while_nothing_forks(|| {
-        fs::copy(env!("CARGO_BIN_EXE_nomux"), &exe).expect("install the binary deep");
-    });
-    // What the daemon's `/proc/<pid>/cmdline` will hold: the three arguments and the
-    // NUL after each. Asserted rather than assumed, since the whole test is about
-    // where that length falls — this is the lower bound `MAX_CMDLINE_LEN` has to clear
-    // for a deep install to be identified at all, and 512 is the size it once was.
-    let cmdline = exe.as_os_str().len() + 1 + "daemon".len() + 1 + "lk19".len() + 1;
-    assert!(
-        cmdline > 512,
-        "the command line must be longer than the buffer once was to test anything: \
-         {cmdline} bytes"
-    );
-
-    let started = collect(
-        Command::new(&exe)
-            .args(["spawn", "lk19"])
-            .env("XDG_RUNTIME_DIR", &root)
-            .env("SHELL", "/bin/sh")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped()),
-    );
-    succeeded(
-        &started,
-        "the deeply installed binary failed to start a session",
-    );
-    let (daemon, _reaper) = daemon_reaper(&root, "lk19");
-
-    assert_identified_as_its_daemon(&root, "lk19", daemon, "started from a long path");
-}
-
 /// Regression: a daemon is still recognised when its command line is long *behind*
 /// the id.
 ///
-/// The path in the test above is bounded — the kernel resolves `argv[0]` and will not
-/// hand back more than `PATH_MAX` — but `--label` is not: `spawn` passes what it was
-/// given straight through (`attach::spawn_daemon`), and the 256-byte cap in
-/// `sanitize_label` applies to the file the daemon *writes*, not to its own `argv`. So
-/// a command line has no length a buffer can be sized against, and a rule that needed
-/// to see the end of one would strand a session over a label.
+/// `argv[0]` is bounded — the kernel resolves it and will not hand back more than
+/// `PATH_MAX`, which is what `MAX_CMDLINE_LEN` is sized from — but `--label` is not:
+/// `spawn` passes what it was given straight through (`attach::spawn_daemon`), and the
+/// 256-byte cap in `sanitize_label` applies to the file the daemon *writes*, not to its
+/// own `argv`. So a command line has no length a buffer can be sized against, and a
+/// rule that needed to see the end of one would strand a session over a label.
 ///
 /// Nothing behind the id is read as anything but padding: the pair is looked for among
 /// the arguments the read saw the end of, and finding it is an answer whether or not
 /// the rest arrived. The label here is an order of magnitude past what the layout
-/// stores and past the whole buffer.
+/// stores and past the whole buffer. What both modes then have to do is the same
+/// thing — `list` must print the pid the file names rather than `?`, and `kill` must
+/// signal it and say so.
 #[test]
 fn a_daemon_started_with_an_over_long_label_is_still_recognised_as_one() {
     let root = run_root("lk20");
@@ -832,11 +901,20 @@ fn a_daemon_started_with_an_over_long_label_is_still_recognised_as_one() {
     succeeded(&started, "a session with a very long label failed to start");
     let (daemon, _reaper) = daemon_reaper(&root, "lk20");
 
-    assert_identified_as_its_daemon(
-        &root,
-        "lk20",
-        daemon,
-        "started with a label past the command-line buffer",
+    let listed = stdout(&control(&root, &["list"]));
+    succeeded(
+        &control(&root, &["kill", "lk20"]),
+        "a daemon started with a label past the command-line buffer was not recognised \
+         as one",
+    );
+    assert_eq!(
+        listed.trim_end().split('\t').nth(1),
+        Some(daemon.to_string().as_str()),
+        "list gave up on a daemon whose label ran past the buffer: {listed:?}"
+    );
+    assert!(
+        poll_until(Duration::from_secs(10), || !process_alive(daemon)),
+        "kill reported success with the daemon still running as pid {daemon}"
     );
 }
 
@@ -903,8 +981,9 @@ fn kill_signals_what_the_pidfile_names_even_when_another_daemon_answers_on_the_s
          daemon and no witness to this one: {:?}",
         stderr(&killed)
     );
-    assert!(
-        !killed.status.success(),
+    assert_eq!(
+        killed.status.code(),
+        Some(1),
         "the socket went on answering, so kill never established that the session had \
          stopped: {:?}",
         stdout(&killed)
@@ -959,6 +1038,14 @@ fn kill_leaves_the_files_of_a_session_that_claimed_the_id_inside_its_locked_regi
     // Stat'ed before `kill` runs, so the inode the wait below watches is this
     // session's own rather than whatever is at the path by then.
     let lock = fs::metadata(session.run.lock_path()).expect("stat the spawn lock");
+    // Emptied for the reason [`kill_waits_out_a_pidfile_that_has_been_created_but_not_yet_written`]
+    // relies on: `resolve` waits two seconds inside the locked region for a pid to be
+    // published, where stopping a healthy daemon takes fifty milliseconds. The region
+    // is what this has to interleave with, and a window that short is missed outright
+    // under a full-core run — the failure is then a wait that never saw the state, on
+    // a `kill` that had already been and gone.
+    let body = fs::read_to_string(session.pid_path()).expect("read the pidfile");
+    fs::write(session.pid_path(), b"").expect("empty the pidfile");
     // Bound now and moved into place later: `rename` is one syscall and `bind` is two,
     // and the gap between the second pair is a window in which the id is nobody's.
     let claiming = session.run.dir.join("claiming");
@@ -978,6 +1065,7 @@ fn kill_leaves_the_files_of_a_session_that_claimed_the_id_inside_its_locked_regi
         deadline,
     );
     fs::rename(&claiming, session.run.socket()).expect("claim the id under kill's lock");
+    fs::write(session.pid_path(), body.as_bytes()).expect("republish the pid");
 
     assert!(
         poll_by(deadline, || !killing.is_running()),
@@ -994,10 +1082,21 @@ fn kill_leaves_the_files_of_a_session_that_claimed_the_id_inside_its_locked_regi
     drop(fs::remove_file(session.run.socket()));
     drop(session.run.run(&["kill", "lk26"]));
 
-    assert!(
-        !killed.status.success(),
+    assert_eq!(
+        killed.status.code(),
+        Some(1),
         "kill claimed to have removed a session that was answering: {:?}",
         stdout(&killed)
+    );
+    // Which refusal it is, so the publish window above cannot be what decided this: a
+    // `kill` that gave up waiting for the pid also exits 1 and also unlinks nothing,
+    // and would pass the two assertions either side of this having never reached the
+    // interleaving.
+    assert!(
+        stderr(&killed).contains("still answering after SIGTERM and SIGKILL"),
+        "kill never got as far as establishing what the id it was holding the lock \
+         over had become: {:?}",
+        stderr(&killed)
     );
     assert_eq!(
         left,
@@ -1005,348 +1104,6 @@ fn kill_leaves_the_files_of_a_session_that_claimed_the_id_inside_its_locked_regi
         "the id was claimed inside the locked region, so not one of the five files was \
          kill's to remove: {:?}",
         stderr(&killed)
-    );
-}
-
-/// Regression: a pidfile whose number ran past the end of the read is not a pid.
-///
-/// The bounded read that keeps `list` off a planted gigabyte hands back a prefix, and
-/// a prefix that ends mid-number parses as a smaller one: `" "*25 + "32770419\n"` came
-/// back as 3277041, which was a real process of this test's. That is the harm the
-/// socket-first change exists to remove, re-entering through the fix for the one
-/// beside it, and the input is exactly what `MAX_PID_LEN`'s own reasoning invites — a
-/// file somebody padded by hand.
-///
-/// Nothing is shut and no mode is used: the socket answers, so the session is
-/// unmistakably alive, and `<id>.pid` is the only account of what serves it either way.
-#[test]
-fn a_pidfile_whose_number_is_cut_off_by_the_read_is_refused_rather_than_signalled() {
-    let session = LiveSession::create("lk17");
-    let mut bystander = Spawned::spawn(
-        Command::new("sleep")
-            .arg("300")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()),
-    );
-    // Padded so that the number straddles the end of any bounded read: a reader that
-    // stops inside it comes back with a different, plausible, live pid.
-    let padded = format!("{}{}\n", " ".repeat(25), 10 * bystander.id() + 7);
-    fs::write(session.pid_path(), &padded).expect("plant a padded pidfile");
-
-    let killed = session.run.run(&["kill", "lk17"]);
-    let listed = stdout(&session.run.run(&["list"]));
-    let survived = bystander.is_running();
-    drop(bystander);
-    // Republished rather than taken away: the file is the only witness there is, so a
-    // session with none is one `kill` rightly refuses, and this session has to go.
-    fs::write(session.pid_path(), format!("{}\n", session.pid)).expect("republish the pid");
-    succeeded(&session.run.run(&["kill", "lk17"]), "kill failed");
-
-    assert!(
-        survived,
-        "a truncated pidfile was parsed into somebody else's pid and signalled: {:?}",
-        stderr(&killed)
-    );
-    assert!(
-        !killed.status.success(),
-        "a pidfile that does not end inside the read is no pidfile, and a live \
-         session it cannot identify is not one to unlink"
-    );
-    assert_eq!(
-        listed.trim_end().split('\t').nth(1),
-        Some("?"),
-        "list must not print half a number as a pid: {listed:?}"
-    );
-}
-
-/// Regression: a FIFO at `<id>.pid` is refused rather than read for a prefix.
-///
-/// The bound above is not the only way a read comes back with part of a number.
-/// `read_prefix` opens `O_NONBLOCK` so that a FIFO cannot park the escape hatch, and
-/// then took the one read it got — but only a regular file answers a read with "this
-/// is all of it". A writer that has delivered `12345` of `1234567` so far hands back a
-/// whole, plausible, *live* pid, well under the bound `parse_pid` guards and with
-/// nothing about it to notice. So the descriptor is `fstat`ed instead.
-///
-/// What that number reaches is `control::chosen`, which asks each candidate what it is
-/// and so does not signal a `sleep` — the refusal is where the difference lands, and it
-/// is the half a user acts on: `kill` named the pid, called it "not a `nomux daemon`",
-/// and sent whoever read that to a number no file on this host ever held. Now it says
-/// the pidfile is not one.
-///
-/// The half-written number is arranged rather than raced: this test holds a reader of
-/// its own on the FIFO, which is what lets the writer's `open` return, so the bytes are
-/// sitting in the pipe before `kill` ever opens it. The socket is left answering, as
-/// above: it is what makes the session one nothing may unlink, and a file type is
-/// refused the same whoever is reading.
-#[test]
-fn a_pidfile_that_is_a_fifo_is_refused_rather_than_read_for_a_prefix() {
-    let session = LiveSession::create("lk31");
-    let mut bystander = Spawned::spawn(
-        Command::new("sleep")
-            .arg("300")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()),
-    );
-    let stranger = bystander.id();
-    fs::remove_file(session.pid_path()).expect("take the real pidfile away");
-    rustix::fs::mknodat(
-        rustix::fs::CWD,
-        session.pid_path(),
-        rustix::fs::FileType::Fifo,
-        rustix::fs::Mode::from_bits_truncate(0o600),
-        0,
-    )
-    .expect("plant a FIFO where the pidfile should be");
-    // Opened `O_NONBLOCK` and never read from: it keeps the pipe alive so the writer
-    // below does not block, and the bytes it leaves in the buffer go to whoever reads
-    // first, which is `kill`.
-    let _reading = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(session.pid_path())
-        .expect("hold the FIFO open for reading");
-    let mut writing = OpenOptions::new()
-        .write(true)
-        .open(session.pid_path())
-        .expect("open the FIFO for writing");
-    // The first bytes of a longer number, and a live process on their own. The rest
-    // never arrives, which is exactly what a FIFO is entitled to do.
-    writing
-        .write_all(stranger.to_string().as_bytes())
-        .expect("deliver a prefix of the number");
-
-    let killed = session.run.run(&["kill", "lk31"]);
-    let listed = stdout(&session.run.run(&["list"]));
-    let survived = bystander.is_running();
-    drop(bystander);
-    fs::remove_file(session.pid_path()).expect("take the FIFO away");
-    // And a real pidfile in its place, since the file is the only witness there is and
-    // this session has to go.
-    fs::write(session.pid_path(), format!("{}\n", session.pid)).expect("republish the pid");
-    succeeded(&session.run.run(&["kill", "lk31"]), "kill failed");
-
-    assert!(
-        survived,
-        "a FIFO handed `kill` a prefix and it signalled the process that number named: \
-         {:?}",
-        stderr(&killed)
-    );
-    assert!(
-        !killed.status.success(),
-        "a live session whose only witness is not a file is not one to unlink"
-    );
-    assert!(
-        !stderr(&killed).contains(&format!("names pid {stranger}")),
-        "the refusal quoted a number the pidfile never held, which is the one thing \
-         whoever reads it would act on: {:?}",
-        stderr(&killed)
-    );
-    assert!(
-        stderr(&killed).contains("is not a regular file"),
-        "and it must say what is actually wrong, since that is what can be repaired: \
-         {:?}",
-        stderr(&killed)
-    );
-    assert_eq!(
-        listed.trim_end().split('\t').nth(1),
-        Some("?"),
-        "list must not print what a FIFO happened to have delivered: {listed:?}"
-    );
-}
-
-/// Regression: `<id>.pid` is not a number to signal until it has been asked what it is.
-///
-/// The check ran only where a *second* witness named a live process too, so a file that
-/// stood alone went straight to `SIGTERM` and then `SIGKILL` with nobody having asked
-/// whether the number was a `nomux daemon <id>`. § 6.6 states the opposite as the
-/// contract: a pidfile the daemon wrote in *its* pid namespace means nothing in the
-/// reader's, so it is left to `resolve` to refuse. It was not refused. `nomux kill` run
-/// inside a container that shares a run directory with a daemon started outside it
-/// terminated whichever process inside happened to wear the outside number.
-///
-/// A live `sleep` stands in for that collision and needs no `unshare`: the number is
-/// there, it is this user's to signal, and it is positively not the daemon — which is the
-/// only reading § 6.6 lets decline one, "could not tell" being the answer that must never
-/// strand a session. Nothing is shut and no mode is used, so this holds as root as
-/// readily as anywhere: what is asked of `/proc` does not depend on who is asking.
-///
-/// `list` is asserted beside it because the two read the one witness the same way
-/// (§ 6.6): a column that still printed the stranger would be the escape hatch handing
-/// a user the pid to signal by hand, at the moment `kill` has just declined to.
-#[test]
-fn a_lone_pidfile_naming_a_live_stranger_is_refused_rather_than_signalled() {
-    let session = LiveSession::create("lk21");
-    let before = entries(&session.run.dir);
-    let mut bystander = Spawned::spawn(
-        Command::new("sleep")
-            .arg("300")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()),
-    );
-    let stranger = bystander.id();
-    fs::write(session.pid_path(), format!("{stranger}\n")).expect("plant a stranger's pid");
-
-    let killed = session.run.run(&["kill", "lk21"]);
-    let listed = stdout(&session.run.run(&["list"]));
-    let survived = bystander.is_running();
-    let left = entries(&session.run.dir);
-    // The other direction, and what keeps the check from being a refusal of every file
-    // witness: a file that *does* name this session's daemon must still be taken, or
-    // § 6.2's fork leaves a healthy session unidentifiable. Asked through `list`, which
-    // is the column a user reads and the one place the answer shows without the session
-    // having to be ended to see it.
-    fs::write(session.pid_path(), format!("{}\n", session.pid)).expect("republish the pid");
-    let identified = stdout(&session.run.run(&["list"]));
-    drop(bystander);
-    // The pid republished above is left where it is: the file is the only witness
-    // there is, so taking it away here would leave this session unkillable.
-    succeeded(&session.run.run(&["kill", "lk21"]), "kill failed");
-
-    assert!(
-        survived,
-        "the only witness there was got signalled without being asked what it is: \
-         {:?}",
-        stderr(&killed)
-    );
-    assert!(
-        !killed.status.success(),
-        "a live session whose one witness is positively not its daemon is not one to \
-         unlink"
-    );
-    assert!(
-        stderr(&killed).contains(&format!(
-            "it names pid {stranger}, which is not a `nomux daemon lk21` process"
-        )),
-        "the refusal must say which number it would not signal and what is wrong with \
-         it, rather than blaming a file that holds exactly what it should: {:?}",
-        stderr(&killed)
-    );
-    assert_eq!(
-        listed.trim_end().split('\t').nth(1),
-        Some("?"),
-        "list must not hand back the number kill has just declined to act on: \
-         {listed:?}"
-    );
-    assert_eq!(
-        identified.trim_end().split('\t').nth(1),
-        Some(session.pid.to_string().as_str()),
-        "a lone file witness that *is* this session's daemon must still be taken, or \
-         § 6.2's fork leaves a healthy session unidentifiable: {identified:?}"
-    );
-    assert_eq!(left, before, "not one of the files was kill's to remove");
-}
-
-/// Regression: a well-formed pidfile whose process is gone is reported as a stale
-/// number, not as a corrupt file.
-///
-/// The refusal is built from the *bytes* of the body, and `control::running_but` had a
-/// branch for a body running past the bound and one for everything else — so
-/// `999999999\n`, which is exactly the pidfile § 6.6 describes, came back as `it holds
-/// "999999999\n"`. That sends the reader to repair a file that is already correct, when
-/// what has happened is the ordinary one: a daemon died without unlinking, and the
-/// number it published names nothing this user can signal. There is no file to mend and
-/// a session to collect, and only one of those two sentences says so.
-///
-/// The socket is left answering, as it is for the truncated pidfile beside it: it is what
-/// makes this a live session rather than a stale one to be collected without a word, and
-/// the number in the file is still all there is to say what serves it. `999999999` is past
-/// any `pid_max` a kernel hands out, so it names nothing whoever runs this could signal,
-/// root included.
-#[test]
-fn a_pidfile_whose_process_is_gone_is_not_reported_as_a_corrupt_file() {
-    let session = LiveSession::create("lk22");
-    fs::write(session.pid_path(), "999999999\n").expect("plant a number that names nothing");
-
-    let killed = session.run.run(&["kill", "lk22"]);
-    // Republished rather than taken away: the file is the only witness there is, so a
-    // session with none is one `kill` rightly refuses, and this session has to go.
-    fs::write(session.pid_path(), format!("{}\n", session.pid)).expect("republish the pid");
-    succeeded(&session.run.run(&["kill", "lk22"]), "kill failed");
-
-    assert!(
-        !killed.status.success(),
-        "a live session with no witness left is not one to unlink"
-    );
-    assert!(
-        stderr(&killed).contains("999999999 names no process"),
-        "the refusal must say the number is stale rather than that the file is: {:?}",
-        stderr(&killed)
-    );
-    assert!(
-        !stderr(&killed).contains("it holds"),
-        "a pidfile holding exactly what the layout says must not be called corrupt: \
-         {:?}",
-        stderr(&killed)
-    );
-}
-
-/// Regression: the control surface answers from a bounded prefix of `<id>.pid`.
-///
-/// The escape hatch has to keep working on any host, which it would not if a file
-/// somebody left in the run directory decided how much memory it faulted in — and
-/// under `-Cpanic=immediate-abort` (§ 8) an allocation that fails is an abort rather
-/// than an error. `rundir::read_prefix` makes the argument; `<id>.label` has always
-/// been read that way and `<id>.pid` was read whole. The magnitude here is only what
-/// makes sixty-four megabytes obviously the wrong amount to read; the assertion is
-/// about the bound.
-///
-/// What such a file *means* is settled either way, and by the layout rather than by
-/// this test: a body that fills the reader's buffer is the prefix of a file whose end
-/// was never seen, so `list` prints `?` and `kill` refuses. Where a bounded reader and
-/// an unbounded one part is what the refusal then quotes — the thirty-two bytes the
-/// layout permits, against the whole file. So that sentence is where the assertion
-/// lands, which is the one place the amount read shows without measuring the process
-/// that read it.
-#[test]
-fn the_pidfile_is_read_as_far_as_the_layout_goes_and_no_further() {
-    let session = LiveSession::create("lk12");
-    let mut body = format!("{}\n", session.pid).into_bytes();
-    // Whitespace to the end of what any bounded reader would take, so the prefix is
-    // exactly what the layout permits and everything past it is not.
-    body.resize(32, b' ');
-    let mut padded = File::create(session.pid_path()).expect("rewrite the pidfile");
-    padded.write_all(&body).expect("write the pid");
-    padded
-        .set_len(1 << 26)
-        .expect("run the file on past anything worth reading");
-    drop(padded);
-
-    let listed = session.run.run(&["list"]);
-    let killed = session.run.run(&["kill", "lk12"]);
-    // Before the assertions, so a failure cannot leave a session behind, and a real
-    // pidfile because that is now the only thing that says what to signal.
-    fs::write(session.pid_path(), format!("{}\n", session.pid)).expect("republish the pid");
-    succeeded(&session.run.run(&["kill", "lk12"]), "kill failed");
-
-    succeeded(&listed, "list failed");
-    let line = stdout(&listed);
-    assert_eq!(
-        line.split('\t').nth(1),
-        Some("?"),
-        "a body that reached the reader's bound is no pid to print: {line:?}"
-    );
-    assert!(
-        !killed.status.success(),
-        "a live session whose pidfile ends where the read did is not one to unlink"
-    );
-    let said = stderr(&killed);
-    // Length before content, and it is half the assertion rather than a guard on the
-    // other half: a reader that faulted the whole file in says so in sixty-four
-    // megabytes, and printing that at the failure below would be the second thing
-    // this test got wrong.
-    assert!(
-        said.len() < 1024,
-        "the refusal quotes what was read, so it must be a sentence rather than the \
-         file it is about: {} bytes",
-        said.len()
-    );
-    assert!(
-        said.contains(&format!("it begins {:?}", String::from_utf8_lossy(&body))),
-        "and what it quotes must be exactly the prefix the layout describes: {said:?}"
     );
 }
 
@@ -1400,8 +1157,9 @@ fn the_control_surface_does_not_park_on_a_run_file_that_is_a_fifo() {
         "a FIFO holds no label, and it is no pidfile either"
     );
     let killed = killed.expect("`nomux kill` parked on a FIFO in the run directory");
-    assert!(
-        !killed.status.success(),
+    assert_eq!(
+        killed.status.code(),
+        Some(1),
         "nothing was left to say which process serves the session, so there was \
          nothing to unlink: {:?}",
         stdout(&killed)
@@ -1434,135 +1192,165 @@ fn ran_by(root: &Path, args: &[&str], deadline: Instant) -> Option<Output> {
     })
 }
 
-/// Regression: an id no command line can carry names no session.
+/// The frozen control surface reaches a live session through the files on disk
+/// alone (`IMPLEMENTATION.md` § 6.6) — `list` finds it and `kill` stops it.
 ///
-/// § 6.3's grammar allowed `-` anywhere, and `main` reads any argument that begins with
-/// one as an option — `nomux kill -abc123` is `unknown option` and `EX_USAGE`, and the
-/// id never reaches a mode. So a conforming client that minted one got a session it
-/// could create and then never spawn, attach or kill, with an exit code saying its
-/// command line was malformed rather than its id; and `list`, which learns ids from the
-/// directory rather than from a caller, printed that id as though something could be
-/// done with it. `rundir::is_valid_session_id` now refuses the leading `-`, so such a
-/// name belongs to no session at either end.
-///
-/// The socket is live and this process holds it, so nothing collects it and what the
-/// listing does with the name is the whole of the assertion.
+/// "Stops it" was the half nobody checked. The assertion was that the socket had
+/// gone, which is a statement about `unlink` and not about the session: a `kill`
+/// that removed the five files and left the daemon running would pass it unchanged,
+/// and § 10's whole contract for `kill` is that a zero status means "there is no
+/// such session". What such a daemon leaves behind is the worst of both — a shell
+/// still holding the user's work, with nothing on disk to attach to it by and
+/// nothing for `list` to report, until the seven-day idle deadline collects it.
 #[test]
-fn an_id_no_command_line_can_carry_is_offered_by_no_listing() {
-    let session = StaleSession::empty("lk30");
-    let listener = UnixListener::bind(session.dir.join("-abc123.sock"))
-        .expect("bind a socket at an id the command line cannot carry");
-    fs::write(session.dir.join("-abc123.pid"), "999999999\n").expect("plant its pidfile");
+fn list_and_kill_operate_without_the_protocol() {
+    let (mut session, _client, _) = Session::attached("control");
 
-    let listed = session.run(&["list"]);
-    let refused = session.run(&["kill", "-abc123"]);
-    drop(listener);
-
-    succeeded(&listed, "list failed");
+    let listed = stdout(&control(&session.root, &["list"]));
     assert!(
-        !stdout(&listed).contains("abc123"),
-        "list offered an id no mode can be given: {:?}",
-        stdout(&listed)
+        listed.contains(&session.id),
+        "list should report the live session, got {listed:?}"
     );
+    // One line per session and not per run file: `list` walks a directory holding
+    // several names that lead to this one id, and it is the only thing that folds
+    // them back together.
     assert_eq!(
-        refused.status.code(),
-        Some(64),
-        "and it cannot be given: a leading `-` is an option whatever the layout would \
-         accept: {:?}",
-        stderr(&refused)
+        listed
+            .lines()
+            .filter(|line| line.starts_with(&format!("{}\t", session.id)))
+            .count(),
+        1,
+        "list reported the same session more than once, got {listed:?}"
+    );
+
+    succeeded(
+        &control(&session.root, &["kill", &session.id]),
+        "kill failed",
+    );
+
+    assert!(!session.socket.exists(), "kill must unlink the run files");
+    // `kill` returns once the daemon has stopped answering, so the process is either
+    // already gone or on its way; the wait is for the reaping rather than for the
+    // signal. Collected here as well as asserted, since the harness would otherwise
+    // `SIGKILL` a corpse and learn nothing.
+    assert!(
+        poll_until(Duration::from_secs(10), || session
+            .child
+            .try_wait()
+            .expect("wait for the daemon")
+            .is_some()),
+        "kill removed the session's five files and left the daemon running, so the \
+         user's shell is still there with nothing left on disk to reach it by"
     );
 }
 
-/// Regression: a session is discovered and collected by every name it has, not by the
-/// handful this build happens to know.
+/// Connecting is not attaching.
 ///
-/// § 6.6 freezes the five names it lists and deliberately does not seal the *set* — it
-/// was four until `<id>.agent` arrived — so the bill for the next name goes to whoever
-/// is older. A build that enumerated extensions removed the ones it knew and left the
-/// rest: one file per collected session for as long as the two versions share a host,
-/// and an id whose *last* remaining file is a name it has never heard of is an id it
-/// never learns, so the `kill` that would clear it can never be typed. Both halves are
-/// here — a stale session carrying a sixth file, and an id that is nothing but one —
-/// and `rundir`'s own tests hold the other end of it, that `lk27` never reaches a
-/// neighbour whose id merely begins the same way.
+/// The frozen control surface decides whether a daemon is alive by connecting to
+/// its socket (§ 6.6), and so does the spawn race in § 6.3. If the daemon counted
+/// that as a takeover, `nomux list` would evict the user from every session on the
+/// host — and the client is told never to auto-reconnect after `TAKEOVER`, so the
+/// damage would be permanent.
 #[test]
-fn a_name_this_build_never_wrote_is_still_discovered_and_collected() {
-    let session = StaleSession::create("lk27");
-    fs::write(session.dir.join("lk27.journal"), b"").expect("plant a later version's file");
-    fs::write(session.dir.join("lk28.journal"), b"").expect("plant an id that is nothing else");
+fn a_liveness_probe_does_not_evict_the_attached_client() {
+    let (session, mut client, ok) = Session::attached("probe");
 
-    collected_within(&session, Duration::from_secs(10));
+    // The bare probe, then the real thing.
+    for _ in 0..3 {
+        drop(UnixStream::connect(&session.socket).expect("probe connect"));
+    }
+    assert!(stdout(&control(&session.root, &["list"])).contains(&session.id));
+
+    // `read_until` refuses anything that is not output, so an `Error{TAKEOVER}`
+    // fails this rather than being skipped over.
+    client.input(0, b"echo NOMUX-STILL-ATTACHED\n");
+    client.read_until("NOMUX-STILL-ATTACHED", ok.resume_from);
 }
 
-/// Regression: the refusal says what was established of the number it declined, rather
-/// than asserting a finding it is not entitled to.
+/// Ids are opaque per-tab identifiers, so the label is the only thing that makes a
+/// session recognisable to a human after the client loses its state.
 ///
-/// It used to weigh two candidates and end "…and *neither* is a `nomux daemon <id>`
-/// process", which `control::chosen` reached on an `is_daemon_for` that answered "could
-/// not tell" — a `/proc/<pid>/cmdline` that will not open, one that ran past the buffer —
-/// as readily as on one that answered no. § 6.6 keeps "it is not the daemon" and "I could
-/// not tell" apart because acting on the first where only the second holds is what strands
-/// a healthy session, and a message is not exempt from the distinction it refuses on.
-/// There is one witness now, and one sentence about it, which has to keep that promise on
-/// its own.
-///
-/// The state is built rather than provoked, and out of nothing but two files — which is
-/// what keeps this one standing where its neighbours stand down as root, since no mode is
-/// used to shut anything. This process binds the session socket, so the session is
-/// unmistakably there and stays there, and a `sleep` goes in the pidfile as the only
-/// account of what serves it. Nothing is signalled and nothing is unlinked.
+/// Through `spawn` because the label belongs to the session rather than to the
+/// connection (§ 6.6): it is recorded when the session is created, so the two modes
+/// that create one take it and `attach` refuses it outright
+/// ([`version_and_usage_report_what_a_client_keys_off`]).
 #[test]
-fn the_refusal_over_the_one_witness_says_what_was_established_of_it() {
-    let session = StaleSession::empty("lk29");
-    // Bound here and left accepting, so every probe finds a session and none of what
-    // follows is the stale path.
-    let listener = UnixListener::bind(session.socket()).expect("bind the session socket");
-    let mut bystander = Spawned::spawn(
-        Command::new("sleep")
-            .arg("300")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()),
+fn a_label_survives_into_list() {
+    let root = run_root("label");
+    let relay = Spawned::spawn(
+        nomux_with_shell(
+            &root,
+            &["spawn", "labelled", "--label", "  release build\tx  "],
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped()),
     );
-    let stranger = bystander.id();
-    fs::write(session.pid_path(), format!("{stranger}\n")).expect("plant a live stranger's pid");
+    // The label, not the socket. The daemon publishes in the order bind, pidfile,
+    // label (§ 6.2), and the assertion below reads the last two — so waiting on the
+    // first would let `list` run against a session that is answering and has not
+    // said what it is called, which prints `labelled\t?\t` and fails on the label.
+    wait_for(&root.join("nomux").join("labelled.label"));
+    // And the pidfile is already there, being one step earlier in that same order.
+    let (_pid, _reaper) = daemon_reaper(&root, "labelled");
 
-    let killed = session.run(&["kill", "lk29"]);
-    let survived = bystander.is_running();
-    let left = entries(&session.dir);
-    drop(bystander);
-    drop(listener);
+    let listed = stdout(&control(&root, &["list"]));
 
-    assert!(
-        survived,
-        "the one candidate there was got signalled without being asked what it is: \
-         {:?}",
-        stderr(&killed)
-    );
-    assert!(
-        !killed.status.success(),
-        "a live session its one witness positively does not identify is not one to \
-         unlink"
-    );
-    let said = stderr(&killed);
-    assert!(
-        said.contains(&format!(
-            "it names pid {stranger}, which is not a `nomux daemon lk29` process"
-        )),
-        "the refusal must give the number it would not signal and say of it what \
-         /proc actually established: {said:?}"
-    );
-    assert!(
-        !said.contains("its socket names"),
-        "the socket is no witness, so no number may be offered as though it were: \
-         {said:?}"
-    );
-    assert!(
-        left.contains(&"lk29.sock".to_owned()) && left.contains(&"lk29.pid".to_owned()),
-        "not one of the files was kill's to remove: {left:?}"
+    // Both collected before the assertions below, so a failure about the label does
+    // not also leave a session behind.
+    drop(relay);
+    drop(control(&root, &["kill", "labelled"]));
+
+    let line = listed
+        .lines()
+        .find(|line| line.starts_with("labelled\t"))
+        .unwrap_or_else(|| panic!("session missing from list: {listed:?}"));
+    let label = line.split('\t').nth(2).expect("label column");
+    assert_eq!(
+        label, "release buildx",
+        "label should be trimmed and stripped of control characters"
     );
 }
 
+/// An id that could never have named a session is a malformed command line rather
+/// than a session that would not have us.
+///
+/// Through `spawn`, which is the mode with something to lose by getting the order
+/// wrong: it is the one that goes on to `ensure_dir`, so a refusal that came after
+/// the directory was created would be a bad id bringing a run directory into
+/// existence — and `../escape` would bring it into existence somewhere the caller
+/// did not name. `attach` reaches the same refusal through the same
+/// `SessionPaths::new` and creates nothing either way, so it is the weaker of the two
+/// spellings.
+#[test]
+fn invalid_session_ids_are_refused() {
+    // A run directory of its own even though nothing should ever be created in it:
+    // the refusal is what is under test, and a regression that got as far as the
+    // filesystem would otherwise leave its mess where every other test lives.
+    let root = run_root("bad_ids");
+    for id in ["../escape", "with/slash", "with space"] {
+        let output = control(&root, &["spawn", id]);
+        // The exit status, not merely a non-zero one: § 10 gives a malformed
+        // invocation `EX_USAGE`, and the distinction is the whole behaviour. A client
+        // caches "unattachable" per host on 126, so an id that could never have named
+        // a session must not come back wearing that number.
+        assert_eq!(
+            output.status.code(),
+            Some(64),
+            "id {id:?} should be refused as EX_USAGE, got {:?}",
+            output.status
+        );
+        assert!(
+            stderr(&output).contains("invalid session id"),
+            "id {id:?} should be rejected by name"
+        );
+    }
+    assert!(
+        !root.join("nomux").exists(),
+        "an id that could never have named a session brought the run directory it \
+         would have lived in into existence"
+    );
+}
 /// One line per session, however many of its files are on disk.
 ///
 /// `list` discovers sessions by every run-file name rather than by the socket alone
@@ -1656,7 +1444,11 @@ fn the_control_surface_refuses_a_run_directory_that_is_not_ours() {
     let planted = PlantedRunDir::create("lk7");
 
     let attached = planted.run(&["attach", "imp"]);
-    assert!(!attached.status.success(), "attach used a planted socket");
+    assert_eq!(
+        attached.status.code(),
+        Some(126),
+        "attach used a planted socket"
+    );
     assert!(
         stderr(&attached).contains("it is a symlink"),
         "attach must say what it refused: {:?}",
@@ -1669,8 +1461,9 @@ fn the_control_surface_refuses_a_run_directory_that_is_not_ours() {
 
     for mode in [vec!["list"], vec!["kill", "imp"]] {
         let out = planted.run(&mode);
-        assert!(
-            !out.status.success(),
+        assert_eq!(
+            out.status.code(),
+            Some(1),
             "{mode:?} used a planted run directory"
         );
         assert!(
@@ -1724,13 +1517,15 @@ fn the_control_surface_neither_creates_nor_complains_about_a_missing_run_directo
 /// pinning the number would make bumping the protocol a two-file change and say
 /// nothing about whether the binary reports the one it speaks.
 ///
-/// 64 is `EX_USAGE` (§ 10), and all three ways of reaching it are here because they
-/// are different code: an argument a mode that takes none was given, a mode that does
-/// not exist, and a `--label` offered to the one session mode that does not create a
-/// session. None may put anything on stdout — a client that parses stdout must not
-/// find usage text in it — and each must name what it objected to, since the usage
-/// text behind it describes five modes and says nothing about which one the caller
-/// got wrong.
+/// 64 is `EX_USAGE` (§ 10), and all four ways of reaching it are here because they are
+/// different code: an argument a mode that takes none was given, a mode that does not
+/// exist, a `--label` offered to the one session mode that does not create a session,
+/// and an id that begins with `-`, which `main` reads as an option before any mode sees
+/// it — `rundir::is_valid_session_id` refuses that leading `-` for the same reason, so
+/// a conforming client can never mint an id it could create and then never kill. None
+/// may put anything on stdout — a client that parses stdout must not find usage text in
+/// it — and each must name what it objected to, since the usage text behind it
+/// describes five modes and says nothing about which one the caller got wrong.
 ///
 /// The `--label` row is the whole of what `main` does about the split beyond
 /// dispatching it, and dropping the option on the floor was the alternative. A
@@ -1773,6 +1568,11 @@ fn version_and_usage_report_what_a_client_keys_off() {
             vec!["attach", "lk10", "--label", "a tab title"],
             "a label offered to the mode that creates nothing",
             "--label",
+        ),
+        (
+            vec!["kill", "-abc123"],
+            "an id no command line can carry",
+            "unknown option",
         ),
     ] {
         let refused = control(&root, &mode);
@@ -1920,13 +1720,6 @@ impl LiveSession {
     fn pid_path(&self) -> PathBuf {
         self.run.pid_path()
     }
-
-    /// Whether a daemon is still answering. The same probe `list` and `kill` make,
-    /// and the same authority: the socket outlives the process that bound it, so
-    /// only a `connect` can tell.
-    fn is_alive(&self) -> bool {
-        UnixStream::connect(self.run.socket()).is_ok()
-    }
 }
 
 /// A run directory that is a symlink into one anybody can write to, with a
@@ -2025,17 +1818,6 @@ fn inode(path: &Path) -> u64 {
     fs::metadata(path)
         .unwrap_or_else(|err| panic!("stat {}: {err}", path.display()))
         .ino()
-}
-
-/// What is left in a run directory, sorted, for assertions about what was removed.
-fn entries(dir: &Path) -> Vec<String> {
-    let mut names: Vec<String> = fs::read_dir(dir)
-        .unwrap_or_else(|err| panic!("read {}: {err}", dir.display()))
-        .filter_map(Result::ok)
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .collect();
-    names.sort_unstable();
-    names
 }
 
 /// Which of the two states `/proc/locks` reports an `flock` request in.

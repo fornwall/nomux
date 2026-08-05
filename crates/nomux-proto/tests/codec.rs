@@ -384,6 +384,32 @@ proptest! {
         decode_as_every_type(&payload)?;
     }
 
+    /// A `Hello` whose declared `term_len` runs past the bytes behind it.
+    ///
+    /// The one length prefix on this wire. The sweeps above reach the boundary only
+    /// on the rare payload already shaped like a `Hello`, and accept any refusal
+    /// there; this reaches it in every case and pins which refusal.
+    #[test]
+    fn a_hello_that_overstates_its_term_length_is_truncated(
+        term in any_bytes(),
+        beyond in 1u16..=u16::MAX,
+    ) {
+        // The fixed prefix § 2.2 gives `Hello` — protocol, flags, out_offset,
+        // winsize — all zero, which is a shape the decoder accepts.
+        let mut payload = vec![0u8; 19];
+        let declared = u16::try_from(term.len()).unwrap_or(u16::MAX).saturating_add(beyond);
+        payload.extend_from_slice(&declared.to_be_bytes());
+        payload.extend_from_slice(&term);
+        prop_assert_eq!(
+            Frame::decode(FrameType::Hello, &payload),
+            Err(ProtoError::Truncated),
+            "declared {} with {} bytes behind it",
+            declared,
+            term.len()
+        );
+        decode_as_every_type(&payload)?;
+    }
+
     /// The same, on payloads one byte away from valid.
     ///
     /// Uniform random bytes almost never reach the code past a length prefix or an

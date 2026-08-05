@@ -89,6 +89,8 @@ pub(crate) struct Agent {
     /// ever reused while a channel holds it, so a close and an open crossing in
     /// flight cannot be confused for each other.
     next_id: u32,
+    /// Whether the cap has already been reported; once is an attachment's worth.
+    capped: bool,
 }
 
 impl Agent {
@@ -110,6 +112,7 @@ impl Agent {
             path: path.to_path_buf(),
             channels: Vec::new(),
             next_id: 1,
+            capped: false,
         })
     }
 
@@ -178,10 +181,22 @@ impl Agent {
             }
             Err(_) => return Accept::Failed,
         };
-        if !serving
-            || self.channels.len() >= MAX_AGENT_CHANNELS as usize
-            || stream.set_nonblocking(true).is_err()
+        if !serving || stream.set_nonblocking(true).is_err() {
+            return Accept::Idle;
+        }
+        // Nothing but a detach frees the slot of a closed channel whose peer stopped
+        // reading, and the queue dropped with it is one that peer's socket buffer had no
+        // room for — bytes already in that buffer survive the close and are still read.
+        if self.channels.len() >= MAX_AGENT_CHANNELS as usize
+            && let Some(at) = self.channels.iter().position(|chan| chan.closing)
         {
+            drop(self.channels.remove(at));
+        }
+        if self.channels.len() >= MAX_AGENT_CHANNELS as usize {
+            if !std::mem::replace(&mut self.capped, true) {
+                let id = crate::rundir::session_id_of(&self.path).unwrap_or_default();
+                crate::syslog::error(id, "agent socket: every channel is in use");
+            }
             return Accept::Idle;
         }
         // Unreachable past the cap above — see [`Agent::take_id`] — and answered by
@@ -315,6 +330,7 @@ impl Agent {
     /// process waiting on it should learn that now rather than at reattach.
     pub(crate) fn forget_all(&mut self) {
         self.channels.clear();
+        self.capped = false;
     }
 }
 

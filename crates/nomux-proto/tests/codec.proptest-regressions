@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8578486c99861469f96ea64547356fbea9c9c7a3f5284041c374b0ba4493af89 # shrinks to payload = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+cc b44a4cf766bdec7d1a850fb9a16666a300485b5b143c6da523fb2f72351108f8 # shrinks to owned = OwnedFrame { frame: Hello(Hello { protocol: 0, agent_forward: false, repaint_ctrl_l: false, out_offset: 0, win: WinSize { cols: 0, rows: 0, xpixel: 0, ypixel: 0 }, term: "" }), text: "𐀀a ¡ࠀ\u{1}a �¡ 𐀀¡A0 \u{1} a𐀀 ࠀ𐀀 ", bytes: [] }, position = 35969, flip = 1, truncate = true

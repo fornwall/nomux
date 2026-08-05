@@ -264,6 +264,11 @@ impl Session {
                 // The child's working directory, so `pwd` is assertable.
                 .env("HOME", &root)
                 .env("NOMUX_RING_BYTES", ring_bytes)
+                // § 6.7 has the daemon overwrite this and § 5.1 has it change nothing
+                // else, so a developer's own agent reaches the child untouched on
+                // every session whose forwarding is off or failed — and a test asking
+                // what the child was pointed at would be reading the host.
+                .env_remove("SSH_AUTH_SOCK")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null()),
@@ -295,6 +300,8 @@ impl Session {
         Client {
             stream,
             pending: Vec::new(),
+            in_offset: 0,
+            out_offset: 0,
         }
     }
 
@@ -501,6 +508,28 @@ pub(crate) fn nomux(root: &Path, args: &[&str]) -> Command {
     command
 }
 
+/// Makes what `command` starts a process-group leader, so `setsid` answers `EPERM`
+/// and § 6.2's detachment has to fork.
+///
+/// `Command` never calls `setpgid`, so a daemon it starts is not a leader and the
+/// fork is unreachable: a test that skipped this would pass against the ordering it
+/// exists to catch. It is also the shape a shell with job control produces.
+pub(crate) fn leads_a_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: the closure runs in the forked child before exec, so it must be
+    // async-signal-safe. `setpgid` is, and nothing here allocates or takes a lock.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+}
+
 /// [`nomux`] with a `SHELL` the developer's login environment cannot vary.
 ///
 /// For every invocation that could put a shell behind a PTY — including the ones
@@ -658,20 +687,37 @@ pub(crate) fn stat_field(pid: u32, field: StatField) -> Option<u32> {
         .ok()
 }
 
-/// How much processor time `pid` has been charged, in the clock ticks `/proc`
-/// counts in.
+/// How long a spin is measured over.
 ///
+/// Half a second rather than the 300 ms one caller used, because no figure can be
+/// quoted for a spin — it is whatever share of a core the scheduler hands the daemon,
+/// and three measurements of it spread from the twenties to the forties. What a
+/// threshold rests on is the other answer, which is not a share of anything: a daemon
+/// that is asleep measures zero, and no amount of load moves zero.
+pub(crate) const SPIN_WINDOW: Duration = Duration::from_millis(500);
+
+/// How much processor time `daemon` is charged over [`SPIN_WINDOW`], in the clock
+/// ticks `/proc` counts in.
+///
+/// A wall-clock interval rather than a wait for a condition, since it *is* the
+/// measurement — every caller establishes the state it is measuring before it starts.
 /// User and system together, because the two states this has to tell apart are
-/// "asleep in `poll`" and "going round the loop as fast as the scheduler allows",
-/// and the second spends its time on both sides of the syscall boundary. A process
-/// that has gone reports nothing, which reads here as zero — the same answer the
-/// caller's assertion wants, and one no daemon that is still there can produce
-/// falsely, since these counters never go down.
-pub(crate) fn cpu_ticks(pid: u32) -> u32 {
-    [StatField::UserTime, StatField::SystemTime]
-        .into_iter()
-        .filter_map(|field| stat_field(pid, field))
-        .sum()
+/// "asleep in `poll`" and "going round the loop as fast as the scheduler allows", and
+/// the second spends its time on both sides of the syscall boundary. A process that
+/// has gone reports nothing, which reads here as zero — the answer the caller's
+/// assertion wants, and one no daemon that is still there can produce falsely, since
+/// these counters never go down.
+pub(crate) fn cpu_ticks(daemon: u32) -> u64 {
+    let charged = || -> u64 {
+        [StatField::UserTime, StatField::SystemTime]
+            .into_iter()
+            .filter_map(|field| stat_field(daemon, field))
+            .map(u64::from)
+            .sum()
+    };
+    let began = charged();
+    thread::sleep(SPIN_WINDOW);
+    charged().saturating_sub(began)
 }
 
 /// Whether `pid` is still a process rather than gone or a zombie nobody has
@@ -706,10 +752,61 @@ pub(crate) fn wait_until_answering(path: &Path) {
     assert!(answered, "the daemon never answered on {}", path.display());
 }
 
+/// What the run directory holds, sorted, or nothing where there is no run directory.
+///
+/// Both readings are the same answer to the same question — which of a session's five
+/// files exist — so the absent directory is folded in here rather than at the call
+/// sites, where it would read as a case to handle rather than as an empty set.
+pub(crate) fn entries(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort_unstable();
+    names
+}
+
+/// Binds `path` and makes every later `connect` to it wait rather than be answered.
+///
+/// What a daemon whose event loop has stopped calling `accept` looks like from
+/// outside, and the only way to produce it: a backlog of zero still takes one
+/// connection — the kernel refuses at *more* than the backlog, not at it — so one
+/// queued `connect` is the whole wedge, and every one after it waits for an `accept`
+/// that is never coming.
+///
+/// Both ends are handed back because both are load-bearing: closing the listener
+/// refuses the queue instead of holding it, and closing the queued connection empties
+/// the backlog again.
+pub(crate) fn wedge_socket(path: &Path) -> (UnixListener, UnixStream) {
+    use std::os::fd::AsRawFd;
+
+    let listener = UnixListener::bind(path).expect("plant a listening socket");
+    // SAFETY: `listen` is passed a descriptor the borrow above keeps open across the
+    // call, and a backlog. `UnixListener` has no safe spelling of a second `listen` —
+    // `bind` chose the backlog and nothing revisits it — and rustix's would mean
+    // adding its `net` feature to the whole crate for one line of one test.
+    let shrunk = unsafe { libc::listen(listener.as_raw_fd(), 0) };
+    assert_eq!(
+        shrunk,
+        0,
+        "shrink the backlog: {}",
+        std::io::Error::last_os_error()
+    );
+    let queued = UnixStream::connect(path).expect("fill the backlog");
+    (listener, queued)
+}
+
 /// A protocol client: enough of one to assert on daemon behaviour.
 pub(crate) struct Client {
     stream: UnixStream,
     pending: Vec<u8>,
+    /// Where this client stands on each stream: one past the last byte it has sent,
+    /// and one past the last it has read. Kept so that [`still_serving`] can ask the
+    /// session a question without being handed the two offsets to ask it at.
+    in_offset: u64,
+    out_offset: u64,
 }
 
 /// Where the two streams stand once the child is ready. See [`Client::make_ready`].
@@ -754,6 +851,7 @@ impl Client {
     /// The most-sent frame in the suite by a wide margin, and the only one whose
     /// struct literal outweighs its content.
     pub(crate) fn input(&mut self, offset: u64, data: &[u8]) {
+        self.in_offset = self.in_offset.max(offset + data.len() as u64);
         self.send(&Frame::Input { offset, data });
     }
 
@@ -766,7 +864,11 @@ impl Client {
         match self.next_frame() {
             (FrameType::HelloOk, payload) => {
                 match Frame::decode(FrameType::HelloOk, &payload).expect("decode HelloOk") {
-                    Frame::HelloOk(ok) => ok,
+                    Frame::HelloOk(ok) => {
+                        self.in_offset = ok.in_applied;
+                        self.out_offset = ok.resume_from;
+                        ok
+                    }
                     other => panic!("expected HelloOk, got {other:?}"),
                 }
             }
@@ -1089,6 +1191,7 @@ impl Client {
                     offset += data.len() as u64;
                     seen.extend_from_slice(data);
                     if String::from_utf8_lossy(&seen).contains(needle) {
+                        self.out_offset = offset;
                         return (String::from_utf8_lossy(&seen).into_owned(), offset);
                     }
                 }
@@ -1102,6 +1205,20 @@ impl Client {
             String::from_utf8_lossy(&seen)
         );
     }
+}
+
+/// Asks the session for a marker no shell that failed to run the line could produce,
+/// and waits for it.
+///
+/// The arithmetic is the assertion: the line discipline echoes the command line
+/// before any shell reads it, so a marker written out whole is satisfied by that echo
+/// alone. See [`Client::make_ready`], where the same trick is load-bearing.
+pub(crate) fn still_serving(client: &mut Client, tag: &str) {
+    client.input(
+        client.in_offset,
+        format!("echo {tag}-$((6*7))\n").as_bytes(),
+    );
+    client.read_until(&format!("{tag}-42"), client.out_offset);
 }
 
 /// Asserts that a frame the daemon sent is an `Error` carrying `code`.

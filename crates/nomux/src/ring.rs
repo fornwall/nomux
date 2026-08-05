@@ -88,6 +88,16 @@ mod tests {
         ring.slices_from(offset).concat()
     }
 
+    /// The clamp `Ring::new` exists to make unreachable: a zero capacity must retain a
+    /// byte rather than reach an abort site in a `panic = "abort"` binary.
+    #[test]
+    fn a_zero_capacity_retains_one_byte_rather_than_aborting() {
+        let mut ring = Ring::new(0);
+        ring.push(b"ab");
+        assert_eq!((ring.base(), ring.end()), (1, 2));
+        assert_eq!(read_from(&ring, ring.base()), b"b");
+    }
+
     #[test]
     fn offsets_track_total_written_not_retained() {
         let mut ring = Ring::new(4);
