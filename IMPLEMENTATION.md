@@ -2,26 +2,21 @@
 
 Low-level detail. Rationale and properties: [DESIGN.md](DESIGN.md).
 
-This is a reference rather than a narrative: §2.2, §6.6 and §10 are looked up, and
-the sections cross-refer constantly. Hence the index, and §1's rule about what belongs
-here at all.
-
 1. [Layout and conventions](#1-layout-and-conventions) — [where a thing is written down](#where-a-thing-is-written-down), [environment](#environment)
 2. [Wire protocol](#2-wire-protocol) — [framing](#21-framing), [messages](#22-messages), [flags](#23-flags)
 3. [Offsets and exactly-once input](#3-offsets-and-exactly-once-input)
 4. [Ring buffer](#4-ring-buffer) — [backpressure](#41-backpressure), [attach below the base](#42-attach-with-from--base_offset), [gap handling](#43-gap-handling)
 5. [Bootstrap](#5-bootstrap) — [probe](#51-probe-and-attach-in-one-round-trip), [upload](#52-upload-and-attach-in-one-round-trip), [decision tree](#53-decision-tree)
-6. [Daemon](#6-daemon) — [PTY and child](#61-pty-and-child) ([what it runs](#611-what-the-child-runs)), [detachment](#62-detachment-from-the-login-session), [socket](#63-socket), [multiple clients](#64-multiple-clients) ([event ordering](#641-event-ordering)), [shutdown](#65-shutdown), [**frozen control surface**](#66-frozen-control-surface) ([identification](#identification), [`list` output](#list-output), [`<id>.label`](#idlabel)), [agent forwarding](#67-agent-forwarding)
+6. [Daemon](#6-daemon) — [PTY and child](#61-pty-and-child), [detachment](#62-detachment-from-the-login-session), [socket](#63-socket), [multiple clients](#64-multiple-clients), [shutdown](#65-shutdown), [**frozen control surface**](#66-frozen-control-surface), [agent forwarding](#67-agent-forwarding)
 7. [Attach relay](#7-attach-relay)
 8. [Build](#8-build)
 9. [Testing](#9-testing)
 10. [Exit codes](#10-exit-codes)
+11. [Diagnostics](#11-diagnostics)
 
-**Building something against nomux?** §6.6 is the only contract here that is frozen
-and the only one a third party may rely on — the five filenames, their permissions,
-the pidfile's format and what `list` prints. Everything else in this file describes a
-version, not a promise. It sits under §6 because that is the code that maintains it,
-not because it is a detail of the daemon.
+**Building something against nomux?** §6.6 is the only frozen contract here and the
+only one a third party may rely on: the five filenames, their permissions, the
+pidfile's format, what `list` prints. Everything else describes a version, not a promise.
 
 ## 1. Layout and conventions
 
@@ -31,48 +26,36 @@ crates/nomux/         the binary: daemon, attach relay, control surface.
 ```
 
 `nomux-proto` is split out because the client project reimplements or links the same
-codec; keeping it I/O-free makes it portable and property-testable in isolation, and
-it is the half that can carry `#![forbid(unsafe_code)]`, which `crates/nomux` — a
-daemon that forks, execs and drives a PTY — cannot. So what belongs there is what is on
-the wire and nothing else: session id validation (§ 6.3) and the agent channel cap
-(§ 6.7) are daemon policy, and live in `crates/nomux` beside the code that enforces them.
+codec; keeping it I/O-free makes it portable and property-testable in isolation, and it
+is the half that can carry `#![forbid(unsafe_code)]`. What belongs there is what is on
+the wire: session id validation (§ 6.3) and the agent channel cap (§ 6.7) are daemon
+policy, and live in `crates/nomux`.
 
-It is not published (`publish = false`). A crates.io version is a semver promise about
-an API that is this wire format, and [DESIGN.md § 2](DESIGN.md#2-scope) says the wire
-format has no stability guarantee; `PROTOCOL_VERSION` is the compatibility axis, and it
-answers a peer rather than a resolver.
+Neither is published (`publish = false`): a crates.io version would be a semver promise
+about an API that is this wire format, which [DESIGN.md § 2](DESIGN.md#2-scope) gives no
+stability guarantee. `PROTOCOL_VERSION` answers a peer rather than a resolver.
 
 - Edition 2024, MSRV 1.97.1 (`rust-toolchain.toml`).
 - Workspace lints: `clippy::pedantic` + `nursery` + `cargo`, plus `unwrap_used`,
-  `expect_used`, `panic`, `indexing_slicing`, `undocumented_unsafe_blocks`.
-  Test relaxations live in `clippy.toml`.
+  `expect_used`, `panic`, `indexing_slicing`, `undocumented_unsafe_blocks`. **Every one
+  stays at `warn` in `Cargo.toml`**; the deny is `-D warnings` on the clippy hook in
+  `.pre-commit-config.yaml`, which gates this tree rather than any build of it. Test
+  relaxations live in `clippy.toml`.
 
 ### Where a thing is written down
-
-One rule decides that, and it is the most consistent convention in this tree:
 
 > **Keep the argument where it is, beside the code. Keep the contract in the
 > document.**
 
-A reader of `rundir.rs` needs to know why the spawn lock is taken before the stale
-probe, and why a lock that cannot be obtained at all is proceeded past; that argument
-turns on the errnos in front of it and belongs in the doc comment on the function that
-makes the call, where it cannot be changed without the change being read. A reader of
-*this* file needs to know that the lock is taken, that collection removes `<id>.lock`
-last, and what `list` prints — which is what a client author, a future binary and a
-reviewer come here for.
-
 So a section here states rules, values, formats and orderings, and names the module
-that argues for them. A paragraph here that has started explaining *why* a syscall was
-chosen has usually been copied out of a doc comment, and the copy is the half that
-goes stale, because the code is what gets edited. That is what "a reference rather
-than a narrative" above is claiming, and it is an obligation on the next change rather
-than a description of how this file happens to read today.
+that argues for them. A paragraph here explaining *why* a syscall was chosen has
+usually been copied out of a doc comment, and the copy is the half that goes stale.
 
 ### Environment
 
 Everything nomux reads from the environment, in one place, with the section that owns
-each behaviour beside it. The three build variables are tested for exactly `1`.
+each behaviour beside it. The two build variables — `NOMUX_DEBUG` and
+`NOMUX_UPDATE_BASELINE` — are tested for exactly `1`; the other two carry a value.
 
 | Variable | Read by | Effect |
 | --- | --- | --- |
@@ -86,9 +69,7 @@ each behaviour beside it. The three build variables are tested for exactly `1`.
 | `NOMUX_DEBUG` | `scripts/build-release.sh` | Also build the unstripped companions (§8) |
 | `NOMUX_UPDATE_BASELINE` | `scripts/build-release.sh` | Rewrite `scripts/size-baseline` from this build and skip the growth gate (§8) |
 
-A run-directory source that does not name an **absolute** path is not a source, and
-where none of the first three names one there is no run directory to resolve and every
-mode fails with that (§10).
+The first three are subject to §6.3's absolute-path rule.
 
 Going the other way, the daemon sets three variables in the child and removes one:
 `TERM` from `Hello`, `NOMUX_SESSION=<id>`, `SSH_AUTH_SOCK` where forwarding is on, and
@@ -99,12 +80,11 @@ Going the other way, the daemon sets three variables in the child and removes on
 Spoken end-to-end between client and daemon (§7 relay is transparent).
 
 Private protocol: client and daemon ship as one unit ([DESIGN.md § 2](DESIGN.md#2-scope)).
-There is no negotiation and no reserved space for extensions. `Hello.protocol` exists
-solely to reject a mismatched peer immediately, which happens only in the bounded
-skew case of [DESIGN.md § 6.4](DESIGN.md#64-version-skew). It is the only revision on
-the wire: `HelloOk` is sent after that check has passed, so a copy of the number in
-the answer could only repeat what the client just said. Nothing here is carried that
-nothing reads, for [DESIGN.md § 2](DESIGN.md#2-scope)'s reason.
+No negotiation, no reserved space for extensions, and nothing carried that nothing
+reads. `Hello.protocol` exists solely to reject a mismatched peer immediately, in the
+bounded skew case of [DESIGN.md § 6.4](DESIGN.md#64-version-skew), and it is the only
+revision on the wire: `HelloOk` is sent after that check has passed, so a copy of the
+number in the answer could only repeat what the client just said.
 
 ### 2.1 Framing
 
@@ -143,27 +123,21 @@ it appears.
 | `0x0f` | ↔ | `AgentData` | `u32` chan, opaque `ssh-agent` bytes |
 | `0x10` | ↔ | `AgentClose` | `u32` chan |
 
-`Hello` carries the current revision, **5** — `PROTOCOL_VERSION` in `nomux-proto`. It
-is bumped on any wire change, compatible ones included: a change that leaves the
-number alone is one `Hello.protocol` cannot catch, and a client built from an older
-copy of this table then misparses rather than being refused. What each revision moved
-is `git log` on `crates/nomux-proto/`; this table is the current one.
+`Hello` carries the current revision, **5** — `PROTOCOL_VERSION` in `nomux-proto`,
+bumped on any wire change, compatible ones included: a change that leaves the number
+alone is one `Hello.protocol` cannot catch, and a client built from an older copy of
+this table then misparses rather than being refused. What each revision moved is
+`git log` on `crates/nomux-proto/`.
 
-The session id is **not** in `Hello` — it is already fixed by the socket path
-(warm) or by the id `spawn` and `attach` were handed (cold).
+The session id is **not** in `Hello` — it is already fixed by the socket path (warm) or
+by the id `spawn` and `attach` were handed (cold). Nor does anything in `Hello` say
+where the client's *input* stream stands: `HelloOk`'s `in_applied` is authoritative and
+the client fast-forwards to it (§3). `Hello.out_offset` of `u64::MAX` means *"I have no
+state, send me whatever you have"*, used on a fresh app launch to recover scrollback.
 
-`Hello.out_offset` of `u64::MAX` means *"I have no state, send me whatever you have"*
-— used on a fresh app launch to recover scrollback.
-
-Nothing in `Hello` says where the client's *input* stream stands. `HelloOk`'s
-`in_applied` is authoritative and the client fast-forwards to it (§3), so a claim
-from the client would be one the daemon has no use for.
-
-`Hello.term_len` counts **bytes**, not characters: `term` is UTF-8, so a name whose
-characters are multi-byte costs more than it reads, and the `u16` ceiling of 65535
-is a byte count too. A `TERM` past it is refused rather than truncated — a session
-opened under a silently shortened terminal type is one nobody chose, and neither end
-can see it happen.
+`Hello.term_len` counts **bytes**, not characters, and the `u16` ceiling of 65535 is a
+byte count too. A `TERM` past it is refused rather than truncated: a session opened
+under a silently shortened terminal type is one nobody chose.
 
 `Hello.term` may not contain a NUL, refused encoding as well as decoding. U+0000 is
 valid UTF-8, so nothing else catches it; let through, it reaches the child's
@@ -174,26 +148,16 @@ environment (§6.1.1), where `execve` refuses it and a malformed frame surfaces 
 elapsed rather than stamped: the daemon reads a monotonic clock it can trust and
 never a wall clock it cannot, and the client converts against its own. It saturates,
 at a width no session reaches — 136 years. It rides on `Exit` and not on `HelloOk`
-for three reasons that agree. It is part of the status, and §6.5 requires the status
-to arrive *after* the final output, where in `HelloOk` it would land before a byte of
-the transcript. `HelloOk` goes out on every attach of every session, so a live one
-would carry four bytes with no reader and no answer to what they meant, the child not
-having exited — which is exactly the field §2's rule refuses. And
-on `Exit` a client that watched the child go and one that arrived a week later are
-handed the identical frame with a different number in it, so nothing needs a
-sentinel.
+because `HelloOk` goes out on every attach of every session, where four bytes about a
+child that has not exited would mean nothing — the field §2's rule refuses.
 
 ### 2.3 Flags
 
 Both flag fields are exhaustive: an undefined bit is a protocol error, not a
-forward-compatibility case ([DESIGN.md § 2](DESIGN.md#2-scope)). The same rule
-covers every other closed set on the wire — `Error.code`, `Exit.kind` and
-`HelloOk.linger` — so an unrecognised value is refused rather than passed
-through. A peer that emits one was built from a different tree than this.
-
-Both are a byte wide, because two bits and one bit are what they carry. There is no
-reserved space here for the same reason there is none anywhere else on this wire, and
-a `u16` holding two flags would have been fourteen bits of it.
+forward-compatibility case ([DESIGN.md § 2](DESIGN.md#2-scope)). The same rule covers
+every other closed set on the wire — `Error.code`, `Exit.kind` and `HelloOk.linger` —
+so an unrecognised value is refused rather than passed through. Both fields are a byte
+wide, because two bits and one bit are what they carry.
 
 `Hello.flags`:
 
@@ -208,21 +172,16 @@ a `u16` holding two flags would have been fourteen bits of it.
 | --- | --- |
 | 0 | an agent socket is being served, so `AgentOpen` may arrive |
 
-The linger state is not in that byte. It is a `u8` field of its own beside it, so its
-wire form is the discriminant this section gives it rather than that discriminant
-shifted — which is one byte spent to delete the shift, the mask, and a pair of
-accessors that were the wrong ones to reach for. `HelloOk` is sent once per attach.
-
-There is no `gap` bit either: `resume_from > Hello.out_offset` is the same predicate,
-computed from a number the client sent and a number it was just told (§4.2).
+The linger state is not in that byte but a `u8` field of its own beside it, so its wire
+form is the discriminant §2.2 gives it rather than that discriminant shifted. There is
+no `gap` bit either: `resume_from > Hello.out_offset` is the same predicate, computed
+from a number the client sent and a number it was just told (§4.2).
 
 ## 3. Offsets and exactly-once input
 
-Both directions are byte streams with absolute `u64` offsets, not per-frame
-counters. Offsets are the offset of the frame's **first** byte.
-
-Output is at-least-once and idempotent: the client discards anything below its
-`next_expected` offset.
+Both directions are byte streams with absolute `u64` offsets, not per-frame counters,
+and an offset is that of the frame's **first** byte. Output is at-least-once and
+idempotent: the client discards anything below its `next_expected` offset.
 
 Input must be **exactly-once** — replaying a partially applied keystroke buffer into
 a shell is how a truncated `rm -rf` gets executed. The daemon's `in_applied` is
@@ -242,44 +201,31 @@ sequenceDiagram
   C->>D: Input{offset: 106, ...}
 ```
 
-Had the client blindly resent its unacked buffer, `ls -l\r` would run twice. The
-absolute offset lets the daemon drop the overlap precisely — a partial overlap is
-trimmed, not rejected.
-
-Rules:
+Had the client blindly resent its unacked buffer, `ls -l\r` would run twice. Rules:
 - Daemon drops any `Input` fully below `in_applied`; trims a straddling one.
 - `Input` above `in_applied` is a gap in the input stream → `Error` + close. The client must not skip.
 - `OutputAck` is advisory and payload-free. It never trims the ring (§4) and the daemon tracks what it has sent by itself, so what the frame does is **arrive**: it wakes the loop, which lets a replay that stopped on a full socket resume. Where a reconnecting client that lost its own state is told what it holds is `HelloOk`, not this.
 
 Ownership, not durability: the master is non-blocking (§6.1), so a child that has
-stopped reading leaves input queued for as long as it likes, and waiting for the
-write would stall the ack behind it. The queue is in the daemon's own memory and is
-never re-applied, so the client's invariant holds; and losing it means losing the
-daemon, which ends the session anyway. Bounded, though — §4.1 says by what, and what
-the daemon does instead once it is full.
+stopped reading leaves input queued indefinitely, and waiting for the write would stall
+the ack behind it. The queue is the daemon's own memory, never re-applied and bounded
+by §4.1; losing it means losing the daemon, which ends the session anyway.
 
-The other half of the invariant is the client's. An `Input` frame that was written
-but not yet read is **not** safe — though not for the reason it looks like. A client
-that closes with data still unread by the peer does make the kernel send RST, but on
-AF_UNIX that discards nothing already delivered: the daemon still reads every byte
-and *then* sees `ECONNRESET`. What loses the frames is the daemon's own answer to
-that error, which is to drop the client without decoding what the failing `fill`
-had just buffered — the right answer for a connection that is going away regardless,
-and the reason the loss is real. So a reconnecting client resends from the daemon's
-`in_applied`, never from what it believes it sent.
-`crates/nomux/tests/chaos.rs` exercises exactly this.
+The other half of the invariant is the client's: an `Input` frame written but not yet
+read is **not** safe, a dropped client's buffered frames going undecoded. So a
+reconnecting client resends from the daemon's `in_applied`, never from what it believes
+it sent.
 
 ## 4. Ring buffer
 
 Fixed capacity, allocated once. `VecDeque<u8>`, drained via `as_slices` to write
 without copying.
 
-Capacity defaults to 4 MiB and is overridable per daemon with `NOMUX_RING_BYTES`.
-The right value is host-dependent — a machine running the eight sessions DESIGN.md §5.1
-intends to cap at pays it eight times over — and an unparseable or zero value falls back to the
-default rather than refusing to start, since a mistyped tuning variable should never
-cost someone their session. One that parses and is positive but larger than the daemon
-can serve is clamped to 1 GiB instead, since nothing on that path rejects it and
+Capacity defaults to 4 MiB and is overridable per daemon with `NOMUX_RING_BYTES` (§1),
+the right value being host-dependent: a machine running the eight sessions DESIGN.md
+§5.1 caps at pays it eight times over. An unparseable or zero value falls back to the
+default rather than refusing to start, a mistyped tuning variable never costing someone
+their session; one that parses positive but past 1 GiB is clamped there, since
 `VecDeque::with_capacity` answers a request it cannot serve by aborting the process.
 
 ```
@@ -301,86 +247,36 @@ The PTY drain must never block on a slow or absent client. Precedence: keep read
 the PTY, drop from the ring's head. A stalled client causes a gap, never a frozen
 shell.
 
-The queue *to* that client is bounded twice over, at two different meanings of "not
-keeping up". Past **1 MiB** pending, output stops being queued: the ring goes on
-absorbing the PTY regardless, so what a slow client costs is a gap and never a
-blocked child. Past **8 MiB** it is no longer slow but gone, and the daemon drops it.
-The second bound is needed because the first does not cover everything: holding back
-*output* still leaves the frames that answer a client — an `InputAck` per `Input`, a
-`Pong` per `Ping` — which are not optional and are queued regardless, so a peer that
-writes without ever reading grows the queue without bound. The gap between the two
-figures is deliberate: it is well clear of the first plus one output chunk, so only
-unanswered control frames can reach it. Dropping such a client costs a working one
-nothing, since reattaching replays from the ring.
+Four bounds, each enforced on its own queue:
 
-The input direction cannot be answered that way. `in_applied` is authoritative and
-exactly-once (§3), so a byte the daemon has acknowledged has to reach the PTY:
-dropping it is not available, and refusing it with `Error{INPUT_GAP}` would accuse a
-client that had done nothing wrong. So the daemon stops **accepting** input once a
-megabyte is queued for a child that is not taking it: it stops decoding `Input` frames,
-and it stops asking the socket for more. The bytes wait in the kernel's buffer, where
-the peer blocks on them — the same argument §6.7 makes for a saturated agent channel.
+| Constant | Value | Bound |
+| --- | --- | --- |
+| `MAX_PENDING_WRITE` | 1 MiB | Past this queued to the client, output stops being queued. The ring absorbs the PTY regardless, so a slow client costs a gap and never a blocked child |
+| `ABANDON_PENDING_WRITE` | 8 MiB | Past this the client is not slow but gone, and is dropped; reattaching replays from the ring. The gap between the two figures is clear of the first plus one output chunk, so only the frames that answer a client — an `InputAck` per `Input`, a `Pong` per `Ping`, queued whatever the first bound says — can reach it |
+| `MAX_PENDING_INPUT` | 1 MiB | Past this queued for a child that is not reading, the daemon stops **accepting** input: it stops decoding `Input` frames and stops asking the socket for more. Dropping is not available, `in_applied` being exactly-once (§3), and `Error{INPUT_GAP}` would accuse a client that had done nothing wrong. The bytes wait in the kernel's buffer, where the peer blocks on them — §6.7's argument for a saturated agent channel |
+| `MAX_PENDING_READ` | 1 MiB | One connection's undecoded receive buffer, bounded by the daemon's own number rather than by whatever the peer set `SO_SNDBUF` to. On a stock host it never binds; [PLAN.md § P4](PLAN.md#p4--test-depth) has the measurements and why no test pins it |
 
-Those two are not one bound, and only the first is the bound. Holding the client out of
-`POLLIN` throttles the reads the poll set drives and nothing else: the takeover path of
-§6.4.1 reaches the same decode loop twice without passing through the poll set at all —
-once to drain the outgoing connection, once for the input the arriving one pipelined
-behind its `Hello` — and a connection promoted with a megabyte already buffered would
-decode every byte of it. Each reconnect could inject another queue's worth, and nothing
-bounds reconnects. **The cap is enforced where the queue grows**, between frames in the
-decode loop; the poll set only keeps the socket from being drained to no purpose while
-it holds.
-
-What that leaves is bounded on both sides. The queue overshoots by at most the one
-frame that crossed the cap, so `MAX_PAYLOAD`. The frames the decode loop declined stay
-in that connection's receive buffer, which has a megabyte cap of its own, and there are
-at most two connections — the client and one pending. No complete frame is stranded
-there: a decode that stops mid-buffer is not announced by a second `POLLIN`, the socket
-having reported those bytes once already, so "buffered and no longer saturated" is
-itself an event the loop acts on — and the `POLLOUT` that drained the queue is what has
-just made it true.
-
-The client stays in the poll set with an *empty* mask rather than being left out of it.
-`POLLHUP` and `POLLERR` are reported whatever the mask says, and that is the point:
-they are the only way to learn that a held-back peer has died. A read is not an answer
-to them — a receive buffer at its cap makes filling a no-op, so it never reaches the
-zero-length read that would notice. So the loop lets the client go on the spot, which
-cannot spin: that descriptor is out of the set on the very next pass. It is also what
-stamps the idle-reaping deadline and fails the agent's waiting callers (§6.7) when the
-peer dies, rather than whenever the child next happens to read. Nothing can wedge
-either, because a non-empty queue is exactly what puts the master in the set asking for
-`POLLOUT`, and draining it re-arms the client on the pass after.
-
-Each of those queues is a `Vec` and a cursor, and each reclaims its consumed prefix on
-a *ratio* rather than at a fixed number of bytes. What a compaction costs is the
-remainder — the part that stays — and a threshold on the prefix says nothing about
-that. Draining a queue of `n` bytes in `c`-byte writes at a fixed 64 KiB threshold
-moves about `n²/2c`: the cost per byte delivered rises with the queue, and it bites
-where the queue is largest, which is the replay path, since `pump_output` tops the
-queue back up to `MAX_PENDING_WRITE` after every write and the remainder never shrinks.
-Halving instead moves at most as many bytes as the compaction retires — the remainder
-being no larger than the prefix, by the test itself — so each byte pays for one move
-and is then gone: O(1) amortised however the writes fall. The receive direction pays a
-memmove per buffer for that, its cursor reaching the end so that a fixed threshold
-would never have been met and the free `clear` would have taken every compaction; that
-is bounded by what a client sends against a megabyte cap, where the send direction
-carries the session's whole output.
-
-What that receive-buffer cap is *for* is bounding one connection's buffered input by
-the daemon's own number rather than by whatever the peer set `SO_SNDBUF` to. It
-converts a peer-chosen bound into a fixed one, not an unbounded one into a bound, and
-on a stock host it never binds at all — [PLAN.md § P4](PLAN.md#p4--test-depth) has the
-measurements and why no test pins it.
+**The input cap is enforced where the queue grows**, between frames in the decode loop,
+and never by the poll set. Holding the client out of `POLLIN` throttles the reads the
+poll set drives and nothing else: the takeover path of §6.4.1 reaches the same decode
+loop twice without passing through the poll set at all — once to drain the outgoing
+connection, once for the input the arriving one pipelined behind its `Hello` — and a
+connection promoted with a megabyte already buffered would decode every byte of it.
+Each reconnect could inject another queue's worth, and nothing bounds reconnects. So
+the queue overshoots by at most the one frame that crossed the cap, `MAX_PAYLOAD`, and
+the declined frames wait in the receive buffers of at most two connections, the client
+and one pending. `Conn::fill`, `conn::compact` and `Daemon::watch_for` carry the rest:
+why no complete frame is stranded there, why a held-back client stays in the poll set
+under an *empty* mask instead of leaving it, and why each queue reclaims its consumed
+prefix on a ratio rather than at a fixed number of bytes.
 
 The cost is that a client's own control frames — `Ping`, `Resize`, `Detach` — queue
-behind its own stalled input. That is accepted; it is being held back on input, and
-nothing that has to work regardless goes through this path. The same applies to the
-final drain a takeover performs: with the queue full, the outgoing connection's last
-frames go with it. They were never acknowledged, so §3 already has the client resending
-them from `in_applied` — the invariant is exactly-once, not never-retransmitted. A
-*new* connection is never held back, since it is polled as pending rather than as the
-client, so `list` and the spawn race of §6.3 are unaffected — and `nomux kill` is a
-signal (§6.5).
+behind its own stalled input, and that a takeover's final drain goes with the outgoing
+connection where the queue is full. Both are accepted: those frames were never
+acknowledged, so §3 already has the client resending from `in_applied`, the invariant
+being exactly-once rather than never-retransmitted. A *new* connection is never held
+back *by the input cap*, being polled as pending rather than as the client, so `list`
+and the spawn race of §6.3 are unaffected — and `nomux kill` is a signal (§6.5).
 
 ### 4.2 Attach with `from < base_offset`
 
@@ -398,23 +294,18 @@ flowchart TD
   H --> I["stream Output[resume_from..]"]
 ```
 
-**The gap is that comparison, and nothing sends it.** Each branch above decides it
-already, so a flag would be the daemon restating a number the client can see: with
-`b <= e` the ring's bounds, the sentinel gives `resume_from = b`, which cannot exceed
-`u64::MAX`; a low `out_offset` gives `b > out_offset`; one inside the ring gives
-`out_offset` itself; and one past the end gives `e < out_offset`. An empty ring is the
-last two cases at `b == e`. Both ends compute it — the daemon to decide the repaint it
-owes (§4.3), the client to reset its emulator — and neither reads it off the wire.
-
-This is the *attach-time* gap. The standalone `Gap` frame is for overflow that happens
-mid-stream, while a client is attached.
+**The gap is that comparison, and nothing sends it.** Every branch above decides it
+already, so a flag would be the daemon restating a number the client can see. Both ends
+compute it — the daemon to decide the repaint it owes (§4.3), the client to reset its
+emulator — and neither reads it off the wire. This is the *attach-time* gap; the
+standalone `Gap` frame is for overflow that happens mid-stream, while a client is
+attached.
 
 `resume_from` is clamped at *both* ends, which is why the no-gap branch carries a
-`min`. An `out_offset` above `end_offset` is a client claiming output the session
-never produced; taken at face value it would set the daemon's `sent_through` past
-the end of the stream, and the session would then look dead until the child happened
-to write enough to catch up. It is not a gap, because nothing was dropped — there was
-never anything there — and the comparison agrees, `resume_from` having come *down*.
+`min`. An `out_offset` above `end_offset` is a client claiming output the session never
+produced, which at face value would set `sent_through` past the end of the stream and
+leave the session looking dead until the child caught up. Not a gap: nothing was
+dropped, and `resume_from` came *down*.
 
 ### 4.3 Gap handling
 
@@ -429,23 +320,15 @@ mid-escape-sequence. Recovery, mirroring `dtach -r`:
 master, so it cannot overtake keystrokes already accepted or block on a full PTY
 buffer. It is not client input, so `in_applied` does not move for it.
 
-The repaint is *owed* at the gap and issued later: on the first pass that finds the
-client holding the whole ring. That is one policy for both ways a gap is reached —
-the `HelloOk` comparison of §4.2 and the mid-stream `Gap` frame — and it is what holds a sustained
-overrun to one repaint rather than one per gap. Overflow recurs: a child outrunning
-its client gaps again on every pass where the queue has dipped below
-`MAX_PENDING_WRITE`, roughly (client throughput ÷ 256 KiB) times a second — a handful
-on a 10 Mbit link, hundreds on a local one — for as long as the overrun lasts, and
-answering each one drives a full redraw out of the very program that is overflowing
-the ring, whose redraw is more output to overflow it with. Deferring is also strictly
-better than rate-limiting would be: a repaint issued mid-overflow paints into bytes
-the next overflow discards, so the coalesced one is the only one whose result the
-client can ever see. A client that never catches up is never repainted, which is right
-— there would be nothing there for it to keep.
-
-Neither restores a plain shell's lost scrollback. That is inherent to byte-stream
-replay and accepted; see [DESIGN.md § 10](DESIGN.md#10-open-questions) for the
-`libvterm` snapshot alternative.
+The repaint is *owed* at the gap and issued later, on the first pass that finds the
+client holding the whole ring — one policy for both ways a gap is reached, §4.2's
+`HelloOk` comparison and the mid-stream `Gap` frame, which holds a sustained overrun to
+one repaint rather than one per gap. A repaint issued mid-overflow paints into bytes the
+next overflow discards, so the coalesced one is the only one the client can ever see; a
+client that never catches up is never repainted. Neither step restores a plain shell's
+lost scrollback, inherent to byte-stream replay and accepted
+([PLAN.md § Deferred by decision](PLAN.md#deferred-by-decision) weighs the `libvterm`
+snapshot).
 
 ## 5. Bootstrap
 
@@ -461,16 +344,13 @@ echo "NOMUX-BOOTSTRAP $(uname -s) $(uname -m) $p"
 is missing or unrunnable. Warm cost: zero extra round trips.
 
 `$MODE` is `spawn` or `attach`, and the client always knows which, because it knows
-whether it already holds a session for this tab. It is a substitution and not a
-second command: `spawn` creates the session *and* attaches to it in the one `exec`
-(§6.3), which is the whole reason creating is a mode rather than a step in front of
-one — a spawn followed by an attach would cost a round trip on every cold start, and
-the count above is what this bootstrap exists to keep.
+whether it already holds a session for this tab. It is a substitution and not a second
+command: `spawn` creates the session *and* attaches to it in the one `exec` (§6.3),
+where a spawn followed by an attach would cost a round trip on every cold start.
 
 The fields are `uname`'s — `Linux`, `x86_64` — because `sh` emits the line before any
-binary exists. Confirming that an *uploaded* artifact runs is `--version`'s job: it
-answers from the installed binary, which is the only thing worth asking after an
-upload, and it carries the protocol revision the client keys off besides.
+binary exists. Confirming that an *uploaded* artifact runs is `--version`'s job, which
+answers from the installed binary and carries the protocol revision besides.
 
 ### 5.2 Upload and attach in one round trip
 
@@ -519,63 +399,54 @@ on every reconnect.
 
 Via `rustix` rather than raw `libc`, so almost none of this needs `unsafe`.
 
-1. `openpt(O_RDWR | O_NOCTTY | O_CLOEXEC)`, `grantpt`, `unlockpt`, `ptsname`.
+1. `openpt(O_RDWR | O_NOCTTY | O_CLOEXEC)`, `unlockpt`, `ptsname`.
 2. Master is set non-blocking.
 3. Parent opens the slave `O_RDWR | O_NOCTTY | O_CLOEXEC` and hands it to the child as all three stdio descriptors.
 4. Parent sets the initial `TIOCSWINSZ` from `Hello`, before the child can observe it, so the shell's first prompt is already laid out correctly.
 5. `fork`. In the child, before `exec`: `setsid()`, acquire the slave as controlling terminal via `ioctl_tiocsctty`, restore `SIGHUP` to `SIG_DFL` (§6.2 leaves it ignored in the daemon, and an ignored disposition survives `exec`). Only async-signal-safe calls, which is why the open is not among them.
 6. Parent closes **its own** slave descriptors — the copy in this frame and the three the `Command` borrowed. The master reports `EIO`, which is how the session learns the child is gone, only once no descriptor onto the slave is left in this process, so a copy outliving the spawn is a child that exits without the daemon ever noticing.
 
-`O_CLOEXEC` on both ends is what keeps them out of the child. Without it every
-process the user runs holds a writable descriptor onto its own PTY master, and
-anything that walks `/proc/self/fd` — or writes to a descriptor it did not open —
-can inject output into the stream or read the user's keystrokes. The child keeps
-its stdio regardless, because `dup2` onto 0/1/2 clears the flag on the copies.
+`O_CLOEXEC` on both ends is what keeps them out of the child; without it every process
+the user runs holds a writable descriptor onto its own PTY master. The child keeps its
+stdio regardless, `dup2` onto 0/1/2 clearing the flag on the copies.
 
 The event loop is `poll` over {master, listener, attached client, pending
 connection, the stop-signal self-pipe (§6.5), agent socket, one fd per agent
 channel}. The *pending* entry is a connection accepted but not yet greeted, and it is
-load-bearing rather than incidental: it is what makes "connecting is not attaching"
-(§6.4) work, since a liveness probe from `list` must not evict anyone.
+what makes "connecting is not attaching" (§6.4) work, a liveness probe from `list` not
+being allowed to evict anyone. The set is variable-length and each entry is tagged with
+what it belongs to rather than read back by position.
 
-The master **must** be non-blocking. A child that stops reading fills the PTY's
-input buffer, and in raw mode the line discipline throttles rather than discarding
-— so a blocking `write` parks the whole event loop inside the kernel until the
-child reads again, freezing output for a session whose only fault was a `sleep`.
-Unwritten input waits in the daemon's queue instead, and the poll set asks for
-`POLLOUT` only while there is something to write — and stops asking the client for
-`POLLIN` once that queue is full (§4.1).
+The master **must** be non-blocking. A child that stops reading fills the PTY's input
+buffer, and in raw mode the line discipline throttles rather than discarding, so a
+blocking `write` would park the whole event loop in the kernel. Unwritten input waits in
+the daemon's queue instead; the poll set asks for `POLLOUT` only while there is something
+to write, and stops asking the client for `POLLIN` once that queue is full (§4.1).
 
-The poll set is variable-length and each entry is tagged with what it belongs to,
-rather than being read back by position. Agent forwarding makes the size depend on
-how many channels are live, and an index-arithmetic slip there would silently
-apply one descriptor's readiness to another.
-
-**The SSH channel must not request a PTY.** nomux allocates its own; if sshd
-allocated one too there would be two line disciplines stacked, giving double echo,
-doubled `\r\n` translation and broken raw mode. The channel is a raw byte pipe and
-nomux owns the only PTY — which is also why `TERM` arrives in `Hello` (§2.2) rather
-than from sshd.
+**The SSH channel must not request a PTY.** nomux allocates its own; two line
+disciplines stacked would give double echo, doubled `\r\n` translation and broken raw
+mode. The channel is a raw byte pipe and nomux owns the only PTY — which is also why
+`TERM` arrives in `Hello` (§2.2) rather than from sshd.
 
 #### 6.1.1 What the child runs
 
 Whatever a plain `ssh host` would have run, because nomux is *already inside* an SSH
-session and inherits its setup rather than reconstructing it. PAM has run, and
-`HOME`, `USER`, `PATH` and `SSH_*` are already in the environment.
+session and inherits its setup: PAM has run, and `HOME`, `USER`, `PATH` and `SSH_*` are
+already in the environment.
 
 - **Login shell, dash-prefixed**: `execv(shell, ["-bash", ...])`, not `["bash", ...]`. That leading `-` is what sshd does for an interactive session and what causes `/etc/profile` and `~/.bash_profile` to be sourced. Omitting it yields a stunted environment that users correctly perceive as broken.
 - **Shell selection**: `$SHELL` as inherited, else the password database, else `/bin/sh`. The middle step is `/etc/passwd` parsed directly rather than `getpwuid`: in a static musl binary those are the same thing, since NSS modules cannot be loaded into a static executable, and doing it in Rust keeps the lookup safe and testable. The cost is not seeing LDAP or NIS users, who fall through to `/bin/sh` — as they would with `getpwuid` anyway.
 - **Working directory**: `$HOME`, else the directory the attaching connection was in, else `/`. The daemon itself has already moved to `/` (§6.2), so this has to be set explicitly or the shell would start there.
 - **Environment**: inherited wholesale. Remove `NOMUX_BOOTSTRAP`, set `TERM` from `Hello`, `NOMUX_SESSION=<id>`, and — when agent forwarding is enabled — `SSH_AUTH_SOCK=$RUNDIR/<id>.agent` (§6.7). Change nothing else, which leaves `NOMUX_RING_BYTES` (§1) in the child's environment on a daemon that was started with it set.
-- **`NOMUX_BOOTSTRAP` is vestigial, not a client contract.** Nothing in this tree ever sets it — not the daemon, not the relay, and neither of the command lines §5 publishes for clients to run; what the probe emits is `NOMUX-BOOTSTRAP` on *stdout* (§5.1), which is a different thing that has kept this name alive. So no client is obliged to set it and nothing depends on one that does. The removal stays because it costs a single call on a path that runs once per session, and because a scrub is the right shape for a name in nomux's own space: if a wrapper ever does export it, the child does not inherit it.
+- **`NOMUX_BOOTSTRAP` is vestigial, not a client contract.** Nothing in this tree sets it, and what §5.1's probe emits is `NOMUX-BOOTSTRAP` on *stdout*, a different thing. No client is obliged to set it; the scrub stays so that a wrapper which does export it cannot reach the child.
 - **No PAM.** It already ran for the SSH login, and the daemon is unprivileged.
 - No client-supplied command in v1. A one-shot remote command has no reason to be persistent; it stays on plain SSH.
 
-The environment is a snapshot of the connection that *created* the session, frozen
-for its lifetime — a later reconnect may carry a different agent socket, `DISPLAY`
-or `AcceptEnv` values that the child can never see, because a running process's
-environment cannot be mutated. Indirection through the run directory (§6.6) is the
-only available fix, and only for variables that name a path.
+The environment is a snapshot of the connection that *created* the session, frozen for
+its lifetime: a later reconnect may carry a different agent socket, `DISPLAY` or
+`AcceptEnv` values the child can never see, a running process's environment not being
+mutable. Indirection through the run directory (§6.6) is the only fix, and only for
+variables that name a path.
 
 ### 6.2 Detachment from the login session
 
@@ -592,171 +463,114 @@ chdir "/"
 ```
 
 The test is **no controlling terminal**, not "leads a session" — a session leader may
-still hold one — and it is put to `/dev/tty`, which *is* that terminal by definition,
-rather than to any descriptor the daemon happens to hold. `setsid` is then asked
-before it is needed, so that "already done" is told apart from "cannot be done" and
-the ordinary path stays fork-free; only a process-group leader is genuinely refused,
-and the way out of that is a child that is not one. Two shapes reach that refusal:
-`nomux daemon <id>` typed at a shell, where job control makes the daemon its own
-process group's leader, and `ssh -t host 'nomux daemon <id>'`, where it leads the
-session itself, because `bash -c` with a single command `exec`s in place rather than
-forking. With dash as `/bin/sh` the shell forks and that second shape does not arise,
-so it is shell-dependent, and bash is the common case.
+still hold one — and it is put to `/dev/tty`, which *is* that terminal by definition.
+`setsid` is asked before it is needed, so "already done" is told apart from "cannot be
+done" and the ordinary path stays fork-free; only a process-group leader is refused.
 `startup::leave_login_session` and `startup::has_controlling_terminal` carry the
-argument for each — why `ENXIO` is the only definite no, and why `TIOCNOTTY` is
-deliberately not used.
-
-The fork happens after the socket is bound, so a session that already exists is still
-reported with an exit status somebody sees, and before the pidfile is written, so
-`nomux kill` (§6.6) reads the pid of the process that survived rather than of the one
-that started.
-
-The survivor then calls `listen` again on the descriptor it inherited. Restating the
-backlog is the reason that matters, and is §6.3's: `listen` installs one rather than
-keeping the one in force, so the fork would otherwise leave the queue at whatever the
-parent asked for. It also re-stamps `SO_PEERCRED`, which is stamped at `listen(2)`
-from the process performing it and would otherwise go on naming a parent that has
-`_exit`ed. Nothing reads that field today — §6.6 identifies a daemon from `<id>.pid`
-alone — so the second listen is held for the backlog and the credentials come along.
-The non-obvious part is that it works at all: `unix_listen` accepts a socket already
-in `TCP_LISTEN` rather than refusing it, and both halves were measured on this kernel,
-that the call is accepted and that a connection queued in between survives it. A
-failure is discarded rather than propagated, a queue at the wrong depth not being a
-reason to refuse a session that is otherwise ready to serve.
+argument, including why `ENXIO` is the only definite no and why `TIOCNOTTY` is not used.
 
 `SIGHUP` is ignored before any of that, and there it is load-bearing rather than
 tidy: the manoeuvre itself provokes one at the forked child, which is still in the
 hung-up terminal's foreground group for the few instructions before its own
 `setsid`. Inherited as ignored, that race cannot be lost.
 
-`spawn` arranges both for the daemon it starts — `setsid` in its own `pre_exec`,
-stdin and stdout to `/dev/null` through `Stdio::null()` on the `Command` — and keeps
-doing so, because the daemon cannot reach either soon enough. Until it runs its own
-`setsid` a hangup would take the session with it, and until it redirects its own stdio
-it holds the *relay's* descriptors, where anything it writes lands in the middle of the
-client's frame stream.
+The fork happens after the socket is bound, so a session that already exists is still
+reported with an exit status somebody sees, and before the pidfile is written, so
+`nomux kill` (§6.6) reads the pid of the process that survived. The survivor then calls
+`listen` again on the descriptor it inherited, `listen` installing a backlog rather than
+keeping the one in force (§6.3); it also re-stamps `SO_PEERCRED`, which nothing reads
+today. A failure is discarded rather than propagated, a queue at the wrong depth not
+being a reason to refuse a session otherwise ready to serve.
 
-Stderr is the exception — `Stdio::piped()`, not `Stdio::null()` — and it is the only
-reason a failure to start has a reason attached to it. Everything that goes wrong
-before `release_startup_state` is still written there, so it arrives at the `spawn`
-that created the session; the pipe reaching end of file is the daemon saying it got
-past that point, after which it has syslog and that end has nothing left to read.
+`spawn` arranges the first two lines for the daemon it starts — `setsid` in its own
+`pre_exec`, stdin and stdout to `/dev/null` through `Stdio::null()` — because until its
+own `setsid` a hangup would take the session with it, and until it redirects its stdio
+it holds the *relay's* descriptors, where anything it writes lands mid-frame. Stderr is
+the exception, `Stdio::piped()`: everything that fails before
+`startup::release_startup_state` is written there and arrives at the `spawn` that
+created the session, and the pipe reaching end of file says the daemon got past that
+point, after which it has syslog (§11).
 
-The classic second fork is deliberately absent, and the conditional one above is not
-it. The conditional fork exists to reach a state `setsid` cannot reach from a
-process-group leader; the classic one exists to leave the daemon a *non*-session-leader
-so it cannot acquire a controlling terminal by opening a tty. That second purpose is
-not needed here: a controlling terminal is acquired only by opening one *without*
-`O_NOCTTY`, and this binary opens exactly three ttys — the PTY master, its slave
-(§6.1), and `/dev/tty` for the probe above — all three with it. The property is held by
-construction at the three lines that could break it, rather than by a fork whose reason
-would have to be rediscovered.
+`chdir "/"` and the `/dev/null` redirection are that same
+`startup::release_startup_state`, past the pidfile and the spawn lock. The chdir comes
+after the run-directory paths are resolved and the socket is bound, the child having its
+own working directory (§6.1.1); it buys a session that cannot keep a removable or
+network mount busy for a week.
 
-`chdir "/"` and the `/dev/null` redirection are the last two things startup does —
-`startup::release_startup_state`, past the pidfile and the spawn lock — and that is
-what leaves a real stderr under everything that can fail before them, which is what
-the pipe above carries. The chdir also has to come after the run-directory paths are
-resolved and the socket is bound, and the child is given its own working directory
-(§6.1.1) — otherwise the shell would start in `/` instead of the user's home. What it
-buys is that a session running for a week cannot keep a removable or network mount
-busy.
+Signal dispositions: `SIGHUP` ignored, and restored to `SIG_DFL` in the child before
+`exec` (§6.1). `SIGTERM` and `SIGINT` handled rather than ignored (§6.5), armed
+immediately after the detachment above and before the pidfile is written, so the pid
+`nomux kill` reads never names a process still on the default disposition. `SIGPIPE`
+ignored by the Rust runtime at startup and reset for spawned children. `SIGQUIT` is
+§6.5's. Nothing but `SIGHUP` needs anything in the child.
 
-`SIGHUP` is ignored in the daemon — first thing, for the reason above — and restored
-to `SIG_DFL` in the child before `exec` (§6.1). `SIGTERM` and `SIGINT` are handled
-instead of ignored (§6.5), armed immediately after the detachment above and before
-the pidfile is written, so that the pid `nomux kill` reads never names a process
-still on the default disposition. Neither needs anything in the child, and neither
-does `SIGPIPE`, which the Rust runtime ignores at startup and resets for spawned
-children.
-
-`systemd-logind` with `KillUserProcesses=yes` kills the daemon at logout regardless.
-The only real fix is `loginctl enable-linger $USER`. The daemon detects the state
-and reports it in `HelloOk.linger` (§2.3); it does not attempt to work around
-it.
-
-Detection reads the files `logind` itself reads — `/run/systemd/system` for "is
-this a `logind` host at all", then `/var/lib/systemd/linger/<user>` — rather than
-running `loginctl show-user -p Linger`. Two `stat` calls and a read of `/etc/passwd`
-for the login name, all on the session-start path, versus a D-Bus round trip that can
-block for its full 25-second timeout on a busy
-or broken bus and turn "linger is off" into "the session would not start". Absence
-of the marker is a definite *disabled*; only a lookup that fails for some other
-reason is *unknown*, and the client must not warn on unknown.
+`systemd-logind` with `KillUserProcesses=yes` kills the daemon at logout regardless,
+and the only real fix is `loginctl enable-linger $USER`. The daemon detects the state
+and reports it in `HelloOk.linger` (§2.3) rather than working around it. Detection
+reads the files `logind` itself reads — `/run/systemd/system` for "is this a `logind`
+host at all", then `/var/lib/systemd/linger/<user>` — rather than running
+`loginctl show-user -p Linger`, a D-Bus round trip that can block for its full 25-second
+timeout on a broken bus. Absence of the marker is a definite *disabled*; only a lookup
+that fails otherwise is *unknown*, and the client must not warn on unknown.
 
 The login name is the password database's first, then `$USER`, then `$LOGNAME` — the
 environment being the fallback for directory-backed accounts with no line in
-`/etc/passwd` (§6.1.1 has why NSS is not reachable from a static binary). The
-environment is not trusted with the result: the name is joined onto a system
-directory, so an empty one, or one holding `/` or NUL, or `.` or `..`, is refused and
-the state is *unknown* rather than a `stat` of somewhere else.
-
-Most distributions ship `KillUserProcesses=no`, where nothing reaps the session at
-logout and `setsid` alone suffices.
+`/etc/passwd` (§6.1.1 has why NSS is not reachable from a static binary). It is joined
+onto a system directory, so an empty one, or one holding `/` or NUL, or `.` or `..`, is
+refused and the state is *unknown*. Most distributions ship `KillUserProcesses=no`,
+where nothing reaps the session at logout and `setsid` alone suffices.
 
 ### 6.3 Socket
 
-Session ids come from the client and are used directly as filename components, so
-they are validated before touching the filesystem — `rundir::is_valid_session_id`, which
-lives with the layout that turns an id into a filename rather than with the codec, the id
-not being on the wire (§ 2.2):
+Session ids come from the client and are used directly as filename components, so they
+are validated before touching the filesystem — `rundir::is_valid_session_id`, which
+lives with the layout rather than with the codec, the id not being on the wire (§ 2.2):
 
 ```
 1..=64 bytes, each of [A-Za-z0-9_-], and never a leading `-`
 ```
 
 The character rule rejects `..`, `/`, `.`, empty, NUL and non-ASCII outright, so path
-traversal is impossible by construction rather than by escaping. The leading `-` is a
-separate bound and a different one's: it is the *command line's* rather than the
-filesystem's. `main` reads any argument beginning with `-` as an option before a mode
-ever sees it, so `nomux attach -abc123` exits 64 as an unknown option — which means an
-id starting with `-` is one a conforming client could mint and then never spawn, attach
-or kill, and the exit code it got would say its command line was malformed rather than
-that its id was. Refusing it in the grammar is what makes the two agree.
-
-Both ends validate: the client before minting, the daemon before use. An invalid id is
-a hard error, never sanitised into something valid — silently rewriting an id would
-attach the user to the wrong session.
+traversal is impossible by construction rather than by escaping. The leading `-` is the
+*command line's* bound rather than the filesystem's: `main` reads any argument beginning
+with `-` as an option before a mode sees it, so `nomux attach -abc123` exits 64 as an
+unknown option, and an id a conforming client could mint but never spawn, attach or kill
+is refused in the grammar instead. Both ends validate — the client before minting, the
+daemon before use — and an invalid id is a hard error, never sanitised into something
+valid, since silently rewriting an id would attach the user to the wrong session.
 
 Path precedence:
 
 1. `$XDG_RUNTIME_DIR/nomux/<id>.sock` — tmpfs, but removed on last logout unless linger is on.
 2. `$XDG_STATE_HOME/nomux/run/<id>.sock`, default `~/.local/state/nomux/run/`.
 
-A source that does not name an **absolute** path is not a source: it is skipped, and
-where none of `XDG_RUNTIME_DIR`, `XDG_STATE_HOME` and `HOME` names one there is no run
-directory to resolve and every mode fails with that (§10). The XDG specification
-requires it anyway, and this daemon needs it for a reason of its own — the resolved
-directory is held for the session's whole life while §6.2 moves the process to `/`
-partway through it, so a relative one would mean the caller's working directory while
-the session was starting and the root afterwards: the socket bound in one place, the
-agent socket and the exit-time cleanup looking in another. An empty value is not
-absolute either, which is the whole of the check.
+A source that does not name an **absolute** path is not a source: it is skipped, an
+empty value included, and where none of `XDG_RUNTIME_DIR`, `XDG_STATE_HOME` and `HOME`
+names one there is no run directory to resolve and every mode fails with that (§10).
+The resolved directory is held for the session's whole life while §6.2 moves the
+process to `/` partway through it, so a relative one would name two different
+directories either side of that move.
 
-The rule above is the whole of what a client can check, and it is not the whole of
-what the daemon enforces. `SessionPaths::new` applies a second refusal that depends on
-which of those two the run directory came from: a `sun_path` is 108 bytes including
-its terminator, so the directory, a `/`, the id and `.label` — six bytes, the longest
-of the five suffixes, with `.agent` the same length — have to fit in 107. Under
-`$XDG_RUNTIME_DIR` at `/run/user/1000` that leaves room for an id of 80 and the
-64-byte ceiling above is what binds. Under the fallback it does not:
-`$HOME/.local/state/nomux/run` is 23 bytes past `$HOME`, so the longest id that fits
-is `77 - len($HOME)` — 63 bytes for a home of 14, one short of an id the same client
-mints happily on the same host with `XDG_RUNTIME_DIR` set. A refused id is therefore
-not necessarily a bad id, which is what §10 has to turn into an exit code and what a
-client must not cache as a property of the id.
+`SessionPaths::new` applies a second refusal, and it depends on which source the run
+directory came from: a `sun_path` is 108 bytes including its terminator, so the
+directory, a `/`, the id and `.label` — six bytes, the longest of the five suffixes,
+with `.agent` the same length — have to fit in 107. Under `$XDG_RUNTIME_DIR` at
+`/run/user/1000` that leaves room for an id of 80 and the 64-byte ceiling above is what
+binds. Under the fallback it does not: `$HOME/.local/state/nomux/run` is 23 bytes past
+`$HOME`, so the longest id that fits is `77 - len($HOME)` — 63 bytes for a home of 14,
+one short of an id the same client mints happily on the same host with
+`XDG_RUNTIME_DIR` set. **A refused id is therefore not necessarily a bad id**, which is
+what §10 has to turn into an exit code and what a client must not cache as a property
+of the id. Taking the bound against `.label` leaves `<id>.sock` a byte shorter still,
+which is what lets §6.6's probe read every `connect` failure it is not told about as a
+live session rather than as an address it could not build.
 
-It is refused there, where both halves are known, rather than at the `bind` that would
-meet it: an address that can never be formed is not a session that failed to start but
-one that can never exist, and `list` and `kill` read an unbindable address as a *live*
-session whose files they must not unlink — so every attempt would leave a `<id>.lock`
-behind, from the command whose job is to collect it. What the early refusal costs
-instead is that files already sitting at such an id are beyond both modes: `list`
-drops the id rather than reporting it and `kill` answers 64, so they stay there for
-good ([PLAN.md § P1](PLAN.md#p1--known-gaps)). Nothing here creates that state; the
-layout §6.6 freezes is managed by binaries that did not create it. The bound is taken
-against `.label` so that `<id>.sock` is a byte shorter still, which is what lets the
-probe in §6.6 read every `connect` failure it is not told about as a live session
-rather than as an address it could not build.
+It is refused there rather than at the `bind` that would meet it, because `list` and
+`kill` read an unbindable address as a *live* session whose files they must not unlink,
+so every attempt would leave a `<id>.lock` behind from the command whose job is to
+collect it. The cost is that files already sitting at such an id are beyond both modes,
+`list` dropping the id and `kill` answering 64, so they stay there for good
+([PLAN.md § P1](PLAN.md#p1--known-gaps)). Nothing here creates that state.
 
 Directory `0700`, socket `0600`, and the three plain files — pidfile, lock, label —
 `0600` as well. Every one of those is exact rather than an upper bound: the umask is
@@ -765,77 +579,52 @@ it, and a `<id>.lock` created `0400` under `umask 0200` is one no later process 
 open at all, which loses the mutex the control surface rests on. Filesystem sockets
 only, never abstract ones ([DESIGN.md § 8](DESIGN.md#8-security-model)).
 
-The backlog is the host's ceiling rather than a number this program picks. `-1` is
-what `UnixListener::bind` passes on Linux, and it is not a length: `listen(2)` takes
-its argument as a signed `int` and casts it to unsigned before clamping to
-`net.core.somaxconn`, so it asks for more than any host can give and gets exactly the
-ceiling — 4096 where this was measured. The re-listen of §6.2 has to restate it,
-because `listen` installs a backlog rather than keeping the one in force, and it must
-not restate it as a literal — a *successful* re-listen at 128 is what once shrank the
-queue 32-fold. What the ceiling buys is a mitigation and not a fix. An `AF_UNIX`
-`connect` to a *full* backlog blocks rather than being refused, and every mode here
-connects, so a queue the daemon has stopped draining would park whoever reaches for it
-inside the kernel. Every one of those connects is therefore bounded, and through one
-call: `rundir::connect_within`, at 2 s for `list`, `kill` and the relay, and at 1 s for
-the daemon's own stale-socket probe. A plain `UnixStream::connect` on a run-directory
-socket is what would bring the wait back.
+The backlog is the host's ceiling rather than a number this program picks: `-1`, what
+`UnixListener::bind` passes on Linux, is not a length but a request `listen(2)` clamps
+to `net.core.somaxconn` — 4096 where this was measured. The re-listen of §6.2 restates
+it and must not restate it as a literal; a *successful* re-listen at 128 is what once
+shrank the queue 32-fold. An `AF_UNIX` `connect` to a full backlog blocks rather than
+being refused, so every connect here is bounded, through one call:
+`rundir::connect_within`, at 2 s for `list`, `kill` and the relay, and at 1 s for the
+daemon's own stale-socket probe.
 
 The directory is *checked* rather than merely created, because on every run but the
-first it already exists, and that it exists says nothing about what it is. It is
-opened `O_DIRECTORY | O_NOFOLLOW` and `fstat`ed: a symlink or a non-directory is
-refused, so is one belonging to another uid, and so is one that group or other can
-write to — whoever had that could have left a socket of their own at a session id
-about to be connected to, and no later `chmod` un-plants it. Refusal here is hard,
-where everything else in the daemon degrades: a run directory that is not what it
-claims to be is not somewhere to start a session.
-
-Every other mode is *repaired* to exactly `0700`, through the descriptor already
-checked rather than through the path. That covers a group- or other-readable mode,
-which discloses the ids and the labels and grants nothing else; an owner bit that is
-missing rather than spare, which an odd umask under an older version leaves behind;
-and `setgid` or `sticky`, harmless in themselves but not the stated mode. The one
-mode that cannot be repaired is one the owner cannot *open* — there is no descriptor
-to `fchmod` through, and a `chmod` by name would resolve the path the `O_NOFOLLOW`
-exists to stop resolving twice — so that is refused, and reported as a judgement on
-the mode rather than as an `EACCES` from a syscall.
+first it already exists and that says nothing about what it is. It is opened
+`O_DIRECTORY | O_NOFOLLOW` and `fstat`ed, and four things are refused outright: a
+symlink, a non-directory, one belonging to another uid, and one that group or other can
+write to — whoever had that could have left a socket of their own at a session id about
+to be connected to, and no later `chmod` un-plants it. Every other mode is *repaired* to
+exactly `0700` through the descriptor already checked, which covers a group- or
+other-readable mode, an owner bit an odd umask left missing, and `setgid` or `sticky`.
+The one mode that cannot be repaired is one the owner cannot *open*, there being no
+descriptor to `fchmod` through, and that is refused as a judgement on the mode rather
+than as an `EACCES` from a syscall.
 
 The check belongs to every mode that touches the directory, before the first name in
-it is resolved: `spawn` before its *first* `connect`, not only on the way to
-starting a daemon; `attach` before its own; `list` before it reads the directory;
-`kill` before it reads a pid and signals it; the daemon before it binds. Checking
-after connecting checks only the case where nothing was planted — with a socket
-already at the path, the relay hands the user's keystrokes to whoever bound it. Only
-`spawn` and the daemon *create* the directory, and the other three check without
-creating: being asked what sessions exist, or to join one, must not be what brings
-the run directory into existence. So a host that has never run a session lists
-nothing and exits 0, and an `attach` there gets the same "no such session" as one
-whose session has been reaped — a directory that is not there holds none.
+it is resolved: `spawn` before its *first* `connect`, not only on the way to starting a
+daemon; `attach` before its own; `list` before it reads the directory; `kill` before it
+reads a pid and signals it; the daemon before it binds. Checking after connecting
+checks only the case where nothing was planted — with a socket already at the path, the
+relay hands the user's keystrokes to whoever bound it. Only `spawn` and the daemon
+*create* the directory; the other three check without creating, being asked what
+sessions exist or to join one, which must not be what brings the directory into being.
 
-The run files are then opened by name rather than relative to that descriptor.
-There is no `bindat(2)`, so the socket and the agent socket — the two that decide
-who a session talks to — have to be resolved by path whichever way the other three
-go, and a layout in which three of the five are addressed race-free reads as though
-the race were closed. What closes it is the check itself: in a directory this user
-owns and nobody else can write to, only this user's own processes can put a name in
-it. What stays open is a *parent* somebody else can write to — an `XDG_RUNTIME_DIR`
-pointed at a shared directory — where the whole run directory can be swapped
-between the check and the next `bind`. No descriptor helps there, because the
-`bind` needs the path either way.
+The run files are then opened by name rather than relative to that descriptor, there
+being no `bindat(2)`, and the check above is what closes the race for all five. What
+stays open is a *parent* somebody else can write to — an `XDG_RUNTIME_DIR` pointed at a
+shared directory — where the whole run directory can be swapped between the check and
+the next `bind`. No descriptor helps there.
 
-Spawn race (two clients spawning the same id at once): `flock(LOCK_EX)` on
-`<id>.lock`; the loser blocks there, then finds the socket the winner bound and is
-told the id is taken (§10) rather than handed a session it did not create — two tabs
-each believing they started this one is the state `spawn` exists to refuse. Only a
-process that spawns its own daemon polls, and only for its own. A stale socket is one
-where `connect` returns `ECONNREFUSED` — unlink and respawn. `EACCES` is not
-staleness.
+Spawn race (two clients spawning the same id at once): `flock(LOCK_EX)` on `<id>.lock`;
+the loser blocks there, then finds the socket the winner bound and is told the id is
+taken (§10) rather than handed a session it did not create. Only a process that spawns
+its own daemon polls, and only for its own. A stale socket is one where `connect`
+returns `ECONNREFUSED` — unlink and respawn. `EACCES` is not staleness.
 
-The rest of what that lock governs is a set of rules, and the order they are stated in
-is the order they bind. `rundir.rs` argues each one where the call is — `SpawnLock`,
-`SessionPaths::acquire`, `removal_order` and `no_lock_here` between them carry the
-reasoning, including why a `try_lock` and not a wait, and why `ENOLCK` is grouped
-where it is. What is below is what a second implementation of `list` or `kill` would
-have to obey:
+`SpawnLock`, `SessionPaths::acquire`, `removal_order` and `no_lock_here` in `rundir.rs`
+argue each of the rules below where the call is, including why a `try_lock` and not a
+wait and why `ENOLCK` is grouped where it is. What follows is what a second
+implementation of `list` or `kill` must obey, in the order the rules bind:
 
 - **Anything that unlinks takes the lock first and holds it to the end.** That is `list`'s sweep and `kill` (§6.6), and the daemon's own exit (§6.5).
 - **The daemon takes it before it probes for a stale socket**, and never blocks for it. Without that ordering a sweep that probed the same socket and was then descheduled unlinks what this daemon has bound in the meantime.
@@ -845,29 +634,20 @@ have to obey:
 - **`<id>.lock` is unlinked last** of the five. From the moment its name is gone the caller's lock guards nothing, so an unlink still to come would land on a session somebody else has legitimately brought up — silently, for `<id>.label` and for the `<id>.agent` socket the child's `SSH_AUTH_SOCK` points at.
 - **A lock no process could obtain is proceeded past without one**, and the list is exactly `EACCES`, `EPERM` and `ENOTSUP` — `<id>.lock` at a mode nothing can open, a uid nothing here may write as, a filesystem that does not implement `flock`. Each is a property of the *file*, so a lock this caller cannot get is one no caller can be holding. Every other errno makes a caller wait, skip or refuse, because it is a property of the moment instead and says nothing about who holds the inode. The escape hatch of §6.6 has to collect a dead session on any host, and refusing on the three above would buy nothing.
 
-One further refusal is decided in that same region, and it is a backstop rather than a
-policy: the daemon counts the distinct session ids already in the run directory and
-refuses to start past **64** — `MAX_SESSIONS`, eight times the cap of 8 that
-[DESIGN.md § 5.1](DESIGN.md#51-identity) argues for and leaves to the client. It
-counts names and not siblings, so a directory of dead sessions `list` would collect
-refuses one that could have started, and the refusal names both commands. Its own id
-never counts against it, and a directory that will not read is not a refusal.
-
-The count is taken before the bind and inside the spawn lock's region, so two starts
-that both hold the lock are serialised against each other. That is not the same as a
-guarantee, and the difference is worth stating rather than rounding off: the lock is a
-`try_lock`, and a daemon that cannot take it goes on without one, so two starts can
-read the same 63 and both proceed. **64 is a backstop a race can cross, not a
-ceiling.** It is the right strength for what it defends against — a runaway is a
-sustained loop, not a photo finish — and tightening it would mean blocking on the lock,
-which the entry above rules out for a better reason.
-
-A refusal here does not leave a session behind either. Taking the lock is what creates
-`<id>.lock`, and `session_id_of` counts a bare one as a session, so a refusal that left
-it would add a counted id on every rejected spawn and ratchet the backstop against
-itself until somebody ran `list`. It is unlinked on the refusal path, while the lock is
-still held and only where this process was the one that created it — which is what the
-lock-last rule above asks of that name.
+One further refusal is decided in that same region: the daemon counts the distinct
+session ids already in the run directory and refuses to start past **64** —
+`MAX_SESSIONS`, eight times the cap of 8 that
+[DESIGN.md § 5.1](DESIGN.md#51-identity) argues for and leaves to the client. It counts
+names and not siblings, so a directory of dead sessions `list` would collect refuses one
+that could have started, and the refusal names both commands. Its own id never counts
+against it, and a directory that will not read is not a refusal. The count is taken
+before the bind and inside the spawn lock's region, but that lock is a `try_lock` and a
+daemon that cannot take it goes on without one, so two starts can read the same 63 and
+both proceed: **64 is a backstop a race can cross, not a ceiling.** A refusal unlinks
+`<id>.lock` where this process created it and still holds it — the daemon's own here,
+`attach::create`'s on a failed spawn or an expired `SPAWN_TIMEOUT` — since
+`session_id_of` counts a bare lock as a session, so leaving it would ratchet the
+backstop against itself on every rejected spawn.
 
 ### 6.4 Multiple clients
 
@@ -876,172 +656,115 @@ previous connection receives `Error{TAKEOVER}` and closes.
 
 **The `Hello` is what takes over, not the `connect`.** A newly accepted connection
 waits as *pending* and owns nothing until it greets. This is not a nicety: `list`
-probes every socket with a bare `connect` to decide which daemons are alive (§6.6),
-and so does the spawn race in §6.3. If connecting counted as attaching, listing
-sessions would evict the user from all of them — permanently, since the client is
-told never to auto-reconnect after `TAKEOVER`. A connection that greets with
-anything other than `Hello` is refused on its own terms and the session keeps its
-client. Only one connection may be pending at a time; a second replaces it.
+probes every socket with a bare `connect` to decide which daemons are alive (§6.6), and
+so does the spawn race in §6.3, so if connecting counted as attaching, listing sessions
+would evict the user from all of them — permanently, the client being told never to
+auto-reconnect after `TAKEOVER`. A connection that greets with anything other than
+`Hello` is refused on its own terms and the session keeps its client. Only one
+connection may be pending at a time: the listener leaves the poll set while that slot
+is taken, so a second waits in the backlog — where its `connect` completes, so `list`
+reports the session throughout — until the incumbent greets, reaches end of file, or
+misses its 5 s deadline.
 
-**A `Hello` this daemon cannot answer is refused before the eviction, not after.**
-The `Hello.protocol` check therefore runs on the pending connection rather than
-inside the handshake it would otherwise be part of. Deferred to the handshake — which
-only runs once the takeover has already happened — a newer client's *failed* greeting
-threw the working client off with `Error{TAKEOVER}` and then dropped the newcomer
-too, leaving the session running with nobody attached. That is worse than losing a
-handshake: the rule above tells a client never to auto-reconnect after a takeover, so
-the session the user was in went quiet until they went looking for it by hand. This
-is the one place [DESIGN.md § 6.4](DESIGN.md#64-version-skew)'s skew story touches
-the daemon, and it is why it is safe.
+**A `Hello` this daemon cannot answer is refused before the eviction, not after.** The
+`Hello.protocol` check therefore runs on the pending connection rather than inside the
+handshake, which only runs once the takeover has happened: deferred there, a newer
+client's *failed* greeting threw the working client off with `Error{TAKEOVER}` and then
+dropped the newcomer too, leaving nobody attached and no client permitted to reconnect.
+The one place [DESIGN.md § 6.4](DESIGN.md#64-version-skew)'s skew story touches the daemon.
 
-The eviction's final write is bounded by a deadline. The connection being replaced
-is usually one that has *stopped reading* — that is what a takeover recovers from —
-and an unbounded blocking write to it would park the entire daemon in the kernel:
-no PTY drained, no client served, no reaping, until a peer that may never read
-again decides to. Its queued output is dropped first; the arriving client replays
-it from the ring anyway.
+The eviction's final write is bounded by a deadline (§6.5's 500 ms), the connection
+being replaced usually being one that has *stopped reading*. Its queued output is
+dropped first; the arriving client replays it from the ring anyway.
 
 No read-only mirrors and no session sharing — there is one client per session by
-construction, and the takeover case exists only to recover from a half-dead
-connection the daemon has not yet noticed.
+construction.
 
 #### 6.4.1 Event ordering
 
 Within one `poll` iteration the client is serviced **before** the listener. A single
-wakeup can report both a readable client and a pending connection; accepting first
-would replace `self.client`, dropping the outgoing `Conn` while a frame it had
-already delivered was still unread in the socket buffer. Input vanished whenever a
-reconnect landed in the same iteration as a keystroke — reliably, under load.
-The `Hello` handler additionally drains the outgoing connection once more, just
-before the eviction, covering the narrower window between the poll returning and
-the greeting being parsed.
+wakeup can report both a readable client and a pending connection; accepting first would
+replace `self.client`, dropping the outgoing `Conn` while a frame it had delivered was
+still unread in the socket buffer — input vanished whenever a reconnect landed in the
+same iteration as a keystroke. The `Hello` handler drains the outgoing connection once
+more just before the eviction, covering the window between the poll returning and the
+greeting being parsed.
 
-A failing client socket is **never** propagated out of the event loop. A client that
-closes with output still queued makes the kernel send RST, so the next read yields
-`ECONNRESET`; treating that as a daemon error terminated the session over exactly
-the kind of unclean disconnect this project exists to survive. Client I/O errors
-detach the client and nothing more.
+A failing client socket is **never** propagated out of the event loop: client I/O
+errors detach the client and nothing more. Treating the `ECONNRESET` an unclean
+disconnect produces as a daemon error terminated the session over exactly the case
+this project exists to survive.
 
 ### 6.5 Shutdown
 
 **The child's exit is not the daemon's.** `waitpid` → flush the ring to any attached
 client → `Exit` frame → and then the session goes on being a session, holding the
-status, the kind and the ring, until the rule that reaps an idle live one reaps it
-too: `last_detach + IDLE_TIMEOUT`, seven days from the departure that left it alone.
-`Daemon::detach_deadline` is the only deadline there is, and an exit is not a second
-one beside it. So a client that attaches, reads the status and leaves starts a fresh
-seven days from *that* moment, and one that stays attached is never reaped at all —
-which is what a live session already promised. The run files go when the daemon goes,
-and that is now the reaping rather than the child.
-
-The cost is a daemon and a ring for a session with nothing running in it, which
-[DESIGN.md § 5.2](DESIGN.md#52-reaping) weighs against what the layout already
-permits. Nothing is written down for it: the status, the kind, the child's last words
-and the ring are in the daemon's memory already, so a tombstone would be a sixth name
-in the layout §6.6 freezes, holding a copy of what the process holding it holds
-anyway.
+status, the kind and the ring, until the rule that reaps an idle live one reaps it too:
+`last_detach + IDLE_TIMEOUT`, seven days from the departure that left it alone.
+`Daemon::detach_deadline` is the only deadline there is, so a client that attaches, reads
+the status and leaves starts a fresh seven days from *that* moment. The run files go when
+the daemon goes; nothing is written down for the interval, a tombstone being a sixth name
+in the layout §6.6 freezes ([DESIGN.md § 5.2](DESIGN.md#52-reaping) weighs the cost).
 
 The unlink is a collection like any other and takes `<id>.lock` first (§6.3),
 leaving the whole set in place if it cannot: a `spawn` may be blocked on that lock
-at this moment. Leftover files are something `spawn` recovers from by itself — a
-socket whose `connect` is refused is one it replaces — and the next `list` clears
-them. A mutex removed from under it is not.
+at this moment. Leftover files are something `spawn` recovers from by itself and the
+next `list` clears; a mutex removed from under it is not.
 
-`waitpid` is not instantaneous here and the order above hides a trap. Linux closes
-the child's descriptors in `do_exit` *before* the task becomes reapable, so the PTY
-master reports end of file while `waitpid` still answers "not yet" — often, not
-rarely. Resolving the status at end of file therefore invents one, and reports
-`exit 3` as `exit 0`. The status stays unknown until `waitpid` yields it, retried
-each pass for up to 2 s (`STATUS_GRACE`). What those two seconds bound is how long a
-client that is *watching* waits to be told anything at all. One that is not watching
-is racing nothing now, the session outliving its child.
+`waitpid` is not instantaneous here. Linux closes the child's descriptors in `do_exit`
+*before* the task becomes reapable, so the PTY master reports end of file while
+`waitpid` still answers "not yet" — often, not rarely — and resolving the status there
+would report `exit 3` as `exit 0`. It stays unknown until `waitpid` yields it, retried
+each pass for up to 2 s (`STATUS_GRACE`).
 
 **Past that deadline the daemon synthesises a status, and a client author has to know
-which one.** Only a child that closed its terminal without exiting reaches it — a
-program that daemonises itself does exactly this — and there is no status to be had,
-so the client is sent `Exit{status: 0, kind: Exited}` rather than left on a connection
-that simply goes quiet. It is indistinguishable on the wire from a shell that really
-did exit 0, and it is a *fabrication*: the process may still be running, and whatever
-it eventually exits with is nobody's to report. The alternative was worse — a session
-that never sends `Exit` is one no client can ever close a tab on — but a client that
-treats exit 0 as proof the child finished is wrong exactly here.
+which one.** Only a child that closed its terminal without exiting reaches it — a program
+that daemonises itself does exactly this — so the client is sent
+`Exit{status: 0, kind: Exited}` rather than left on a connection that goes quiet. It is
+indistinguishable on the wire from a real exit 0, and it is a *fabrication*: the process
+may still be running.
 
-The order is load-bearing and the code enforces it in one place: `Exit` is queued
-by the output pump, only once everything the child wrote has been queued ahead of
-it. A client that closes the tab on `Exit` and is handed it first — which is what
-happens if the handshake sends it — loses the whole transcript, including whatever
-the child said on its way out.
-
-That one guard is also the whole of what an attach a week later needs, so the late
-arrival cost the wire nothing. `pump_output` queues `Exit` only once *that* client's
-`sent_through` has reached the end of the ring, and a greeting rewinds `sent_through`
-to where the client resumes and clears the per-connection `exit_sent` — so a client
-arriving long afterwards replays the transcript and is *then* handed the status, in
-that same order, indistinguishable from the one that watched it happen. Telling the
-two apart is `since_exit_secs`'s job (§2.2) and nothing else's.
+The order is load-bearing and the code enforces it in one place: `pump_output` queues
+`Exit` only once *that* client's `sent_through` has reached the end of the ring, and a
+greeting rewinds `sent_through` to where the client resumes and clears the
+per-connection `exit_sent`. So a client that closes the tab on `Exit` never loses the
+transcript, and one arriving a week later replays it and is *then* handed the status.
+Telling the two apart is `since_exit_secs`'s job (§2.2) and nothing else's.
 
 Idle reaping ([DESIGN.md § 5.2](DESIGN.md#52-reaping)) is self-inflicted, not
 external: the daemon stamps `last_detach` on losing a client and arms a `poll`
-timeout against it. On expiry it sends `SIGHUP` then, after a grace period,
-`SIGKILL`, and exits through the same path, naming in syslog the rule that fired and
-whether the shell had already finished — which, the run files being gone by then, is
-the only record left that it had. No cron, no supervisor, nothing to install.
+timeout against it. On expiry it sends `SIGHUP` then, after a grace period, `SIGKILL`,
+and exits through the same path, naming in syslog (§11) the rule that fired. No cron, no
+supervisor, nothing to install. A session nobody ever attaches to is reaped after 30 s
+instead: a daemon spawned by a connection that died mid-handshake has no client coming.
 
-Both signals go out **twice**, because neither reach alone covers the session: the
-child's process group first, then a walk of `/proc` over everything still in its
-session. The group is the cheap one and gets the ordinary case in a single syscall
-— `setsid` in the child's `pre_exec` (§6.1) made it its own group leader — and the
-walk is what reaches the backgrounded jobs a shell with job control has put in
-groups of their own. The walk is ordered second because it costs a directory scan
-and a read per process, and on most shutdowns the common case is already over
-before it runs.
+Both signals go out **twice**, neither reach alone covering the session: the child's
+process group first, in a single syscall, then a walk of `/proc` over everything still
+in its session, which is what reaches the backgrounded jobs a shell with job control
+has put in groups of their own. Both address the child by *number* — a pgid and a
+session id are pids — and both are guarded by the start time in field 22 of
+`/proc/<pid>/stat`, read when the child is spawned: a number the kernel has reissued
+since must not be signalled. `pty::terminate` and `Pty::pid_reissued` carry the
+argument for each.
 
-Both reaches address the child by *number* — a pgid and a session id are pids — and
-both are guarded by the start time in field 22 of `/proc/<pid>/stat`, read when the
-child is spawned: a number the kernel has reissued since must not be signalled.
-`pty::terminate` and `Pty::pid_reissued` carry the argument for each — why the
-group `SIGKILL` is conditional where the walk's is not, why the guard is asked
-twice, and why a *missing* `/proc/<pid>` is deliberately not read as a reissue.
-
-A session nobody ever attaches to is reaped after 30 s rather than the idle
-timeout: a daemon spawned by a connection that died mid-handshake has no client
-coming and would otherwise sit there for a week.
-
-`SIGTERM` and `SIGINT` reach the same exit. A handler writes one byte to a
-self-pipe whose read end is in the poll set, and the loop leaves on its next pass —
-so `nomux kill` (§6.6) collects the child's process group and session, and unlinks
-the run files, rather than dropping the daemon where it stands. Closing the PTY master hides the
-difference for the ordinary case, because the kernel then delivers `SIGHUP` to the
-foreground process group on the way out; what it does not cover is a backgrounded
-process that ignores the hangup.
-
-A self-pipe rather than `signalfd`, which reports only *blocked* signals and so
-wants a process-wide `sigprocmask` — and a blocked mask survives `exec`, so §6.1
-would have to unblock it again in the child or leave the user's shell permanently
-deaf to `SIGTERM`. `poll` returning `EINTR` loses nothing: the handler wrote its
-byte before the syscall returned, and the next pass finds the pipe readable.
+`SIGTERM` and `SIGINT` reach the same exit. A handler writes one byte to a self-pipe
+whose read end is in the poll set, and the loop leaves on its next pass — so
+`nomux kill` (§6.6) collects the child's process group and session, and unlinks the run
+files, rather than dropping the daemon where it stands. A self-pipe rather than
+`signalfd`, which reports only *blocked* signals and so wants a process-wide
+`sigprocmask` surviving `exec` into the child. `poll` returning `EINTR` loses nothing.
 
 The budget is `nomux kill`'s two seconds, and everything on the way out is bounded
 against them: a final flush to the attached client for at most 500 ms — against the
 whole call, not per `write`, or a peer reading a trickle would reset it — and then
-`SIGHUP`, 500 ms, `SIGKILL`, each to both reaches above. An overrun would mean the daemon
-being `SIGKILL`ed mid-shutdown, which is the bug this closes, wearing a hat.
-
-One flush, not several, and the iteration the signal lands in is arranged so it cannot
-become several. `stopping` is set at the top of that iteration and the rest of it still
-runs, so whatever the client is owed is queued before the flush that delivers it — but
-the listener and the pending connection are skipped from that point on. A takeover
-arriving in the same wakeup would otherwise evict the client with a bounded 500 ms
-flush of its own, and a protocol error in the same wakeup would spend another, both on
-top of the one the shutdown itself performs: three, against a budget for two. What
-remains cannot double up, because the paths that flush early also take the client with
-them — after a `reject` or a client dropping out, the shutdown finds none. So the worst
-case is 500 ms of flush plus the 500 ms of `SIGHUP` grace. The ordinary case — an
-attached client and a shell that goes when asked — measures at 10 to 15 ms from the
-signal to the run files being unlinked.
+`SIGHUP`, 500 ms, `SIGKILL`, each to both reaches above. One flush, not several: the
+iteration the signal lands in sets `stopping` at its top and still runs, so whatever the
+client is owed is queued before the flush that delivers it, but the listener and the
+pending connection are skipped from there on. The ordinary case measures at 10 to 15 ms
+from the signal to the run files being unlinked.
 
 `SIGQUIT` is deliberately left at its default. Its action is a core dump, which is
-the only way left to get a snapshot out of a daemon that has wedged, and `SIGKILL`
+the only way left to get a snapshot out of a daemon that has wedged (§8), and `SIGKILL`
 — which nothing can handle — already means "go away now" for anyone who does not
 want one.
 
@@ -1063,17 +786,11 @@ $RUNDIR/<id>.agent   ssh-agent socket, 0600 (§6.7)
 
 The two plain files either mode reads by hand — `<id>.pid` and `<id>.label` — go
 through one bounded helper and are never read whole, opened `O_NONBLOCK | O_NOFOLLOW`
-so that a FIFO left at either name cannot park the escape hatch in `open(2)` and a
-symlink cannot send it elsewhere. What somebody dropped in the run directory does not
-get to decide how much memory `list` faults in either: an allocation that fails under
-§8's `-Cpanic=immediate-abort` is an abort with no message, not an error the escape
-hatch could report and go on from. The two
-ends of that bargain are deliberately asymmetric. A label that reaches its bound is
-truncated, and costs a column; a pid body that reaches **32 bytes is refused
-outright**, because a prefix ending mid-number is not the number in the file but a
-smaller, plausible, live one — `" "*25 + "32770419\n"` reads back as 3277041 — and
-what the prefix cannot settle it does not get to answer. The layout puts a pid and a
-newline there, eleven bytes at the widest; nothing legitimate reaches the bound.
+against a FIFO or a symlink left at either name. The two ends are deliberately
+asymmetric: a label that reaches its bound is truncated and costs a column, where a pid
+body reaching **32 bytes is refused outright**, a prefix ending mid-number being a
+smaller, plausible, live pid rather than the number on disk. `rundir::read_prefix`
+argues both, and why one read of a regular file is enough.
 
 - Both establish first that the run directory is this user's alone (§6.3), before any name in it is read, connected to or signalled. Neither creates it: on a host that has never run a session, `list` prints nothing and exits 0, and `kill` reports the "no such session" that already holds.
 - `list` reads the directory and probes each socket with `connect`; `ECONNREFUSED` — or a socket that is no longer there at all — means stale, and stale entries are unlinked. The probe is safe because connecting is not attaching (§6.4) — it costs a live session nothing.
@@ -1090,14 +807,16 @@ evidence, because a daemon that died without unlinking leaves its number behind 
 kernel is free to reissue it, so two questions are asked of it in order:
 
 1. **Does it still name a live process this user may signal?** A number naming nothing is discarded outright, and there is no second candidate to fall back to.
-2. **Is that process a `nomux daemon <id>`?** Put to `/proc/<pid>/cmdline`, because the daemon runs exactly those words and the two relay modes beside it — `nomux spawn <id>` and `nomux attach <id>` — do not, so no reissued number wears them by accident.
+2. **Is that process a `nomux daemon <id>`?** Put to `/proc/<pid>/cmdline`, and *parsed* rather than searched: a labelled session's daemon runs `nomux daemon <id> --label <text>`, so caller-supplied text sits in that same argv and a search for both words would accept `--label "daemon sess"` from a stranger. The rule, `control::names_daemon_for`, is four steps over the NUL-separated argv: skip `argv[0]`; require `argv[1]` to be exactly `daemon`; skip `--label` **and the argument after it**, anything spelled `--label=…`, and anything else beginning with `-`; the first argument left is the id, which must equal `<id>`. The relay modes beside it — `nomux spawn <id>` and `nomux attach <id>` — fail at step two, so no reissued number wears the words by accident.
 
 The second question has **three** answers, and keeping the last two apart is the
 load-bearing part: *is*, *is not*, and *could not tell* — `hidepid`, or a command line
 that ran past the buffer. Only a positive *is not* declines the pid. Refusing on *could
 not tell* would strand every session whose daemon sits behind `hidepid`, where
 accepting on it costs only the case where `/proc` is unreadable **and** the number has
-been reissued.
+been reissued. Truncation is asymmetric for the same reason: a match found inside a
+read that stopped at the buffer is authoritative — which is what keeps a session with a
+long `--label` killable — and only a *failure* to match leaves truncation deciding.
 
 | `<id>.pid` | `/proc` | Result |
 | --- | --- | --- |
@@ -1107,14 +826,14 @@ been reissued.
 | missing, or created but not yet filled | not asked | §6.2's publish window: re-read for up to 2 s, then refused if it still says nothing |
 | unreadable, not a number, or past 32 bytes | not asked | refused at once — waiting cannot change any of the three |
 
-What is deliberately **not** asked is which process holds the socket's descriptor.
-Matching a `sockfs` inode means parsing `/proc/net/unix` on the one surface that has to
+What is deliberately **not** asked is which process holds the socket's descriptor:
+matching a `sockfs` inode means parsing `/proc/net/unix` on the one surface that has to
 keep working anywhere, and what that gives up — telling this daemon from a second
 `nomux daemon <id>` — §6.3's bind already makes unreachable.
 
 `list` and `kill` run the identical weighing, so the number a user reads is the number
-`kill` would signal. That matters most where `kill` refuses: it recommends no repair
-there, and a user who wants to act asks `list` what to signal.
+`kill` would signal. That matters most where `kill` refuses, since it recommends no
+repair there.
 
 #### `list` output
 
@@ -1124,75 +843,53 @@ Three tab-separated columns per session, one line each, no header:
 <id>\t<pid>\t<label>\n
 ```
 
-- **Order is the run directory's `read_dir` order**, which is neither sorted nor stable. Nothing downstream is owed one, and `control.rs` records what sorting cost: instantiating `sort_unstable` for `String` was 3 KiB of §8's budget on every target.
+- **Order is ascending by id**: `rundir::session_ids` sorts and dedups what `read_dir` hands back, which is neither sorted nor stable. It costs §8's budget 4.3 KiB on `x86_64` and 3.9 KiB on `aarch64`.
 - **`<pid>` is a literal `?`** wherever the identification above yields no pid — the same weighing `kill` uses, so the number shown is the number that would be signalled.
 - **`<label>` is empty** where there is no label, where it could not be read, or where it was not valid UTF-8. The trailing tab is still written, so a line always has three fields and a consumer can split on the count.
 - **Dead sessions are collected, not printed.** An entry whose socket refuses is unlinked during the sweep and never reaches stdout, so what `list` prints is the live set.
-- **Exit 0 is not "sessions exist"**, it is "the directory was read": no run directory, or an empty one, prints nothing and exits 0 (§10 has the rest of the table).
+- **Exit 0 is not "sessions exist."** No run directory, an empty one, or one `read_dir` could not open prints nothing and exits 0 (§10 has the rest of the table).
 - `EPIPE` on stdout — `nomux list | head` — stops the printing but **not** the sweep, so a stale session is never left behind because the reader went away.
 
 #### `<id>.label`
 
 It exists because ids are opaque per-tab identifiers
-([DESIGN.md § 5.1](DESIGN.md#51-identity)). Without it, a client that has lost its
-state sees only UUIDs and cannot tell the user which session was which. It is
-written once at session creation and is advisory — never parsed, never used for
-lookup, and a missing or malformed label degrades `list` output but nothing else.
+([DESIGN.md § 5.1](DESIGN.md#51-identity)), so a client that has lost its state would
+otherwise see only UUIDs. Written once at session creation and advisory — never parsed,
+never used for lookup, and a missing or malformed one degrades `list` and nothing else.
 
-It arrives as `nomux spawn <id> --label <text>`, which `spawn` passes to the daemon
-it starts, and as `nomux daemon <id> --label <text>` where that daemon was started by
-hand: the two modes that create a session are the two that take one. `attach`
-*refuses* it rather than ignoring it, because a label offered to a mode that cannot
-create is a caller that still believes it might — the exact confusion `spawn` and
-`attach` were split apart to end, and dropping it on the floor would leave that
-caller believing it. `kill` goes on parsing and ignoring one, what the frozen surface
-accepts not being this change's to narrow. `--label=<text>` is accepted as well as the
-two-word form. A command-line flag rather than a `Hello` field because the writer is
-part of the frozen on-disk layout and should not depend on the protocol that layout
-exists to outlive.
+It arrives as `nomux spawn <id> --label <text>` or `nomux daemon <id> --label <text>`,
+`--label=<text>` accepted as well as the two-word form and a second of either refused
+(§10): the two modes that create a session are the two that take one. `attach` *refuses*
+it rather than ignoring it, and `kill` parses and ignores one, what the frozen surface
+accepts not being this change's to narrow. A command-line flag rather than a `Hello`
+field, the writer being part of a layout that exists to outlive the protocol.
 
-The daemon strips **control, bidi-override and tag characters**, then truncates to 256
-bytes on a character boundary and trims. The value is a tab title typed by a human and
-`list` writes it straight to a terminal, so all three classes are the same hazard in
-three spellings:
-
-- **Control characters** (`Cc`) — a label containing `ESC ]0;` would retitle the window of whoever ran `list`, and a literal tab would forge a column.
-- **Bidi overrides** (`Cf`: U+061C, U+200E/F, U+202A–U+202E, U+2066–U+2069) — one U+202E reverses the run after it, so a label reads as one thing in the listing and is another on disk, and the columns beside it come out backwards. This is the Trojan Source class, and it is what the `ESC ]0;` above is really an instance of.
-- **Tag characters** (U+E0000–U+E007F) — a whole copy of printable ASCII that renders as nothing, so one string can carry a second nobody ever sees.
-
-The rest of `Cf` is deliberately kept: ZWJ and ZWNJ are how Indic scripts and emoji
-sequences are spelled, so filtering `Cf` wholesale would mangle labels people typed
-correctly. Both ends sanitise — the writing daemon may be any version — and the same
-filter guards syslog, which is read on a terminal too.
+The daemon strips **control characters** (`Cc`), **bidi overrides** (`Cf`: U+061C,
+U+200E/F, U+202A–U+202E, U+2066–U+2069) and **tag characters** (U+E0000–U+E007F), then
+truncates to 256 bytes on a character boundary and trims. `list` writes the value
+straight to a terminal, so all three are one hazard in three spellings — the Trojan
+Source class. The rest of `Cf` is deliberately kept: ZWJ and ZWNJ are how Indic scripts
+and emoji sequences are spelled. Both ends sanitise, the writing daemon being any
+version, and the same filter guards syslog (§11), which is read on a terminal too.
 
 Neither opens a session, sends a frame, or reads `PROTOCOL_VERSION`. What is frozen is
 what is written above: **these five names, their permissions and the pidfile's format
 may never change**, and everything version-dependent lives behind the socket. The set
-is deliberately *not* sealed against growth, and the promise is stated over the
-existing five rather than over the layout as a whole because that is the part anything
-can be built against.
+is *not* sealed against growth, and that is only free because discovery and collection
+glob rather than enumerate: a binary that named the extensions it knew would leave the
+one it did not, and its `list`, scanning a directory whose only remaining name was that
+one, would never learn the id, so the `kill` that would clear it could never be typed.
 
-Growth is only free because discovery and collection glob rather than enumerate. A
-binary that named the extensions it knew would collect those and leave the one it did
-not — a file per collected session, for as long as two versions shared a host — and
-its `list`, scanning a directory whose only remaining name was the unfamiliar one,
-would never learn that id at all, so the `kill` that would clear it could never be
-typed.
-
-Both work from `<id>.*` instead, so a name added later costs an older binary
-nothing. One rule reads it: the id is the part of a filename **before the first `.`**,
-and it is only an id if `is_valid_session_id` accepts it. Splitting at the first dot
-rather than the last is what keeps `sess.sock` and `sess2.sock` two sessions rather
-than one prefix of the other; validating before anything is derived is what keeps a
-name in this directory from naming a path, a probe or a signal it should not. The
-consequence to accept is that the glob is the contract: a stray file whose name parses
-as `<valid-id>.<anything>` is discovered as that session and, nothing listening,
-collected. This directory is nomux's own, created at `0700` and holding nothing else,
-so the alternative — a garbage collector that leaves behind whatever it does not
-recognise — is the worse one.
-
-Corollary: a *new* binary can reap an *old* daemon, so recovery does not depend on
-the old binary still being present on the host.
+Both work from `<id>.*` instead, so a name added later costs an older binary nothing.
+One rule reads it: the id is the part of a filename **before the first `.`**, and it is
+only an id if `is_valid_session_id` accepts it. Splitting at the first dot rather than
+the last is what keeps `sess.sock` and `sess2.sock` two sessions rather than one prefix
+of the other; validating before anything is derived is what keeps a name here from
+naming a path, a probe or a signal it should not. The glob is therefore the contract: a
+stray file whose name parses as `<valid-id>.<anything>` is discovered as that session
+and, nothing listening, collected — acceptable because this directory is nomux's own,
+created at `0700` and holding nothing else. Corollary: a *new* binary can reap an *old*
+daemon, so recovery does not depend on the old binary still being on the host.
 
 ### 6.7 Agent forwarding
 
@@ -1220,11 +917,11 @@ sequenceDiagram
 
 Why the daemon owns the socket rather than borrowing or refreshing sshd's, and why
 that is worth a sub-channel in a protocol that otherwise refuses to multiplex:
-[DESIGN.md § 5.4](DESIGN.md#54-agent-forwarding). Mechanics below.
+[DESIGN.md § 5.4](DESIGN.md#54-agent-forwarding). Mechanics:
 
 - Channel ids are `u32`, allocated by the daemon — the only opener — from a cursor that advances and, at `u32::MAX`, wraps onto an id no live channel holds. So a close/open pair crossing in flight still cannot alias, and a session that opens and closes four billion channels goes on serving rather than refusing for the rest of its life: with eight live at most, one of any nine candidates is always free.
 - `AgentOpen` is optimistic: no ack. A client that cannot serve replies `AgentClose`.
-- At most `MAX_AGENT_CHANNELS` (8) concurrent; beyond that the daemon closes immediately rather than queueing.
+- At most `MAX_AGENT_CHANNELS` (8) concurrent; at the cap the oldest channel the client has already closed gives up its slot, and past that the daemon closes the connection immediately rather than queueing.
 - Payloads are opaque. The daemon never parses the agent protocol — it is a byte pipe, exactly like the PTY stream. Which is what puts `session-bind@openssh.com` on the client: a byte pipe cannot know which SSH hop the session is on, so a client that re-originates to the real agent without synthesising that binding gets destination-constrained keys refused, or used with their constraint unapplied ([DESIGN.md § 5.4](DESIGN.md#54-agent-forwarding)).
 - **While detached, connections are accepted and closed immediately.** A `git push` with no client attached fails fast with the same error as a missing agent, rather than hanging until reattach. The same applies the moment a client leaves or is taken over: every open channel is dropped, since nothing can answer a signature request any more, and the waiting process should learn that now rather than at reattach.
 - No flow control of its own, but two hard bounds. While the client's write queue is saturated the daemon stops reading agent sockets, leaving the bytes in the kernel's buffer where the peer blocks on them; and a channel whose local peer has stopped reading is closed as soon as a frame *would* take its queue past 256 KiB, rather than held on the client's behalf. The bound is tested before the bytes are taken, so 256 KiB is the peak a channel reaches and not the point it is noticed past — which is what makes the eight-channel product 2 MiB as written. An agent exchange is a few hundred bytes, so both limits are two orders of magnitude clear of real traffic.
@@ -1232,11 +929,7 @@ that is worth a sub-channel in a protocol that otherwise refuses to multiplex:
 - The socket is bound when the session is created, and only then. Turning forwarding on later would mean changing `SSH_AUTH_SOCK` in a running process, which is not possible; the client re-creating the session is the only path.
 - A socket that cannot be bound is not fatal. The session starts without forwarding and `HelloOk` says so, because a session without an agent is worth having and one that refuses to start is not.
 
-Security — the two consequences that are this side of the boundary; the policy that
-follows from them is [DESIGN.md § 5.4](DESIGN.md#54-agent-forwarding)'s:
-
-- The socket is `0600` inside the `0700` run directory, so reachable only by the session's own user — the same permissions as sshd's forwarded socket, but a longer window: sshd's dies with the connection, this one lives as long as the session does. That is the point of it ([DESIGN.md § 5.4](DESIGN.md#54-agent-forwarding)), and it is why forwarding is opt-in per host.
-- If sshd forwarding is also active, `SSH_AUTH_SOCK` is set by sshd and then overwritten by the daemon (§6.1.1). Ours wins.
+- Security, the two consequences this side of the boundary: the socket is `0600` inside the `0700` run directory, so reachable only by the session's own user — the same permissions as sshd's forwarded socket, but a longer window, since sshd's dies with the connection and this one lives as long as the session does, which is why forwarding is opt-in per host. And where sshd forwarding is also active, `SSH_AUTH_SOCK` is set by sshd and then overwritten by the daemon (§6.1.1): ours wins. The policy that follows is [DESIGN.md § 5.4](DESIGN.md#54-agent-forwarding)'s.
 
 ## 7. Attach relay
 
@@ -1251,24 +944,17 @@ difference between the modes. Deliberately dumb:
 
 Protocol logic exists only in the daemon. The relay must never need a version bump.
 
-`splice` needs one end of each pair to be a pipe, and whether that holds is a
-property of the host, not of this code: under sshd our stdio is a pipe on some
-builds and a socketpair on others, while the peer is always a unix socket. So it is
-discovered by trying — one refused syscall per direction, latched off for the rest
-of the run — rather than by probing. Measured over 2 MiB in each direction: 68
-syscalls and no userspace copy at all where stdio is a pipe, against 544 where it is
-a socketpair and the fallback takes over.
+`splice` needs one end of each pair to be a pipe, which under sshd our stdio is on some
+builds and not others, so it is discovered by trying — one refused syscall per
+direction, latched off for the rest of the run. Measured over 2 MiB each way: 68
+syscalls and no userspace copy where stdio is a pipe, against 544 where it is a
+socketpair and the fallback takes over.
 
-Two paths through the one component that must never break is worth being uneasy
-about, so they cannot interleave: `splice` is attempted only while that direction's
-buffer is empty, and a `splice` never puts anything into it. A direction is
-therefore either draining userspace bytes or moving kernel pages, never both, and
-the choice cannot reorder them.
-
-`SPLICE_F_NONBLOCK` applies only to the pipe end of the pair, so the socket has to
-be non-blocking too — otherwise a splice into a full socket parks the whole relay
-in the kernel with the other direction unserved. That is what makes the buffered
-write path live rather than the dead code it was when the socket blocked.
+The two paths cannot interleave: `splice` is attempted only while that direction's
+buffer is empty and never puts anything into it, so a direction is either draining
+userspace bytes or moving kernel pages. `SPLICE_F_NONBLOCK` applies only to the pipe end
+of the pair, so the socket has to be non-blocking too, or a splice into a full socket
+parks the whole relay in the kernel with the other direction unserved.
 
 ## 8. Build
 
@@ -1281,165 +967,101 @@ Targets:
 
 Two, and the rule for a third is that somebody asks for it: every target is a build, a
 baseline entry and a companion to carry for as long as it ships. `armv7`, `riscv64gc`,
-`ppc64le` and `s390x` are omitted on those terms. Which of them this table has held
-before is `git log`'s.
-
-`scripts/build-release.sh` builds both, writes `SHA256SUMS`, and exits non-zero
-if any binary misses the budget. It also holds each size against the per-target
-baseline recorded in `scripts/size-baseline`, prints the signed delta beside the
-size, and fails a target that has grown more than 3% against it — the cap alone passed
-a commit that grew armv7 by nearly half in one step, back when armv7 shipped, since
-the result still fitted it.
-Sizes are not repeated here: `scripts/size-baseline` is what a build writes and what
-the gate reads, and every prose copy of those numbers has gone stale at least once.
-`NOMUX_UPDATE_BASELINE=1` rewrites the
-baseline from that build and skips the growth gate, which puts an accepted size change
-in the diff a reviewer reads.
-
-**No cross toolchain.** `rust-lld` links both, including the host target, and
-each `rust-std` component ships the musl CRT objects and `libc.a` beside it in
-`self-contained/`. So `rustup target add` is the entire setup: no gcc, no zig, no
-sysroot. This works because the tree is pure Rust — rustix is on its `linux_raw`
-backend, so nothing links a C object. `zig cc` was evaluated as the documented
-alternative and rejected: it produces binaries 8–19% smaller than `rust-lld` against
-rust's bundled musl, but its own musl version is not pinned by
-`rust-toolchain.toml`, which works directly against the reproducibility requirement
-below. It remains the fallback for the day a dependency needs a real C compiler.
-`crt-static` is passed explicitly rather than left to each target's spec: both musl
-targets default to it, but `riscv64gc` did not while it shipped, and left alone it
-attempted a dynamic link and failed on `-lgcc_s`.
+`ppc64le` and `s390x` are omitted on those terms.
 
 Size matters because the cold upload happens over cellular. Release profile:
 `opt-level = "z"`, `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`,
-`strip = "symbols"`. Budget ≤ 400 KiB per arch.
+`strip = "symbols"`. Budget **≤ 400 KiB per arch**, and a growth gate at **3%** against
+the per-target baseline in `scripts/size-baseline`: the budget alone once passed a commit
+that grew armv7 by nearly half in one step. `scripts/build-release.sh` builds both
+targets, writes `SHA256SUMS`, prints the signed delta beside each size, and exits
+non-zero on either gate. `NOMUX_UPDATE_BASELINE=1` rewrites the baseline from that build
+and skips the growth gate, putting an accepted size change in the diff a reviewer reads.
 
-**The released standard library does not fit.** Both musl targets overrun the 400 KiB
-budget against a precompiled `std`, and comfortably rather than marginally.
+**No size table is kept here.** `scripts/size-baseline` is what a build writes and what
+the gate reads, and every prose copy of those numbers has gone stale at least once.
 
-No table of those two sizes is kept here. It used to be re-derivable — a build
-variable rebuilt the same source against the pinned stable toolchain and reported them
-— and that path is gone from `scripts/build-release.sh`, which leaves any figure
-written here one nothing measures. That is the case the rule above exists for.
-Reproducing it means a hand build on a stable toolchain with `-Zbuild-std` dropped,
-and belongs in the commit that takes the measurement.
+**No cross toolchain.** `rust-lld` links both, including the host target, and each
+`rust-std` component ships the musl CRT objects and `libc.a` beside it in
+`self-contained/`. So `rustup target add` is the entire setup: no gcc, no zig, no
+sysroot. This works because the tree is pure Rust — rustix is on its `linux_raw`
+backend, so nothing links a C object. `zig cc` produces binaries 8–19% smaller and is
+rejected anyway, pinning no musl version of its own; it remains the fallback for the day
+a dependency needs a real C compiler. `crt-static` is passed explicitly rather than left
+to each target's spec, which `riscv64gc` did not default to while it shipped.
 
-The panic machinery — formatting, backtrace symbolisation, `gimli`, `addr2line` —
-is most of the overrun, and it cannot be dropped from a precompiled `std` however the
-release profile is tuned. `-Z build-std` **alone earns little** — still comfortably
-over the budget; `-Cpanic=immediate-abort` is the entire win. So it is not an opt-in
-profile, it is the only configuration that ships, and the cost is a nightly
-compiler and panics that abort without a message. That is acceptable only because
-the lint wall in `Cargo.toml` already denies `unwrap`, `expect`, `panic` and
-`indexing_slicing`.
+**The released standard library does not fit.** Both musl targets overrun the budget
+against a precompiled `std`, the panic machinery — formatting, backtrace symbolisation,
+`gimli`, `addr2line` — being most of it. `-Z build-std` **alone earns little**;
+`-Cpanic=immediate-abort` is the entire win. So it is not an opt-in profile but the only
+configuration that ships, and the cost is a nightly compiler and panics that abort
+without a message — acceptable because §1's lint wall stands against `unwrap`, `expect`,
+`panic` and `indexing_slicing` on every commit.
 
-Builds are reproducible, and `scripts/build-release.sh` checks it the only way that
-means anything — by grepping each artifact for the builder's `$CARGO_HOME`,
-sysroot and checkout path, since two clean builds on one machine are byte-identical
-whether or not the paths were remapped. Three `--remap-path-prefix` flags are what
-make it true — for `$CARGO_HOME`, the sysroot and the checkout — because rustc bakes
-absolute paths into panic location strings, and an unremapped binary contains the
-builder's home directory 56 times over.
+Builds are reproducible, and three `--remap-path-prefix` flags — `$CARGO_HOME`, the
+sysroot, the checkout — are what make them so, rustc baking absolute paths into panic
+location strings. `scripts/build-release.sh` checks it the only way that means anything,
+by grepping each artifact for those three paths, since two clean builds on one machine
+are byte-identical whether or not the paths were remapped.
 
 Reproducibility is the producing half of a check whose consuming half does not exist
 yet. **The client is meant to pin a SHA-256 per architecture and verify it after
-upload; nothing does that today.** Where `SHA256SUMS` goes once
-`scripts/build-release.sh` has written it is no longer the open part: a `v*` tag
-publishes it as a release asset beside the binaries it covers, in the format
-`sha256sum -c` reads, and GitHub computes its own immutable SHA-256 per asset at
-upload time alongside it. What is missing before that check exists is the client, and
-that is [PLAN.md § P3](PLAN.md#p3--release-process)'s. Release builds must pin a
-**dated** nightly regardless, since a floating one moves the bytes that hash would be
-taken over. `scripts/nightly-version` holds the dated name, and it is the only way to name a
-compiler: trying a newer one means editing that file, which `git status` then shows
-you did. `scripts/size-baseline` records the compiler that measured it, so the two are
-checked against each other rather than merely documented as moving together: a tree
-whose baseline was measured by a compiler other than the one `scripts/nightly-version`
-names is refused outright, since a delta across two compilers measures the compilers.
-`NOMUX_UPDATE_BASELINE=1` is the one way past that check, and it is the one that
-rewrites the file.
+upload; nothing does that today** ([PLAN.md § P3](PLAN.md#p3--release-process)). The
+producing half is settled: a `v*` tag publishes `SHA256SUMS` as a release asset beside
+the binaries it covers, in the format `sha256sum -c` reads. Release builds pin a
+**dated** nightly regardless, a floating one moving the bytes that hash is taken over.
+`scripts/nightly-version` holds the dated name and is the only way to name a compiler;
+`scripts/size-baseline` records the compiler that measured it, and a tree whose baseline
+was measured by any other is refused outright, a delta across two compilers measuring
+the compilers. `NOMUX_UPDATE_BASELINE=1` is the one way past that check.
 
-**Debug companions.** `strip = "symbols"` and `-Cpanic=immediate-abort` are between
-them why an abort says nothing at all, and the `SIGQUIT` core of § 6.5 is what is left
-to read afterwards. A stripped binary gives that core no function names, so
-`NOMUX_DEBUG=1` asks the build for `nomux-<target>.debug` per target — the same build
-with `-Cstrip=none`, carrying `.symtab` and the DWARF the shipping binary drops. It is
-off by default because it doubles the build and needs `llvm-tools`; CI sets it for
-everything but a pull request, so every release has them. They are published beside
-the binaries they describe, with their own `SHA256SUMS.debug`; `SHA256SUMS` names only
-the ones that ship, since `sha256sum -c` fails on a file it cannot open and nearly
-everyone downloads only what they run.
+**Debug companions.** A stripped binary gives § 6.5's `SIGQUIT` core no function names,
+so `NOMUX_DEBUG=1` asks the build for `nomux-<target>.debug` per target — the same build
+with `-Cstrip=none`, carrying `.symtab` and the DWARF the shipping binary drops. Off by
+default because it doubles the build and needs `llvm-tools`; CI sets it for everything
+but a pull request. They are published beside the binaries they describe, with their own
+`SHA256SUMS.debug`; `SHA256SUMS` names only the ones that ship, since `sha256sum -c`
+fails on a file it cannot open.
 
-A companion is a **second build**, not the shipping binary with symbols added back and
-not the shipping binary stripped afterwards. Stripping does not commute here: rustc
-strips at link time and `llvm-strip` after it, and the two ELFs differ by a couple of
-hundred bytes — so deriving one from the other would change what ships, and what ships
-is what the checksums and the baseline are taken over. Two builds means their
-correspondence is an inference, and a companion whose addresses had moved would name
-the wrong functions rather than none, so the script checks it instead of assuming it:
-identical `.text` at an identical address, per target, per build. That check is what
-`llvm-tools` is installed for.
+A companion is a **second build**, not the shipping binary with symbols added back or
+stripped afterwards: stripping does not commute — rustc strips at link time and
+`llvm-strip` after it, and the two ELFs differ — so deriving one from the other would
+change what ships, which is what the checksums and the baseline are taken over. Their
+correspondence is an inference the script checks rather than assumes: identical `.text`
+at an identical address, per target, per build.
 
 ## 9. Testing
 
 What each layer asserts is in the doc comment on the test that asserts it, which is
-where it cannot go stale. This table is the map from a property to the file:
-
-| Layer | Where |
-| --- | --- |
-| Codec | `crates/nomux-proto/` |
-| Frame reassembly, send queue | `src/conn.rs` |
-| Wire format | `crates/nomux-proto/tests/wire.rs` |
-| Ring buffer | `src/ring.rs`, `tests/session.rs` |
-| Exactly-once input | `tests/chaos.rs` |
-| Session | `tests/session.rs` |
-| Frames from the client | `tests/session.rs` |
-| Gap | `tests/session.rs`, `tests/chaos.rs` |
-| Backpressure | `tests/flow.rs` |
-| Chaos | `tests/chaos.rs` |
-| Agent forwarding | `tests/agent.rs` |
-| Relay | `tests/attach.rs` |
-| Detachment | `tests/lifecycle.rs` |
-| Shutdown | `tests/lifecycle.rs` |
-| A session outliving its child | `tests/lifecycle.rs` |
-| Which mode may create a session | `tests/attach.rs`, `tests/spawn_lock.rs` |
-| Run directory | `src/rundir.rs`, `tests/attach.rs` |
-| Spawn lock | `tests/spawn_lock.rs`, `src/rundir.rs` |
-| Command line | `tests/spawn_lock.rs` |
-| Control surface | `tests/spawn_lock.rs` |
-| Session identity | `tests/spawn_lock.rs` |
+where it cannot go stale; every test file opens with the map from a property to itself.
 
 The two invariants that matter: **no duplicated input, ever**, and **no lost output
 unless a `Gap` was reported**.
 
-Both runners have to pass, which is a constraint on the tests rather than a preference
-between the two: `cargo nextest` gives every test a process, `cargo test` gives all the
-unit tests one, and a process-wide singleton is then shared by threads that know nothing
-about each other. Two have cost a run — the umask `rundir::with_umask` sets around a
-create, where the second restore leaves the process at the first's mask for good, and the
-standard descriptor numbers `startup`'s test frees one of — so the first is serialised by
-`scratch::umask_lock` and the second forked into a child. PLAN.md § P2 is the same rule
-for descriptors a `fork` duplicated.
+**Both runners have to pass**, which is a constraint on the tests: `cargo nextest`
+gives every test a process, `cargo test` gives all the unit tests one, so any
+process-wide singleton — the umask `rundir::with_umask` sets around a create, the
+standard descriptor numbers — is shared by threads that know nothing about each other,
+and each such case has to be serialised or forked into a child.
+[PLAN.md § P2](PLAN.md#p2--structure) is the same rule for descriptors a `fork`
+duplicated.
 
-The chaos suite covers what a shell transcript does not. A byte lost inside a CSI
-or sixel sequence does not lose a character, it changes the meaning of everything
-after it — so the escape-heavy case compares the reconstructed stream against the
-exact bytes the child wrote, rather than looking for a marker in it. Its emitter
-pauses briefly every few hundred rounds, without which the child outruns the
-client, the daemon coalesces the run into two or three maximum-size frames, and
-there is almost nowhere for a disconnect to land. Seeds come from
-`NOMUX_CHAOS_SEED`, and every failure message carries the seed that produced it.
+The chaos suite covers what a shell transcript does not: a byte lost inside a CSI or
+sixel sequence changes the meaning of everything after it, so the escape-heavy case
+compares the reconstructed stream against the exact bytes the child wrote. Its emitter
+pauses briefly every few hundred rounds, without which the child outruns the client and
+the daemon coalesces the run into two or three maximum-size frames, leaving almost
+nowhere for a disconnect to land. Seeds come from `NOMUX_CHAOS_SEED`, and every failure
+message carries the seed that produced it.
 
-A regression test that cannot fail is not a test. The event ordering of §6.4.1 can
-no longer be reverted by hand — the code that made it wrong does not compile any
-more — so the pre-fix ordering lives behind `--cfg nomux_fault_injection`, and
-`scripts/verify-takeover-guard.sh` asserts that the guard *fails* under it. It is a
-`const` rather than a `#[cfg]` block so both orderings stay type-checked and the
-shipped binary is unaffected either way.
-
-The bug only bites when the input and the `Hello` that evicts its sender land in one
-wakeup, which is otherwise a matter of microseconds, so `--cfg nomux_fault_settle`
-forces that interleaving alone and the script runs the guard under both. Its header
-says which run must pass and which must fail.
+A regression test that cannot fail is not a test. The event ordering of §6.4.1 can no
+longer be reverted by hand, so the pre-fix ordering lives behind
+`--cfg nomux_fault_injection` — a `const` rather than a `#[cfg]` block, so both
+orderings stay type-checked and the shipped binary is unaffected — and
+`scripts/verify-takeover-guard.sh` asserts that the guard *fails* under it. The bug only
+bites when the input and the `Hello` that evicts its sender land in one wakeup, so
+`--cfg nomux_fault_settle` forces that interleaving alone and the script runs the guard
+under both, its header saying which run must pass and which must fail.
 
 ## 10. Exit codes
 
@@ -1450,31 +1072,22 @@ the fate of *the relay*, not of the child:
 | Code | Meaning |
 | --- | --- |
 | 0 | The relay ended cleanly: the client detached, the session ended and the `Exit` frame was delivered, or the relay's own stdout was closed by its reader |
-| 64 | Malformed invocation (`EX_USAGE`), or an id this run directory has no room for — the smaller table below has the difference |
-| 126 | The session is there but this mode cannot have it: `spawn` found the id already taken, or `attach` found one it could not join (permissions, protocol) |
+| 64 | Malformed invocation (`EX_USAGE`), `--label` on `attach` included, or an id this run directory has no room for — the smaller table below has the difference |
+| 126 | This mode cannot have the session: `spawn` found the id already taken, `attach` found one it could not join (permissions, protocol), **or the run directory itself was refused** (§6.3) — group-writable, another uid's, unopenable, or not resolvable at all — where no session is involved and neither mode gets as far as one |
 | 127 | No such session: `attach` on an id nothing answers for, or a `spawn` whose daemon never started |
 
 The child's own status is **not** propagated through this exit code, and the
 `128+n` convention is the client's to apply. The status arrives in the `Exit` frame
 (§2.2), which the relay cannot read without parsing frames — precisely what §7
-forbids, because protocol logic must exist in exactly one place. The client is also
-the side that can do something useful with it; a relay exit code is invisible to
-the user behind an SSH exec channel.
+forbids, because protocol logic must exist in exactly one place.
 
-Two conventions meet in that table, and only one of them is `sysexits.h`. 64 is
-`EX_USAGE` and is the only code borrowed from it. 126 and 127 are the *shell's*
-exec codes — "found but not executable" and "not found" — applied to a session
-rather than a command, which reads as an analogy and is one: these are what a
-client runs over an SSH exec channel, so they reach it exactly where a shell's own
-would. The split tightens the analogy rather than straining it. A `spawn` that finds
-the id already taken is precisely a command that found something at the name and
-could not run it, and an `attach` on an id nothing answers for is precisely one that
-found nothing there at all — where the mode that did both had to read 127 as "and
-spawn failed", which is not a thing a shell ever means by it. The two codes therefore
-collide with a shell's, and deliberately: a missing binary also exits 127 and a
-`noexec` home also exits 126. Nothing has to tell those apart from the codes, because
-§5.1's `NOMUX-BOOTSTRAP` line is what distinguishes them, and it arrives on stdout
-rather than in the status.
+Two conventions meet in that table, and only one of them is `sysexits.h`: 64 is
+`EX_USAGE` and is the only code borrowed from it, where 126 and 127 are the *shell's*
+exec codes — "found but not executable" and "not found" — applied to a session rather
+than a command. These are what a client runs over an SSH exec channel, so they reach it
+exactly where a shell's own would, and they collide with a shell's deliberately: a
+missing binary also exits 127 and a `noexec` home also exits 126. §5.1's
+`NOMUX-BOOTSTRAP` line is what tells those apart, on stdout rather than in the status.
 
 `daemon`, `list` and `kill` share a smaller table:
 
@@ -1486,35 +1099,46 @@ rather than in the status.
 
 The 64 covers two refusals that read differently to whoever gets it, and only the
 first is a property of the id. An id outside `[A-Za-z0-9_-]`, one starting with `-`, or
-one past 64 bytes, fails on every host and is the client's own bug. An id that
-overruns `sun_path` fails against
-*this run directory* — the same id is accepted on the same host when
-`XDG_RUNTIME_DIR` is set, since the fallback under `$HOME` is the longer path (§6.3).
-So what the code says is that the id cannot name a session in the directory this
-command found, never that the id is malformed, and the stderr line carries the
-directory and both byte counts because that is where the difference is. A client that
+one past 64 bytes, fails on every host and is the client's own bug; an id that overruns
+`sun_path` fails against *this run directory* alone (§6.3). So the code says the id
+cannot name a session in the directory this command found, never that the id is
+malformed, and the stderr line carries the directory and both byte counts. A client that
 caches it as the latter caches its way out of ids that work.
 
-That last row is deliberately coarse, and §6.6 lists the five states behind it: a live
-session the pidfile will not identify, a socket that could not be probed at all, a
-session still answering after `SIGKILL`, a spawn lock still held at the 2 s deadline,
-and an unlink that failed over a session that did stop. Two more reach
-the same row without being any of the five, and both belong to §6.3 rather than to
-`kill`: a run directory that is not this user's alone, and one that cannot be resolved
-at all, because none of `XDG_RUNTIME_DIR`, `XDG_STATE_HOME` and `HOME` names an
-absolute path. All three modes reach both. A third is `daemon`'s alone: the session
-ceiling §6.3 refuses past. The temptation is to give each a
-code of its own out of the range `EX_USAGE` came from, and it is worth writing down why
-that is refused. `EX_TEMPFAIL` is the fit that suggests itself and is wrong for most of
-the five: it means *"user is invited to retry"*, and the states that turn on what the
-pidfile named do not clear on their own — a retry either refuses identically or, where
-the signals have already gone to a stranger, sends them again, so the code would be
-recommending the harm. Only the held lock is genuinely temporary.
-Splitting the rest would add a third convention to a surface §6.6
-freezes, for a private contract with one consumer, and buy resolution the stderr
-line already carries in words.
+That last row is deliberately coarse. §6.6 lists the five `kill` states behind it; the
+run-directory refusals of §6.3 reach it from all three modes, as does the session
+ceiling from `daemon`. Splitting them would add a third convention to a surface §6.6
+freezes, for a private contract with one consumer, and buy resolution the stderr line
+already carries in words — `EX_TEMPFAIL`, the fit that suggests itself, means *"user is
+invited to retry"*, which for every one of those states but the held lock would be
+recommending the harm.
 
 What a client actually wants from a non-zero `kill` is whether the session is still
 alive, and that question has a better answer than an exit code: `list`, which is
 the same frozen surface and exists to answer it. So the contract here stays binary
 — zero means established, non-zero means not — which is the form that cannot rot.
+
+## 11. Diagnostics
+
+The daemon redirects its own stdio to `/dev/null` as the last thing startup does
+(§6.2), so from there on it writes to **syslog** and nowhere else, tagged `nomux`:
+`user.err` for failures, `user.info` for a session beginning or ending. What fails
+*before* that point arrives at the `spawn` that tried to start the session, over the
+stderr pipe §6.2 holds open; an `attach` on an id nothing answers for fails at the
+caller the same way (§10). On a systemd host:
+
+```sh
+journalctl -t nomux           # everything nomux has said
+journalctl -t nomux -f        # follow, while reproducing something
+journalctl -t nomux -p err    # failures only
+```
+
+Elsewhere it lands in the host's system log under whatever name that host keeps. A host
+with no syslog at all gets no logging and starts regardless.
+
+**Session ids are logged; labels and terminal bytes never are.** Ids are opaque and are
+what `list` and `kill` take, where syslog is a host-wide sink and a session whose whole
+footprint is otherwise `0600` files inside a `0700` directory does not announce a tab
+title to everyone who can read it. One case stays silent whatever the sink: the shipping
+build compiles panics down to a bare trap (§8), so an abort produces no message to
+forward, and `SIGQUIT`'s core is what is left (§6.5).
