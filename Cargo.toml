@@ -9,8 +9,6 @@ rust-version = "1.97.1"
 license = "Apache-2.0"
 repository = "https://github.com/fornwall/nomux"
 authors = ["Fredrik Fornwall <fredrik@fornwall.net>"]
-keywords = ["ssh", "terminal", "pty", "session"]
-categories = ["command-line-utilities"]
 
 [workspace.dependencies]
 nomux-proto = { path = "crates/nomux-proto" }
@@ -25,10 +23,8 @@ panic = "abort"
 strip = "symbols"
 
 # Every lint below stays at "warn"; the deny lives in the gates, in
-# .pre-commit-config.yaml. A deny here would escape the repository — cargo inlines this
-# table into the published manifest, so it becomes a stranger's `cargo install nomux`
-# failure on any toolchain past the pin. `future_incompatible` is the sharpest edge:
-# that group is designed to gain members every release, each one an instant hard error.
+# .pre-commit-config.yaml, so a toolchain bump is a red gate rather than a tree that will
+# not build. No rustc *group* is named: a level applies to a group's members downwards.
 [workspace.lints.rust]
 # Fault injection for the test suite, never set in a shipped build. Declared so
 # `cfg!` on it is not itself a warning — which the gates would turn into an error.
@@ -43,8 +39,9 @@ unused_qualifications = "warn"
 unused_lifetimes = "warn"
 trivial_casts = "warn"
 trivial_numeric_casts = "warn"
-future_incompatible = { level = "warn", priority = -1 }
-rust_2018_idioms = { level = "warn", priority = -1 }
+elided_lifetimes_in_paths = "warn"
+explicit_outlives_requirements = "warn"
+unused_extern_crates = "warn"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

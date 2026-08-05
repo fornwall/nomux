@@ -3,14 +3,14 @@
 #
 # .github/dependabot.yml schedules version bumps monthly, which is a cadence rather
 # than a gate: an advisory published the day after a run waits four weeks for a bump
-# nobody has told dependabot to make. This fails the build instead. `nomux` is
-# published, so licences are a real question here too, and `clippy::cargo` does not
-# ask it — it checks this crate's manifest metadata, not what the tree pulls in.
+# nobody has told dependabot to make. This fails the build instead. Licences too: the
+# shipped binary statically links other people's Apache-2.0/MIT object code, whose
+# attribution terms `clippy::cargo` never asks about — it reads this crate's manifest
+# metadata, not what the tree pulls in.
 #
 # No `[graph] targets`, deliberately: every target is checked rather than the two that
-# ship, so the windows crates errno pulls in are in scope. An advisory or a licence
-# that would stop a `cargo install` on someone else's platform is one this repository
-# would rather hear about than not.
+# ship, so the windows crates errno pulls in are in scope — an advisory that surfaces
+# only on someone else's platform is one this repository would rather hear about.
 
 [advisories]
 version = 2

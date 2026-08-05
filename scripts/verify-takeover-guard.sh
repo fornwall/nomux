@@ -47,6 +47,12 @@ cd "$repo"
 # sharing one would rebuild everything twice on every switch. Absolute, so it does not
 # depend on anyone's working directory.
 base_target="${CARGO_TARGET_DIR:-$repo/target}"
+# `sockaddr_un` truncates at 108, and the `fi-*` below plus a run root is fifty of them.
+if [ "${#base_target}" -gt 56 ]; then
+    echo "the target directory is ${#base_target} bytes, over the 56 the tests bind under:" >&2
+    echo "  $base_target" >&2
+    exit 1
+fi
 
 log=$(mktemp)
 cleanup() { rm -f "$log"; }
@@ -75,8 +81,7 @@ run_with() {
 
 # Output is captured rather than discarded, and replayed on every failure path. A
 # silent failure here is indistinguishable from the bug being undetected, and the
-# usual cause is environmental — an over-long $CARGO_TARGET_DIR pushing the tests'
-# socket paths past the 108-byte limit, for one.
+# usual cause is environmental rather than the ordering under test.
 fail() {
     echo "FAIL: $1" >&2
     echo "--- output of the run ---" >&2

@@ -13,15 +13,9 @@ publish = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-# Literal rather than inherited: an inherited `README.md` resolves against the
-# workspace root, and cargo then rewrites it to the crate's own copy while warning
-# that it did. Same packaged file either way, one fewer warning on every publish.
-readme = "README.md"
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-keywords.workspace = true
-categories.workspace = true
 
 # The default `fork` and `timeout` features run every case in a subprocess so a
 # hang or an abort can be attributed. This codec allocates nothing it does not

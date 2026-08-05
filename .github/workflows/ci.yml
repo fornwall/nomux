@@ -10,6 +10,9 @@ on:
     # byte-identical by § 8, but "would be" is a claim and this is not one.
     tags: ['v*']
   pull_request:
+    # Not on `push` above, which owes every main commit a set of artifacts. Branch
+    # protection is off; turning it on makes a skipped job sit "expected" for ever.
+    paths-ignore: ['**/*.md', 'LICENSE']
   # The release job's artifacts expire, and it is the only producer of the
   # per-architecture binaries and their checksums. Without this, getting them back
   # means an empty commit.
@@ -62,29 +65,18 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Two files, checked against each other before anything is installed. Because the
-      # step below installs from rust-toolchain.toml, every build in this job genuinely
-      # is an MSRV build — but only while the two strings agree. Bump one alone and the
-      # declared MSRV becomes a claim nothing tests: `clippy::incompatible_msrv` reads
-      # `rust-version` and catches std-API drift, never a language or edition feature.
-      - name: rust-toolchain.toml and rust-version name the same compiler
-        run: |
-          pinned=$(awk -F'"' '/^channel *=/ { print $2; exit }' rust-toolchain.toml)
-          msrv=$(awk -F'"' '/^rust-version *=/ { print $2; exit }' Cargo.toml)
-          if [ -z "$pinned" ] || [ "$pinned" != "$msrv" ]; then
-              echo "the toolchain CI builds with is not the MSRV the crate declares:" >&2
-              echo "  rust-toolchain.toml channel: '$pinned'" >&2
-              echo "  Cargo.toml rust-version:     '$msrv'" >&2
-              echo "  move both, or the declared MSRV is tested by nothing." >&2
-              exit 1
-          fi
-
       # Bare `toolchain install` reads rust-toolchain.toml, so the 1.97.1 pin and
       # its components stay stated in exactly one place.
       - name: Install the pinned toolchain
         run: rustup toolchain install --profile minimal --no-self-update
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # rust-cache covers ~/.cargo and ./target; prek builds actionlint from Go into this.
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/prek
+          key: prek-${{ hashFiles('.pre-commit-config.yaml') }}
 
       # Prebuilt binaries; `cargo install` would build each from source on every
       # cache miss.
@@ -93,9 +85,9 @@ jobs:
           tool: cargo-nextest,cargo-deny,prek
 
       # Advisories, because dependabot schedules version bumps monthly and a CVE does
-      # not wait for the month; licences and sources, because `nomux` is published and
-      # `clippy::cargo` checks manifest metadata rather than what is in the tree.
-      # Seconds against two direct dependencies.
+      # not wait for the month; licences and sources, because the binary ships other
+      # people's object code and `clippy::cargo` checks this crate's manifest metadata
+      # rather than what is in the tree. Seconds against two direct dependencies.
       - run: cargo deny check advisories bans licenses sources
 
       # The gate itself, from .pre-commit-config.yaml, so a hook and the CI step
@@ -124,11 +116,12 @@ jobs:
       - run: cargo nextest run --locked --workspace --run-ignored all --no-fail-fast
 
   # Its own job: the script rebuilds `nomux` and its session tests under
-  # `--cfg nomux_fault_injection`, which shares no artifacts with the job above, and
-  # keeping it parallel leaves it off the critical path.
+  # `--cfg nomux_fault_injection`, which shares no artifacts with the job above.
   takeover-guard:
     name: takeover guard
     runs-on: ubuntu-latest
+    # A compile error is paid for once rather than in two jobs at the same time.
+    needs: check
     timeout-minutes: 20
     # Here too, because this is the only job that compiles the fault-injection code at
     # all: the check job above never sets those cfgs, so a warning behind one is
@@ -185,28 +178,13 @@ jobs:
         id: nightly
         run: |
           nightly=$(cat scripts/nightly-version)
-          # Checked rather than passed on, because two readers parse this file and
-          # they parse it differently: build-release.sh takes it whole with `cat`,
-          # while $GITHUB_OUTPUT is line-oriented, so a second line would install one
-          # compiler and build with another. Empty is the same class of problem from
-          # the other side — `cat` succeeds on an empty file, so the assignment above
-          # cannot catch it, and the failure surfaces a step later as a rustup usage
-          # error about a file this step has already read. One plain toolchain name
-          # is all either reader accepts; anything else stops here, next to the file.
-          case "$nightly" in
-              '' | *[!A-Za-z0-9._-]*)
-                  echo "scripts/nightly-version names the release compiler and must" >&2
-                  echo "  hold one plain toolchain name; it holds: '$nightly'" >&2
-                  exit 1
-                  ;;
-          esac
           echo "version=$nightly" >> "$GITHUB_OUTPUT"
 
       # The shipping build rebuilds std with panics compiled out, which needs a
       # nightly compiler plus its sources (IMPLEMENTATION.md § 8). `llvm-tools` is for
       # the debug companions: the script checks each one against the binary it
       # describes with `llvm-objcopy`, and the host's binutils cannot be assumed to
-      # read riscv64 or armv7.
+      # read aarch64.
       #
       # Through `env:` and a quoted expansion, not `${{ }}` spliced into the script:
       # on a pull request the file's contents are the contributor's, and a value
@@ -236,17 +214,18 @@ jobs:
         env:
           NOMUX_DEBUG: ${{ github.event_name == 'pull_request' && '0' || '1' }}
 
-      # The only place the shipping configuration is ever executed on a commit that is
-      # not a tag. Nothing in the check job builds `-Zbuild-std` with
-      # `-Cpanic=immediate-abort`, so without this a release binary that does not start
-      # at all — a miscompiled std, a seccomp filter that traps on the way up — passes
-      # every pull request and first fails on the tag that publishes it. The runner is
-      # x86_64 and the musl binary is static, so it can simply be asked. `chmod` even
-      # though `cp` carries the mode across, so the step does not rest on that.
-      - name: Run the binary that ships
+      # The only place the shipping configuration is ever executed on a commit that is not
+      # a tag. Nothing in the check job builds `-Zbuild-std` with `-Cpanic=immediate-abort`,
+      # so without this a binary that does not start at all — a miscompiled std — passes
+      # every pull request and first fails on the tag that publishes it. Both of them: the
+      # tree has no `target_arch` cfg, so std and codegen are the whole divergence between
+      # the two. Static, so the runner runs one and qemu-user the other.
+      - name: Run the binaries that ship
         run: |
-          chmod +x target/dist/nomux-x86_64-unknown-linux-musl
+          sudo apt-get update -qq && sudo apt-get install -y qemu-user
+          chmod +x target/dist/nomux-x86_64-unknown-linux-musl target/dist/nomux-aarch64-unknown-linux-musl
           target/dist/nomux-x86_64-unknown-linux-musl --version
+          qemu-aarch64 target/dist/nomux-aarch64-unknown-linux-musl --version
 
       # The checksums are the point of this job — the client pins one per
       # architecture — so they have to outlive the log they were printed to. On a tag

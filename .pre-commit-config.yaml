@@ -17,7 +17,28 @@
 repos:
   - repo: local
     hooks:
-      # ci.yml carries ~90 lines of embedded shell that the hook below never sees —
+      # Two files, compared as text. Every build here and in CI installs its toolchain
+      # from rust-toolchain.toml, so all of them are MSRV builds — but only while the two
+      # strings agree, and `clippy::incompatible_msrv` catches std-API drift alone.
+      - id: msrv-is-the-pinned-toolchain
+        name: rust-toolchain.toml and rust-version name the same compiler
+        entry: |
+          sh -c '
+          pinned=$(awk -F\" "/^channel *=/ { print \$2; exit }" rust-toolchain.toml)
+          msrv=$(awk -F\" "/^rust-version *=/ { print \$2; exit }" Cargo.toml)
+          if [ -z "$pinned" ] || [ "$pinned" != "$msrv" ]; then
+              echo "the toolchain CI builds with is not the MSRV the crate declares:" >&2
+              echo "  rust-toolchain.toml channel: '"'"'$pinned'"'"'" >&2
+              echo "  Cargo.toml rust-version:     '"'"'$msrv'"'"'" >&2
+              echo "  move both, or the declared MSRV is tested by nothing." >&2
+              exit 1
+          fi
+          '
+        language: system
+        files: '^(rust-toolchain\.toml|Cargo\.toml)$'
+        pass_filenames: false
+
+      # ci.yml carries ~60 lines of embedded shell that the hook below never sees —
       # it matches `*.sh`. actionlint shellchecks every `run:` block and validates the
       # workflow schema besides, which is the half of that file nothing else reads.
       #
@@ -49,7 +70,7 @@ repos:
         pass_filenames: false
 
       # `-- -D warnings` rather than a deny in [workspace.lints], for the reason
-      # Cargo.toml gives: a deny there escapes the repository, this one gates the tree.
+      # Cargo.toml gives: a toolchain bump should redden this gate, not break the build.
       - id: cargo-clippy
         name: cargo clippy
         entry: cargo clippy --locked --workspace --all-targets -- -D warnings

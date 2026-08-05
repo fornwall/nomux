@@ -77,7 +77,7 @@ fi
 # construction: a literal in ci.yml against a floating `nightly` here once meant the
 # documented local run measured whatever compiler the day handed it. It holds the name and
 # nothing else — this reader takes it verbatim while CI round-trips it through the
-# line-oriented $GITHUB_OUTPUT, so anything the two could read differently is rejected there.
+# line-oriented $GITHUB_OUTPUT, so anything the two could read differently is rejected here.
 nightly=''
 if [ -r "$nightly_file" ]; then
     nightly=$(cat "$nightly_file")
@@ -86,6 +86,9 @@ if [ -z "$nightly" ]; then
     die "no toolchain name in ${nightly_file#"$repo"/}, which names the release" \
         "  compiler. Restore it: nothing else in the tree says which one ships."
 fi
+case "$nightly" in
+*[!A-Za-z0-9._-]*) die "${nightly_file#"$repo"/} must hold one plain toolchain name: '$nightly'" ;;
+esac
 RUSTUP_TOOLCHAIN="$nightly"
 export RUSTUP_TOOLCHAIN
 toolchain="$nightly"
@@ -112,7 +115,11 @@ esac
 if [ "$update_baseline" != 1 ]; then
     measured_by=$(awk '/^#[[:space:]]*Measured on/ {
         getline; sub(/^#[[:space:]]*/, ""); print; exit }' "$baseline_file")
-    if [ -n "$measured_by" ] && [ "$measured_by" != "$version" ]; then
+    if [ -z "$measured_by" ]; then
+        die "no \`# Measured on\` stamp in ${baseline_file#"$repo"/}: its figures name no" \
+            "  compiler, so this check cannot run. NOMUX_UPDATE_BASELINE=1 writes one."
+    fi
+    if [ "$measured_by" != "$version" ]; then
         die "${baseline_file#"$repo"/} was measured by a different compiler than" \
             "  ${nightly_file#"$repo"/} names, so its figures are not this build's:" \
             "    building with: $version" \
