@@ -2,11 +2,13 @@
 //! them does, and the relay they share.
 //!
 //! One relay and two answers to an id nothing is serving (`DESIGN.md` § 5.1), so the
-//! bootstrap half is per mode and is mostly a table of refusals: a run directory
-//! neither may use, an id `spawn` finds taken, an id `attach` finds empty, and the
-//! exit status `IMPLEMENTATION.md` § 10 owes each of them. What is left is the one
-//! creation this suite performs over the relay rather than by running `nomux daemon`
-//! directly — a daemon under the flock, and the conversation behind it.
+//! bootstrap half is per mode and is mostly a table of refusals: an id `spawn` finds
+//! taken, an id `attach` finds empty, and the exit status `IMPLEMENTATION.md` § 10
+//! owes each of them. The refusals these two share with `list` and `kill` — a run
+//! directory nobody may use, a socket whose backlog is full — are `control.rs`'s,
+//! where the whole table is in one place. What is left is the one creation this suite
+//! performs over the relay rather than by running `nomux daemon` directly — a daemon
+//! under the flock, and the conversation behind it.
 //!
 //! The relay half is § 7 and belongs to neither mode: the byte pipe between the
 //! client's stdio and the session socket, in both the `splice` and the copying
@@ -36,104 +38,8 @@ use harness::{
     Rng, Session, Spawned, accept_within, collect, control, daemon_reaper, entries,
     has_unread_bytes, hello_frame, join_before, nomux, nomux_with_shell, poll_by, poll_until,
     process_state, push_until_refused, read_uninterrupted, run_root, shrink_send_buffer, stderr,
-    stdout, still_serving, succeeded, wedge_socket, while_nothing_forks, write_frame,
+    stdout, still_serving, succeeded, while_nothing_forks, write_frame,
 };
-
-/// A run directory that is a symlink is refused, out loud, by every mode that
-/// resolves one.
-///
-/// The unit tests in `rundir` cover the decision; this covers the consequence,
-/// which is the half a user sees. Everything else in this daemon degrades rather
-/// than aborts, so a session that must not start has to say so with a message and
-/// an exit status rather than by quietly doing something else — and what it must
-/// not do is what the code before it did, which was to `chmod` whatever the link
-/// points at and bind a session's sockets inside it.
-///
-/// All three modes rather than the two that create one, because `attach` no longer
-/// creates and still has to refuse: it is the mode that would otherwise hand the
-/// user's keystrokes to whatever is listening inside somebody else's directory, which
-/// is a worse outcome than a session started in the wrong place.
-#[test]
-fn a_symlinked_run_directory_is_refused_by_every_mode_that_resolves_one() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let root = run_root("symdir");
-    let target = root.join("elsewhere");
-    fs::create_dir_all(&target).expect("create the directory the link points at");
-    fs::set_permissions(&target, fs::Permissions::from_mode(0o777)).expect("loosen the target");
-    std::os::unix::fs::symlink(&target, root.join("nomux")).expect("plant the symlink");
-
-    // The exit code each mode owes § 10 for this refusal. Both relay modes report
-    // 126 — the shell's "found but not executable", applied to a session — and
-    // `DESIGN.md` § 7 has the client cache a host as unattachable on exactly that
-    // number, so a refusal answered with 127 instead would have it retry a host that
-    // will never work and one answered with 1 would have it give up on none.
-    // `daemon` is on the other table, where everything that is not a malformed
-    // command line is 1.
-    //
-    // 126 for `attach` is pinned rather than assumed, because it is the one number
-    // the split could plausibly have moved: `attach` reaches this through `check_dir`
-    // now rather than through the `ensure_dir` it used to share with `spawn`, and
-    // `check_dir` is also where the absent run directory that earns 127 is
-    // discovered. What separates the two is the errno rather than the call — only
-    // `NotFound` becomes "no session", and a symlink is `NotADirectory` — so a
-    // directory this process cannot use is still a host to give up on rather than a
-    // session to come back for.
-    let refusals: Vec<(&str, i32, Option<i32>, String)> =
-        [("spawn", 126), ("attach", 126), ("daemon", 1)]
-            .into_iter()
-            .map(|(mode, owed)| {
-                // Waited out rather than backgrounded, which is safe only because
-                // every one of these modes is refused before it serves: were that
-                // refusal ever to regress, this would hang rather than fail. `SHELL`
-                // is here for the same reason — a regression that got past the
-                // refusal starts one.
-                let output = collect(
-                    nomux_with_shell(&root, &[mode, "symdir"])
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped()),
-                );
-                (mode, owed, output.status.code(), stderr(&output))
-            })
-            .collect();
-
-    // Before the assertions, because the thing being asserted is that no session was
-    // started — and a failure here means one *was*, in nobody's process group, with a
-    // seven-day idle limit rather than the thirty seconds of a session no client ever
-    // reached. Nothing else in this test would collect it.
-    drop(control(&root, &["kill", "symdir"]));
-
-    for (mode, owed, code, stderr) in &refusals {
-        assert_eq!(
-            *code,
-            Some(*owed),
-            "{mode} must refuse a symlinked run directory with {owed}, got {code:?}: \
-             {stderr:?}"
-        );
-        assert!(
-            stderr.contains("run directory") && stderr.contains("symlink"),
-            "{mode} must say what it refused and why, got {stderr:?}"
-        );
-    }
-
-    assert_eq!(
-        fs::symlink_metadata(&target)
-            .expect("stat the target")
-            .permissions()
-            .mode()
-            & 0o7777,
-        0o777,
-        "the mode of a directory nomux does not own is not nomux's to change"
-    );
-    assert!(
-        fs::read_dir(&target)
-            .expect("read the target")
-            .next()
-            .is_none(),
-        "nothing may be created through the link"
-    );
-}
 
 /// A daemon that cannot publish `<id>.pid` refuses to start rather than serving a
 /// session nothing can find.
@@ -172,12 +78,8 @@ fn a_daemon_that_cannot_publish_its_pidfile_refuses_to_start() {
         "a daemon that cannot publish its pidfile must refuse to start (§ 10): {:?}",
         stderr(&refused)
     );
-    // Only that it said something, which is all it says. `write_pid` propagates the
-    // bare `io::Error` from `fs::write`, so the line the user gets is `nomux: Is a
-    // directory (os error 21)` with no path in it — every other refusal on this path
-    // names what it refused, and this one is worth an errno with a filename beside
-    // it. Left as a note rather than asserted, because tightening it is a change to
-    // the daemon rather than to its tests.
+    // Only that it said something: `write_pid` propagates the bare `io::Error` from
+    // `fs::write`, so the line names no path to look for.
     assert!(
         !stderr(&refused).is_empty(),
         "a daemon that refuses to start must say why"
@@ -382,70 +284,6 @@ fn attach_refuses_an_id_nothing_answers_for_rather_than_inventing_a_session() {
              start: {left:?}"
         );
     }
-}
-
-/// Regression: `attach` onto a session socket whose backlog is full gives up on a
-/// deadline rather than parking in `connect(2)`.
-///
-/// An `AF_UNIX` `connect` to a listener that has stopped calling `accept` *blocks*
-/// rather than being refused (§ 6.3), and the rule that follows from it covers `list`,
-/// `kill` and every attach on that id. This mode was the one still connecting without
-/// a deadline: a daemon that has stopped accepting — flushing a departing client,
-/// stopped, wedged — and a client that reconnects on every network change is a queue
-/// that fills, and the user's next tab then hangs with no output and no error, which
-/// is the one failure the relay has no way to report.
-///
-/// `the_control_surface_does_not_park_on_a_socket_whose_backlog_is_full` in
-/// `spawn_lock.rs` holds the same line for the other two modes.
-///
-/// 127 rather than 126, on § 10's table: a backlog that never drained is not evidence
-/// of death (§ 6.3), so this is the "come back for this one" a session that is not
-/// there earns, and never the host `DESIGN.md` § 7 has a client give up on.
-#[test]
-fn attach_does_not_park_on_a_socket_whose_backlog_is_full() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let root = run_root("attach_wedged");
-    let dir = root.join("nomux");
-    fs::create_dir_all(&dir).expect("create the run directory");
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
-        .expect("tighten the run directory");
-    let _wedged = wedge_socket(&dir.join("wedged.sock"));
-
-    let mut attaching = Spawned::spawn(
-        nomux(&root, &["attach", "wedged"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
-    );
-    assert!(
-        poll_until(RELAY_PATIENCE, || !attaching.is_running()),
-        "`nomux attach` never came back from a `connect` to a session socket whose \
-         backlog is full"
-    );
-    let refused = attaching
-        .into_exited()
-        .wait_with_output()
-        .expect("collect what the attach said");
-
-    assert_eq!(
-        refused.status.code(),
-        Some(127),
-        "a session that would not answer is one to come back for: {:?}",
-        stderr(&refused)
-    );
-    assert!(
-        stderr(&refused).contains("backlog is full"),
-        "and the refusal must name the state it gave up on, since nothing else on \
-         this host will say so: {:?}",
-        stderr(&refused)
-    );
-    assert!(
-        stdout(&refused).is_empty(),
-        "stdout is where § 5.1 has the client read the bootstrap line, so an attach \
-         that reached no session must leave it alone: {:?}",
-        stdout(&refused)
-    );
 }
 
 /// Exercises the path a real bootstrap takes: `nomux spawn` on an id nothing is
@@ -657,14 +495,8 @@ fn the_relay_moves_the_same_traffic_by_copying_when_the_kernel_will_not_splice_i
 /// Far above the second or so the transfers really take, and far below the
 /// termination in `.config/nextest.toml`, so a stalled relay fails here — naming the
 /// direction that stopped — rather than being killed there with nothing to point at.
-///
-/// A *whole*, at every site that makes more than one wait: the four joins in
-/// [`assert_relay_moves_bulk`] share one deadline, and so do the two waits in
-/// [`a_session_that_ends_with_the_relays_input_unread_still_exits_clean`]. Each of
-/// those used to spend the figure again per wait, which came to a hundred and twenty
-/// seconds and fifty against a runner that kills at forty — so a relay that stalled
-/// anywhere but in the first wait was killed by nextest, and the named failure this
-/// exists to produce never ran.
+/// Spent once per *test*, since a site that waits three times with this bound each is
+/// bounded by their sum, which is past the runner's own kill.
 ///
 /// The read timeout in [`relay_onto_a_socket_over`] is the one place it is a per-call
 /// figure, and it is not a deadline: it is what stops a `read_to_end` on a socket
@@ -795,42 +627,30 @@ fn the_relay_exits_when_its_stdout_dies_with_the_destination_latched_full() {
     // waiting for it to become writable. Now take away the reader.
     drop(stdout);
 
-    assert!(
-        poll_until(Duration::from_secs(10), || !child.is_running()),
-        "the relay was still running with its stdout gone and its buffer empty"
-    );
+    assert_relay_left(child, "with its stdout gone and its buffer empty");
 }
 
-/// Regression: the relay must leave when its stdout dies while nothing is owed to
-/// it, which is the state it is in almost all of the time.
+/// Regression: the relay must leave when its stdout dies while nothing is owed to it,
+/// which is the state it is in almost all of the time. It used to answer the `EPIPE`
+/// by dropping the buffer and carrying on, discarding every byte the session produced
+/// over a dead pipe while holding its one client slot.
 ///
-/// The regression is what the relay used to do about it: answer the `EPIPE` by
-/// dropping the buffer and carrying on, so every byte the session produced was read
-/// off the socket and discarded over a dead pipe, for as long as the session kept
-/// producing, with the relay holding its one client slot throughout.
-///
-/// Which of the two discoveries arrives first depends on what stdout is. An idle
-/// direction is out of the poll set altogether — an empty buffer wants nothing — so
-/// nothing is noticed until the session produces something, and that first chunk is
-/// buffered rather than written, the relay writing only to a descriptor `poll` has
+/// An idle direction is out of the poll set altogether — an empty buffer wants nothing
+/// — so nothing is noticed until the session produces something, and that first chunk
+/// is buffered rather than written, the relay writing only to a descriptor `poll` has
 /// just called writable. Buffering it is what puts stdout into the set. A pipe whose
-/// read end is gone answers `POLLOUT | POLLERR`, so here the `ERR` branch wins and
-/// the relay leaves without ever attempting the write. A socket whose peer has shut
-/// down its read half answers `POLLOUT` alone, the write is made, and the `EPIPE` it
-/// returns is the only thing that ever reports the death — which is
-/// [`the_relay_exits_when_a_stdout_it_can_only_copy_to_stops_reading`], the sibling
-/// that keeps that arm under test.
+/// read end is gone then answers `POLLOUT | POLLERR` and the `ERR` branch wins, so the
+/// relay leaves without attempting the write at all. A socket that has shut down its
+/// read half answers `POLLOUT` alone and the `EPIPE` from the write is the only report
+/// there is, which is [`the_relay_exits_when_a_stdout_it_can_only_copy_to_stops_reading`].
 ///
-/// Asserted as the relay exiting rather than as bytes not moving, because that is
-/// the only thing that distinguishes the two: a discard loop accepts everything it
-/// is handed — 42 MB of it, when this was measured — and from the socket end looks
-/// exactly like a relay doing its job.
+/// Asserted as the relay exiting rather than as bytes not moving, because that is the
+/// only thing that tells the two apart: a discard loop accepts everything it is handed
+/// and from the socket end looks exactly like a relay doing its job.
 ///
-/// The pipe is built and half-closed inside [`while_nothing_forks`], because a pipe
-/// is broken only when the *last* descriptor onto its read end goes and another
-/// test's `fork` in flight holds a copy of everything open here (`PLAN.md` § P2). The
-/// relay is idle from birth either way: it does not touch stdout until it has
-/// something for it.
+/// The pipe is half-closed inside [`while_nothing_forks`], because a pipe is broken
+/// only when the *last* descriptor onto its read end goes and another test's `fork` in
+/// flight holds a copy of everything open here (`PLAN.md` § P2).
 #[test]
 fn the_relay_exits_when_its_stdout_dies_with_nothing_owed_to_it() {
     // Before a single byte has crossed, so the direction is idle rather than
@@ -858,10 +678,7 @@ fn the_relay_exits_when_its_stdout_dies_with_nothing_owed_to_it() {
     peer.write_all(&vec![b'x'; 8 * 1024])
         .expect("write to the relay's socket");
 
-    assert!(
-        poll_until(Duration::from_secs(10), || !child.is_running()),
-        "the relay was still running with its stdout gone and its buffer idle"
-    );
+    assert_relay_left(child, "with its stdout gone and its buffer idle");
 }
 
 /// The same ending on a relay that was already copying before its stdout died.
@@ -888,7 +705,7 @@ fn the_relay_exits_when_a_stdout_it_can_only_copy_to_stops_reading() {
     // this relay for a reason that is not the one under test.
     let (_stdin, relay_stdin) = UnixStream::pair().expect("a socketpair for the relay's stdin");
     let (reader, relay_stdout) = UnixStream::pair().expect("a socketpair for the relay's stdout");
-    let (mut child, mut peer, _listener) = relay_onto_a_socket_over(
+    let (child, mut peer, _listener) = relay_onto_a_socket_over(
         "relay_copy_epipe",
         Stdio::from(OwnedFd::from(relay_stdin)),
         Stdio::from(OwnedFd::from(relay_stdout)),
@@ -909,34 +726,50 @@ fn the_relay_exits_when_a_stdout_it_can_only_copy_to_stops_reading() {
     peer.write_all(&vec![b'x'; 8 * 1024])
         .expect("write to the relay's socket");
 
+    assert_relay_left(child, "with a stdout it could only copy to gone");
+}
+
+/// The ending the three tests above share: the relay leaves, and § 10 gives exit 0 to
+/// one whose own stdout was closed by its reader — whichever of the three ways it
+/// finds that out. Nothing asserted the status, so the only part of § 10's row that
+/// was ever under test was that the process stopped.
+fn assert_relay_left(mut child: Spawned, still_running: &str) {
     assert!(
         poll_until(Duration::from_secs(10), || !child.is_running()),
-        "the relay was still running with a stdout it could only copy to gone"
+        "the relay was still running {still_running}"
+    );
+    let finished = child
+        .into_exited()
+        .wait_with_output()
+        .expect("collect the relay");
+    assert!(
+        finished.status.success(),
+        "a relay whose stdout its reader closed is exit 0 (§ 10), got {}: {:?}",
+        finished.status,
+        stderr(&finished)
     );
 }
 
 /// Regression: a session that ends with the relay's own input still unread is a
 /// clean exit, and what is buffered for stdout still gets there.
 ///
-/// That is the ordinary way a session ends rather than an exotic one. § 4.1 stops
-/// the daemon draining a client it is holding back, `write_client` drops a peer that
-/// has stopped reading, and `shutdown` closes straight after `flush_final` — each of
-/// them closes with bytes of the relay's still in the socket's receive queue, and a
-/// unix socket closed in that state hands the peer the last of the data and then
-/// `ECONNRESET` where an orderly close gives it a zero. Confirmed against a
-/// socketpair before this test was written, since the whole thing rests on it.
+/// The ordinary way a session ends rather than an exotic one: § 4.1 stops the daemon
+/// draining a client it is holding back, `write_client` drops a peer that has stopped
+/// reading, and `shutdown` closes straight after `flush_final`. Each closes with bytes
+/// of the relay's still in the socket's receive queue, and a unix socket closed in
+/// that state hands the peer the last of the data and then `ECONNRESET` where an
+/// orderly close gives it a zero.
 ///
-/// `copy_in` mapped only `EIO` to an ending, so that reset came back out of `relay`
-/// as a failure: `nomux: Connection reset by peer` and exit 126, where § 10 gives 0
-/// to "the session ended and the `Exit` frame was delivered". And the last of the
-/// session's output went with it — a `relay` that returns `Err` never goes back for
-/// what stdout is owed, and the buffer holds it precisely here, since a direction
-/// that had nothing queued when `poll` was called is not asking for `POLLOUT` yet.
+/// `copy_in` mapped only `EIO` to an ending, so that reset came back out of `relay` as
+/// `nomux: Connection reset by peer` and exit 126, where § 10 gives 0 to "the session
+/// ended and the `Exit` frame was delivered". The last of the session's output went
+/// with it — a `relay` that returns `Err` never goes back for what stdout is owed, and
+/// the buffer holds it precisely here, a direction with nothing queued when `poll` was
+/// called not yet asking for `POLLOUT`.
 ///
-/// Stdio on a socketpair for the reason [`the_relay_moves_the_same_traffic_by_copying_when_the_kernel_will_not_splice_it`]
-/// gives, and here it is what makes the bug reachable at all: the first `splice`
-/// consumes the socket's pending error, so a host whose stdio is a pipe never sees
-/// the reset. § 7 gives the other kind a socketpair.
+/// Stdio on a socketpair is what makes the bug reachable at all: the first `splice`
+/// consumes the socket's pending error, so a host whose stdio is a pipe never sees the
+/// reset. § 7 gives the other kind a socketpair.
 #[test]
 fn a_session_that_ends_with_the_relays_input_unread_still_exits_clean() {
     use std::os::fd::OwnedFd;
@@ -1005,34 +838,26 @@ fn a_session_that_ends_with_the_relays_input_unread_still_exits_clean() {
 /// Regression: a write to stdout that a signal cut short must not send the relay
 /// straight back into the kernel for the rest of it.
 ///
-/// `nbio::drain_to` used to write until the descriptor refused. Every descriptor in
-/// the daemon is non-blocking, so there the retry could answer nothing but `EAGAIN` —
-/// but the relay points it at *stdout*, which is deliberately left blocking, because
-/// it may be a terminal whose open file description the user's shell shares and
-/// `O_NONBLOCK` is not this process's to set (`attach.rs`). There the second `writev`
-/// is a second block, and the relay sits inside it with the other direction unserved:
-/// keystrokes stop reaching the session because the session's output has nowhere to
-/// go. `POLLOUT` promises only that *some* write will succeed, which is exactly the
-/// promise the loop was reading as more than that.
+/// `nbio::drain_to` used to write until the descriptor refused. That is safe against
+/// the daemon's non-blocking descriptors, but the relay points it at *stdout*, which
+/// is left blocking because it may be a terminal whose open file description the
+/// user's shell shares. There the second `writev` is a second block, and the relay
+/// sits inside it with the other direction unserved: `POLLOUT` promises only that
+/// *some* write will succeed, which is exactly what the loop read as more.
 ///
 /// What makes it observable is a *short* write, and on Linux a blocking descriptor
 /// short-writes only when a signal ends the call after it has already transferred
-/// something. So this provides one: `SIGSTOP` cannot be caught, blocked or ignored,
-/// so it always reaches a task parked in a write, and a write that has already moved
-/// bytes reports the short count rather than being restarted. `SIGCONT` then puts the
-/// relay back exactly where the fix has to matter — one `drain_to` call, mid-queue,
-/// against a destination that is still full.
+/// something. `SIGSTOP` cannot be caught, blocked or ignored, so it always reaches a
+/// task parked in a write; `SIGCONT` then puts the relay back exactly where the fix
+/// has to matter — one `drain_to` call, mid-queue, against a destination still full.
 ///
 /// The destination is a socketpair with a shrunken send buffer, which is what makes
-/// the rest exact rather than probable. A unix socket blocks only once its buffer is
-/// at the limit — the same condition `POLLOUT` answers — so the write the relay makes
-/// on `POLLOUT` always transfers at least one segment before it stops, and the write
-/// it would go back for afterwards has no `POLLOUT` to start from. Shrinking the
-/// buffer is what makes 16 KiB more than one segment; at the default 208 KiB the
-/// whole write is a single one, which either fits or is refused outright. A socket is
-/// also a destination the kernel will not splice into, which is what keeps the relay
-/// on the copying path `drain_to` belongs to — a pipe would be moved inside the
-/// kernel and never reach it (§ 7).
+/// that exact rather than probable: a unix socket blocks only once its buffer is at
+/// the limit, so the write made on `POLLOUT` always transfers at least one segment
+/// before it stops. Shrinking the buffer is what makes 16 KiB more than one segment;
+/// at the default 208 KiB the whole write is a single one, which either fits or is
+/// refused outright. A socket is also a destination the kernel will not splice into,
+/// which keeps the relay on the copying path `drain_to` belongs to (§ 7).
 #[test]
 fn a_write_to_stdout_a_signal_cut_short_does_not_park_the_relay_again() {
     use std::os::fd::OwnedFd;
@@ -1046,8 +871,10 @@ fn a_write_to_stdout_a_signal_cut_short_does_not_park_the_relay_again() {
     /// Sent the other way, and nothing to do with the write above: this is the
     /// traffic the parked relay is failing to serve.
     const MARKER: &[u8] = b"NOMUX-OTHER-DIRECTION";
-    /// How long the marker is given to *not* arrive. Only has to outlast a relay that
-    /// is still going round its loop, which takes microseconds.
+    /// How long the marker is given to *not* arrive. A wall-clock negative, and safe
+    /// as one only because [`parked_in_a_write`] has already been observed true
+    /// below: what this has to outlast is a relay going round its loop, which takes
+    /// microseconds, and never a relay that has not reached the write yet.
     const PARKED: Duration = Duration::from_millis(250);
 
     // Never read from, which is what keeps the relay's stdout full; held to the end

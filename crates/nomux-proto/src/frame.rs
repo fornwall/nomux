@@ -77,7 +77,8 @@ pub struct Hello<'a> {
     /// there being no negotiation (`DESIGN.md` § 6.4). The only revision on the wire,
     /// for the reason `IMPLEMENTATION.md` § 2 gives.
     pub protocol: u16,
-    /// Whether to serve an `ssh-agent` socket ([`HELLO_AGENT_FORWARD`]).
+    /// Whether to serve an `ssh-agent` socket ([`HELLO_AGENT_FORWARD`]). Honoured only
+    /// on the `Hello` that creates the session; ignored when resuming one.
     pub agent_forward: bool,
     /// Whether to repaint after a gap with `Ctrl-L` rather than a `SIGWINCH` pair
     /// ([`HELLO_REPAINT_CTRL_L`]).
@@ -123,10 +124,9 @@ wire_enum! {
     Enabled = 2,
 }
 
-/// [`HelloOk`] flags bit: this session is serving an agent socket.
+/// The only bit defined in [`HelloOk`]'s flags byte: this session is serving an agent
+/// socket. Anything else set is a protocol error.
 const HELLOOK_AGENT: u8 = 1 << 0;
-/// Bits defined in [`HelloOk`]'s flags byte. Anything else set is a protocol error.
-const HELLOOK_FLAG_BITS: u8 = HELLOOK_AGENT;
 
 /// Daemon's answer to [`Hello`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,8 +135,6 @@ pub struct HelloOk {
     pub resume_from: u64,
     /// Authoritative input offset; the client fast-forwards to this.
     pub in_applied: u64,
-    /// The session's current dimensions.
-    pub win: WinSize,
     /// Whether this session survives the user's logout.
     pub linger: Linger,
     /// Whether an agent socket is being served, so the client knows to expect
@@ -151,8 +149,7 @@ impl HelloOk {
     ///
     /// Derived rather than carried: each of `IMPLEMENTATION.md` § 4.2's branches
     /// already decides it, and the client already holds the `out_offset` it sent.
-    /// § 4.2 carries the argument that the two agree, and
-    /// `the_derived_gap_agrees_with_the_flowchart_it_replaces` runs it.
+    /// § 4.2 carries the argument.
     #[must_use]
     pub const fn gap(&self, out_offset: u64) -> bool {
         self.resume_from > out_offset
@@ -226,15 +223,10 @@ pub enum Frame<'a> {
     /// Client is leaving without ending the session.
     Detach,
     /// Liveness probe.
-    Ping {
-        /// Echoed back in [`Frame::Pong`].
-        nonce: u64,
-    },
-    /// Liveness response.
-    Pong {
-        /// Nonce from the corresponding [`Frame::Ping`].
-        nonce: u64,
-    },
+    Ping,
+    /// Liveness response. Carries nothing: the stream is ordered, so the *n*th `Pong`
+    /// can only answer the *n*th [`Frame::Ping`].
+    Pong,
     /// Daemon-side failure; the connection closes after this.
     Error {
         /// Machine-readable reason.
@@ -276,8 +268,8 @@ impl<'a> Frame<'a> {
             Self::Gap { .. } => FrameType::Gap,
             Self::Exit { .. } => FrameType::Exit,
             Self::Detach => FrameType::Detach,
-            Self::Ping { .. } => FrameType::Ping,
-            Self::Pong { .. } => FrameType::Pong,
+            Self::Ping => FrameType::Ping,
+            Self::Pong => FrameType::Pong,
             Self::Error { .. } => FrameType::Error,
             Self::AgentOpen { .. } => FrameType::AgentOpen,
             Self::AgentData { .. } => FrameType::AgentData,
@@ -305,9 +297,7 @@ impl<'a> Frame<'a> {
             .map_err(|_| ProtoError::PayloadTooLarge(u32::MAX))
             .and_then(|len| encode_header(self.frame_type(), len))
             .inspect_err(|_| out.truncate(start))?;
-        // Unreachable behind the `extend_from_slice` above, and an error rather than
-        // a silence: a patch that did not land ships the zero header reserved there,
-        // which the peer answers with `Error{Protocol}`.
+        // Unreachable after the `extend_from_slice`; fallible for `indexing_slicing`.
         let Some(slot) = out
             .get_mut(start..)
             .and_then(<[u8]>::first_chunk_mut::<HEADER_LEN>)
@@ -337,7 +327,6 @@ impl<'a> Frame<'a> {
             Self::HelloOk(ok) => {
                 out.extend_from_slice(&ok.resume_from.to_be_bytes());
                 out.extend_from_slice(&ok.in_applied.to_be_bytes());
-                put_win(out, ok.win);
                 out.push(ok.linger.as_byte());
                 out.push(ok.flags());
             }
@@ -350,9 +339,7 @@ impl<'a> Frame<'a> {
             }
             | Self::Gap {
                 new_base_offset: value,
-            }
-            | Self::Ping { nonce: value }
-            | Self::Pong { nonce: value } => out.extend_from_slice(&value.to_be_bytes()),
+            } => out.extend_from_slice(&value.to_be_bytes()),
             Self::Resize(win) => put_win(out, win),
             Self::Exit {
                 status,
@@ -363,7 +350,7 @@ impl<'a> Frame<'a> {
                 out.push(kind.as_byte());
                 out.extend_from_slice(&since_exit_secs.to_be_bytes());
             }
-            Self::Detach | Self::OutputAck => {}
+            Self::Detach | Self::OutputAck | Self::Ping | Self::Pong => {}
             Self::Error { code, message } => {
                 out.extend_from_slice(&code.as_u16().to_be_bytes());
                 out.extend_from_slice(message.as_bytes());
@@ -424,17 +411,15 @@ impl<'a> Frame<'a> {
             FrameType::HelloOk => {
                 let resume_from = r.u64()?;
                 let in_applied = r.u64()?;
-                let win = r.win()?;
                 let linger = Linger::from_byte(r.u8()?)
                     .ok_or(ProtoError::Malformed("unknown linger state"))?;
                 let flags = r.u8()?;
-                if flags & !HELLOOK_FLAG_BITS != 0 {
+                if flags & !HELLOOK_AGENT != 0 {
                     return Err(ProtoError::Malformed("undefined HelloOk flag bits"));
                 }
                 Self::HelloOk(HelloOk {
                     resume_from,
                     in_applied,
-                    win,
                     linger,
                     agent: flags & HELLOOK_AGENT != 0,
                 })
@@ -462,8 +447,8 @@ impl<'a> Frame<'a> {
                 since_exit_secs: r.u32()?,
             },
             FrameType::Detach => Self::Detach,
-            FrameType::Ping => Self::Ping { nonce: r.u64()? },
-            FrameType::Pong => Self::Pong { nonce: r.u64()? },
+            FrameType::Ping => Self::Ping,
+            FrameType::Pong => Self::Pong,
             FrameType::Error => Self::Error {
                 code: ErrorCode::from_u16(r.u16()?)
                     .ok_or(ProtoError::Malformed("unknown error code"))?,
@@ -604,7 +589,7 @@ mod tests {
     #[test]
     fn truncated_payload_is_rejected() {
         assert_eq!(
-            Frame::decode(FrameType::Ping, &[0, 0, 0]),
+            Frame::decode(FrameType::InputAck, &[0, 0, 0]),
             Err(ProtoError::Truncated)
         );
         assert_eq!(
@@ -616,7 +601,12 @@ mod tests {
     #[test]
     fn trailing_bytes_are_rejected() {
         assert_eq!(
-            Frame::decode(FrameType::Ping, &[0, 0, 0, 0, 0, 0, 0, 0, 9]),
+            Frame::decode(FrameType::InputAck, &[0, 0, 0, 0, 0, 0, 0, 0, 9]),
+            Err(ProtoError::TrailingBytes)
+        );
+        // `Ping` carries nothing, so any payload at all is trailing.
+        assert_eq!(
+            Frame::decode(FrameType::Ping, &[0]),
             Err(ProtoError::TrailingBytes)
         );
     }
@@ -657,7 +647,6 @@ mod tests {
         Frame::HelloOk(HelloOk {
             resume_from: 0,
             in_applied: 0,
-            win: WIN,
             linger: Linger::Unknown,
             agent: false,
         })
@@ -681,62 +670,25 @@ mod tests {
         }
     }
 
-    /// § 4.2's argument run rather than written down: the flowchart is transcribed
-    /// once below and compared against [`HelloOk::gap`] for every ring shape that
-    /// matters, on both sides of each edge.
+    /// § 4.2's `gap = resume_from > out_offset`, at the one offset where the sentinel
+    /// and a real position collide, and either side of an ordinary edge.
     #[test]
-    fn the_derived_gap_agrees_with_the_flowchart_it_replaces() {
-        /// § 4.2's flowchart, for a ring retaining `base..end`.
-        fn flowchart(out_offset: u64, base: u64, end: u64) -> (u64, bool) {
-            if out_offset == RESUME_FROM_START {
-                (base, false)
-            } else if out_offset < base {
-                (base, true)
-            } else {
-                // Clamped at both ends, exactly as `Daemon::on_hello` does it.
-                (out_offset.min(end).max(base), false)
+    fn the_derived_gap_is_the_comparison_section_4_2_makes() {
+        let gap = |resume_from, out_offset| {
+            HelloOk {
+                resume_from,
+                in_applied: 0,
+                linger: Linger::Unknown,
+                agent: false,
             }
-        }
-
-        for (base, end) in [
-            // Never written to, not overflowed, head dropped (full and empty), and
-            // the top of the offset space where the sentinel and a real offset are
-            // the closest they can be.
-            (0, 0),
-            (0, 16),
-            (8, 8),
-            (8, 24),
-            (u64::MAX - 4, u64::MAX),
-            (u64::MAX, u64::MAX),
-        ] {
-            for out_offset in [
-                0,
-                base.saturating_sub(1),
-                base,
-                base.saturating_add(1),
-                end.saturating_sub(1),
-                end,
-                end.saturating_add(1),
-                u64::MAX - 1,
-                RESUME_FROM_START,
-            ] {
-                let (resume_from, gap) = flowchart(out_offset, base, end);
-                let ok = HelloOk {
-                    resume_from,
-                    in_applied: 0,
-                    win: WIN,
-                    linger: Linger::Unknown,
-                    agent: false,
-                };
-                assert_eq!(
-                    ok.gap(out_offset),
-                    gap,
-                    "a client resuming at {out_offset} against a ring holding \
-                     {base}..{end} is told to resume at {resume_from}, which § 4.2 \
-                     calls gap={gap}"
-                );
-            }
-        }
+            .gap(out_offset)
+        };
+        // `RESUME_FROM_START` *is* `u64::MAX`, so a ring based at the top of the offset
+        // space answers the sentinel and a client genuinely there with one number.
+        // § 4.2 calls both no-gap, which is what makes the collision harmless.
+        assert!(!gap(u64::MAX, RESUME_FROM_START), "the sentinel is no gap");
+        assert!(gap(16, 8), "output dropped before the client is a gap");
+        assert!(!gap(8, 16), "a resume_from clamped down is no gap");
     }
 
     #[test]

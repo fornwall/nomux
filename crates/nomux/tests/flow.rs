@@ -18,15 +18,16 @@
 mod harness;
 
 use std::fs;
-use std::io::{ErrorKind, Write};
+use std::io::ErrorKind;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use nomux_proto::{Frame, FrameType, HEADER_LEN, RESUME_FROM_START, decode_header};
 
 use harness::{
-    FRAME_PATIENCE, SPIN_WINDOW, Session, cpu_ticks, hello_frame, poll_until, push_until_refused,
-    read_uninterrupted, still_serving, wait_for, write_frame,
+    ABANDON_PENDING_WRITE, Cue, FRAME_PATIENCE, MAX_PENDING_INPUT, SPIN_WINDOW, Session, cpu_ticks,
+    hello_frame, poll_until, push_until_refused, read_uninterrupted, still_serving, wait_for,
+    write_frame,
 };
 
 /// The PTY master is non-blocking, so a child that has stopped reading cannot
@@ -62,11 +63,11 @@ fn a_child_that_stops_reading_input_does_not_wedge_the_daemon() {
     // The daemon must still be answering: with a blocking master this does not
     // return until the sleep does.
     let began = Instant::now();
-    client.send(&Frame::Ping { nonce: 0xF00D });
+    client.send(&Frame::Ping);
     let payload = client.next_of(FrameType::Pong);
     assert_eq!(
         Frame::decode(FrameType::Pong, &payload).expect("decode pong"),
-        Frame::Pong { nonce: 0xF00D }
+        Frame::Pong
     );
     assert!(
         began.elapsed() < Duration::from_secs(10),
@@ -78,25 +79,16 @@ fn a_child_that_stops_reading_input_does_not_wedge_the_daemon() {
 /// A client writing faster than the child reads is back-pressured rather than
 /// buffered without limit, and reconnecting does not raise the ceiling.
 ///
-/// `Conn::rx` and `pending_input` had no cap, so a client could grow the daemon by
-/// however much it cared to send — and the two cheaper answers are both closed off,
-/// since `in_applied` is authoritative and exactly-once (§ 3): a byte cannot be
-/// dropped once acknowledged, and refusing one with an `InputGap` would accuse a
-/// client that had done nothing wrong. So the daemon stops reading the socket
-/// instead, exactly as the output direction always has.
-///
-/// Holding the client out of the poll set throttles only the reads the poll set
-/// drives, and that is not where the queue grows. The takeover path of § 6.4.1 reaches
-/// the decode loop twice without passing through the poll set at all — once to drain
-/// the outgoing connection, once for the input pipelined behind the arriving `Hello` —
-/// and nothing bounds reconnects, so each one injected another queue's worth. The cap
-/// is therefore enforced between frames in the decode loop, and this is the test that
-/// says so.
+/// Holding a client out of the poll set throttles only the reads the poll set drives,
+/// and that is not where the queue grows: the takeover path of § 6.4.1 reaches the
+/// decode loop twice without passing through the poll set at all — once to drain the
+/// outgoing connection, once for the input pipelined behind the arriving `Hello` — so
+/// each reconnect injected another queue's worth. The cap therefore has to be enforced
+/// between frames in the decode loop, and every round after the first is what says so.
 ///
 /// `in_applied` is what is asserted on because it is exactly what the daemon has taken
 /// ownership of (§ 3): every byte queued for the PTY is below it, so a ceiling on it is
-/// a ceiling on the queue. One connection measured once would keep passing with the cap
-/// in either place, which is what every round after the first is for.
+/// a ceiling on the queue.
 #[test]
 fn reconnecting_does_not_raise_the_input_ceiling() {
     /// Enough per round that the old growth — a third of a megabyte a takeover —
@@ -168,8 +160,9 @@ fn reconnecting_does_not_raise_the_input_ceiling() {
     // between frames.
     let ceiling = ceiling.expect("at least one round");
     assert!(
-        ceiling >= (1 << 20),
-        "the daemon stopped far short of the megabyte it is allowed to queue: {ceiling}"
+        ceiling >= MAX_PENDING_INPUT,
+        "the daemon stopped short of the {MAX_PENDING_INPUT} it is allowed to queue: \
+         {ceiling}"
     );
 }
 
@@ -184,16 +177,12 @@ fn reconnecting_does_not_raise_the_input_ceiling() {
 /// draining output (§ 7), so `nomux attach ID < script.sh` against a child that is
 /// slow to read ran the first megabyte and silently lost the rest.
 ///
-/// Sized to the real cap rather than to a knob, there being no `NOMUX_RING_BYTES` for
-/// the input direction. What the child is *given* is what is asserted on, from the far
-/// side of the PTY, because that is the claim: `in_applied` behind it says the daemon
-/// agrees, and is what a reattaching client would resume from.
+/// What the child is *given* is what is asserted on, from the far side of the PTY,
+/// because that is the claim: `in_applied` behind it says the daemon agrees, and is
+/// what a reattaching client would resume from.
 #[test]
 fn input_delivered_before_a_half_close_is_applied_rather_than_dropped() {
     use std::net::Shutdown;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    use rustix::fs::Mode;
 
     /// More than the megabyte the daemon queues, the megabyte it buffers undecoded
     /// and the socket buffers between them, so what crosses is bounded by the daemon
@@ -201,23 +190,16 @@ fn input_delivered_before_a_half_close_is_applied_rather_than_dropped() {
     const BLAST: usize = 8 << 20;
     /// One `Input` frame's payload, well inside `MAX_PAYLOAD`.
     const CHUNK: usize = 60 * 1024;
-    /// The queue cap of § 4.1. Named because the test means nothing unless more than
-    /// this crossed the socket before the half-close: below it nothing was ever held
-    /// back, and there would have been nothing to strand.
-    const CAP: u64 = 1 << 20;
 
     let session = Session::start("input_halfclose");
-    let cue = session.root.join("cue");
-    rustix::fs::mkfifoat(rustix::fs::CWD, &cue, Mode::RUSR | Mode::WUSR)
-        .expect("create the FIFO the child waits on");
+    let cue = Cue::new(&session.root);
 
     let mut client = session.connect();
     let ok = client.hello(RESUME_FROM_START);
     // `raw` for the back pressure it keeps (see [`Client::make_ready`]) and `-echo` so
-    // the blast is not echoed back at a peer that never reads. Past the marker the
-    // child never touches its terminal until the cue arrives: the whole line is parsed
-    // before any of it runs, and `read` has the FIFO. Then `cat` drains the terminal
-    // into a file, which is where this side counts what the child was really given.
+    // the blast is not echoed back at a peer that never reads. `cat` then drains the
+    // terminal into a file, which is where this side counts what the child was really
+    // given.
     let ready = client.make_ready(
         "raw -echo",
         Some("read cue < cue; exec cat > drained"),
@@ -245,20 +227,16 @@ fn input_delivered_before_a_half_close_is_applied_rather_than_dropped() {
     }
 
     // A raw socket rather than the harness client, because this has to stop writing
-    // exactly where the daemon stops reading and then half-close on the spot. A
-    // second of a socket that will not take another byte is a daemon that has stopped
-    // rather than one that is busy, which is the same measure the two cap tests above
-    // are built on — and one second rather than the three this used to spend, since
-    // nothing here ever gets the byte back that would end the wait early.
+    // exactly where the daemon stops reading and then half-close on the spot. A second
+    // of a socket that will not take another byte is a daemon that has stopped rather
+    // than one that is busy, which is the same measure the two cap tests above are
+    // built on.
     //
-    // Pushed again while the daemon has not yet taken more than it queues, rather
-    // than judged on the first answer. The push ends on a window in which nothing was
-    // accepted, and a daemon merely descheduled for the whole of one produces exactly
-    // that — a short count, and then an assertion below reporting a back-pressure
-    // defect that did not happen, where its two siblings would have passed. The state
-    // this test needs is the daemon having *stopped*, which is something to wait for.
-    // A daemon that really has stopped is past the threshold on the first push, so
-    // the ordinary path pays nothing for this.
+    // Pushed again while the daemon has not yet taken more than it queues, rather than
+    // judged on the first answer: the push also ends on a window in which nothing was
+    // accepted, and a daemon merely descheduled for the whole of one produces the same
+    // short count. The state this test needs is the daemon having *stopped*, and one
+    // that really has is past the threshold on the first push.
     let mut blaster = blaster(&session);
     let mut sent = 0;
     let deadline = Instant::now() + FRAME_PATIENCE;
@@ -276,20 +254,22 @@ fn input_delivered_before_a_half_close_is_applied_rather_than_dropped() {
             .rev()
             .find(|(through, _)| *through <= sent)
             .map_or(ready.in_offset, |(_, end)| *end);
-        if applied_end - ready.in_offset > CAP + CHUNK as u64 || Instant::now() >= deadline {
+        if applied_end - ready.in_offset > MAX_PENDING_INPUT + CHUNK as u64
+            || Instant::now() >= deadline
+        {
             break applied_end;
         }
     };
     let owed = applied_end - ready.in_offset;
-    // The queue is tested between frames, so it stops at [`CAP`] plus the one frame
+    // The queue is tested between frames, so it stops at the cap plus the one frame
     // that crossed it and never holds more. Anything past that was waiting *outside*
     // it — in the receive buffer or the socket's — which is what the bug threw away
     // and so is what has to be there for any of this to be a test.
     assert!(
-        owed > CAP + CHUNK as u64,
+        owed > MAX_PENDING_INPUT + CHUNK as u64,
         "the {owed} bytes of whole frames that reached the daemon all fit in the \
-         {CAP} it queues, so nothing was ever held back outside it and the \
-         half-close below would prove nothing"
+         {MAX_PENDING_INPUT} it queues, so nothing was ever held back outside it and \
+         the half-close below would prove nothing"
     );
 
     // The half-close § 7 has the relay make on stdin EOF, arriving while everything
@@ -300,25 +280,8 @@ fn input_delivered_before_a_half_close_is_applied_rather_than_dropped() {
         .expect("half-close the client the way the relay does");
 
     // And now the child starts reading, which is what drains the queue and lets the
-    // decode loop through the rest. Opened without blocking so a child that never
-    // reached its own `open` fails here rather than parking this: a FIFO answers
-    // `ENXIO` until a reader is there, and the child counts as one from the moment it
-    // enters the wait.
-    let mut go = None;
-    assert!(
-        poll_until(FRAME_PATIENCE, || {
-            go = fs::OpenOptions::new()
-                .write(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(&cue)
-                .ok();
-            go.is_some()
-        }),
-        "the child never reached the cue it waits on"
-    );
-    go.expect("the FIFO the wait above opened")
-        .write_all(b"go\n")
-        .expect("cue the child");
+    // decode loop through the rest.
+    cue.release();
 
     let drained = session.root.join("drained");
     let seen = || fs::metadata(&drained).map_or(0, |meta| meta.len());
@@ -358,11 +321,10 @@ fn input_delivered_before_a_half_close_is_applied_rather_than_dropped() {
 /// through the loop that has stopped. With a client attached the session is on no
 /// deadline at all (§ 6.5), so nothing but `nomux kill` ever ended it.
 ///
-/// Composed exactly rather than hoped for, and every step a condition. The child waits
-/// on a FIFO and so never touches its terminal, which is what lets the queue reach the
-/// cap; `push_until_refused` returning short of the blast is the daemon having stopped
-/// reading, which is saturation observed rather than assumed; and the cue is what makes
-/// the exit happen after it rather than at some point during it.
+/// Every step is a condition rather than a hope: the cue holds the child off its
+/// terminal, which is what lets the queue reach the cap; `push_until_refused` returning
+/// short of the blast is saturation observed; and releasing the cue is what puts the
+/// exit after it rather than somewhere during it.
 ///
 /// The `Ping` goes down a connection opened after the exit because that is the state a
 /// user is in — a session that looks alive, answers the handshake, and then says
@@ -370,29 +332,19 @@ fn input_delivered_before_a_half_close_is_applied_rather_than_dropped() {
 /// input direction is doing and so cannot tell the two daemons apart.
 #[test]
 fn a_child_that_exits_behind_a_full_input_queue_leaves_the_session_answering() {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    use rustix::fs::Mode;
-
     /// Comfortably past the megabyte § 4.1 queues, the megabyte it buffers undecoded
     /// and the socket buffers between them, so what stops the push is the daemon.
     const BLAST: usize = 8 << 20;
-    /// The queue cap of § 4.1. The test means nothing unless the daemon really reached
-    /// it before the child exited: below it nothing was ever held back.
-    const CAP: u64 = 1 << 20;
 
     let session = Session::start("exit_saturated");
-    let cue = session.root.join("cue");
-    rustix::fs::mkfifoat(rustix::fs::CWD, &cue, Mode::RUSR | Mode::WUSR)
-        .expect("create the FIFO the child waits on");
+    let cue = Cue::new(&session.root);
 
     let mut client = session.connect();
     let ok = client.hello(RESUME_FROM_START);
     // `raw` for the back pressure it keeps (see [`Client::make_ready`]) and `-echo` so
-    // the blast is not echoed back at a peer that never reads. Past the marker the child
-    // never touches its terminal: the whole line is parsed before any of it runs, and
-    // `read` has the FIFO — so the terminal's input buffer fills, the daemon stops
-    // being able to write, and everything after that piles up in `pending_input`.
+    // the blast is not echoed back at a peer that never reads. With the child off its
+    // terminal the input buffer fills, the daemon stops being able to write, and
+    // everything after that piles up in `pending_input`.
     let ready = client.make_ready("raw -echo", Some("read cue < cue; exit 9"), ok.resume_from);
     drop(client);
 
@@ -404,31 +356,14 @@ fn a_child_that_exits_behind_a_full_input_queue_leaves_the_session_answering() {
     let (frames, _) = input_frames(BLAST, ready.in_offset);
     let sent = push_until_refused(&mut blaster, &frames, Duration::from_secs(1));
     assert!(
-        sent as u64 > CAP,
+        sent as u64 > MAX_PENDING_INPUT,
         "the daemon took only {sent} bytes before it stopped, which all fits in the \
-         {CAP} it queues — so the queue never reached the cap and the exit below has \
-         nothing to strand"
+         {MAX_PENDING_INPUT} it queues — so the queue never reached the cap and the \
+         exit below has nothing to strand"
     );
 
-    // And now the child leaves, with the queue full behind it. Opened without blocking
-    // so a child that never reached its own `open` fails here rather than parking this:
-    // a FIFO answers `ENXIO` until a reader is there, and the child counts as one from
-    // the moment it enters the wait.
-    let mut go = None;
-    assert!(
-        poll_until(FRAME_PATIENCE, || {
-            go = fs::OpenOptions::new()
-                .write(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(&cue)
-                .ok();
-            go.is_some()
-        }),
-        "the child never reached the cue it waits on"
-    );
-    go.expect("the FIFO the wait above opened")
-        .write_all(b"go\n")
-        .expect("cue the child");
+    // And now the child leaves, with the queue full behind it.
+    cue.release();
 
     // A fresh attach, which is what a user reaching for a session that has gone quiet
     // does. The greeting proves the daemon is scheduling; the `Pong` behind it is the
@@ -436,10 +371,8 @@ fn a_child_that_exits_behind_a_full_input_queue_leaves_the_session_answering() {
     // used to stop.
     let mut client = session.connect();
     client.hello(RESUME_FROM_START);
-    client.send(&Frame::Ping { nonce: 0x5A7 });
+    client.send(&Frame::Ping);
 
-    // One deadline for the whole loop rather than a fresh one per frame: the replay and
-    // the `Exit` arrive ahead of the `Pong` and each would renew the patience for it.
     let deadline = Instant::now() + FRAME_PATIENCE;
     let awaiting = "a Pong from a session whose child exited behind a full input queue";
     loop {
@@ -451,10 +384,8 @@ fn a_child_that_exits_behind_a_full_input_queue_leaves_the_session_answering() {
             )
         });
         match Frame::decode(ty, &payload).expect("decode") {
-            Frame::Pong { nonce } => {
-                assert_eq!(nonce, 0x5A7, "the Pong must answer the Ping this sent");
-                break;
-            }
+            // The only `Ping` this connection sent, so the only `Pong` it can be owed.
+            Frame::Pong => break,
             Frame::Output { .. }
             | Frame::Gap { .. }
             | Frame::InputAck { .. }
@@ -467,47 +398,38 @@ fn a_child_that_exits_behind_a_full_input_queue_leaves_the_session_answering() {
 /// A peer that writes without ever reading is let go of, rather than queued for
 /// without bound (`IMPLEMENTATION.md` § 4.1).
 ///
-/// The output direction is bounded twice, at two different meanings of "not keeping
-/// up", and only the first has a test. Past a megabyte pending the daemon stops
+/// The output direction is bounded twice. Past a megabyte pending the daemon stops
 /// *queueing output*, which is what
 /// [`an_overflow_that_outruns_an_attached_client_is_reported_as_a_gap_mid_stream`]
-/// builds its gap out of. That bound does not cover everything, because the frames
-/// that *answer* a client — an `InputAck` per `Input`, a `Pong` per `Ping` — are not
-/// optional and are queued whatever the output policy says. So a peer that only ever
-/// writes grows the queue at exactly the rate it is fed, and `ABANDON_PENDING_WRITE`
-/// is the second bound: past eight megabytes it is not slow but gone. Nothing in the
-/// suite sent a daemon anything it had to answer without reading the answers, so both
-/// the bound and its consequence were untested — § 9's backpressure row is the input
-/// direction alone.
+/// builds its gap out of. That bound does not cover the frames that *answer* a client
+/// — an `InputAck` per `Input`, a `Pong` per `Ping` — which are queued whatever the
+/// output policy says, so a peer that only ever writes grows the queue at exactly the
+/// rate it is fed. `ABANDON_PENDING_WRITE` is the second bound: past it the peer is
+/// not slow but gone.
 ///
-/// `Ping` is what this is written in because it is the smallest frame that must be
-/// answered and the answer is the same size, so the queue tracks what was pushed at
-/// it byte for byte, and the two-sided bound below can say which bound fired. That is
-/// the point of the *lower* one: every cheaper way for the daemon to end up with a
-/// closed connection — a write it could not make, a frame it would not accept, a peer
-/// it decided was a protocol violation — happens far below eight megabytes, so a
-/// figure at the bound is the bound. The transcript is checked for the same reason
-/// from the other side: it must carry the pongs that filled the queue and no `Error`,
-/// since a refusal reaches the same closed socket by a different route entirely.
+/// Written in `Ping` because it is the smallest frame that must be answered and the
+/// answer is the same size, so the queue tracks what was pushed at it byte for byte
+/// and the two-sided bound below can say which bound fired. That is the point of the
+/// *lower* one: every cheaper way for the daemon to close a connection — a write it
+/// could not make, a frame it would not accept, a protocol violation — happens far
+/// below eight megabytes, so a figure at the bound is the bound. The transcript is
+/// checked from the other side for the same reason: it must carry the pongs that
+/// filled the queue and no `Error`, since a refusal reaches the same closed socket by
+/// a different route.
 ///
-/// What the daemon does about it is nothing: `drop_client`, no `Error`, no goodbye,
-/// which is the connection simply ending under a peer that was not listening anyway.
-/// This side sees it as the `EPIPE` that stops the push, and then as everything the
-/// daemon did send followed by an end — `ECONNRESET` rather than a clean zero, since
-/// it let go with bytes of ours still unread (§ 3).
+/// What the daemon does about it is nothing: `drop_client`, no `Error`, no goodbye.
+/// This side sees the `EPIPE` that stops the push, then everything the daemon did send
+/// followed by `ECONNRESET` rather than a clean zero, since it let go with bytes of
+/// ours still unread (§ 3).
 #[test]
 fn a_client_that_never_reads_its_answers_is_dropped_rather_than_queued_for() {
-    /// Comfortably past [`QUEUE`] and the socket buffers either side of it: a daemon
-    /// that lets go takes a fraction of this, and one that queues without bound takes
-    /// all of it.
+    /// Comfortably past [`ABANDON_PENDING_WRITE`] and the socket buffers either side
+    /// of it: a daemon that lets go takes a fraction of this, and one that queues
+    /// without bound takes all of it.
     const BLAST: usize = 24 << 20;
-    /// The queue § 4.1 lets a client reach before it counts as gone. Every byte of it
-    /// is a pong answering a ping, so it is also, near enough, how much of [`BLAST`]
-    /// the daemon has to have taken to get there.
-    const QUEUE: usize = 8 << 20;
-    /// [`QUEUE`] over again for the kernel's buffers, the undecoded megabyte § 4.1
-    /// caps the receive side at, and the pongs already on the wire — and nothing like
-    /// room for [`BLAST`].
+    /// [`ABANDON_PENDING_WRITE`] over again for the kernel's buffers, the undecoded
+    /// megabyte § 4.1 caps the receive side at, and the pongs already on the wire —
+    /// and nothing like room for [`BLAST`].
     const TOLERATED: usize = 16 << 20;
 
     let session = Session::start("abandon");
@@ -516,19 +438,14 @@ fn a_client_that_never_reads_its_answers_is_dropped_rather_than_queued_for() {
     // reads another byte until the measurement is over.
     let mut peer = blaster(&session);
     let mut ping = Vec::new();
-    Frame::Ping { nonce: 0x8B_ACED }
-        .encode(&mut ping)
-        .expect("encode a ping");
+    Frame::Ping.encode(&mut ping).expect("encode a ping");
     let pings = ping.repeat(BLAST.div_ceil(ping.len()));
 
     // A second of a socket that will not take another byte, which is not what ends
-    // this: the daemon lets go, and the write after that is an `EPIPE`. The patience
-    // is for the daemon that never does — a full second without a byte accepted is one
-    // that has stopped rather than one that is busy — and it doubles as the pace of the
-    // push, since [`push_until_refused`] backs off by a fiftieth of it whenever the
-    // send buffer is full. That is most of this test's second: the buffer holds a
-    // fraction of what has to cross, so the eight megabytes are handed over in some
-    // forty rounds of filling it and waiting for the daemon to drain it.
+    // this: the daemon lets go, and the write after that is an `EPIPE`. The patience is
+    // for the daemon that never does, and it doubles as the pace of the push, since
+    // [`push_until_refused`] backs off by a fiftieth of it whenever the send buffer is
+    // full.
     let sent = push_until_refused(&mut peer, &pings, Duration::from_secs(1));
 
     // Blocking with a timeout for the drain, so what the daemon managed to send is
@@ -566,10 +483,10 @@ fn a_client_that_never_reads_its_answers_is_dropped_rather_than_queued_for() {
         answered.len()
     );
     assert!(
-        sent >= QUEUE,
-        "the daemon let go at {sent} bytes of pings, short of the {QUEUE} of pongs \
-         they queue — so it dropped this peer for something other than a queue it \
-         could not deliver"
+        sent >= ABANDON_PENDING_WRITE,
+        "the daemon let go at {sent} bytes of pings, short of the \
+         {ABANDON_PENDING_WRITE} of pongs they queue — so it dropped this peer for \
+         something other than a queue it could not deliver"
     );
     assert!(
         sent < TOLERATED,

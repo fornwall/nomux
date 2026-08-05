@@ -15,22 +15,20 @@ disconnect that outlasts it is reported as an explicit gap, not silently truncat
 `attach`; `list` and `kill` are the control surface, frozen across versions.
 `nomux --help` has the rest.
 
-Four properties drive the design. They are the system's — this binary and the client
-that pushes and drives it, versioned as one unit — and two of them, the resume path
-and the zero install, are the client's half to hold:
+Four properties drive the system — this binary plus the client that pushes and drives
+it, versioned as one unit. Two, the resume path and the zero install, are the client's:
 
 - **Byte-stream replay, not screen-state sync** — no terminal emulator on the server.
 - **Resume over a fresh SSH connection, not a side channel** — inherits ProxyJump, certificates, 2FA, agent forwarding.
 - **Zero server-side install** — the client carries the binary and pushes it on first use.
 - **No new ports, no new crypto** — the only endpoints are unix sockets at `0600` inside a `0700` directory, one per session, plus one more when agent forwarding is enabled.
 
-**There is nothing to run yet.** This repository is the server half. The SSH client
-and terminal emulator that drive it are a separate, unreleased project, and both
-`nomux spawn` and `nomux attach` relay a binary frame protocol over stdio rather than
-driving a terminal — so without that client there is no way to get a shell out of
-this. What works standalone today is `nomux list` and `nomux kill`. The two halves
-ship as one unit, so the wire protocol is private and carries no stability guarantee
-([DESIGN.md § 2](DESIGN.md#2-scope)).
+**There is nothing to run yet.** This repository is the server half; the SSH client
+and terminal emulator that drive it are a separate, unreleased project. The relay
+modes speak a binary frame protocol over stdio rather than driving a terminal, so
+without that client there is no way to get a shell out of this — what works standalone
+today is `nomux list` and `nomux kill`. The two halves ship as one unit, so the wire
+protocol is private and carries no stability guarantee ([DESIGN.md § 2](DESIGN.md#2-scope)).
 
 - [DESIGN.md](DESIGN.md) — problem, properties, architecture, security model, prior art.
 - [IMPLEMENTATION.md](IMPLEMENTATION.md) — wire protocol, ring buffer, PTY handling, bootstrap, build.
@@ -44,7 +42,7 @@ Nothing has to be installed by hand: the toolchain is pinned in
 ```sh
 git clone https://github.com/fornwall/nomux && cd nomux
 cargo build     # rustup installs the pinned 1.97.1 on first use
-cargo test      # the whole suite, doctests included, about 20 s
+cargo test      # the whole suite, doctests included
 prek install    # once per clone: the commit gate, `.pre-commit-config.yaml`
 ```
 

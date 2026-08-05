@@ -1,16 +1,14 @@
 //! Randomised disconnect injection (`IMPLEMENTATION.md` § 9).
 //!
-//! The other end-to-end tests sever the connection at points a human chose. These
-//! sever it at points a generator chose, under the two workloads that break the
-//! assumptions a shell transcript does not exercise: an escape-heavy full-screen
-//! stream, where losing or duplicating one byte corrupts everything after it, and
-//! an unbounded firehose, where the ring overflows while the client is away.
-//!
-//! The invariants under test are § 9's two: no duplicated input, and no lost
+//! The other end-to-end tests sever the connection where a human chose; these sever it
+//! where a generator chose, under the two workloads a shell transcript does not
+//! exercise: an escape-heavy full-screen stream, where one byte lost or duplicated
+//! corrupts everything after it, and an unbounded firehose, where the ring overflows
+//! while the client is away. § 9's two invariants — no duplicated input, and no lost
 //! output unless a `Gap` was reported.
 //!
-//! Disconnect points come from a fixed seed so a failure is reproducible; override
-//! it with `NOMUX_CHAOS_SEED` to explore other interleavings.
+//! Disconnect points come from a fixed seed so a failure is reproducible; override it
+//! with `NOMUX_CHAOS_SEED` to explore other interleavings.
 
 mod harness;
 
@@ -26,17 +24,34 @@ const EMIT_ROUNDS: u32 = 20_000;
 
 /// How long a chaos test waits for its workload before calling it stalled.
 ///
-/// Under the termination in `.config/nextest.toml`, which is what makes it mean
-/// anything: the runner kills at forty seconds, so a minute — which is what this
-/// was — is a deadline that can never fire. A stalled run was killed from outside
-/// with nothing said, and § 9's promise that every chaos failure carries the seed
-/// that produced it held only for the failures that were not stalls. Both tests
-/// finish in under two seconds, so this is more than an order of magnitude of
-/// headroom either way.
-const PATIENCE: Duration = Duration::from_secs(30);
+/// Under the forty-second kill in `.config/nextest.toml`: a deadline at or above that
+/// can never fire, and the stall is then killed from outside with nothing said — losing
+/// § 9's promise that every chaos failure carries its seed. Reached only through
+/// [`frame_by`], so it bounds a whole multi-frame read rather than each frame in it.
+/// Both tests finish in under two seconds.
+const PATIENCE: Duration = Duration::from_secs(20);
 
 /// Seed used when `NOMUX_CHAOS_SEED` is unset.
 const DEFAULT_SEED: u64 = 0x6e6f_6d75_785f_3031;
+
+/// The next frame, bounded by the whole test's `deadline` rather than by one frame's.
+///
+/// [`harness::Client::next_frame`] renews its patience on every frame, so a daemon
+/// dribbling one frame just inside it is never late and the loop has no bound at all.
+#[expect(
+    clippy::panic,
+    reason = "clippy.toml's allow-panic-in-tests does not reach a helper outside a #[test] fn"
+)]
+fn frame_by(
+    client: &mut harness::Client,
+    deadline: Instant,
+    seed: u64,
+    stalled: &str,
+) -> (nomux_proto::FrameType, Vec<u8>) {
+    client
+        .frame_before(deadline, stalled)
+        .unwrap_or_else(|| panic!("{stalled} (seed {seed})"))
+}
 
 fn chaos_seed() -> u64 {
     std::env::var("NOMUX_CHAOS_SEED")
@@ -48,10 +63,9 @@ fn chaos_seed() -> u64 {
 /// One iteration of the emitter's output: cursor addressing, an SGR colour, a
 /// four-digit counter, a minimal sixel image, and a reset.
 ///
-/// Chosen because every part of it is a *sequence*: a byte lost anywhere in here
-/// does not merely lose a character, it changes the meaning of everything the
-/// emulator reads afterwards. That is what makes byte-exactness the property
-/// worth asserting.
+/// Every part of it is a *sequence*, so a byte lost anywhere in here does not merely
+/// lose a character — it changes the meaning of everything read afterwards. That is
+/// what makes byte-exactness the property worth asserting.
 fn emitted_chunk(i: u32) -> String {
     format!(
         "\x1b[{row};1H\x1b[38;5;{colour}m{i:04}\x1bPq#0;2;0;0;0~~\x1b\\\x1b[0m|",
@@ -66,12 +80,11 @@ const BURST: u32 = 500;
 /// The shell command that produces exactly [`emitted_chunk`] for each round,
 /// bracketed by markers.
 ///
-/// The pause every [`BURST`] rounds is what makes this a test rather than a
-/// formality: without it the child outruns the client, the daemon coalesces the
-/// whole run into two or three maximum-size frames, and there are almost no
-/// moments at which a disconnect can land. Its stderr is discarded because a
-/// `sleep` without sub-second support would otherwise write a complaint into the
-/// very stream being compared.
+/// The pause every [`BURST`] rounds is what makes this a test rather than a formality:
+/// without it the child outruns the client, the daemon coalesces the run into two or
+/// three maximum-size frames, and there is almost nowhere for a disconnect to land. Its
+/// stderr is discarded because a `sleep` without sub-second support would otherwise
+/// write a complaint into the very stream being compared.
 fn emitter_command(rounds: u32) -> String {
     format!(
         "printf 'CHAOS-BEGIN'; i=0; while [ $i -lt {rounds} ]; do \
@@ -81,10 +94,9 @@ fn emitter_command(rounds: u32) -> String {
     )
 }
 
-/// What `yes` writes `since` bytes into its output.
-///
-/// Checking the firehose against position rather than against "a `y` or a newline" is
-/// what catches a byte dropped, duplicated or reordered inside the stream.
+/// What `yes` writes `since` bytes into its output. Checking against position rather
+/// than against "a `y` or a newline" is what catches a byte dropped, duplicated or
+/// reordered inside the stream.
 const fn yes_byte(since: u64) -> u8 {
     if since.is_multiple_of(2) { b'y' } else { b'\n' }
 }
@@ -96,11 +108,9 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-/// A full-screen stream survives disconnects byte for byte.
-///
-/// The ring is large enough that nothing can be dropped, so the reconstructed
-/// stream must equal what the child wrote, exactly, with no gap reported and no
-/// byte repeated across a resume.
+/// A full-screen stream survives disconnects byte for byte: the ring is large enough
+/// that nothing can be dropped, so the reconstructed stream must equal what the child
+/// wrote exactly, with no gap reported and no byte repeated across a resume.
 #[test]
 fn an_escape_heavy_stream_is_byte_exact_across_random_disconnects() {
     let chaos_seed = chaos_seed();
@@ -108,8 +118,8 @@ fn an_escape_heavy_stream_is_byte_exact_across_random_disconnects() {
     let mut client = session.connect();
     let ok = client.hello(RESUME_FROM_START);
 
-    // Echo and newline translation silenced, so what arrives is exactly what the
-    // child wrote and the comparison below can be literal.
+    // Echo and newline translation silenced, so what arrives is exactly what the child
+    // wrote and the comparison below can be literal.
     let ready = client.make_ready("-echo -onlcr", None, ok.resume_from);
     let mut offset = ready.offset;
     let mut in_offset = ready.in_offset;
@@ -125,11 +135,7 @@ fn an_escape_heavy_stream_is_byte_exact_across_random_disconnects() {
     let deadline = Instant::now() + PATIENCE;
 
     while find(&seen, b"CHAOS-END").is_none() {
-        assert!(
-            Instant::now() < deadline,
-            "emitter never finished (seed {chaos_seed})"
-        );
-        let (ty, payload) = client.next_frame();
+        let (ty, payload) = frame_by(&mut client, deadline, chaos_seed, "emitter never finished");
         match Frame::decode(ty, &payload).expect("decode frame") {
             Frame::Output { offset: at, data } => {
                 assert_eq!(
@@ -140,18 +146,18 @@ fn an_escape_heavy_stream_is_byte_exact_across_random_disconnects() {
                 since_disconnect += data.len();
                 seen.extend_from_slice(data);
             }
-            Frame::InputAck { .. } | Frame::Pong { .. } => {}
+            Frame::InputAck { .. } | Frame::Pong => {}
             Frame::Gap { .. } => panic!("an 8 MiB ring must not overflow on {EMIT_ROUNDS} rounds"),
             other => panic!("unexpected {other:?} (seed {chaos_seed})"),
         }
 
-        // By volume rather than by frame count: one frame can carry anything from
-        // a few bytes to `MAX_PAYLOAD`, so counting frames would make the
-        // disconnect rate depend on how fast the machine happens to be.
+        // By volume rather than frame count: one frame carries anything from a few
+        // bytes to `MAX_PAYLOAD`, so counting frames would make the disconnect rate
+        // depend on how fast the machine happens to be.
         if since_disconnect >= 4 * 1024 + usize::try_from(rng.below(12 * 1024)).unwrap_or(0) {
             drop(client);
             client = session.connect();
-            let resumed = client.hello(offset);
+            let resumed = client.hello_before(deadline, offset);
             assert!(
                 !resumed.gap(offset),
                 "nothing should be dropped (seed {chaos_seed})"
@@ -196,11 +202,10 @@ fn an_escape_heavy_stream_is_byte_exact_across_random_disconnects() {
     }
 }
 
-/// Under a firehose and a ring too small to hold it, every byte that goes missing
-/// is accounted for by a gap — and everything between gaps is still contiguous.
-///
-/// This is the other half of § 9's invariant. The client cannot be told "here is
-/// where you are" and then quietly handed a stream with a hole in it.
+/// Under a firehose and a ring too small to hold it, every byte that goes missing is
+/// accounted for by a gap — and everything between gaps is still contiguous. § 9's
+/// other half: a client cannot be told where it is and then handed a stream with an
+/// unannounced hole in it.
 #[test]
 fn overflow_during_disconnects_is_always_reported() {
     /// `conn::MAX_PENDING_WRITE`, private to the daemon: what § 4.1 has it queue for a
@@ -219,40 +224,33 @@ fn overflow_during_disconnects_is_always_reported() {
     // `yes` outruns anything the client can do about it, which is the point.
     let command = b"yes\n";
     client.input(in_offset, command);
-    // Wait for the first of its output before starting to disconnect. Otherwise
-    // the very first drop could discard the command itself — a client that closes
-    // with output queued makes the kernel send RST, taking unread input with it —
-    // and the test would sit waiting for a firehose that was never started.
-    //
-    // Past a gap rather than refusing one, which `read_until` would: overflow against
-    // the 32 KiB ring is obliged here rather than a surprise (`read_past_gaps`). Neither
-    // counter below sees it, so a setup satisfying them on its own proves nothing.
+    // Wait for the first output before disconnecting: otherwise the first drop could
+    // discard the command itself — a client that closes with output queued makes the
+    // kernel send RST, taking unread input with it — and the test would sit waiting for
+    // a firehose that was never started. Past a gap rather than refusing one, since
+    // overflow against a 32 KiB ring is obliged here rather than a surprise; neither
+    // counter below sees this one, so a setup satisfying them alone proves nothing.
     let (_, started) = client.read_past_gaps("y", offset);
     offset = started;
 
     let mut rng = Rng::new(chaos_seed);
     let capacity = socket_capacity();
-    // Two promises, counted apart: § 9 obliges the daemon to announce an overflow to a
-    // client that is *attached*, and to move the resume point of one that comes back.
+    // Two promises, counted apart: § 9 obliges the daemon to announce an overflow to an
+    // *attached* client, and to move the resume point of one that comes back.
     let mut announced_gaps = 0u32;
     let mut resume_gaps = 0u32;
     let mut received = 0u64;
     let deadline = Instant::now() + PATIENCE;
 
     for round in 0..24 {
-        assert!(
-            Instant::now() < deadline,
-            "firehose stalled (seed {chaos_seed})"
-        );
         // Read past everything already queued, because § 9's announcement is behind all
         // of it: the daemon fills `QUEUED` and the socket beneath it, stops adding, and
-        // appends the `Gap` the overflow then owes to the back of that queue. By volume
-        // rather than by frame count, for the reason the sibling test gives; the random
-        // tail keeps the disconnect below off the announcement.
+        // appends the `Gap` it then owes to the back of that queue. The random tail
+        // keeps the disconnect below off the announcement.
         let through = QUEUED + capacity + usize::try_from(rng.below(16 * 1024)).unwrap_or(0);
         let mut read = 0usize;
         while read < through {
-            let (ty, payload) = client.next_frame();
+            let (ty, payload) = frame_by(&mut client, deadline, chaos_seed, "firehose stalled");
             read += payload.len();
             match Frame::decode(ty, &payload).expect("decode frame") {
                 Frame::Output { offset: at, data } => {
@@ -280,7 +278,7 @@ fn overflow_during_disconnects_is_always_reported() {
                     offset = new_base_offset;
                     announced_gaps += 1;
                 }
-                Frame::InputAck { .. } | Frame::Pong { .. } => {}
+                Frame::InputAck { .. } | Frame::Pong => {}
                 other => panic!("round {round}: unexpected {other:?} (seed {chaos_seed})"),
             }
         }
@@ -288,13 +286,12 @@ fn overflow_during_disconnects_is_always_reported() {
         drop(client);
         std::thread::sleep(Duration::from_millis(rng.below(30)));
         client = session.connect();
-        let resumed = client.hello(offset);
+        let resumed = client.hello_before(deadline, offset);
         assert!(
             resumed.resume_from >= offset,
             "round {round}: the daemon must never rewind (seed {chaos_seed})"
         );
-        // A moved resume point is exactly what a gap is (`HelloOk::gap`), so what is
-        // left to count is how often it happened.
+        // A moved resume point is exactly what a gap is (`HelloOk::gap`).
         if resumed.gap(offset) {
             resume_gaps += 1;
         }
@@ -313,20 +310,15 @@ fn overflow_during_disconnects_is_always_reported() {
     );
 }
 
-/// Input is applied exactly once, whatever the disconnect pattern.
+/// Input is applied exactly once, whatever the disconnect pattern (§ 3).
 ///
-/// This is § 3 played out as a client actually experiences it. Every round writes
-/// a line and then severs the connection immediately, so each frame lands in one
-/// of three states: fully applied, partly applied, or lost entirely — a client that
-/// closes with output still queued makes the kernel send RST, and the daemon answers
-/// the `ECONNRESET` that follows by letting the connection go without decoding what
-/// it had just read from it (§ 3). The client responds the way the
-/// protocol says: take the daemon's `in_applied` as authoritative and resend from
-/// there, deliberately overlapping into bytes already applied so the trimming path
-/// is exercised too.
-///
-/// The shell counts what it actually received, and the count is what proves the
-/// invariant: every line runs, and none runs twice.
+/// Every round writes a line and severs the connection at once, so each frame lands
+/// fully applied, partly applied, or lost entirely — a client that closes with output
+/// queued makes the kernel send RST, and the daemon answers the `ECONNRESET` by letting
+/// the connection go without decoding what it had just read. The client then does what
+/// the protocol says: take `in_applied` as authoritative and resend from there,
+/// deliberately overlapping into applied bytes so the trimming path runs too. The
+/// shell's own count of what reached it is the proof: every line once, none twice.
 #[test]
 fn replayed_input_across_random_disconnects_is_applied_once() {
     let chaos_seed = chaos_seed();
@@ -337,14 +329,16 @@ fn replayed_input_across_random_disconnects_is_applied_once() {
     let ready = client.make_ready("-echo -onlcr", None, ok.resume_from);
     let mut offset = ready.offset;
     // Everything the client has ever wanted the child to receive, the setup line
-    // included. A real client keeps exactly this, because it is what a resend is
-    // drawn from.
+    // included: a real client keeps exactly this, being what a resend is drawn from.
     let mut intended: Vec<u8> = ready.line.into_bytes();
 
     let mut rng = Rng::new(chaos_seed);
     let line = b"printf M\n";
     let rounds = 12usize;
     let mut applied = intended.len() as u64;
+    // One deadline for all twelve rounds, as the two tests above have: a per-round wait
+    // renews itself and so cannot be bounded by anything but the runner's kill.
+    let deadline = Instant::now() + PATIENCE;
 
     for round in 0..rounds {
         intended.extend_from_slice(line);
@@ -353,7 +347,7 @@ fn replayed_input_across_random_disconnects_is_applied_once() {
 
         drop(client);
         client = session.connect();
-        let resumed = client.hello(offset);
+        let resumed = client.hello_before(deadline, offset);
         assert!(
             resumed.in_applied <= intended.len() as u64,
             "round {round}: the daemon applied input the client never sent (seed {chaos_seed})"
@@ -364,8 +358,8 @@ fn replayed_input_across_random_disconnects_is_applied_once() {
         );
         offset = resumed.resume_from;
 
-        // Resend from a point slightly before what the daemon reports, so the
-        // overlap has to be trimmed rather than run a second time.
+        // Slightly before what the daemon reports, so the overlap has to be trimmed
+        // rather than run a second time.
         applied = resumed.in_applied.saturating_sub(rng.below(6));
     }
 

@@ -22,6 +22,12 @@ use crate::rundir::{
 /// refused (§ 6.3). Two seconds, the budget every other wait here is given.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// What `list` gives a probe instead. Nothing, because only [`Liveness::Stale`] changes
+/// what it does with a session, and every errno behind `Stale` is settled on the first
+/// attempt ([`connect_within`]) — waiting a full backlog out would cost two seconds per
+/// wedged daemon to print the same line.
+const LIST_PROBE: Duration = Duration::ZERO;
+
 /// How long a terminated daemon has to exit before it is killed outright.
 const TERM_GRACE: Duration = Duration::from_secs(2);
 
@@ -44,22 +50,15 @@ const SPAWN_LOCK_GRACE: Duration = Duration::from_secs(2);
 /// finds a session unmistakably there and no pid to signal.
 const PUBLISH_GRACE: Duration = Duration::from_secs(2);
 
+/// The kernel's longest path, which is what bounds a resolved `argv[0]`.
+const PATH_MAX: usize = 4096;
+
 /// Longest `/proc/<pid>/cmdline` prefix [`is_daemon_for`] reads: `argv[0]`, bounded by the
 /// kernel's [`PATH_MAX`] rather than by anything this program picks, then the mode, then an
 /// id of at most [`MAX_SESSION_ID_LEN`], with a NUL after each. Deliberately *not* sized
 /// for the whole command line, which has no bound: nothing past the id is read as
 /// anything but padding.
 const MAX_CMDLINE_LEN: usize = PATH_MAX + 1 + "daemon".len() + 1 + MAX_SESSION_ID_LEN + 1;
-
-const _: () = assert!(
-    MAX_CMDLINE_LEN >= PATH_MAX,
-    "a daemon installed under the longest path this host can name would be read with \
-     its argv[0] cut off, and so be a session `chosen` refuses to name for as long as \
-     it runs"
-);
-
-/// The kernel's longest path, which is what bounds a resolved `argv[0]`.
-const PATH_MAX: usize = 4096;
 
 /// State of one session as seen from the run directory alone.
 #[derive(Debug)]
@@ -111,7 +110,7 @@ pub(crate) fn list() -> io::Result<()> {
         };
         // Only death collects (§ 6.3); a probe that failed for any other reason leaves a
         // session to list.
-        if matches!(liveness(&paths.socket(), PROBE_TIMEOUT), Liveness::Stale(_)) {
+        if matches!(liveness(&paths.socket(), LIST_PROBE), Liveness::Stale(_)) {
             collect(&paths);
             continue;
         }
@@ -386,11 +385,10 @@ fn running_but(paths: &SessionPaths, problem: &str) -> io::Error {
 /// Why [`chosen`] came back with nothing over a session that is answering, in the words
 /// [`running_but`] finishes.
 ///
-/// The three read very differently to whoever has to act on them, and only the last is a
-/// file to repair. A body that reached the bound holds what may be a good number with its
-/// end unread, so quoting it would show the user a pid and call it unusable. A body that
-/// parsed and named nothing is the daemon that died without unlinking, where the file is
-/// exactly what its author meant it to be.
+/// The three read very differently to whoever has to act on them, and only the middle one —
+/// a body that reached the bound ([`parse_pid`]) — is a file to repair. That one is quoted
+/// as bytes rather than as a number: its end was never read, so showing a pid and calling it
+/// unusable would be worse than showing none.
 fn unidentified(id: &str, filed: Option<Pid>, body: &[u8]) -> String {
     let quoted = String::from_utf8_lossy(body);
     match filed {
@@ -453,7 +451,7 @@ fn collect(paths: &SessionPaths) {
     let Some(lock) = paths.try_lock_spawn() else {
         return;
     };
-    if matches!(liveness(&paths.socket(), PROBE_TIMEOUT), Liveness::Stale(_)) {
+    if matches!(liveness(&paths.socket(), LIST_PROBE), Liveness::Stale(_)) {
         // Ignored, unlike `kill`: this is opportunistic tidying behind a `list`, with no
         // caller waiting on an answer and nothing lost by trying again.
         drop(paths.unlink_all_locked(&lock));

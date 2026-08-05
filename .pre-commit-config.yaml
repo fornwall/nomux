@@ -42,15 +42,13 @@ repos:
       # it matches `*.sh`. actionlint shellchecks every `run:` block and validates the
       # workflow schema besides, which is the half of that file nothing else reads.
       #
-      # Pinned by version and built by prek rather than taken from $PATH, so the
-      # runner and a laptop lint against the same release: actionlint's checks are
-      # what fails a build, and a newer one finding more is a green PR going red on
-      # someone else's machine.
+      # From $PATH, as shellcheck below is. CI installs the released binary by
+      # checksum, so what fails a build is a pinned version; a laptop running a newer
+      # one may find more, which is the same deal shellcheck already has here.
       - id: actionlint
         name: actionlint
         entry: actionlint
-        language: golang
-        additional_dependencies: ["github.com/rhysd/actionlint/cmd/actionlint@v1.7.12"]
+        language: system
         files: '^\.github/workflows/.*\.ya?ml$'
         pass_filenames: false
 

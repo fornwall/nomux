@@ -36,6 +36,12 @@ pub(crate) fn umask_lock() -> MutexGuard<'static, ()> {
     UMASK.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// The permission bits as they are on disk, never as a symlink pointing at the file would
+/// report them.
+pub(crate) fn mode_of(path: &Path) -> u32 {
+    fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
 /// Creates `dir` and every parent it needs, under [`umask_lock`].
 fn create_dir(dir: &Path) {
     let _umask = umask_lock();
@@ -54,7 +60,6 @@ impl Scratch {
     /// The wipe on the way in stays even though the name carries this process's pid,
     /// for the reason the integration harness gives: pids are reused.
     pub(crate) fn new(name: &str) -> Self {
-        sweep_finished_runs();
         let dir = std::env::temp_dir().join(format!("nomux-{}-{name}", std::process::id()));
         make_removable(&dir);
         drop(fs::remove_dir_all(&dir));
@@ -118,40 +123,9 @@ fn make_removable(dir: &Path) {
     }
 }
 
-/// Removes the scratch directories of test processes that have exited.
-///
-/// A directory goes only once `/proc` says its process is gone: a live pid is either
-/// this one or a run in flight, and taking either away is the exact fault the pid in
-/// the name exists to prevent.
-fn sweep_finished_runs() {
-    let temp = std::env::temp_dir();
-    let Ok(entries) = fs::read_dir(&temp) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let owner = name
-            .to_string_lossy()
-            .strip_prefix("nomux-")
-            .and_then(|tail| tail.split_once('-'))
-            .and_then(|(pid, _)| pid.parse::<u32>().ok());
-        if owner.is_some_and(|pid| !Path::new(&format!("/proc/{pid}")).exists()) {
-            let path = entry.path();
-            make_removable(&path);
-            drop(fs::remove_dir_all(&path));
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The permission bits as they are on disk, never as a symlink pointing at the
-    /// file would report them.
-    fn mode_of(path: &Path) -> u32 {
-        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
-    }
 
     /// Both directions of the guard at the top of [`make_removable`], because either
     /// one alone is a fault: a `chmod` that follows a link is somebody else's file at

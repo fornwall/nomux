@@ -1,25 +1,10 @@
 //! Best-effort syslog, for the half of the daemon's life that has nowhere else to
-//! write.
+//! write: `startup::silence_stdio` has pointed the daemon's three descriptors at
+//! `/dev/null` (`IMPLEMENTATION.md` § 11, which also has what is never logged and why
+//! an abort stays silent).
 //!
-//! `startup::silence_stdio` points the daemon's three descriptors at `/dev/null` —
-//! under `attach` they are the SSH channel carrying the client's frame stream — and
-//! a process with no terminal is what syslog is for.
-//!
-//! A datagram to `/dev/log`, which is the whole implementation: the traditional
-//! socket and also what `systemd-journald` provides for compatibility, so one code
-//! path reaches journald, rsyslog and busybox alike at no new dependency and no
-//! privilege the daemon does not already have.
-//!
-//! What is *not* here is as deliberate as what is. Nothing this module sends carries
-//! PTY bytes or a session's `--label`: the label is free-form text from a tab title,
-//! and syslog is a host-wide sink that root and often an `adm` group can read, so a
-//! session whose entire footprint is otherwise `0600` inside a `0700` directory would
-//! be announcing itself by name. Session ids are opaque and go out; labels stay in
-//! the run directory.
-//!
-//! It does not cover an abort: the shipping build strips symbols and aborts on panic
-//! (`IMPLEMENTATION.md` § 8), so an allocation failure produces no message for
-//! anything to forward, and that case belongs to the `SIGQUIT` core § 6.5 preserves.
+//! One datagram to `/dev/log` is the whole implementation: journald, rsyslog and
+//! busybox all offer that socket, at no new dependency.
 
 use std::os::unix::net::UnixDatagram;
 
@@ -27,19 +12,10 @@ use std::os::unix::net::UnixDatagram;
 /// `systemd-journald` keeps for compatibility.
 const SOCKET: &str = "/dev/log";
 
-/// `LOG_USER`, the facility for a message from an ordinary program.
-const FACILITY_USER: u8 = 1;
-
-/// Severities, from RFC 5424 § 6.2.1. Only the two the daemon has a use for.
-#[derive(Clone, Copy, Debug)]
-enum Severity {
-    /// Something failed. The session may not exist, or may not have survived.
-    Error = 3,
-    /// A session began or ended in the ordinary way.
-    Info = 6,
-}
-
 /// Sends one line, and never reports whether it arrived.
+///
+/// `priority` is RFC 5424 § 6.2.1's `facility * 8 + severity`: 11 is `user.err` and
+/// 14 is `user.info`, the two § 11 names.
 ///
 /// Every failure is swallowed on purpose. A host may have no syslog at all — a
 /// minimal container being the ordinary case — and a daemon that declined to start
@@ -50,18 +26,16 @@ enum Severity {
 /// RFC 3164 timestamp means local time, local time means a timezone database, and
 /// that is real weight against the § 8 budget to restate what the collector stamps
 /// anyway — `journald`, `rsyslog` and `busybox syslogd` all fill both in.
-fn send(severity: Severity, message: &str) {
-    let priority = FACILITY_USER * 8 + severity as u8;
-    // Filtered by the function `list` filters a label with, and applied to the whole
-    // assembled line: the text beside a session id is usually an `io::Error` carrying
-    // a run directory somebody else chose, and the id is not always validated either
-    // — `daemon::run` reports a startup failure before anything has looked at its
+fn send(priority: u8, session_id: &str, message: &str) {
+    // Filtered by the function `list` filters a label with, over the whole assembled
+    // line: the text beside a session id is usually an `io::Error` carrying a run
+    // directory somebody else chose, and the id is not always validated either —
+    // `daemon::run` reports a startup failure before anything has looked at its
     // argument. A newline in a datagram is how one log line becomes two.
-    let line = format!(
-        "<{priority}>nomux[{pid}]: {message}",
+    let line = crate::rundir::sanitize_text(&format!(
+        "<{priority}>nomux[{pid}]: session {session_id}: {message}",
         pid = std::process::id(),
-        message = crate::rundir::sanitize_text(message),
-    );
+    ));
     if let Ok(socket) = UnixDatagram::unbound() {
         // A full collector must not park the daemon inside a `send`. Dropping the
         // line is the right answer to a log nobody is draining.
@@ -72,17 +46,16 @@ fn send(severity: Severity, message: &str) {
 
 /// Reports a failure, identified by the session it belongs to.
 pub(crate) fn error(session_id: &str, message: &str) {
-    send(Severity::Error, &format!("session {session_id}: {message}"));
+    send(11, session_id, message);
 }
 
 /// Reports something ordinary in a session's life.
 pub(crate) fn info(session_id: &str, message: &str) {
-    send(Severity::Info, &format!("session {session_id}: {message}"));
+    send(14, session_id, message);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{FACILITY_USER, Severity};
     use crate::rundir::{sanitize_label, sanitize_text};
 
     #[test]
@@ -110,19 +83,5 @@ mod tests {
                 "one hazard, one filter: {message:?}"
             );
         }
-    }
-
-    #[test]
-    fn priorities_are_the_rfc_5424_numbers() {
-        assert_eq!(
-            FACILITY_USER * 8 + Severity::Error as u8,
-            11,
-            "user.err is the priority every collector files as a failure"
-        );
-        assert_eq!(
-            FACILITY_USER * 8 + Severity::Info as u8,
-            14,
-            "user.info is the priority for the ordinary lifecycle events"
-        );
     }
 }

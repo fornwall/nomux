@@ -22,34 +22,29 @@ const DIR_MODE: u32 = 0o700;
 /// Permissions for every socket inside it.
 const SOCKET_MODE: u32 = 0o600;
 
-/// Permissions for the three plain files: the pidfile, the label and the spawn
-/// lock.
+/// Permissions for the three plain files: the pidfile, the label and the spawn lock.
 ///
-/// Owner-only like everything else here, and exact for the same reason. The
-/// directory already keeps other users out, so what this buys is not secrecy but a
-/// mode that does not depend on the umask of whoever happened to create the file:
-/// `<id>.lock` at `0400` is one that no *later* process can open for writing, and
-/// the mutex the whole control surface rests on then belongs to nobody.
+/// Owner-only like everything else here, and exact for the same reason. The directory
+/// already keeps other users out, so what this buys is not secrecy but a mode that does
+/// not depend on the umask of whoever created the file: `<id>.lock` at `0400` is one no
+/// *later* process can open for writing, and the mutex the whole control surface rests
+/// on then belongs to nobody.
 const FILE_MODE: u32 = 0o600;
 
-/// How many times an acquirer will re-take the lock on finding that the file it
-/// locked is no longer the file at the path. Each retry costs some other process a
-/// whole collection, so a second is already a machine looping on `nomux list` rather
-/// than a race being lost.
+/// How many times an acquirer will re-take the lock on finding that the file it locked is
+/// no longer the file at the path. Each retry costs some other process a whole
+/// collection, so a second is already a machine looping on `nomux list`.
 const LOCK_ATTEMPTS: usize = 2;
 
-/// Runs `f` with the umask suppressed, so that a node created at `mode` is created
-/// at exactly `mode`.
+/// Runs `f` with the umask suppressed, so a node created at `mode` gets exactly `mode`.
 ///
-/// `mkdir(2)`, `bind(2)` and `open(2)` all subtract the caller's umask from the
-/// mode they are given, which makes that argument an upper bound rather than a
-/// request — and every mode in this module is exact. Creating and then `chmod`ing
-/// would narrow the window rather than close it, and would `chmod` a path that is
-/// being raced.
+/// `mkdir(2)`, `bind(2)` and `open(2)` subtract the caller's umask, making their mode
+/// argument an upper bound rather than a request — and every mode in this module is exact.
+/// Creating and then `chmod`ing would narrow the window rather than close it, on a path
+/// that is being raced.
 ///
-/// The umask is process-wide, and no shipped caller is multi-threaded or spawns a
-/// process while it is in effect. `cargo test` is: `scratch::umask_lock` states that
-/// and closes it, unlinked because both it and the line below are `#[cfg(test)]`.
+/// The umask is process-wide; no shipped caller is multi-threaded or spawns while it is in
+/// effect, and `scratch::umask_lock` closes that for `cargo test`, which is.
 fn with_umask<T>(mode: u32, f: impl FnOnce() -> T) -> T {
     #[cfg(test)]
     let _umask = crate::scratch::umask_lock();
@@ -62,27 +57,23 @@ fn with_umask<T>(mode: u32, f: impl FnOnce() -> T) -> T {
 /// Replaces `path` with `body`, at exactly [`FILE_MODE`], in one `write`.
 ///
 /// Removed first because a mode argument applies only to a file the call creates:
-/// `O_TRUNC` onto one already at the path keeps whatever mode it arrived with, so
-/// the suppression below would silently do nothing for the leftover of a previous
-/// incarnation. Only the socket is cleared when a daemon rebinds an id, so such a
-/// leftover is ordinary rather than exotic — and for `<id>.pid` the mode it keeps
-/// can be one its own owner cannot read, which is a session `kill` will not touch.
+/// `O_TRUNC` onto one already there keeps the mode it arrived with, leaving [`with_umask`]
+/// nothing to do — and for `<id>.pid` that mode can be one its own owner cannot read,
+/// which is a session `kill` will not touch. Leftovers are ordinary, since rebinding an id
+/// clears only the socket.
 ///
-/// One `write` rather than a `File` and a `writeln!`: `File` is unbuffered and
-/// `format_args!` hands its pieces over one at a time, so a formatted pidfile would be
-/// published three syscalls wide instead of the two `control::resolve` waits out.
+/// One `write` rather than a `File` and a `writeln!`, which would publish the pidfile
+/// three syscalls wide instead of the two `control::resolve` waits out.
 fn write_private(path: &Path, body: &[u8]) -> io::Result<()> {
     drop(fs::remove_file(path));
     with_umask(FILE_MODE, || fs::write(path, body))
 }
 
-/// Binds a unix socket that is never, even briefly, more permissive than
-/// [`SOCKET_MODE`] — [`with_umask`] is why that cannot be a `bind` and a `chmod`, and
-/// a login with `umask 000` is what it would cost.
+/// Binds a unix socket at exactly [`SOCKET_MODE`], never briefly wider ([`with_umask`]).
 ///
 /// # Errors
 ///
-/// Propagates bind failures.
+/// Propagates the `bind`.
 pub(crate) fn bind_socket_private(path: &Path) -> io::Result<UnixListener> {
     with_umask(SOCKET_MODE, || UnixListener::bind(path))
 }
@@ -90,35 +81,30 @@ pub(crate) fn bind_socket_private(path: &Path) -> io::Result<UnixListener> {
 /// Longest label written to `<id>.label`, in bytes, per the frozen layout.
 const MAX_LABEL_LEN: usize = 256;
 
-/// Longest `<id>.pid` body anything reads (§ 6.6), the rest of it room for whatever
-/// whitespace a file repaired by hand carries. Bounded for [`read_prefix`]'s reason, and
-/// beside [`MAX_LABEL_LEN`] because those are the two files read by hand.
-///
-/// `pub(crate)` because `control`'s refusal quotes it: a body that *reached* the bound is
-/// a file to repair, and one that parsed and named nothing is not.
+/// Longest `<id>.pid` body anything reads (§ 6.6), the slack past a pid and a newline
+/// being room for whatever whitespace a file repaired by hand carries. What a body that
+/// reaches it means is [`parse_pid`]'s; `pub(crate)` because `control`'s refusal quotes
+/// the number.
 pub(crate) const MAX_PID_LEN: usize = 32;
 
 /// Longest session id, in bytes (§ 6.3).
 ///
-/// Not on the wire — § 2.2 keeps the id out of `Hello` — so it lives beside the layout
-/// that turns one into a filename. `pub(crate)` because `control` sizes its
-/// `/proc/<pid>/cmdline` prefix against it.
+/// Beside the layout that turns one into a filename rather than on the wire, which § 2.2
+/// keeps the id out of. `pub(crate)` because `control` sizes its `/proc/<pid>/cmdline`
+/// prefix against it.
 pub(crate) const MAX_SESSION_ID_LEN: usize = 64;
 
-/// Longest path a unix socket can be bound to, in bytes.
-///
-/// `sun_path` is 108 bytes and holds a terminator, so 107 is what is left for the
-/// path itself — the figure std checks before it will build the address at all.
+/// Longest path a unix socket can be bound to: `sun_path` is 108 bytes and holds a
+/// terminator, so 107 is what is left — the figure std checks before it builds an address.
 const SUN_PATH_MAX: usize = 107;
 
 /// Whether a failed `connect` to a session socket means nothing is listening there.
 ///
-/// The one predicate behind every such decision in this binary, because § 6.3 is what
-/// requires the daemon's probe, its bind, `list` and `kill` to agree. A socket file
-/// outlives the process that bound it, so `ECONNREFUSED` is a dead daemon and a name
-/// that is not there at all is the same answer one syscall sooner. Anything else —
-/// `EACCES`, a descriptor limit — is not evidence of death and must never license an
-/// unlink; § 6.3 puts that as "`EACCES` is not staleness".
+/// The one predicate behind every such decision in this binary, since § 6.3 requires the
+/// daemon's probe, its bind, `list` and `kill` to agree. A socket file outlives the process
+/// that bound it, so `ECONNREFUSED` is a dead daemon, and an absent name is that answer one
+/// syscall sooner. Anything else — `EACCES`, a descriptor limit — is not evidence of death
+/// and must never license an unlink: § 6.3's "`EACCES` is not staleness".
 pub(crate) fn nothing_is_listening(err: &io::Error) -> bool {
     matches!(
         err.kind(),
@@ -126,41 +112,36 @@ pub(crate) fn nothing_is_listening(err: &io::Error) -> bool {
     )
 }
 
-/// How long to wait between attempts at a `connect` that was refused for room rather
-/// than for want of a listener. Short against any deadline a caller sets, because the
-/// state it waits out clears in one `accept`.
+/// How long to wait between attempts at a `connect` refused for room rather than for want
+/// of a listener. Short, because the state it waits out clears in one `accept`.
 const PROBE_RETRY: Duration = Duration::from_millis(10);
 
-/// Connects to the unix socket at `path`, giving up after `within` rather than
-/// parking in the kernel.
+/// Connects to the unix socket at `path`, giving up after `within` rather than parking in
+/// the kernel.
 ///
-/// The `connect` every mode here makes, because § 6.3 states the hazard and leaves no
-/// mode out of it: an `AF_UNIX` `connect` to a listener whose backlog is *full* blocks
-/// rather than being refused, so a daemon that has stopped calling `accept` parks
-/// `list`, `kill` and every attach on that id inside the kernel with nothing to end the
-/// wait — and § 6.6's escape hatch has to answer on any host.
+/// Bounded because an `AF_UNIX` `connect` to a *full* backlog blocks rather than being
+/// refused (§ 6.3), so a daemon that has stopped calling `accept` would park `list`, `kill`
+/// and every attach on that id with nothing to end the wait — and § 6.6's escape hatch has
+/// to answer on any host.
 ///
-/// The deadline is this loop rather than a `poll`, which is the shape a reader coming
-/// from TCP will not expect and is what `AF_UNIX` requires: a stream socket whose
-/// `connect` was refused for room answers `EAGAIN` at once and registers nothing to
-/// wait on — it stays in `TCP_CLOSE`, where `poll` reports `POLLOUT | POLLHUP`
-/// immediately and for ever. `SO_SNDTIMEO`, which the kernel *does* honour on a
-/// blocking `connect` here, is not used either: a bound the kernel enforces is one a
-/// kernel could stop enforcing, and this is the surface that may not hang.
+/// A sleep loop rather than a `poll`, which is what `AF_UNIX` requires: a stream socket
+/// refused for room answers `EAGAIN` at once and registers nothing to wait on, staying in
+/// `TCP_CLOSE`, where `poll` reports `POLLOUT | POLLHUP` immediately and for ever.
+/// `SO_SNDTIMEO`, which the kernel *does* honour here, is a bound a kernel could stop
+/// enforcing, and this is the surface that may not hang.
 ///
 /// # Errors
 ///
-/// Propagates the `connect`, so [`nothing_is_listening`] still divides a dead daemon
-/// from everything else, and reports [`io::ErrorKind::TimedOut`] for a backlog that
-/// never drained — which is neither death nor an answer, and must license no unlink.
+/// Propagates the `connect`, so [`nothing_is_listening`] still divides a dead daemon from
+/// everything else, and reports [`io::ErrorKind::TimedOut`] for a backlog that never
+/// drained — neither death nor an answer, and licence for no unlink.
 pub(crate) fn connect_within(path: &Path, within: Duration) -> io::Result<UnixStream> {
     let (addr, len) = unix_address(path)?;
     let deadline = Instant::now() + within;
     loop {
         match connect_once(&addr, len) {
-            // `EAGAIN` is the full backlog and `EINTR` is a call that has not happened
-            // yet: the two outcomes that say nothing about the listener, and so the
-            // only two worth asking about again.
+            // `EAGAIN` is the full backlog and `EINTR` a call that has not happened yet:
+            // the two outcomes that say nothing about the listener.
             Err(err)
                 if matches!(
                     err.kind(),
@@ -169,9 +150,8 @@ pub(crate) fn connect_within(path: &Path, within: Duration) -> io::Result<UnixSt
             outcome => return outcome,
         }
         if Instant::now() >= deadline {
-            // Narrowed before formatting: `as_millis` is a `u128`, and this is the only
-            // one in the crate — printing it instantiates that `Display` on its own,
-            // measured at 723 bytes of the § 8 budget for a message on a cold path.
+            // Narrowed before formatting: this would be the crate's only `u128` `Display`,
+            // some 700 bytes of the § 8 budget for a message on a cold path.
             let ms = u64::try_from(within.as_millis()).unwrap_or(u64::MAX);
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -225,9 +205,8 @@ fn connect_once(addr: &libc::sockaddr_un, len: libc::socklen_t) -> io::Result<Un
 
 /// The `sockaddr_un` naming `path`, and the length a `connect` is given for it.
 ///
-/// By hand because std creates the socket inside its own `connect` and offers no way
-/// to set a flag on one first, and rustix's would mean adding its `net` feature to a
-/// crate that otherwise reaches sockets through `std` alone.
+/// By hand because std creates the socket inside its own `connect` and offers no way to set
+/// a flag on one first, and rustix's would mean adding its `net` feature.
 fn unix_address(path: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -240,17 +219,10 @@ fn unix_address(path: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)>
         ));
     };
     let bytes = path.as_os_str().as_bytes();
-    // [`SessionPaths::new`] refuses an id this would overrun before any path is built
-    // (§ 6.3); this is that bound where the address is actually formed, for the callers
-    // that reach here with a path of their own.
+    // Unreachable — `SessionPaths::new` refuses an id this would overrun (§ 6.3) — and
+    // kept because the copy below is what it makes sound.
     if bytes.len() > SUN_PATH_MAX {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "{} is longer than the {SUN_PATH_MAX} bytes a unix socket path allows",
-                path.display()
-            ),
-        ));
+        return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
     }
     let mut addr = libc::sockaddr_un {
         sun_family: family,
@@ -274,23 +246,21 @@ fn unix_address(path: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)>
 /// The value of environment variable `key`, but only where it names an **absolute**
 /// path.
 ///
-/// The rule every directory this binary takes from the environment obeys: a source
-/// that does not name an absolute path is not a source, and an empty value is not
-/// absolute either, so this is the whole of the check. `IMPLEMENTATION.md` § 6.3 has
-/// why, and § 6.2 has the `chdir` that makes it matter.
-pub(crate) fn absolute_env(key: &str) -> Option<std::ffi::OsString> {
+/// The rule every directory this binary takes from the environment obeys: a source that
+/// does not name an absolute path is not a source, and an empty value is not absolute
+/// either. § 6.3 has why, and § 6.2 has the `chdir` that makes it matter.
+fn absolute_env(key: &str) -> Option<std::ffi::OsString> {
     env::var_os(key).filter(|value| Path::new(value).is_absolute())
 }
 
 /// Resolves the run directory, preferring `XDG_RUNTIME_DIR`.
 ///
-/// The precedence and the reason for each half are `IMPLEMENTATION.md` § 6.3's, as is
-/// the rule [`absolute_env`] applies to every source.
+/// The precedence and the reason for each half are § 6.3's, as is the rule
+/// [`absolute_env`] applies to every source.
 ///
 /// # Errors
 ///
-/// Fails when none of `XDG_RUNTIME_DIR`, `XDG_STATE_HOME` or `HOME` names an
-/// absolute path.
+/// Fails when none of `XDG_RUNTIME_DIR`, `XDG_STATE_HOME` or `HOME` is an absolute path.
 pub(crate) fn run_dir() -> io::Result<PathBuf> {
     if let Some(dir) = absolute_env("XDG_RUNTIME_DIR") {
         return Ok(PathBuf::from(dir).join("nomux"));
@@ -308,66 +278,55 @@ pub(crate) fn run_dir() -> io::Result<PathBuf> {
 
 /// Creates `dir` if it is absent, and refuses it if it is not this user's alone.
 ///
-/// Creating it is the easy half. It usually exists already, and that it exists says
-/// nothing about *what* exists — [`check_run_dir`] is the other half and § 6.3 the
-/// argument for it.
-///
-/// The check runs before the creation, so the ordinary case costs one `open` and
-/// one `fstat`, and so a plain file sitting at the path is reported as what it is
-/// rather than as an `EEXIST` naming nothing.
+/// That it exists says nothing about *what* exists, which is [`check_run_dir`]'s half.
+/// That check runs first, so the ordinary case costs one `open` and one `fstat`, and a
+/// plain file at the path is reported as what it is rather than as an `EEXIST` naming
+/// nothing.
 ///
 /// # Errors
 ///
-/// Fails if the directory cannot be created, is not a directory, belongs to
-/// somebody else, or is one other users can write to — a refusal § 6.3 makes hard
-/// where the rest of this daemon degrades.
+/// See [`check_run_dir`], plus a directory that cannot be created.
 fn ensure_dir_at(dir: &Path) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     match check_run_dir(dir) {
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         settled => return settled,
     }
-    // Suppressed for the parents `recursive` creates along the way as much as for the
-    // directory itself ([`with_umask`]): left to a `umask 0500` this line would make a
-    // run directory its owner cannot open, and the check below would then refuse what
-    // it had just made.
+    // [`with_umask`] for the parents `recursive` creates along the way as much as for the
+    // directory itself: under a `umask 0500` this would otherwise make a run directory
+    // its owner cannot open, and the check below would refuse what it had just made.
     with_umask(DIR_MODE, || {
         fs::DirBuilder::new()
             .recursive(true)
             .mode(DIR_MODE)
             .create(dir)
     })?;
-    // Checked again rather than trusted: `recursive` reports an existing directory
-    // as success, so what this call created may be what another attach created a
-    // moment earlier — or, where the parent is one somebody else can write to, what
-    // they left there between the two checks.
+    // Checked again rather than trusted: `recursive` reports an existing directory as
+    // success, so what this "created" may be another attach's — or, under a parent
+    // somebody else can write to, what they left there between the two checks.
     check_run_dir(dir)
 }
 
 /// Opens `dir` as itself and establishes that it belongs to this user alone.
 ///
-/// `O_DIRECTORY` and `O_NOFOLLOW` do most of the work (§ 6.3), leaving this to decide
-/// who owns the thing and who else may create names in it. That the file type is the
-/// kernel's answer rather than a second `fstat` of ours is deliberate: a check that
-/// could disagree with the descriptor it is meant to describe is worse than no check.
+/// `O_DIRECTORY` and `O_NOFOLLOW` do most of the work (§ 6.3), leaving this the owner and
+/// who else may create names in it. The file type is the kernel's answer rather than a
+/// second `fstat` of ours, which could disagree with the descriptor it describes.
 ///
-/// The descriptor is dropped at the end and the run files go on being opened by
-/// path, which is a decision rather than an oversight: there is no `bindat(2)`, so
-/// the two sockets that decide who a session is talking to must be resolved by name
-/// whatever this function returns. `IMPLEMENTATION.md` § 6.3 gives the rest of that
-/// argument. What is established is one link of the path rather than the whole of
-/// it: nobody but this uid can put a name in *this* directory. Every component above
-/// it is taken on trust, so a parent somebody else can write to is a run directory
-/// they can replace outright — `DESIGN.md` § 8 states that gap rather than closing
-/// it. Keeping the descriptor for the session's lifetime would also pin the
-/// filesystem the daemon deliberately lets go of in § 6.2.
+/// The descriptor is dropped at the end and the run files go on being opened by path,
+/// deliberately: there is no `bindat(2)`, so the two sockets that decide who a session talks
+/// to must be resolved by name whatever this returns (§ 6.3), and holding it would pin the
+/// filesystem § 6.2 lets go of. What is established is one link — nobody but this uid can
+/// put a name in *this* directory. Every component above it is trusted, so a parent somebody
+/// else can write to is a run directory they can replace, a gap `DESIGN.md` § 8 states
+/// rather than closes.
 ///
 /// # Errors
 ///
-/// Fails if `dir` is not a directory, is a symlink, belongs to another uid, is one
-/// group or other can write to, or is in a mode its owner cannot open. A directory
-/// that is simply absent arrives as [`io::ErrorKind::NotFound`], which the control
-/// surface reads as an answer rather than a failure: no session was ever created here.
+/// Fails if `dir` is not a directory, is a symlink, belongs to another uid, is one group
+/// or other can write to, or is in a mode its owner cannot open. Simply absent arrives as
+/// [`io::ErrorKind::NotFound`], which the control surface reads as an answer rather than a
+/// failure: no session was ever created here.
 pub(crate) fn check_run_dir(dir: &Path) -> io::Result<()> {
     let fd = rustix::fs::open(
         dir,
@@ -375,11 +334,10 @@ pub(crate) fn check_run_dir(dir: &Path) -> io::Result<()> {
         Mode::empty(),
     )
     .map_err(|err| match err {
-        // Linux answers `O_DIRECTORY | O_NOFOLLOW` on a symlink with `ENOTDIR` rather
-        // than the `ELOOP` the manual page leads one to expect, so the two cases arrive
-        // as one errno and telling them apart means asking again. Worth asking: "it is
-        // a symlink" is the sentence that tells somebody what to do about it, and the
-        // extra `lstat` is paid only on the way to failing.
+        // Linux answers `O_DIRECTORY | O_NOFOLLOW` on a symlink with `ENOTDIR` rather than
+        // the `ELOOP` the manual page leads one to expect, so telling the two apart means
+        // asking again — worth an `lstat` paid only on the way to failing, since "it is a
+        // symlink" is the sentence that tells somebody what to do about it.
         rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP => refuse(
             dir,
             io::ErrorKind::NotADirectory,
@@ -388,16 +346,15 @@ pub(crate) fn check_run_dir(dir: &Path) -> io::Result<()> {
                 _ => "it is not a directory",
             },
         ),
-        // A mode with the owner's own read bit missing is the one loosening — or
-        // tightening — that cannot be repaired (§ 6.3), and it is still a judgement
-        // on the mode rather than on the syscall, so it is reported as one. The
-        // `lstat` is paid only on the way to failing, and falls back where it is a
-        // searchless parent rather than this directory that answered `EACCES`.
+        // A mode its own owner cannot open is the one tightening that cannot be repaired
+        // (§ 6.3), and is a judgement on the mode rather than on the syscall, so it is
+        // reported as one. The fallback arm is a searchless parent rather than this
+        // directory having answered `EACCES`.
         rustix::io::Errno::ACCESS => match fs::symlink_metadata(dir) {
-            // Somebody else's, at a mode that keeps us out. The uid is the whole
-            // sentence — this is the § 8 threat, reachable with `XDG_RUNTIME_DIR`
-            // pointed into a shared parent — and naming the mode instead would report
-            // `0700`, the expected one, as the fault.
+            // Somebody else's, at a mode that keeps us out: the § 8 threat, reachable with
+            // `XDG_RUNTIME_DIR` pointed into a shared parent. The uid is the whole
+            // sentence — naming the mode would report `0700`, the expected one, as the
+            // fault.
             Ok(meta) if meta.is_dir() && meta.uid() != rustix::process::getuid().as_raw() => {
                 refuse(
                     dir,
@@ -428,15 +385,10 @@ pub(crate) fn check_run_dir(dir: &Path) -> io::Result<()> {
         ));
     }
 
-    // Write for group or other is the one loosening that is not repairable, and the
-    // only one answered the way a wrong owner is (§ 6.3): tightening the directory
-    // now does not un-plant what somebody left in it, so nothing inside is evidence
-    // of anything any more.
-    //
-    // Every other mode is repaired to exactly [`DIR_MODE`], through the descriptor
-    // already checked above, since § 6.3 states the mode as exact and says what each
-    // of them costs. The one mode not reached here is one the owner cannot open at
-    // all, which failed above with nothing to repair through.
+    // Write for group or other is the one loosening that is not repairable, and so the only
+    // one answered the way a wrong owner is (§ 6.3): tightening now does not un-plant what
+    // somebody left there, so nothing inside is evidence of anything any more. Every other
+    // mode is repaired to exactly [`DIR_MODE`].
     let mode = Mode::from_raw_mode(stat.st_mode);
     if mode.intersects(Mode::WGRP | Mode::WOTH) {
         return Err(refuse(
@@ -446,18 +398,17 @@ pub(crate) fn check_run_dir(dir: &Path) -> io::Result<()> {
         ));
     }
     if mode != Mode::from_bits_truncate(DIR_MODE) {
-        // Through the descriptor, never the path, which would reopen exactly the
-        // hole the `O_NOFOLLOW` above closed.
+        // Through the descriptor, never the path, which would reopen exactly the hole the
+        // `O_NOFOLLOW` above closed.
         rustix::fs::fchmod(&fd, Mode::from_bits_truncate(DIR_MODE))
             .map_err(|err| refuse_errno(dir, err, "its mode could not be tightened"))?;
     }
     Ok(())
 }
 
-/// A refusal in the terms the user needs: which directory, what is wrong with it,
-/// and what it was supposed to be. It reaches them as `nomux: ...` on stderr and is
-/// the whole account they get, so it names the path even where the errno beneath it
-/// names nothing at all.
+/// A refusal in the terms the user needs: which directory, what is wrong with it, and what
+/// it was supposed to be. It reaches them as `nomux: ...` on stderr and is the whole
+/// account they get, so it names the path even where the errno beneath names nothing.
 fn refuse(dir: &Path, kind: io::ErrorKind, problem: &str) -> io::Error {
     io::Error::new(
         kind,
@@ -478,17 +429,15 @@ fn refuse_errno(dir: &Path, err: rustix::io::Errno, problem: &str) -> io::Error 
 
 /// Returns whether `id` is usable as a session id.
 ///
-/// Ids are minted by the client and used directly as filename components, so the
-/// accepted set is deliberately narrow — 1..=64 bytes of `[A-Za-z0-9_-]`, never a
-/// leading `-` (`IMPLEMENTATION.md` § 6.3) — which makes path traversal impossible by
-/// construction rather than by escaping. The leading `-` is the command line's bound
-/// rather than the filesystem's: `main` reads any argument beginning with one as an
-/// option before a mode ever sees it, so an id that starts with `-` is one a
-/// conforming client could mint and then never spawn, attach or kill — and the exit
-/// code it would get says its command line was malformed rather than that its id was.
+/// Ids are minted by the client and used directly as filename components, so the accepted
+/// set is deliberately narrow — 1..=64 bytes of `[A-Za-z0-9_-]`, never a leading `-` (§ 6.3)
+/// — which makes path traversal impossible by construction rather than by escaping. The
+/// leading `-` is the command line's bound rather than the filesystem's: `main` reads any
+/// argument beginning with one as an option, so such an id could be minted and then never
+/// spawned, attached or killed.
 ///
-/// An invalid id is a hard error at both ends and is never sanitised: rewriting one
-/// into a valid id would silently attach the user to the wrong session.
+/// An invalid id is a hard error at both ends and is never sanitised: rewriting one into a
+/// valid id would silently attach the user to the wrong session.
 #[must_use]
 fn is_valid_session_id(id: &str) -> bool {
     !id.is_empty()
@@ -501,30 +450,24 @@ fn is_valid_session_id(id: &str) -> bool {
 
 /// The session a name in the run directory belongs to, if it belongs to one.
 ///
-/// The inverse of [`SessionPaths::with_extension`], and the one rule by which anything
-/// here learns an id from a directory rather than from a caller.
+/// The inverse of [`SessionPaths::with_extension`], and the one rule by which anything here
+/// learns an id from a directory rather than from a caller.
 ///
-/// A glob rather than an enumeration, because § 6.6 freezes the five names it lists and
-/// not the *set*: naming the extensions it knew made every future name a leak in every
-/// binary already shipped — one file left behind per collected session, and an id whose
-/// last remaining file is a name this build has never heard of is an id it never learns,
-/// so the `kill` that would clear it can never be typed.
+/// A glob rather than an enumeration, since § 6.6 freezes those five names and not the
+/// *set*: an id whose last remaining file is a name this build never heard of is an id it
+/// never learns, so the `kill` that would clear it can never be typed. The id is what
+/// precedes the **first** `.`, not a prefix — `sess.sock` and `sess2.sock` are two
+/// sessions — and a name with no `.` is nobody's.
 ///
-/// The id is what precedes the **first** `.`, which is not the same as a prefix:
-/// `sess.sock` and `sess2.sock` are two sessions, and a match on `starts_with` would
-/// have one of them collect the other's files. A name with no `.` at all is nobody's.
-///
-/// It is validated before it is handed back: every caller derives a path, a probe or a
-/// signal from what this returns, and these bytes came out of a directory rather than
-/// out of a client [`is_valid_session_id`] has already refused (§ 6.3).
+/// Validated before it is handed back ([`is_valid_session_id`], § 6.3): every caller derives
+/// a path, a probe or a signal from it, and these bytes came out of a directory.
 pub(crate) fn session_id_of(path: &Path) -> Option<&str> {
     let (id, _extension) = path.file_name()?.to_str()?.split_once('.')?;
     is_valid_session_id(id).then_some(id)
 }
 
-/// Every distinct session id `dir` holds, and none at all where it cannot be read.
-///
-/// One entry per session, not per file (§ 6.6).
+/// Every distinct session id `dir` holds — one entry per session, not per file (§ 6.6) —
+/// and none at all where it cannot be read.
 pub(crate) fn session_ids(dir: &Path) -> Vec<String> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
@@ -541,8 +484,7 @@ pub(crate) fn session_ids(dir: &Path) -> Vec<String> {
     ids
 }
 
-/// The five names § 6.6 freezes for one session, and the id that finds whatever else
-/// it has.
+/// The five names § 6.6 freezes for one session, and the id that finds whatever else it has.
 #[derive(Debug)]
 pub(crate) struct SessionPaths {
     dir: PathBuf,
@@ -554,9 +496,9 @@ impl SessionPaths {
     ///
     /// # Errors
     ///
-    /// Fails if `id` is not a valid session id, the run directory cannot be resolved,
-    /// or the two together are too long to name a socket. Validation happens here
-    /// rather than at each use so no caller can build a path from an unchecked id.
+    /// Fails if `id` is not a valid session id, the run directory cannot be resolved, or
+    /// the two together are too long to name a socket. Validated here rather than at each
+    /// use, so no caller can build a path from an unchecked id.
     pub(crate) fn new(id: &str) -> io::Result<Self> {
         if !is_valid_session_id(id) {
             return Err(io::Error::new(
@@ -568,11 +510,10 @@ impl SessionPaths {
             ));
         }
         let dir = run_dir()?;
-        // A valid id is not enough: `sun_path` is 108 bytes including its terminator,
-        // and a 64-byte id under a deep enough run directory overruns it. Why that is
-        // refused here rather than at the `bind`, and why against `.label` rather than
-        // `.sock`, are both § 6.3's — what it buys this crate is that no `SessionPaths`
-        // that exists can fail to build its own address.
+        // A valid id is not enough: a 64-byte one under a deep enough run directory
+        // overruns `SUN_PATH_MAX`. Refused here rather than at the `bind`, and against the
+        // longest name rather than `.sock` (§ 6.3), so no `SessionPaths` that exists can
+        // fail to build its own address.
         let longest = dir.as_os_str().len() + "/".len() + id.len() + ".label".len();
         if longest > SUN_PATH_MAX {
             return Err(io::Error::new(
@@ -596,32 +537,31 @@ impl SessionPaths {
         &self.id
     }
 
-    /// Creates the run directory with owner-only permissions, and refuses one that
-    /// is not this user's alone.
+    /// The run directory these five names are in.
+    #[must_use]
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Creates the run directory with owner-only permissions, and refuses one that is not
+    /// this user's alone.
     ///
     /// # Errors
     ///
-    /// See [`ensure_dir_at`], which is where the whole of this lives so that it can
-    /// be tested against a directory of the test's choosing.
+    /// See [`ensure_dir_at`], which holds the whole of this so that a test can point it at
+    /// a directory of its own.
     pub(crate) fn ensure_dir(&self) -> io::Result<()> {
         ensure_dir_at(&self.dir)
     }
 
-    /// Establishes the same property as [`Self::ensure_dir`] on a directory that is
-    /// already there, creating nothing.
-    ///
-    /// For `kill`, which must not bring a run directory into existence as a side
-    /// effect of being told to remove a session from it. It is the same property and
-    /// not a weaker one, so a mode is repaired here exactly as [`check_run_dir`]
-    /// repairs it anywhere else: § 6.3 states `0700` as the layout's rather than the
-    /// user's, and a read-only path that left the directory at a mode every creating
-    /// path tightens would only postpone the repair by one command.
+    /// [`Self::ensure_dir`]'s property, and not a weaker one, on a directory that is already
+    /// there: `kill` must not bring a run directory into existence as a side effect of being
+    /// told to remove a session from it.
     ///
     /// # Errors
     ///
-    /// See [`check_run_dir`]. An absent directory arrives as
-    /// [`io::ErrorKind::NotFound`], which is the answer "no such session" rather
-    /// than a failure.
+    /// See [`check_run_dir`]. An absent directory arrives as [`io::ErrorKind::NotFound`],
+    /// which is the answer "no such session" rather than a failure.
     pub(crate) fn check_dir(&self) -> io::Result<()> {
         check_run_dir(&self.dir)
     }
@@ -656,8 +596,8 @@ impl SessionPaths {
 
     /// Writes the display label, if `label` has anything left after sanitising.
     ///
-    /// Advisory throughout: a failure here costs `list` a column and nothing else, so
-    /// the caller is expected to ignore the error rather than refuse a session over it.
+    /// Advisory throughout: a failure here costs `list` a column and nothing else, so the
+    /// caller is expected to ignore it rather than refuse a session over a decoration.
     ///
     /// # Errors
     ///
@@ -670,27 +610,19 @@ impl SessionPaths {
         write_private(&self.label(), label.as_bytes())
     }
 
-    /// Records the pid `nomux kill` will signal, at a mode its owner can read back
-    /// ([`write_private`]): `kill` refuses to unlink a live session whose pid it
-    /// cannot read, correctly, so a pidfile left at `0266` by an odd umask is a
-    /// session nobody can stop until somebody notices and `chmod`s it.
-    ///
-    /// The file is created and filled a syscall apart, which `control::kill` knows
-    /// about: it waits out a zero-length pidfile rather than reporting the corrupt
-    /// one it would otherwise see.
-    ///
-    /// [`parse_pid`] is the other half of this, and is in this module for that reason:
-    /// the pidfile's *format* belongs to the frozen layout, as `<id>.label`'s does.
+    /// Records the pid `nomux kill` will signal, through [`write_private`] so its owner can
+    /// read it back: `kill` correctly refuses to unlink a live session whose pid it cannot
+    /// read. The file is created and filled a syscall apart, which `control::resolve` knows
+    /// about, and [`parse_pid`] is the other half of the format.
     pub(crate) fn write_pid(&self) -> io::Result<()> {
         write_private(&self.pid(), format!("{}\n", std::process::id()).as_bytes())
     }
 
     /// Removes the pidfile a previous incarnation of this id left behind.
     ///
-    /// For the daemon, at the point where it has established that no live one is on
-    /// the socket — `daemon::bind_socket` says why that is the moment. Absent is a
-    /// state `control::resolve` already waits out; stale is the one it cannot tell
-    /// from current.
+    /// For the daemon, at the point where it has established that no live one is on the
+    /// socket — `daemon::bind_socket` says why that is the moment. Absent is a state
+    /// `control::resolve` already waits out; stale is the one it cannot tell from current.
     pub(crate) fn clear_pid(&self) {
         drop(fs::remove_file(self.pid()));
     }
@@ -707,10 +639,9 @@ impl SessionPaths {
     /// # Errors
     ///
     /// Reports [`io::ErrorKind::ResourceBusy`] for the two ways a blocking
-    /// [`Self::acquire`] comes back empty-handed. Neither is the caller's fault and
-    /// neither says the lock is free, which is why the message names both rather than
-    /// the first alone. A *host* that cannot provide the lock at all is still not an
-    /// error — see [`SpawnLock`].
+    /// [`Self::acquire`] comes back empty-handed, naming both because neither says the
+    /// lock is free. A *host* that cannot provide the lock at all is not an error
+    /// ([`SpawnLock`]).
     pub(crate) fn lock_spawn(&self) -> io::Result<SpawnLock> {
         self.acquire(FlockOperation::LockExclusive).ok_or_else(|| {
             io::Error::new(
@@ -725,34 +656,32 @@ impl SessionPaths {
         })
     }
 
-    /// Takes the spawn lock if it is free this instant, for callers with better
-    /// things to do than wait.
-    ///
-    /// `None` is "not this time" and nothing more, in [`Self::acquire`]'s three
-    /// readings. Everything that is a property of the *host* rather than of this moment
-    /// comes back as a [`SpawnLock`] instead, which is where that policy is argued.
+    /// Takes the spawn lock if it is free this instant, for callers with better things to
+    /// do than wait. `None` is [`Self::acquire`]'s "not this time" and nothing more.
     pub(crate) fn try_lock_spawn(&self) -> Option<SpawnLock> {
         self.acquire(FlockOperation::NonBlockingLockExclusive)
     }
 
     /// Locks `<id>.lock` and confirms that what got locked is still that file.
     ///
-    /// `None` is "not this time", in one of three readings the callers need not tell
-    /// apart, since each answers all three the same way — wait, skip, or refuse:
-    /// somebody else is holding the lock, the file at the path was replaced under this
-    /// call more often than [`LOCK_ATTEMPTS`] allows for, or the descriptors and lock
-    /// records it takes to ask have run out. [`SpawnLock::unavailable`] is kept for the
-    /// failures [`no_lock_here`] names and for no others.
+    /// `None` is "not this time", in one of three readings the callers need not tell apart,
+    /// since each answers all three the same way — wait, skip, or refuse: somebody else
+    /// holds the lock, the file at the path was replaced more often than [`LOCK_ATTEMPTS`]
+    /// allows for, or the descriptors and lock records it takes to ask have run out.
+    /// [`SpawnLock::unavailable`] is kept for the failures [`no_lock_here`] names.
     fn acquire(&self, operation: FlockOperation) -> Option<SpawnLock> {
         let path = self.lock();
         for _ in 0..LOCK_ATTEMPTS {
-            // At exactly [`FILE_MODE`], which is the constant this file is documented
-            // around: a lock left at `0400` is a mutex every later process is shut
-            // out of.
+            // At exactly [`FILE_MODE`], for the reason that constant gives.
+            // `NOFOLLOW` as every other name in this directory is opened: a symlink here
+            // would be locked at its target while [`removal_order`] unlinked the link,
+            // leaving the mutex on an inode nothing else resolves to. `ELOOP` is not in
+            // [`no_lock_here`], so that refusal reads as "not this time" rather than as
+            // licence to proceed unlocked.
             let opened = with_umask(FILE_MODE, || {
                 rustix::fs::open(
                     &path,
-                    OFlags::CREATE | OFlags::RDWR | OFlags::CLOEXEC,
+                    OFlags::CREATE | OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW,
                     Mode::from_bits_truncate(FILE_MODE),
                 )
             });
@@ -764,20 +693,17 @@ impl SessionPaths {
             };
             loop {
                 match rustix::fs::flock(&fd, operation) {
-                    // A signal landing on a blocking `flock` is not an answer about
-                    // the lock; ask again.
+                    // A signal landing on a blocking `flock` is not an answer; ask again.
                     Err(rustix::io::Errno::INTR) => {}
                     Ok(()) => break,
-                    // `ENOLCK` is `EMFILE`'s counterpart one syscall later, and has a
-                    // second reading this cannot tell from it: a mount whose `flock`
-                    // goes to a lock manager that is not answering says `ENOLCK` too,
-                    // and that one *is* a host with no lock to give. Settled toward
-                    // `None` because that is the reading that claims nothing —
+                    // `ENOLCK` has two readings this cannot tell apart: out of lock records,
+                    // and a mount whose lock manager is not answering — a host with no lock
+                    // to give. Settled toward `None`, the reading that claims nothing, since
                     // [`SpawnLock`] may only proceed where no other process here can be
-                    // holding the lock, and out of lock records does not establish that.
+                    // holding the lock.
                     Err(rustix::io::Errno::WOULDBLOCK | rustix::io::Errno::NOLCK) => return None,
-                    // The same division as the `open` above, and the arm that carries
-                    // it here is the filesystem which does not implement `flock` at all.
+                    // The same division as the `open` above; the arm that carries it here is
+                    // a filesystem that does not implement `flock` at all.
                     Err(err) => return no_lock_here(err).then(SpawnLock::unavailable),
                 }
             }
@@ -785,23 +711,21 @@ impl SessionPaths {
             if lock.locks_the_file_at(&path) {
                 return Some(lock);
             }
-            // Collection removed the file while this call was waiting for it, so what
-            // is held now is an inode nobody else can reach ([`SpawnLock`]). Go back
-            // for the file that is actually there.
+            // Collection removed the file while this call waited for it, so what is held
+            // is an inode nobody else can reach ([`SpawnLock`]). Go round again.
         }
         None
     }
 
     /// Removes every file belonging to this session, ignoring absences.
     ///
-    /// `lock` is never read: it is the caller's standing to remove `<id>.lock` along
-    /// with the rest, which is [`SpawnLock`]'s argument and not this function's.
+    /// `lock` is never read: it is the caller's standing to remove `<id>.lock` along with
+    /// the rest ([`SpawnLock`]).
     ///
     /// # Errors
     ///
-    /// The first failure that is not an absence, once every path has been tried.
-    /// § 6.6 says why absence is success here and why anything else has to reach
-    /// `kill` rather than be swallowed.
+    /// The first failure that is not an absence, once every path has been tried. § 6.6
+    /// says why absence is success here and why anything else has to reach `kill`.
     pub(crate) fn unlink_all_locked(&self, _lock: &SpawnLock) -> io::Result<()> {
         // Every path is attempted before the first failure is returned: they are
         // independent, and stopping at one would leave the rest of a session behind.
@@ -820,15 +744,14 @@ impl SessionPaths {
     /// Every `<id>.*` in the run directory, in the order [`Self::unlink_all_locked`]
     /// removes them.
     ///
-    /// Split out so that the order can be asserted directly, rather than through a
-    /// test that has to win a race against a live preemption to see anything.
+    /// Split out so the order can be asserted directly, rather than through a test that has
+    /// to win a race against a live preemption to see anything.
     ///
     /// The four named files lead, and are attempted whatever the directory says: a
-    /// `read_dir` this call could not make is not a session with nothing left to
-    /// remove, and answering it with an empty list would turn the one failure § 6.6
-    /// insists is reported — the unlink itself — into a silent success. What the scan
-    /// adds is every *other* name sharing the id, which is [`session_id_of`]'s argument
-    /// seen from the collecting end.
+    /// `read_dir` this call could not make is not a session with nothing left to remove, and
+    /// an empty list would turn the one failure § 6.6 insists is reported — the unlink
+    /// itself — into a silent success. The scan adds every *other* name sharing the id
+    /// ([`session_id_of`]).
     fn removal_order(&self) -> Vec<PathBuf> {
         let lock = self.lock();
         let mut order = vec![self.socket(), self.pid(), self.label(), self.agent()];
@@ -843,14 +766,11 @@ impl SessionPaths {
                 }
             }
         }
-        // `<id>.lock` last, and the ordering is load-bearing rather than tidy: the
-        // instant that name is gone the caller's lock guards nothing ([`SpawnLock`]),
-        // so the unlinks still to come here land on a session somebody else has
-        // legitimately brought up in the meantime. Two of them are silent when that
-        // happens — `<id>.label` costs the new session its column in `list`, and
-        // `<id>.agent` is the live socket the child's `SSH_AUTH_SOCK` points at, so
-        // its agent forwarding dies for the whole life of the session with nothing
-        // said.
+        // `<id>.lock` last, and the ordering is load-bearing: the instant that name is
+        // gone the caller's lock guards nothing ([`SpawnLock`]), so the unlinks still to
+        // come would land on a session somebody else has legitimately brought up — and
+        // silently, for `<id>.label` and for the `<id>.agent` socket the child's
+        // `SSH_AUTH_SOCK` still points at.
         order.push(lock);
         order
     }
@@ -858,11 +778,10 @@ impl SessionPaths {
     /// Removes every file belonging to this session, if the spawn lock is free.
     ///
     /// For the daemon's own shutdown, which holds nothing. An attach may be waiting on
-    /// `<id>.lock` at this very moment — this daemon's exit is what it is about to
-    /// discover — so the files are left alone rather than removed from under it. That
-    /// costs little: the attach finds a socket whose `connect` is refused, which it
-    /// already treats as stale and replaces. Waiting for the lock instead would park
-    /// the daemon's exit behind that attach's spawn timeout.
+    /// `<id>.lock` right now — this exit is what it is about to discover — so the files are
+    /// left to it, which costs little: it finds a socket whose `connect` is refused and
+    /// replaces it as stale. Waiting for the lock would park the exit behind that attach's
+    /// spawn timeout.
     pub(crate) fn unlink_all(&self) {
         if let Some(lock) = self.try_lock_spawn() {
             drop(self.unlink_all_locked(&lock));
@@ -870,46 +789,43 @@ impl SessionPaths {
     }
 }
 
-/// Whether `err` says the spawn lock cannot be taken by *anybody*, which is the only
-/// reading [`SpawnLock::unavailable`]'s argument holds for.
+/// Whether `err` says the spawn lock cannot be taken by *anybody* — the only reading
+/// [`SpawnLock::unavailable`]'s argument holds for.
 ///
 /// A whitelist rather than "everything that is not a descriptor limit", because that
-/// argument is about the *file* — a mode nobody can open, a uid nothing here may write
-/// as, an `flock` the filesystem does not implement — and several errnos are about the
-/// *moment* instead. `ENOSPC` and `EDQUOT` are the sharp case: they can only be met
-/// where `<id>.lock` does not exist, which is precisely the collection race of § 6.3 —
-/// another process holding a lock on the inode that has just been unlinked — so
-/// answering "nobody can be holding this" there is how two spawners come to hold a
-/// mutex each.
+/// argument is about the *file* while several errnos are about the *moment*. `ENOSPC` and
+/// `EDQUOT` are the sharp case: they can only be met where `<id>.lock` does not exist,
+/// which is precisely the collection race of § 6.3 — another process holding a lock on
+/// the inode just unlinked — so answering "nobody can be holding this" there is how two
+/// spawners come to hold a mutex each.
 const fn no_lock_here(err: rustix::io::Errno) -> bool {
     use rustix::io::Errno;
 
     matches!(err, Errno::ACCESS | Errno::PERM | Errno::OPNOTSUPP)
 }
 
-/// A caller's exclusive standing on one session id: the right to spawn a daemon
-/// into it, and to remove its files.
+/// A caller's exclusive standing on one session id: the right to spawn a daemon into it,
+/// and to remove its files.
 ///
-/// Normally that is an exclusive `flock` on `<id>.lock`, released when this is dropped.
-/// It serialises two attaches racing to create the same session (`IMPLEMENTATION.md`
-/// § 6.3) and — less obviously — either of them against the garbage collection of
-/// § 6.6, which removes `<id>.lock` along with the rest of the session. Both must take
-/// it, because a file that is unlinked while it is locked stops being a mutex at all:
-/// the next process to ask creates a new file at the same path, locks that, and both
-/// are then certain they hold the only lock there is.
+/// Normally an exclusive `flock` on `<id>.lock`, released when this is dropped. It
+/// serialises two attaches racing to create the same session (§ 6.3) and — less obviously —
+/// either of them against the collection of § 6.6, which removes `<id>.lock` along with the
+/// rest. Both must take it, because **a file unlinked while it is locked stops being a
+/// mutex**: the next process to ask creates a new file at the same path, locks that, and
+/// both are then certain they hold the only lock there is.
 ///
 /// It also stands for the *absence* of a lock, on a host that has none to give —
-/// `<id>.lock` is at a mode nobody can open, or the filesystem rejects `flock` on it
-/// outright. Proceeding without one there is deliberate: a lock this process cannot
-/// obtain by any means is one no other process here can be holding either, since every
-/// one of them reaches it through [`SessionPaths::acquire`], on the same file, under
-/// the same uid — so refusing would buy nothing and would cost the § 6.6 escape hatch
-/// its ability to collect a session that is genuinely dead. What that rests on is a
-/// failure of the *file*, and [`no_lock_here`] is the list of errnos that are one.
+/// `<id>.lock` at a mode nobody can open, or a filesystem that rejects `flock` outright.
+/// Proceeding without one is deliberate: a lock this process cannot obtain by any means is
+/// one no other process here can be holding either, since every one of them reaches it
+/// through [`SessionPaths::acquire`], on the same file, under the same uid — so refusing
+/// would buy nothing and would cost § 6.6's escape hatch its ability to collect a session
+/// that is genuinely dead. [`no_lock_here`] is the list of errnos that are a failure of the
+/// *file* in that sense.
 #[derive(Debug)]
 pub(crate) struct SpawnLock {
-    /// The locked descriptor: `close(2)` on it is what releases the lock, so it is
-    /// held for that. `None` where there was no lock to be had.
+    /// The locked descriptor: `close(2)` on it releases the lock, so it is held for that.
+    /// `None` where there was no lock to be had.
     fd: Option<OwnedFd>,
 }
 
@@ -919,15 +835,12 @@ impl SpawnLock {
         Self { fd: None }
     }
 
-    /// Whether this holds a lock on the file that is at `path` now.
+    /// Whether this holds a lock on the file that is at `path` now — `flock` attaches to
+    /// the inode rather than to the name ([`SpawnLock`]), so nothing else can tell a lock
+    /// on the spawn mutex from a lock on what used to be it.
     ///
-    /// `flock` attaches to the inode rather than to the name, so this is the only
-    /// way to tell a lock on the spawn mutex from a lock on what used to be it.
-    /// Every failure — no lock at all, an unreadable descriptor, a path that is
-    /// gone — answers "no", which is the safe direction: the caller goes round
-    /// again instead of acting on a lock it may not hold. The first of those cannot
-    /// arise from the one caller, and is still what reads `fd`, which is otherwise
-    /// held only for its `Drop`.
+    /// Every failure answers "no", the safe direction: the caller goes round again rather
+    /// than act on a lock it may not hold.
     fn locks_the_file_at(&self, path: &Path) -> bool {
         let Some(fd) = self.fd.as_ref() else {
             return false;
@@ -939,27 +852,25 @@ impl SpawnLock {
     }
 }
 
-/// Drops every character that would let text say one thing and mean another once a
-/// terminal draws it.
+/// Drops every character that would let text say one thing and mean another once a terminal
+/// draws it.
 ///
-/// One function for both surfaces that print text somebody else chose, because both
-/// are terminals: `list` writes a label to the operator's, and `crate::syslog` hands a
-/// line to a journal that is read on one.
-///
-/// Dropped rather than escaped, so nothing supplied here can occupy width at all.
-/// Most of category `Cf` is kept on purpose — ZWJ and ZWNJ are how Indic scripts and
-/// emoji sequences are spelled — and what goes is the two classes [`is_deceptive`]
-/// names, which are not text in that sense.
+/// One function for both surfaces that print text somebody else chose, because both are
+/// terminals: `list` writes a label to the operator's, and `crate::syslog` hands a line to a
+/// journal read on one. Dropped rather than escaped, so nothing supplied here can occupy
+/// width at all. Most of category `Cf` is kept on purpose — ZWJ and ZWNJ are how Indic
+/// scripts and emoji sequences are spelled — and what goes is [`is_deceptive`]'s two
+/// classes.
 pub(crate) fn sanitize_text(text: &str) -> String {
     text.chars().filter(|ch| !is_deceptive(*ch)).collect()
 }
 
 /// Whether `ch` can make a run of text read as something other than its contents.
 ///
-/// `char::is_control` is category `Cc` alone, and both additions here are `Cf`, so
-/// every one of them passes it: the bidi overrides, one of which reverses the whole run
-/// after it (the Trojan Source class), and the tag characters, which are a copy of
-/// printable ASCII that renders as nothing. The two tests named for them run each.
+/// `char::is_control` is category `Cc` alone, and both additions here are `Cf`, so every one
+/// of them passes it: the bidi overrides, one of which reverses the whole run after it (the
+/// Trojan Source class), and the tag characters, a copy of printable ASCII that renders as
+/// nothing.
 const fn is_deceptive(ch: char) -> bool {
     ch.is_control()
         || matches!(ch,
@@ -967,13 +878,12 @@ const fn is_deceptive(ch: char) -> bool {
             | '\u{e0000}'..='\u{e007f}')
 }
 
-/// Trims a client-supplied label to what the frozen layout permits: one line of
-/// printable UTF-8, at most [`MAX_LABEL_LEN`] bytes.
+/// Trims a client-supplied label to what the frozen layout permits: one line of printable
+/// UTF-8, at most [`MAX_LABEL_LEN`] bytes.
 ///
-/// The label is a tab title chosen by a human, so it arrives with whatever they typed
-/// in it — [`sanitize_text`] is what takes the `ESC ]0;` that would retitle the window
-/// of whoever ran `list` back out. Truncation is at a character boundary, so the result
-/// is always valid UTF-8.
+/// A tab title chosen by a human, so it arrives with whatever they typed — [`sanitize_text`]
+/// takes back out the `ESC ]0;` that would retitle the window of whoever ran `list`.
+/// Truncation is at a character boundary, so the result is always valid UTF-8.
 pub(crate) fn sanitize_label(label: &str) -> String {
     let mut out = sanitize_text(label);
     out.truncate(out.floor_char_boundary(MAX_LABEL_LEN));
@@ -982,37 +892,27 @@ pub(crate) fn sanitize_label(label: &str) -> String {
 
 /// Reads a bounded prefix of the regular file at `path`, and hands back what arrived.
 ///
-/// Both files the frozen control surface reads by hand come through here —
-/// `<id>.label` and `<id>.pid` — and neither is read whole. The write side bounds
-/// both; the read side cannot assume it did, for the same reason [`read_label`]
-/// sanitizes what it finds: this is the frozen layout (§ 6.6), so the daemon that
-/// wrote the file may be any version, and a stray shell redirect into the run
-/// directory is not a daemon at all. `list` and `kill` are the escape hatch that has
-/// to keep working on any host, which they would not if a file somebody left there
-/// decided how much memory they faulted in — nor if it could park them in a syscall
-/// with no end.
+/// Both files the frozen control surface reads by hand — `<id>.label` and `<id>.pid` — come
+/// through here, and neither is read whole. The write side bounds both; the read side cannot
+/// assume it did, this being the frozen layout (§ 6.6): the daemon that wrote the file may be
+/// any version, and a stray shell redirect into the run directory is not a daemon at all.
+/// `list` and `kill` would stop working on such a host if a file left there decided how much
+/// memory they faulted in, or could park them in a syscall with no end.
 ///
-/// Nothing but a regular file is read from, and that is what makes one read enough: a
-/// regular file hands back what was asked for or reaches its end, where a FIFO hands
-/// back whatever its writer has delivered so far — `"327"` ahead of `"70419\n"` is a
-/// prefix [`parse_pid`] cannot tell from a whole pidfile, and `kill` would signal 327.
-/// The `fstat` is what refuses that; `O_NONBLOCK` keeps the `open` of such a file from
-/// waiting for a writer that never comes, the refusal being a syscall later, and
-/// `O_NOFOLLOW` keeps the name from resolving somewhere else entirely.
-///
-/// [`crate::nbio::read`] covers the signal that would otherwise cut the read short.
-/// `File` with `Take` and `read_to_end` measured 1.6 KiB of machinery this binary
-/// otherwise does not link, against the § 8 budget, for two files that cannot exceed
-/// a few hundred bytes worth reading.
+/// Nothing but a regular file is read from, and that is what makes one read enough: a regular
+/// file hands back what was asked for or reaches its end, where a FIFO hands back whatever
+/// its writer has delivered so far — `"327"` ahead of `"70419\n"` is a prefix [`parse_pid`]
+/// cannot tell from a whole pidfile, and `kill` would signal 327. The `fstat` refuses that;
+/// `O_NONBLOCK` keeps the `open` of such a file from waiting for a writer that never comes;
+/// `O_NOFOLLOW` keeps the name from resolving somewhere else. [`crate::nbio::read`] covers
+/// the signal that would otherwise cut the read short.
 ///
 /// # Errors
 ///
-/// Propagates the `open`, so a caller can tell a file that is absent from one it may
-/// not read — which is the difference between a daemon that has not published yet
-/// and one `kill` must refuse to touch. Anything at the path that is not a regular
-/// file is [`io::ErrorKind::InvalidInput`], which is neither of those; it is worded
-/// for the one caller that reports it, `control::running_but`, which names the path
-/// ahead of it as [`refuse`] does.
+/// Propagates the `open`, so a caller can tell a file that is absent from one it may not
+/// read — the difference between a daemon that has not published yet and one `kill` must
+/// refuse to touch. Anything that is not a regular file is [`io::ErrorKind::InvalidInput`],
+/// worded for the one caller that reports it, `control::running_but`.
 pub(crate) fn read_prefix<'a>(path: &Path, buf: &'a mut [u8]) -> io::Result<&'a [u8]> {
     let fd = rustix::fs::open(
         path,
@@ -1032,32 +932,27 @@ pub(crate) fn read_prefix<'a>(path: &Path, buf: &'a mut [u8]) -> io::Result<&'a 
 
 /// Reads a session's label, bounded by what the layout permits.
 ///
-/// Anything unreadable is an empty label, invalid UTF-8 included: a listing that names
-/// the session and its pid is worth more than one that fails over a decoration.
+/// Anything unreadable is an empty label: a listing that names the session and its pid is
+/// worth more than one that fails over a decoration. Bad UTF-8 is replaced rather than
+/// dropped, since a read cut at the bound can split a character — [`sanitize_label`] keeps
+/// this daemon's own writes off that edge, but the file may be anybody's.
 pub(crate) fn read_label(path: &Path) -> String {
     // One byte past the cap, so a label written at exactly [`MAX_LABEL_LEN`] still
     // arrives whole and a longer one is visibly over.
     let mut buf = [0u8; MAX_LABEL_LEN + 1];
     let body = read_prefix(path, &mut buf).unwrap_or(&[]);
-    sanitize_label(str::from_utf8(body).unwrap_or(""))
+    sanitize_label(&String::from_utf8_lossy(body))
 }
 
-/// The pidfile's on-disk contract (§ 6.6): what [`SessionPaths::write_pid`] puts there,
-/// read back.
+/// The pidfile's on-disk contract (§ 6.6): what [`SessionPaths::write_pid`] puts there, read
+/// back. Here because the *format* is the frozen layout's; what to say about a witness that
+/// cannot be believed stays with the two modes that act on the number.
 ///
-/// Here rather than beside the two modes that act on the number, because the *format* is
-/// the frozen layout's. What stays with the caller is the policy: what to say when this,
-/// the only witness § 6.6 has, cannot be believed.
-///
-/// Zero and negatives are refused rather than passed on: `kill(2)` reads those as a whole
-/// process group and as every process the caller may signal, so a pidfile holding one is a
-/// number that must never reach a signal.
-///
-/// A body that filled the reader's buffer is refused for the sharper reason § 6.6 gives —
-/// it is the prefix of a file whose end was never seen, so a number still running at the
-/// last byte is a truncation of somebody else's pid, and what the prefix cannot settle it
-/// does not get to answer. The layout puts a pid and a newline there, eleven bytes at the
-/// widest, so nothing legitimate reaches the bound.
+/// Zero and negatives are refused: `kill(2)` reads those as a whole process group and as
+/// every process the caller may signal. A body that reached [`MAX_PID_LEN`] is refused for
+/// § 6.6's sharper reason — it is the prefix of a file whose end was never seen, so a number
+/// still running at the last byte is a truncation of somebody else's pid. The layout puts a
+/// pid and a newline there, eleven bytes at the widest, so nothing legitimate reaches it.
 pub(crate) fn parse_pid(body: &[u8]) -> Option<i32> {
     if body.len() >= MAX_PID_LEN {
         return None;
@@ -1076,13 +971,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
-    use crate::scratch::Scratch;
-
-    /// The permission bits as they are on disk, never as the symlink pointing at it
-    /// would report them.
-    fn mode_of(path: &Path) -> u32 {
-        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
-    }
+    use crate::scratch::{Scratch, mode_of};
 
     #[test]
     fn a_run_directory_is_created_owner_only_and_then_accepted_as_it_stands() {

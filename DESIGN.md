@@ -1,29 +1,26 @@
 # nomux — Design
 
-`nomux` is a single static Linux binary that runs **on an SSH server**. It owns a
-PTY and a bounded output buffer so a terminal session survives the loss of the SSH
-connection that created it.
-
-Low-level details: [IMPLEMENTATION.md](IMPLEMENTATION.md).
+`nomux` is a single static Linux binary that runs **on an SSH server**, owning a PTY
+and a bounded output buffer so a terminal session survives the loss of the SSH
+connection that created it. Low-level detail: [IMPLEMENTATION.md](IMPLEMENTATION.md).
 
 ## 1. Problem
 
 Mobile SSH connections drop constantly — WiFi↔cellular handoff, NAT rebind, radio
-sleep, Doze, app eviction — and plain SSH loses the shell and everything it held.
-The existing fix is a multiplexer (`tmux`, `screen`), which costs a prefix key, a
-rewritten `TERM`, a second copy-mode, broken host scrollback and OSC passthrough
-bugs — a large visible surface for one property.
+sleep, Doze, app eviction — and plain SSH loses the shell with everything it held. A
+multiplexer (`tmux`, `screen`) fixes that at the cost of a prefix key, a rewritten
+`TERM`, a second copy-mode, broken host scrollback and OSC passthrough bugs: a large
+visible surface for one property.
 
 ## 2. Scope
 
-This repo is **the server binary only**. The SSH client and terminal emulator are a
-separate project by the same author, and the two ship as a unit, so:
+This repo is **the server binary only**, and nothing in it aims to be a general
+terminal tool. The SSH client and terminal emulator are a separate project by the same
+author, and the two ship as a unit, so:
 
-- The wire protocol is **private**. No negotiation, no extension points, no third-party clients, no stability guarantee. Enums are exhaustive; an unknown value is a bug, not a forward-compatibility case. Nothing is on the wire that nothing reads: a field kept for a hypothetical consumer is bytes on every connection, and there is no such consumer. `nomux-proto` is not published for the same reason — a crates.io version is a stability promise about exactly the thing this bullet says has none.
-- Behaviour may be split across the boundary wherever it is cheapest, not wherever it is most "correct" for a hypothetical other consumer. Emulator reset on gap recovery lives client-side because the client already has the emulator, and the *decision* that there was a gap is a comparison both ends can make ([IMPLEMENTATION.md § 4.2](IMPLEMENTATION.md#42-attach-with-from--base_offset)) rather than a flag the daemon spends a bit on.
-- Version skew has exactly one real case (§6.4), and it is bounded rather than designed around.
-
-Nothing here aims to be a general terminal tool.
+- The wire protocol is **private**: no negotiation, no extension points, no stability guarantee. Enums are exhaustive, so an unknown value is a bug rather than a forward-compatibility case; nothing is on the wire that nothing reads; and `nomux-proto` is unpublished, a crates.io version being a stability promise this bullet refuses to make.
+- Behaviour goes to whichever side it is cheapest on: emulator reset on gap recovery is the client's because the client already holds the emulator, and either end can tell there was a gap by comparing offsets ([IMPLEMENTATION.md § 4.2](IMPLEMENTATION.md#42-attach-with-from--base)).
+- Version skew has exactly one real case (§6.4), bounded rather than designed around.
 
 | In scope | Out of scope |
 | --- | --- |
@@ -36,42 +33,33 @@ Nothing here aims to be a general terminal tool.
 
 ### Byte-stream replay, not screen-state sync
 
-The daemon buffers raw PTY bytes with monotonic offsets and replays from the
-client's last acknowledged offset. It does **not** model the screen.
-
-- Perfect fidelity: sixel, OSC 52, hyperlinks, mouse, bracketed paste all pass through untouched.
-- Scrollback survives, because scrollback is just earlier bytes.
-- No terminal emulator on the server — the client already has one, and a second, lossier one is pure liability.
-- Cost: a long disconnect can overflow the buffer. Handled explicitly as a *gap* (§6.3), not papered over.
+Raw PTY bytes with monotonic offsets, replayed from the client's last acknowledged
+offset; the screen is never modelled. Sixel, OSC 52, hyperlinks, mouse and bracketed
+paste pass through untouched, scrollback survives because scrollback is just earlier
+bytes, and no second lossier emulator runs on the server. Cost: a long disconnect can
+overflow the buffer, which is a *gap* (§6.3) rather than silent truncation.
 
 ### Carry the resume channel over a fresh SSH connection, not a side channel
 
-Resume is a new SSH connection running one command, or one
-`direct-streamlocal@openssh.com` channel. There is no nomux-owned socket on the
-network.
-
-- Inherits ProxyJump, certificates, 2FA, agent forwarding, `authorized_keys` restrictions, and the host's audit configuration for free.
-- Works through bastions and captive corporate networks.
-- Cost: a full SSH handshake per resume. Acceptable — on mobile that latency is dominated by radio wake anyway, and we are not chasing mosh's sub-second roaming feel.
+One command over a new SSH connection, or one `direct-streamlocal@openssh.com`
+channel; no nomux-owned socket on the network. ProxyJump, certificates, 2FA, agent
+forwarding, `authorized_keys` restrictions, bastions, captive corporate networks and
+the host's audit configuration all come free. Cost: a full handshake per resume,
+dominated on mobile by radio wake anyway.
 
 ### Zero server-side install
 
-The client carries the binary and pushes it on first use. Nothing is installed by
-an administrator, no package exists, no root is required.
-
-This is the adoption property: every other persistence tool needs a binary on the
-host first, once per host and once per upgrade, which is why people fall back to the
-`tmux` already on the box.
+The client carries the binary and pushes it on first use — no administrator, no
+package, no root. This is the adoption property: every other persistence tool wants a
+binary on the host first, which is why people fall back to the `tmux` already there.
 
 ### No new ports, no new crypto
 
-No network listener, no key exchange, no cipher selection, no certificate handling.
-What the daemon does listen on is the filesystem: a unix socket at mode `0600`
-inside a `0700` directory per session, and a second one beside it — `<id>.agent` —
-for the sessions that opted into agent forwarding (§5.4).
-
-Nothing new for a firewall to block, and what a security team reviews is §8's local
-surface, not a protocol. All confidentiality and authentication is SSH's, unchanged.
+No network listener, no key exchange, no cipher selection, no certificate handling —
+nothing new for a firewall to block, and confidentiality and authentication stay SSH's
+unchanged. What the daemon listens on is the filesystem: a unix socket at `0600` inside
+a `0700` directory per session, plus `<id>.agent` beside it for sessions that opted
+into agent forwarding (§5.4). That local surface, not a protocol, is what §8 reviews.
 
 ## 4. Architecture
 
@@ -95,18 +83,17 @@ flowchart LR
   DAEMON -- "PTY master" --> CHILD
 ```
 
-Five modes of one binary, in three groups: `spawn` and `attach` are one relay that
-differ only in whether they may create the session, `kill` and `list` one frozen
-surface:
+Five modes of one binary in three groups: `spawn` and `attach` are one relay differing
+only in whether they may create the session, `kill` and `list` one frozen surface.
 
 | Mode | Lifetime | Role |
 | --- | --- | --- |
 | `nomux daemon` | Outlives connections | Owns the PTY master, child process, ring buffer, and unix socket. Speaks the wire protocol. |
-| `nomux spawn` / `nomux attach` | One connection | Dumb byte relay between stdio and the unix socket. No protocol awareness. Every session is *created* through `spawn`, which creates and attaches in one `exec` (§6.2) and refuses an id something already answers for; `attach` refuses one nothing answers for, and never the reverse (§5.1). `direct-streamlocal` skips the relay on resume, never on creation. |
+| `nomux spawn` / `nomux attach` | One connection | Dumb byte relay between stdio and the unix socket, with no protocol awareness. `spawn` creates and attaches in one `exec` (§6.2) and refuses an id something already answers for; `attach` refuses one nothing answers for, and never the reverse. |
 | `nomux kill` / `nomux list` | One-shot | Frozen control surface. Acts on the run directory — the `<id>.*` files per session described in [IMPLEMENTATION.md § 6.6](IMPLEMENTATION.md#66-frozen-control-surface) — never on the session protocol, so any build can manage any daemon regardless of version. |
 
-The protocol is spoken end-to-end between client and daemon. The relay is dumb so
-protocol logic exists in one place: neither mode parses a frame, and neither is bumped.
+The protocol runs end-to-end between client and daemon: logic lives in one place, and
+the relay parses no frame and is never bumped.
 
 ## 5. Session lifecycle
 
@@ -124,185 +111,123 @@ stateDiagram-v2
   Reaping --> [*]: signal whatever is left, unlink run files
 ```
 
-The daemon keeps draining the PTY while detached — otherwise the child blocks on
-write and the session appears frozen on reattach.
+The daemon keeps draining the PTY while detached — otherwise the child blocks on write
+and the session appears frozen on reattach.
 
 ### 5.1 Identity
 
-**One session per client tab.** The client mints an opaque id when a tab is created;
-session identity *is* tab identity. There is no naming UI, no session picker, and no
-id ever shown to the user — they see tabs.
+**One session per client tab.** The client mints an opaque id when a tab is created, so
+session identity *is* tab identity: no naming UI, no session picker, no id ever shown.
 
-Consequences:
+- The daemon never interprets an id. It is a filename component and nothing else, validated strictly against path traversal ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)).
+- Opaque ids do not survive loss of client state: after a reinstall the daemons still run but the app no longer knows which tab each was. A human-readable label therefore sits beside the socket, so `nomux list` stays meaningful and orphans are recoverable. It is also why `attach` refuses an id nothing answers for instead of creating one (§4).
+- Concurrency is *intended* to cap at 8 per host, and the cap is the client's: only the side that knows a tab was opened can hold it, so nothing holds it today. The daemon holds a backstop instead, refusing to start past 64 ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)), because what reaches 64 is a runaway rather than a user who wanted one more terminal.
 
-- The daemon never interprets an id. It is a filename component and nothing else, so it is validated strictly against path traversal (see [IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)).
-- Opaque ids do not survive loss of client state. After a reinstall the daemons are still running but the app no longer knows which tab each was. A human-readable label is therefore stored beside the socket, so `nomux list` stays meaningful and orphans are recoverable. It is also why `attach` refuses an id nothing answers for instead of creating one, which is the whole of why it is a separate mode from `spawn` (§4): an id outliving what it names is the ordinary failure here, and a mode that answered both cases handed back a brand-new shell indistinguishable from the one that had held the build. A stale or mistyped id fails loudly instead.
-- Concurrency is *intended* to cap at 8 sessions per host, and that cap is the client's: only the side that knows a tab was opened can hold it, so nothing holds it today. The daemon holds a backstop instead, refusing to start past 64 ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)) — eight times the intended figure, because what reaches 64 is a runaway, not a user who wanted one more terminal. It counts names in a directory and knows nothing of its siblings' state.
-
-Rejected: one implicit session per host (survives reinstall, but no second terminal
-for a build alongside an editor) and user-named sessions (solves both, at the cost of
-the session-list UI this project exists to avoid).
+Rejected: one implicit session per host (survives reinstall, but no second terminal for
+a build alongside an editor) and user-named sessions (solve both, at the cost of the
+session-list UI this project exists to avoid).
 
 ### 5.2 Reaping
 
-A clientless session is reaped 7 days after the last detach, not currently tunable.
-One that never started a PTY gets 30 s instead, which is what removes a daemon nobody
-ever reached. The child having exited is not a second rule beside it: a session that
-has served somebody stays on the week whatever became of its shell.
-
-One rule for both repairs an asymmetry: an *idle* session survived a week where an
-*exited* one survived five seconds, and on a connection profile of signal lost, radio
-asleep, reconnect minutes later, five seconds is never the window. A client arriving
-days later collects the replayed output and *then* the status, plus
-`Exit.since_exit_secs` so a days-old status is not read as one that just happened
-([IMPLEMENTATION.md § 2.2](IMPLEMENTATION.md#22-messages)).
-
-Output volume cannot be the signal: it cannot tell a multi-hour build that must
-survive from a `tail -f` that could run forever. Time-since-detach is the only
-tractable rule, and the generous default matters more with per-tab ids, every
-abandoned tab being a shell holding memory and locks on someone else's server.
+A clientless session is reaped 7 days after the last detach, not currently tunable; one
+that never started a PTY gets 30 s instead, which removes a daemon nobody ever reached.
+The child having exited is not a second rule beside it: a session that has served
+somebody stays on the week whatever became of its shell, and a client arriving days
+later gets the replay and *then* the status, carrying `Exit.since_exit_secs` lest a
+days-old exit read as fresh ([IMPLEMENTATION.md § 2.2](IMPLEMENTATION.md#22-messages)).
+Output volume cannot be the signal — nothing in it separates a multi-hour build that
+must survive from an endless `tail -f` — so time-since-detach it is, its generous
+default paid for in abandoned tabs holding memory and locks on someone else's server.
 
 ### 5.3 Transparency
 
-A session runs exactly what a plain `ssh host` would have run: the user's login
-shell, dash-prefixed, with the environment sshd already established. nomux starts
-*inside* an SSH session, so this is inheritance, not reconstruction — see
-[IMPLEMENTATION.md § 6.1.1](IMPLEMENTATION.md#611-what-the-child-runs).
-
-The limit: a running process's environment cannot be mutated, so what the creating
-connection brought is frozen for the session's lifetime — a later reconnect's
-`DISPLAY` or `AcceptEnv` values are invisible to the child. Inherent to persistence,
-and `tmux`'s too; §5.4 is the one case worth solving.
+A session runs exactly what a plain `ssh host` would have run: the user's login shell,
+dash-prefixed, with the environment sshd already established. That is inheritance, not
+reconstruction, because nomux starts *inside* an SSH session
+([IMPLEMENTATION.md § 6.1.1](IMPLEMENTATION.md#611-what-the-child-runs)). A running
+process's environment cannot be mutated, so what the creating connection brought is
+frozen for the session's lifetime and a later reconnect's `DISPLAY` or `AcceptEnv` is
+invisible to the child: inherent to persistence, `tmux`'s too, and §5.4 is the one case
+worth solving.
 
 ### 5.4 Agent forwarding
 
 A forwarded `ssh-agent` socket belongs to one SSH connection and is unlinked when it
 closes, so a persistent session loses the agent on first reconnect — `git push` and
-nested `ssh` break for the rest of the session's life. It is the most-complained-about
-`tmux` behaviour, and inheriting it would undercut §5.3.
+nested `ssh` break for the rest of its life, the most-complained-about `tmux` behaviour
+and one that would undercut §5.3. nomux forwards the agent **itself**: the daemon owns
+a socket for the session's whole life and proxies each connection to the client as a
+protocol sub-channel, answered from the client's own key store. Nothing dangles or
+needs refreshing, and no environment has to be re-read — which the warm path (§6.1)
+could not do anyway, running no process on the server.
 
-nomux forwards the agent **itself** instead of borrowing sshd's socket. The daemon
-listens on a socket it owns for the session's whole life and proxies each connection
-to the client as a protocol sub-channel; the client answers from its own key store.
-Nothing dangles or needs refreshing, and no environment has to be re-read — which the
-warm resume path (§6.1) could not do anyway, running no process on the server.
-
-Consequences:
-
-- The protocol gains sub-channels ([IMPLEMENTATION.md § 6.7](IMPLEMENTATION.md#67-agent-forwarding)). This is the one place the design multiplexes, and it is a deliberate, bounded exception.
-- It works **without** `ForwardAgent`, bypassing a deliberate user decision. So it is opt-in per host, off by default, never enabled silently.
-- Because the client sees every request, it *can* prompt per signature or name the asking session — something plain `ssh -A` can never do.
-- What it **loses** is OpenSSH's destination constraints. `ssh-add -h` binds a key to a hop, and `ssh(1)` enforces that by sending `session-bind@openssh.com` down each forwarded agent connection. Here the daemon is an opaque byte pipe ([IMPLEMENTATION.md § 6.7](IMPLEMENTATION.md#67-agent-forwarding)) and the client re-originates the request against the real agent, so unless the client synthesises a binding for the hop the session sits on, a constrained key is refused outright or used with its constraint silently not applied. The opt-in above is the compensating control: a user who reasoned that `ssh-add -h` had already made forwarding cheap was reasoning about `ssh -A`.
+- The protocol gains sub-channels ([IMPLEMENTATION.md § 6.7](IMPLEMENTATION.md#67-agent-forwarding)) — the one place the design multiplexes, a deliberate and bounded exception.
+- It works **without** `ForwardAgent`, bypassing a deliberate user decision, so it is opt-in per host and off by default.
+- Because the client sees every request it *can* prompt per signature or name the asking session, which plain `ssh -A` can never do.
+- It **loses** OpenSSH's destination constraints: `ssh-add -h` binds a key to a hop and `ssh(1)` enforces that with `session-bind@openssh.com` down each forwarded agent connection, but the daemon here is an opaque byte pipe and the client re-originates against the real agent, so without a synthesised binding for the session's hop a constrained key is refused outright or used with its constraint silently unapplied ([IMPLEMENTATION.md § 6.7](IMPLEMENTATION.md#67-agent-forwarding)). The per-host opt-in is the compensating control.
 
 ## 6. Connection paths
 
 ### 6.1 Warm resume
 
-Steady state, and the path that runs on every network change. Always a resume: the
-socket *is* the session, so a channel opened straight to it reaches one that already
-exists or nothing at all — creation needs a process, and this path runs none.
-
-```mermaid
-sequenceDiagram
-  participant C as Client
-  participant S as sshd
-  participant D as daemon
-  C->>S: direct-streamlocal to $XDG_RUNTIME_DIR/nomux/$ID.sock
-  C->>D: Hello{out_offset, cols, rows, TERM}
-  D-->>C: HelloOk{resume_from == out_offset, so no gap}
-  D-->>C: Output[resume_from..end]
-  Note over C,D: no process spawned, no shell parsed
-```
+Steady state, run on every network change, and always a resume: the socket *is* the
+session, so a `direct-streamlocal` channel opened straight to it finds one or finds
+nothing — creation needs a process, and this path runs none. `Hello` in, `HelloOk` and
+the replay out; no process spawned, no shell parsed.
 
 ### 6.2 Cold bootstrap
 
-First contact with a host, or after a version bump. `$MODE` below is `spawn` or
-`attach`, and the client always knows which, because it knows whether it already
-holds a session for this tab.
-
-```mermaid
-sequenceDiagram
-  participant C as Client
-  participant S as sshd
-  participant D as daemon
-  C->>S: exec: exec $p/nomux-$VER $MODE $ID<br/>echo "NOMUX-BOOTSTRAP $(uname -s) $(uname -m) $p"
-  S-->>C: NOMUX-BOOTSTRAP Linux aarch64 /home/u/.local/share/nomux
-  C->>S: exec: mkdir -p -m 700, set -C, cat to tmp, chmod, mv,<br/>then exec nomux-$VER $MODE $ID
-  S->>D: start a daemon if creating, then connect the socket
-  D-->>C: HelloOk{resume_from}, 0 where spawn just made the session
-```
-
-Two round trips cold, zero extra warm — the `exec` replaces the shell on success, so
-the probe line is only reached on failure, and `spawn` creates *and* attaches within
-that one `exec`, which is why creating is a mode of the relay and not a command run
-before it. Details in [IMPLEMENTATION.md § Bootstrap](IMPLEMENTATION.md#5-bootstrap).
+First contact with a host, or after a version bump: a probe `exec` that runs the binary
+where it is already present, then an upload and a second `exec` where it is not. Two
+round trips cold, zero extra warm; `$MODE` is `spawn` or `attach` and the client always
+knows which ([IMPLEMENTATION.md § Bootstrap](IMPLEMENTATION.md#5-bootstrap)).
 
 ### 6.3 Gap
 
-The buffer is bounded. If a disconnect outlasts it the oldest bytes are gone and
-resuming mid-escape-sequence would corrupt the client's emulator, so it is reported as
-an explicit `Gap` frame: the client resets its emulator and the daemon repaints from
-the child ([IMPLEMENTATION.md § 4.3](IMPLEMENTATION.md#43-gap-handling)).
+The buffer is bounded, and resuming mid-escape-sequence after it overflows would
+corrupt the client's emulator, so overflow is an explicit `Gap` frame: the client
+resets, the daemon repaints from the child ([IMPLEMENTATION.md § 4.3](IMPLEMENTATION.md#43-gap-handling)).
 
 ### 6.4 Version skew
 
-Because the version is in the binary's filename, old binaries persist on the server
-and an old daemon can still be holding a live session when a newer client connects.
-This is the only compatibility case that exists.
+The version is in the binary's filename, so old binaries persist on the server and an
+old daemon can still hold a live session when a newer client connects — the only
+compatibility case there is. Retention is keyed to the protocol revision and the client
+keeps every revision it has ever shipped: app stores batch updates, so a user can go
+from release 5 to release 8 without ever running 6 or 7, and an N-1 window assumes the
+client runs under every release, while revisions are append-only integers and a codec
+is a few hundred lines, so keeping them all costs nothing.
 
-Policy: the client records which version created each session and keeps invoking that
-path, carrying the previous release's codec as well as the current one. Older than
-that, it reports the session unreachable and offers to kill it. One release of grace is
-enough to be proactive: on update, sessions still reachable on the old codec are
-offered a restart *while they are still reachable*. The window closes only if two
-releases are skipped with a session alive throughout.
-
-This is safe only because reaping never uses the session protocol. `kill` and `list`
-act on the run directory, so a client that cannot speak a session's protocol can
-still clean it up — the fallback is never an orphaned shell. See
-[IMPLEMENTATION.md § 6.6](IMPLEMENTATION.md#66-frozen-control-surface).
-
-The daemon carries none of this. It only ever speaks its own version and rejects a
-mismatched `Hello.protocol` outright, which is why `HelloOk` carries no revision: by
-the time it is sent, the number is agreed. All skew handling is client-side, the
-daemon being the size-constrained binary uploaded over cellular.
+Safe because reaping never uses the session protocol — `kill` and `list` act on the run
+directory ([IMPLEMENTATION.md § 6.6](IMPLEMENTATION.md#66-frozen-control-surface)), so
+the fallback is never an orphaned shell. The daemon carries none of it, speaking only
+its own version and rejecting a mismatched `Hello.protocol`.
 
 ## 7. Degradation
 
-The feature must be invisible when unavailable. Every failure below falls back to a
-plain SSH session and is cached per-host so it is not re-probed on every connect.
-
-| Condition | Behaviour |
-| --- | --- |
-| `uname -s` is not `Linux` | Linux only by construction — the daemon uses Linux syscall and `/proc` interfaces directly. Plain SSH. |
-| Unknown architecture | Plain SSH. |
-| Exec fails with format error | Retry next-best architecture once, then plain SSH. |
-| Home is `noexec` or read-only | Plain SSH. Detected by exec failing, never by parsing mounts. |
-| `AllowStreamLocalForwarding no` | Warm path unavailable; use the exec relay, `attach` or `spawn` as the session needs. |
-| Restricted shell / no `uname` | Plain SSH. |
-| `KillUserProcesses=yes`, no linger | Daemon dies at logout. Detected and surfaced; session is best-effort. |
+The feature must be invisible when unavailable: every failure falls back to a plain SSH
+session, cached per host so it is not re-probed, on the conditions in
+[IMPLEMENTATION.md § 5.3](IMPLEMENTATION.md#53-decision-tree).
 
 ## 8. Security model
 
-- **No new *network* attack surface.** No listening TCP or UDP port, nothing for a firewall to open. Locally there is new surface and it is enumerated below: a unix socket per session, an optional agent socket, and a process that outlives the login. The uploaded binary is not among it — anyone who can write `~/.local/share/nomux/` can already edit `.bashrc`.
-- **That equivalence holds for the same user only.** The run directory is checked — `O_NOFOLLOW`, uid, mode ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)); the install directory is only created ([§ 5.2](IMPLEMENTATION.md#52-upload-and-attach-in-one-round-trip)). Where another user can write to it, they can replace the binary every connection on the exec path runs, which is code execution as the victim. The published command line holds `mkdir -p -m 700` and `set -C`. The client must check a directory that already exists and refuse a parent that is not the user's.
+- **No new *network* attack surface.** No listening TCP or UDP port. The local surface is what follows: a unix socket per session, an optional agent socket, and a process outliving the login. The uploaded binary is not part of it — anyone who can write `~/.local/share/nomux/` can already edit `.bashrc`.
+- **That equivalence holds for the same user only.** The run directory is checked (`O_NOFOLLOW`, uid, mode — [IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)) while the install directory is only created ([§ 5.2](IMPLEMENTATION.md#52-upload-and-attach-in-one-round-trip)), so another user able to write there replaces the binary every connection on the exec path runs: code execution as the victim. The published command line holds `mkdir -p -m 700` and `set -C`, and the client must check a directory that already exists and refuse a parent that is not the user's.
 - **No new secrets.** No keys, no tokens, no crypto. Authentication is the unix socket's filesystem permissions (`0600` in a `0700` directory) plus SSH itself.
 - **No abstract sockets.** They are namespace-scoped, not permission-scoped, and would be reachable by any local user.
-- **Agent forwarding is a real capability expansion — the only one here.** The daemon serves an `ssh-agent` socket of its own, so a session reaches the user's keys on a connection that never set `ForwardAgent`, and only a session created with the flag set gets one. See §5.4 for the policy that follows from bypassing that decision, and what it buys back.
-- **Auditability.** A persistent shell can outlive the login session that spawned it. On hosts with session recording this is a policy question, not a technical one; it is why the feature is opt-in per host.
+- **Agent forwarding is a real capability expansion — the only one here.** The daemon serves an `ssh-agent` socket of its own, so a session reaches the user's keys over a connection that never set `ForwardAgent`, and only a session created with the flag set gets one (§5.4).
+- **Auditability.** A persistent shell can outlive the login session that spawned it. On hosts with session recording that is a policy question, not a technical one, and it is why the feature is opt-in per host.
 - **File integrity monitoring** (AIDE, tripwire, osquery) will flag a new executable in a home directory. Expected, documented, not worked around.
 
 ## 9. Prior art
 
-Each layer has precedent; the assembly is what is new.
-
 | Layer | Existing work | Difference |
 | --- | --- | --- |
-| Detach/attach daemon | `dtach`, `abduco`, `shpool` | Those require server-side install, and reattaching resumes the terminal rather than the byte stream — output produced while you were disconnected is not replayed. |
+| Detach/attach daemon | `dtach`, `abduco`, `shpool` | Need a server-side install, and reattaching resumes the terminal rather than the byte stream: output produced while you were away is not replayed. |
 | Byte-stream resume | Eternal Terminal | Opens its own TCP port with its own crypto. |
 | Roaming | mosh | UDP range, server-side emulator, no scrollback or port forwarding. |
 | Self-bootstrap over SSH | VS Code Remote-SSH, JetBrains Gateway, `sshuttle`, `xxh` | Not terminal-persistence tools. |
 
-The combination — zero-install, no new ports, byte-exact — does not exist today.
-`dtach`'s `-r winch|ctrl_l` repaint strategy is adopted directly for gap recovery.
-
+Each layer has precedent; the combination — zero-install, no new ports, byte-exact —
+does not. `dtach`'s `-r winch|ctrl_l` repaint strategy is adopted directly for gap
+recovery.

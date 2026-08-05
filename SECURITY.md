@@ -19,10 +19,8 @@ are [PLAN.md](PLAN.md)'s, notably [§ P3](PLAN.md#p3--release-process): a `v*` t
 publishes the per-architecture checksums, and nothing verifies an upload against
 them yet — the client's half.
 
-Two things are deliberate, and DESIGN § 8 has both:
-
-- **An attacker who is already the user.** The uploaded binary lands where `.bashrc`
-  does. A *different* user replacing a binary the victim then execs is a real gap and
-  is in scope.
-- **The wire protocol's lack of authentication.** A session's sockets are `0600`
-  inside a `0700` run directory, so reaching one already means being the user.
+Two things are deliberate, both in [DESIGN.md § 8](DESIGN.md#8-security-model): an
+attacker who is already the user — though a *different* user replacing a binary the
+victim then execs is a real gap, and in scope — and the wire protocol's lack of
+authentication, its sockets being `0600` inside a `0700` run directory, so reaching
+one already means being the user.

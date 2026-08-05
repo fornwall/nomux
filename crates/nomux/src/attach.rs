@@ -18,7 +18,7 @@ use std::os::unix::process::CommandExt;
 use std::process::{ChildStderr, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use rustix::event::PollFlags;
+use rustix::event::{PollFd, PollFlags};
 use rustix::pipe::SpliceFlags;
 
 use crate::control::{Liveness, liveness};
@@ -32,9 +32,9 @@ const SPAWN_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// How long any one `connect` to the session socket waits out a full backlog.
 ///
-/// [`connect_within`] has why every `connect` here is bounded and this one is not a
-/// plain `UnixStream::connect` (§ 6.3). Short, because the state it waits out clears
-/// in one `accept` and this is on the path of every attach.
+/// [`crate::rundir::connect_within`] has why every `connect` here is bounded and this
+/// one is not a plain `UnixStream::connect` (§ 6.3). Short, because the state it waits
+/// out clears in one `accept` and this is on the path of every attach.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Delay between checks for the pidfile the daemon publishes just after its socket.
@@ -56,10 +56,12 @@ const SPLICE_CHUNK: usize = 64 * 1024;
 /// the whole of the distinction (`DESIGN.md` § 5.1): `spawn` creates it, `attach`
 /// refuses.
 #[derive(Clone, Copy)]
-pub(crate) enum Intent {
+pub(crate) enum Intent<'a> {
     /// `nomux spawn <id>`: creates the session and attaches to it in one exec, and
-    /// refuses an id something is already serving.
-    Create,
+    /// refuses an id something is already serving. Carries the label the new daemon is
+    /// started with — a label belongs to the session rather than to the connection
+    /// (§ 6.6), so this is the only mode with anywhere to put one.
+    Create(Option<&'a str>),
     /// `nomux attach <id>`: relays to a session that exists, and refuses one that
     /// does not rather than quietly starting a second.
     Resume,
@@ -67,18 +69,13 @@ pub(crate) enum Intent {
 
 /// Reaches the session `session_id` names, per `intent`, and relays stdio to it.
 ///
-/// `label` is passed on to a daemon this call creates and is meaningless otherwise:
-/// the label belongs to the session rather than to the connection (§ 6.6), so
-/// [`Intent::Resume`] never carries one and `main` refuses a command line that offers
-/// one.
-///
 /// # Errors
 ///
 /// Fails if the session cannot be reached or created, or if relaying fails.
-pub(crate) fn run(session_id: &str, intent: Intent, label: Option<&str>) -> io::Result<()> {
+pub(crate) fn run(session_id: &str, intent: Intent<'_>) -> io::Result<()> {
     let paths = SessionPaths::new(session_id)?;
     let stream = match intent {
-        Intent::Create => create(&paths, label)?,
+        Intent::Create(label) => create(&paths, label)?,
         Intent::Resume => resume(&paths)?,
     };
     relay(&stream)
@@ -156,6 +153,18 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> io::Result<UnixStream> {
     // the path.
     let _spawn_lock = paths.lock_spawn()?;
 
+    // One release point for every way the attempt can fail, so no exit path can forget
+    // it. Still under the lock, `_spawn_lock` outliving this expression. `AlreadyExists`
+    // is the one failure that leaves a session behind, where the name is that session's.
+    spawn_and_join(paths, label).inspect_err(|err| {
+        if err.kind() != io::ErrorKind::AlreadyExists {
+            release_lock_name(paths);
+        }
+    })
+}
+
+/// The body of [`create`], as one fallible call so its lock has a single owner.
+fn spawn_and_join(paths: &SessionPaths, label: Option<&str>) -> io::Result<UnixStream> {
     let socket = paths.socket();
     // Once, and under the lock: another spawn may have created the session while we
     // waited for it, and the loser of that race is refused rather than handed the
@@ -169,7 +178,7 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> io::Result<UnixStream> {
         Liveness::Unknown(err) => return Err(err),
     }
 
-    let complaint = spawn_daemon(paths.id(), label).inspect_err(|_| release_lock_name(paths))?;
+    let complaint = spawn_daemon(paths.id(), label)?;
 
     let deadline = Instant::now() + SPAWN_TIMEOUT;
     loop {
@@ -185,7 +194,6 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> io::Result<UnixStream> {
                         || format!("daemon for session {id} did not start"),
                         |said| format!("daemon for session {id} did not start: {said}"),
                     );
-                    release_lock_name(paths);
                     return Err(io::Error::new(io::ErrorKind::TimedOut, complaint));
                 }
                 std::thread::sleep(SPAWN_POLL_INTERVAL);
@@ -198,12 +206,9 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> io::Result<UnixStream> {
 /// Gives back the `<id>.lock` this call created, on the way out of a spawn that left no
 /// session behind.
 ///
-/// While the lock is still held, and with nothing of ours unlinking after it, which is
-/// `rundir::removal_order`'s ordering seen from the other end. Left behind it is a bare
-/// name `session_id_of` counts as a session, so every spawn refused at § 6.3's ceiling
-/// would raise the count that refused it — the daemon cannot undo that from its side,
-/// this process being the one holding the lock. Never on [`already_running`], where the
-/// name belongs to the session that is there.
+/// A leftover name is one `session_id_of` counts as a session, so without this every
+/// spawn refused at § 6.3's ceiling would raise the count that refused it — and only
+/// this process, still holding the lock, can undo that.
 fn release_lock_name(paths: &SessionPaths) {
     drop(fs::remove_file(paths.lock()));
 }
@@ -311,6 +316,10 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
 
     let mut to_socket = Pump::default();
     let mut to_stdout = Pump::default();
+    // One buffer for both directions, which never transfer within the same call, and
+    // hoisted out of the loop: it is handed by reference to an opaque syscall wrapper,
+    // so a fresh one per read is a memset nothing can elide — 32 KiB per keystroke.
+    let mut chunk = [0u8; 16 * 1024];
     let mut stdin_open = true;
     let mut socket_open = true;
     // The only one of the three about a *destination*: the session's output having
@@ -318,43 +327,52 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
     let mut stdout_open = true;
 
     while stdout_open && (socket_open || to_stdout.has_data()) {
-        let mut fds = Vec::with_capacity(3);
-        let want_stdin = stdin_open && to_socket.wants_source();
-        if want_stdin {
-            fds.push(rustix::event::PollFd::new(&stdin_fd, PollFlags::IN));
-        }
+        // One mask per descriptor, empty where it is not worth watching this pass, and
+        // read back below in the same order.
+        let mut stdin_flags = PollFlags::empty();
+        stdin_flags.set(PollFlags::IN, stdin_open && to_socket.wants_source());
         let mut socket_flags = PollFlags::empty();
-        if socket_open && to_stdout.wants_source() {
-            socket_flags |= PollFlags::IN;
-        }
-        if to_socket.wants_dest() {
-            socket_flags |= PollFlags::OUT;
-        }
-        if !socket_flags.is_empty() {
-            fds.push(rustix::event::PollFd::new(&sock_fd, socket_flags));
-        }
-        let want_stdout = to_stdout.wants_dest();
-        if want_stdout {
-            fds.push(rustix::event::PollFd::new(&stdout_fd, PollFlags::OUT));
+        socket_flags.set(PollFlags::IN, socket_open && to_stdout.wants_source());
+        socket_flags.set(PollFlags::OUT, to_socket.wants_dest());
+        let mut stdout_flags = PollFlags::empty();
+        stdout_flags.set(PollFlags::OUT, to_stdout.wants_dest());
+        // A fixed frame rather than a `Vec`, which would be a heap allocation per
+        // wakeup for a set of at most three. Seeded as `daemon::wait` seeds its slots:
+        // `PollFd` has no vacant spelling, so the tail past `watched` carries a
+        // descriptor of our own under an empty mask and is never shown to `poll`.
+        let mut fds: [PollFd<'_>; 3] =
+            std::array::from_fn(|_| PollFd::from_borrowed_fd(sock_fd, PollFlags::empty()));
+        let mut watched = 0;
+        for (fd, flags) in [
+            (stdin_fd, stdin_flags),
+            (sock_fd, socket_flags),
+            (stdout_fd, stdout_flags),
+        ] {
+            if !flags.is_empty()
+                && let Some(slot) = fds.get_mut(watched)
+            {
+                *slot = PollFd::from_borrowed_fd(fd, flags);
+                watched += 1;
+            }
         }
         // Unreachable, [`Pump::wants_source`] being exactly `!wants_dest()`, and kept
         // because what it stands between is a `poll` on an empty set, which blocks
         // for ever.
-        if fds.is_empty() {
+        if watched == 0 {
             break;
         }
 
         // No deadline of our own: the relay lives exactly as long as the channel,
         // and every wakeup it can act on is a readiness event.
-        match rustix::event::poll(&mut fds, None) {
+        match rustix::event::poll(fds.get_mut(..watched).unwrap_or(&mut []), None) {
             Ok(_) => {}
             Err(rustix::io::Errno::INTR) => continue,
             Err(err) => return Err(err.into()),
         }
-        // Read back by position, which is safe only because the three conditions that
-        // decided whether each entry was pushed are reused below rather than
+        // Read back by position, which is safe only because the three masks that
+        // decided whether each entry was taken are reused below rather than
         // recomputed: a `Pump` that changed state during `poll` cannot shift it.
-        let mut events = fds.iter().map(rustix::event::PollFd::revents);
+        let mut events = fds.iter().map(PollFd::revents);
         let mut revents = |registered: bool| {
             if registered {
                 events.next().unwrap_or_else(PollFlags::empty)
@@ -362,39 +380,40 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
                 PollFlags::empty()
             }
         };
-        let stdin_events = revents(want_stdin);
+        let stdin_events = revents(!stdin_flags.is_empty());
         let socket_events = revents(!socket_flags.is_empty());
-        let stdout_events = revents(want_stdout);
+        let stdout_events = revents(!stdout_flags.is_empty());
 
-        // `ERR` alongside `HUP`, as `daemon::poll_once` has it: a source reporting
-        // only `ERR` would otherwise never be read, never be closed, and spin in the
-        // poll set.
-        if stdin_events.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
-            && !to_socket.transfer(stdin_fd, sock_fd)?
+        // `ERR` and `NVAL` alongside `HUP`, as `daemon::wait` has them: a source
+        // reporting one of those alone would otherwise never be read, never be closed,
+        // and spin in the poll set.
+        let readable = PollFlags::IN | PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL;
+
+        if stdin_events.intersects(readable)
+            && !to_socket.transfer(stdin_fd, sock_fd, &mut chunk)?
         {
             stdin_open = false;
             // Propagate the half-close so the daemon sees our EOF while we keep
             // draining its output.
             drop(stream.shutdown(Shutdown::Write));
         }
-        if socket_events.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
-            && !to_stdout.transfer(sock_fd, stdout_fd)?
+        if socket_events.intersects(readable)
+            && !to_stdout.transfer(sock_fd, stdout_fd, &mut chunk)?
         {
             socket_open = false;
         }
-        // Speculative on a non-empty buffer as well as on `POLLOUT`, which stdout
-        // below deliberately is not: this descriptor was switched to non-blocking at
-        // the top, so an optimistic write here either saves a wakeup or costs one
-        // `EAGAIN`. The answer is deliberately not read back into an ending — an
-        // `EPIPE` towards the socket is a client that has gone, and the same
-        // departure arrives as EOF from the socket's *read* side above.
+        // Speculative on a non-empty buffer as well as on `POLLOUT`, which stdout below
+        // deliberately is not: this descriptor was made non-blocking at the top, so an
+        // optimistic write costs at worst one `EAGAIN`. The answer is dropped rather
+        // than read as an ending — an `EPIPE` towards the socket is a client that has
+        // gone, and that same departure arrives as EOF from its *read* side above.
         if socket_events.contains(PollFlags::OUT) || to_socket.has_data() {
-            let _client_still_reading = to_socket.drain_to(sock_fd)?;
+            let _ = to_socket.drain_to(sock_fd)?;
         }
         // One of the two ways a dead stdout arrives: `POLLOUT` is the only thing that
         // clears `Pump::dest_full`, and a destination whose reader has gone never
         // reports it — a full pipe with no reader is not writable, it is broken.
-        if stdout_events.intersects(PollFlags::ERR | PollFlags::HUP) {
+        if stdout_events.intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL) {
             stdout_open = false;
         } else if stdout_events.contains(PollFlags::OUT) {
             // On `POLLOUT` alone, and never speculatively the way the socket above is
@@ -411,16 +430,12 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
         }
     }
 
-    // Nothing is owed here: every exit from the loop leaves `to_stdout` empty whenever
-    // stdout is still open, the `while` condition being what keeps going round while
-    // it has data and the `fds.is_empty()` break needing that same emptiness.
     Ok(())
 }
 
-/// Reads once into `buf`. `false` means the source reached EOF.
-fn copy_in(fd: BorrowedFd<'_>, buf: &mut VecDeque<u8>) -> io::Result<bool> {
-    let mut chunk = [0u8; 16 * 1024];
-    match crate::nbio::read(fd, &mut chunk) {
+/// Reads once through `chunk` into `buf`. `false` means the source reached EOF.
+fn copy_in(fd: BorrowedFd<'_>, buf: &mut VecDeque<u8>, chunk: &mut [u8]) -> io::Result<bool> {
+    match crate::nbio::read(fd, chunk) {
         // Four shapes of one ending. A PTY-backed peer reports end of session as
         // `EIO` rather than 0; a socket peer that closed with bytes of *ours* still
         // unread hands over the last of its own and then answers `ECONNRESET`, and
@@ -524,7 +539,12 @@ impl Pump {
     ///
     /// Falling back within the same call keeps a host that cannot splice from losing
     /// a wakeup to the discovery.
-    fn transfer(&mut self, src: BorrowedFd<'_>, dst: BorrowedFd<'_>) -> io::Result<bool> {
+    fn transfer(
+        &mut self,
+        src: BorrowedFd<'_>,
+        dst: BorrowedFd<'_>,
+        chunk: &mut [u8],
+    ) -> io::Result<bool> {
         if !self.splice_refused && !self.has_data() {
             match splice_once(src, dst) {
                 Spliced::Moved(moved) => return Ok(moved != 0),
@@ -536,7 +556,7 @@ impl Pump {
                 Spliced::Failed => {}
             }
         }
-        copy_in(src, &mut self.buf)
+        copy_in(src, &mut self.buf, chunk)
     }
 
     /// Hands the destination whatever is owed it, and forgets that it was full.

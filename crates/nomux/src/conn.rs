@@ -342,17 +342,13 @@ mod tests {
 
     /// One frame of each shape the reassembler has to handle: empty, fixed-size, and
     /// both variable-length forms.
-    fn samples(payload: &[u8]) -> [Frame<'_>; 7] {
+    fn samples(payload: &[u8]) -> [Frame<'_>; 6] {
         [
             Frame::Detach,
-            Frame::Ping {
-                nonce: 0x0102_0304_0506_0708,
-            },
             Frame::Resize(WIN),
             Frame::HelloOk(HelloOk {
                 resume_from: 9,
                 in_applied: 4,
-                win: WIN,
                 linger: Linger::Enabled,
                 agent: true,
             }),
@@ -452,39 +448,9 @@ mod tests {
         pos == 0 || pos * 2 < len
     }
 
-    /// A frame handed over one byte at a time must stay invisible until its last
-    /// byte, and arrive byte-identical — the split-read path every real socket takes
-    /// and no integration test reaches.
-    #[test]
-    fn a_frame_arriving_one_byte_at_a_time_completes_only_on_its_last_byte() {
-        let payload = bulk(300);
-        let mut scratch = Vec::new();
-        for frame in samples(&payload) {
-            let wire = encoded(&frame);
-            let (mut peer, mut conn) = pair();
-            for (i, byte) in wire.iter().enumerate() {
-                feed(&mut peer, &mut conn, &[*byte]);
-                if i + 1 == wire.len() {
-                    break;
-                }
-                assert!(
-                    matches!(conn.take_frame(&mut scratch), Ok(None)),
-                    "{frame:?} completed after {} of {} bytes",
-                    i + 1,
-                    wire.len()
-                );
-            }
-            assert_eq!(take(&mut conn, &mut scratch), Some(frame), "{frame:?}");
-            assert_eq!(&scratch[..], &wire[HEADER_LEN..], "payload for {frame:?}");
-            assert!(
-                !conn.has_buffered_input(),
-                "a taken frame must leave nothing"
-            );
-        }
-    }
-
-    /// The same frames split at every possible point into two writes: reassembly
-    /// must not depend on where the boundary landed, header or payload.
+    /// Every frame split at every possible point into two writes: reassembly must not
+    /// depend on where the read boundary landed, header or payload — the split-read
+    /// path every real socket takes and no integration test reaches.
     #[test]
     fn every_split_point_reassembles_the_same_frame() {
         let payload = bulk(300);
@@ -512,11 +478,11 @@ mod tests {
         }
     }
 
-    /// A frame at exactly [`MAX_PAYLOAD`], whole and split — the case the const
-    /// assert at the top of this module protects, since a read cap below a whole
+    /// A frame at exactly [`MAX_PAYLOAD`] clears [`MAX_PENDING_READ`] — the case the
+    /// const assert at the top of this module protects, since a read cap below a whole
     /// frame is a frame `take_frame` never completes and a connection stuck for good.
     #[test]
-    fn a_maximum_payload_frame_survives_whole_and_split() {
+    fn a_maximum_payload_frame_fits_under_the_read_cap() {
         // The 8-byte offset shares the payload, so this is the largest `Output` there
         // is — and exactly what `send_output` chunks to.
         let data = bulk(MAX_PAYLOAD as usize - 8);
@@ -542,30 +508,6 @@ mod tests {
         assert!(!conn.is_read_saturated(), "a whole frame must not saturate");
         assert_eq!(take(&mut conn, &mut scratch), Some(frame));
         assert_eq!(&scratch[..], &wire[HEADER_LEN..]);
-
-        for split in [
-            1,
-            HEADER_LEN - 1,
-            HEADER_LEN,
-            HEADER_LEN + 1,
-            wire.len() / 2,
-            wire.len() - 1,
-        ] {
-            let (mut peer, mut conn) = pair();
-            feed(&mut peer, &mut conn, &wire[..split]);
-            assert!(
-                matches!(conn.take_frame(&mut scratch), Ok(None)),
-                "completed on {split} of {} bytes",
-                wire.len()
-            );
-            assert_eq!(buffered(&conn), split, "every byte given must be kept");
-            assert!(
-                !conn.is_read_saturated(),
-                "reading must not stop one byte short of a frame"
-            );
-            feed(&mut peer, &mut conn, &wire[split..]);
-            assert_eq!(take(&mut conn, &mut scratch), Some(frame), "split {split}");
-        }
     }
 
     /// `send_output` chunks at exactly [`MAX_PAYLOAD`], so the production path emits

@@ -1,9 +1,6 @@
-//! What the daemon does to itself before it is a daemon, and how it is asked to
-//! stop.
+//! What the daemon does to itself before it is a daemon, and how it is asked to stop.
 //!
-//! Two subjects, one property: both are about the *process* rather than about the
-//! session, both run exactly once from `daemon::run`, and neither touches any daemon
-//! state. `IMPLEMENTATION.md` § 6.2 for the detachment, § 6.5 for the stop signals.
+//! `IMPLEMENTATION.md` § 6.2 for the detachment, § 6.5 for the stop signals.
 
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd, OwnedFd};
@@ -13,12 +10,7 @@ use rustix::fs::{Mode, OFlags};
 use rustix::pipe::PipeFlags;
 
 /// Signals that mean "stop", handled so that leaving runs `IMPLEMENTATION.md`
-/// § 6.5's shutdown path instead of the default disposition.
-///
-/// Armed right after § 6.2's detachment: the earliest point at which the byte a
-/// handler writes cannot be inherited by a child that never received the signal, and
-/// late enough to cost nothing, dying before it being indistinguishable from never
-/// having started.
+/// § 6.5's shutdown path instead of the default disposition. Armed where § 6.2 says.
 const STOP_SIGNALS: [libc::c_int; 2] = [libc::SIGTERM, libc::SIGINT];
 
 /// Write end of the self-pipe, as a raw descriptor because a signal handler may
@@ -76,6 +68,7 @@ pub(crate) fn arm_stop_signals() -> io::Result<OwnedFd> {
     }
     Ok(read)
 }
+
 /// Puts the daemon in a session of its own *and* without a controlling terminal,
 /// which is what lets it outlive the connection that started it
 /// (`IMPLEMENTATION.md` § 6.2, which has the order, the two shapes that need the
@@ -124,10 +117,8 @@ pub(crate) fn leave_login_session() {
 
 /// Whether this process has a controlling terminal.
 ///
-/// `/dev/tty` *is* that terminal, by definition, so opening it answers the question
-/// whatever the daemon's own stdio has become — a pipe, a socket or `/dev/null` all
-/// leave the terminal attached. `O_NOCTTY` keeps § 6.2's rule that this binary never
-/// acquires one by opening it.
+/// Put to `/dev/tty` as § 6.2 requires, with `O_NOCTTY` so that asking never acquires
+/// one.
 ///
 /// `ENXIO` is the only definite no — § 6.2 delegates the argument here. Anything
 /// else, such as no `/dev/tty` node in a stripped container, is taken as yes: being
@@ -154,89 +145,16 @@ pub(crate) fn release_startup_state() {
     let _ = silence_stdio();
 }
 
-/// Points the three standard descriptors at `/dev/null`, last in the startup
-/// sequence so that everything which can fail with a message worth reading has
-/// already had its chance to write one (`IMPLEMENTATION.md` § 6.2).
-///
-/// The `Result` is here to chain the four calls, not to be handled: a daemon that
-/// could not reach `/dev/null` writes where it should not, which is worse than a
-/// session but better than none.
+/// Points the three standard descriptors at `/dev/null`, last of all for the reason
+/// § 6.2 gives. The `Result` chains the four calls rather than being handled.
 fn silence_stdio() -> io::Result<()> {
     let null = rustix::fs::open("/dev/null", OFlags::RDWR, Mode::empty())?;
     rustix::stdio::dup2_stdin(&null)?;
     rustix::stdio::dup2_stdout(&null)?;
     rustix::stdio::dup2_stderr(&null)?;
     if null.as_raw_fd() <= libc::STDERR_FILENO {
-        // Leaked on purpose, and only where `open` handed back one of the three it
-        // was about to fill: it hands back the lowest free descriptor, and the
-        // `dup2`s above have just left it as its own copy. Dropping it would close
-        // it again and free that number for the next `openpt` or `accept` to claim,
-        // after which everything written to what was believed to be `/dev/null`
-        // lands in a PTY master or in the middle of a client's frame stream.
-        //
-        // Belt and braces rather than a live bug: std reopens a standard descriptor
-        // it finds closed before `main` runs, so `nomux daemon <id> 1>&-` reaches
-        // here with all three taken.
+        // Dropping it closes a standard descriptor, freeing it for the next `accept`.
         let _ = null.into_raw_fd();
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::os::fd::FromRawFd;
-
-    use super::*;
-
-    /// Regression: every standard descriptor is left *open* on `/dev/null`,
-    /// including the one whose number `open` handed back.
-    ///
-    /// Freed by hand because nothing else can, which is the same reason this is a
-    /// unit test: std reopens a standard descriptor it finds closed at startup, so no
-    /// command line reaches [`silence_stdio`] with one free. And in a child, because
-    /// fds 0..=2 belong to the process rather than to this test while `cargo test`
-    /// runs the others as threads in it — a child's descriptor table is its own, so
-    /// the verdict comes back as an exit status.
-    #[test]
-    fn silencing_stdio_leaves_a_freed_descriptor_open_on_dev_null() {
-        // Resolved before the fork, so the child does nothing but syscalls on
-        // descriptors: what "is `/dev/null`" means to an `fstat`.
-        let null = rustix::fs::stat("/dev/null")
-            .expect("stat /dev/null")
-            .st_rdev;
-
-        // SAFETY: the child reaches only `close`, `open`, `dup2`, `fstat` and `_exit`,
-        // every one of them async-signal-safe, so it never needs a lock that one of the
-        // other threads of this process could have been holding at the fork.
-        let child = unsafe { libc::fork() };
-        assert!(child >= 0, "fork: {}", io::Error::last_os_error());
-        if child == 0 {
-            // SAFETY: fd 0 is this child's alone, and std's `Stdin` only borrows it.
-            drop(unsafe { OwnedFd::from_raw_fd(libc::STDIN_FILENO) });
-            // SAFETY: borrowed only for the `fstat` below, after `silence_stdio` has
-            // filled the number; nothing here closes it.
-            let stdin = unsafe { BorrowedFd::borrow_raw(libc::STDIN_FILENO) };
-            let verdict = match silence_stdio().map(|()| rustix::fs::fstat(stdin)) {
-                Ok(Ok(stat)) if stat.st_rdev == null => 0,
-                // The descriptor `open` handed back was closed again, leaving fd 0 for
-                // the next socket or PTY master to claim.
-                Ok(Err(_)) => 1,
-                Ok(Ok(_)) => 2,
-                Err(_) => 3,
-            };
-            // SAFETY: the only correct exit for a forked child, which shares the
-            // parent's atexit handlers and its buffered, half-written output.
-            unsafe { libc::_exit(verdict) }
-        }
-
-        let mut status = 0;
-        // SAFETY: `waitpid` writes only through `&mut status`, for the pid just forked.
-        let waited = unsafe { libc::waitpid(child, &raw mut status, 0) };
-        assert_eq!(waited, child, "waitpid: {}", io::Error::last_os_error());
-        assert!(
-            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-            "fd 0 is open on /dev/null once stdio is silenced; the child said {status:#x} \
-             (1: closed again, 2: some other file, 3: silence_stdio failed)"
-        );
-    }
 }

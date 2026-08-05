@@ -1,19 +1,34 @@
-//! The two transfers the PTY master, the agent channels and the relay are moved by.
+//! The transfers the PTY master, the agent channels and the relay are moved by.
 //!
-//! Every descriptor here is non-blocking, a single-threaded `poll` loop not being
-//! able to afford to be parked inside a `read` or a `write`, so `EINTR` and `EAGAIN`
-//! are part of the ordinary flow rather than failures.
+//! Every descriptor here is non-blocking bar one — the relay's stdout, which may be a
+//! terminal it cannot take out of blocking mode (`attach.rs`) — a single-threaded
+//! `poll` loop not being able to afford to be parked inside a `read` or a `write`, so
+//! `EINTR` and `EAGAIN` are part of the ordinary flow rather than failures.
 //!
-//! What an outcome *means* is not here: a closed peer ends the session for the PTY,
-//! one channel for the agent and one direction for the relay, and `EPIPE` divides
-//! them the same way. So both come back as they arrived, rather than folded into a
-//! decision two of the three callers would get wrong.
+//! What an outcome *means* is mostly not here: a closed peer ends the session for the
+//! PTY, one channel for the agent and one direction for the relay, so [`drain_to`]
+//! hands `EPIPE` back as it arrived rather than folded into a decision two of the three
+//! callers would get wrong. [`read_or_eof`] is the one fold they do agree on.
 
 use std::collections::VecDeque;
 use std::io::IoSlice;
 use std::os::fd::BorrowedFd;
 
 use rustix::io::Errno;
+
+/// Outcome of one [`read_or_eof`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Read {
+    /// Bytes are available in the buffer.
+    Data(usize),
+    /// The peer is gone, or the descriptor failed. One ending: the payload is opaque,
+    /// so there is nothing worth telling apart.
+    Eof,
+    /// Nothing buffered right now, which is the whole reason this is an enum: on a
+    /// non-blocking descriptor this and [`Read::Eof`] both arrive as an error return,
+    /// and confusing the two would end the session on every spurious wakeup.
+    WouldBlock,
+}
 
 /// Reads into `buf`, retrying a call a signal interrupted: `EINTR` says a signal
 /// arrived and nothing about the descriptor, so it is never news to a caller.
@@ -26,41 +41,58 @@ pub(crate) fn read(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<usize, Errno> {
     }
 }
 
+/// Reads from a descriptor whose only endings are bytes and gone: the PTY master and
+/// an agent channel's socket.
+///
+/// Linux fails master reads with `EIO`, rather than returning 0, once the last process
+/// holding the slave exits — so the kernel's own EOF is folded in here too. Nothing is
+/// propagated, which is why there is no `Result`: `IMPLEMENTATION.md` § 6.4.1 keeps a
+/// stray errno from destroying the session, and an errno this does not know is a
+/// descriptor nothing can be read from. Both callers answer [`Read::Eof`] by dropping
+/// the descriptor out of the poll set, so nothing spins on one either.
+pub(crate) fn read_or_eof(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Read {
+    match read(fd, buf) {
+        Ok(n) if n > 0 => Read::Data(n),
+        Err(Errno::AGAIN) => Read::WouldBlock,
+        Ok(_) | Err(_) => Read::Eof,
+    }
+}
+
 /// Writes as much of `queue` as `fd` will take, removing what it accepted.
 ///
 /// Returning with a non-empty queue is the normal ending rather than a failure: ask
 /// `poll` for `POLLOUT` and come back. Errors are the caller's to interpret.
 ///
-/// One write, not a loop until `EAGAIN`: a short write already means the descriptor
-/// is full, and on the one *blocking* descriptor this is pointed at — the relay's
-/// stdout, which may be a terminal it cannot set non-blocking (`attach.rs`) —
-/// `POLLOUT` promises only that *some* write will succeed, so a second one parks the
-/// whole relay inside the kernel with the other direction unserved.
+/// One write, not a loop until `EAGAIN`. On the blocking stdout above `POLLOUT`
+/// promises only that *some* write will succeed, so even the first one can park for up
+/// to a whole 16 KiB chunk where a byte of room was reported, and a second would park
+/// on no promise at all — the relay's other direction unserved throughout.
 ///
-/// One `writev` over both halves in order rather than a write apiece, which is
-/// load-bearing rather than an optimisation: a wrapped `VecDeque` served back-first
-/// delivers transposed keystrokes rather than an error anybody could see, and an
-/// empty front handed to `write` alone comes back `Ok(0)` — the break below — after
-/// which the queue never drains again.
+/// One `writev` over both halves rather than a write apiece, load-bearing rather than
+/// an optimisation: a wrapped `VecDeque` served back-first delivers transposed
+/// keystrokes rather than an error anybody could see, and an empty front handed to
+/// `write` alone comes back `Ok(0)`, after which the queue never drains again.
 pub(crate) fn drain_to(queue: &mut VecDeque<u8>, fd: BorrowedFd<'_>) -> Result<(), Errno> {
-    while !queue.is_empty() {
+    if queue.is_empty() {
+        return Ok(());
+    }
+    loop {
         let written = {
             let (front, back) = queue.as_slices();
             rustix::io::writev(fd, &[IoSlice::new(front), IoSlice::new(back)])
         };
-        match written {
-            Ok(0) | Err(Errno::AGAIN) => break,
+        return match written {
+            Ok(0) | Err(Errno::AGAIN) => Ok(()),
             // Clamped like every returned count in this tree: `drain` past the end
             // panics, and this binary is built `panic = "abort"`.
             Ok(n) => {
                 drop(queue.drain(..n.min(queue.len())));
-                break;
+                Ok(())
             }
-            Err(Errno::INTR) => {}
-            Err(err) => return Err(err),
-        }
+            Err(Errno::INTR) => continue,
+            Err(err) => Err(err),
+        };
     }
-    Ok(())
 }
 
 #[cfg(test)]

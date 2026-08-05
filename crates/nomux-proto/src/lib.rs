@@ -21,7 +21,7 @@ pub use frame::{
 /// section by `the_frozen_numbers_are_the_ones_the_document_gives` and against the
 /// handshake vectors' literal by `the_vectors_pin_every_value_of_every_closed_set`,
 /// so a bump has to move the constant, the vectors and the document.
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 
 /// Fixed frame header size, so reads are a two-stage `read_exact`.
 pub const HEADER_LEN: usize = 4;
@@ -102,7 +102,7 @@ wire_enum! {
     Detach = 0x0a,
     /// Liveness probe.
     Ping = 0x0b,
-    /// Liveness response, echoing the nonce.
+    /// Liveness response.
     Pong = 0x0c,
     /// Daemon-side failure; the connection closes after this.
     Error = 0x0d,

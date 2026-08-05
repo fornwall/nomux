@@ -11,6 +11,8 @@ use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
+use crate::nbio::Read;
+
 /// Most concurrent agent channels one session will serve
 /// (`IMPLEMENTATION.md` § 6.7).
 ///
@@ -45,27 +47,14 @@ pub(crate) enum Accept {
 pub(crate) enum Flush {
     /// Still in use, whether or not anything is left queued.
     Open,
-    /// The client closed this channel and the last of what it sent has now
-    /// reached the waiting process. Forget it *without* telling the client, which
-    /// closed it and is not waiting to hear so.
+    /// Nothing more will be written: the client closed this channel and the last of
+    /// what it sent has reached the waiting process, or there is no such channel
+    /// because it closed while a frame for it was in flight. Forget it *without*
+    /// telling the client, which closed it and is not waiting to hear so.
     Finished,
     /// The write failed on a channel the client still holds; the local peer is gone
     /// and the client needs telling.
     Failed,
-    /// No such channel — it closed while a frame for it was in flight.
-    Gone,
-}
-
-/// Outcome of one read from a channel's socket.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Read {
-    /// Bytes are available in the buffer.
-    Data(usize),
-    /// The peer is done, or the connection failed. Either way the channel closes:
-    /// there is no error path worth distinguishing when the payload is opaque.
-    Closed,
-    /// Nothing buffered right now.
-    WouldBlock,
 }
 
 /// One proxied connection to the agent socket.
@@ -236,7 +225,7 @@ impl Agent {
     /// Reads from one channel's socket.
     pub(crate) fn read(&mut self, id: u32, buf: &mut [u8]) -> Read {
         let Some(chan) = self.channel(id) else {
-            return Read::Closed;
+            return Read::Eof;
         };
         // A channel the client has closed has had its read half shut down by
         // `close_from_client`, so it answers every read with the end of file we
@@ -246,14 +235,7 @@ impl Agent {
         if chan.closing {
             return Read::WouldBlock;
         }
-        match crate::nbio::read(chan.stream.as_fd(), buf) {
-            Ok(0) => Read::Closed,
-            Ok(n) => Read::Data(n),
-            Err(rustix::io::Errno::AGAIN) => Read::WouldBlock,
-            // Anything else is this one socket's problem, never the session's:
-            // the process on the other end is a `ssh-add` that went away.
-            Err(_) => Read::Closed,
-        }
+        crate::nbio::read_or_eof(chan.stream.as_fd(), buf)
     }
 
     /// Queues bytes from the client for one channel's socket.
@@ -281,7 +263,7 @@ impl Agent {
     /// Writes what it can of one channel's queue.
     pub(crate) fn flush(&mut self, id: u32) -> Flush {
         let Some(chan) = self.channel(id) else {
-            return Flush::Gone;
+            return Flush::Finished;
         };
         let failed = crate::nbio::drain_to(&mut chan.pending, chan.stream.as_fd()).is_err();
         if chan.closing {

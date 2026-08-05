@@ -16,7 +16,6 @@
 mod harness;
 
 use std::fs;
-use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -26,9 +25,9 @@ use std::time::{Duration, Instant};
 use nomux_proto::{Frame, FrameType, RESUME_FROM_START};
 
 use harness::{
-    Client, FRAME_PATIENCE, Reaper, Rng, SPIN_WINDOW, Session, Spawned, StatField, control,
-    cpu_ticks, leads_a_process_group, nomux_with_shell, poll_until, process_alive, process_state,
-    run_root, stat_field, still_serving, succeeded, wait_for,
+    Client, Cue, FRAME_PATIENCE, MAX_SESSIONS, Reaper, Rng, SETTLE, SPIN_WINDOW, Session, Spawned,
+    StatField, control, cpu_ticks, leads_a_process_group, nomux_with_shell, poll_until,
+    process_alive, process_state, run_root, stat_field, still_serving, succeeded, wait_for,
 };
 
 /// The child's last words come before its status.
@@ -42,11 +41,10 @@ use harness::{
 /// one client that has no way to ask again. That client closes the tab on `Exit` and
 /// loses the entire transcript, including whatever the shell said on its way out.
 ///
-/// The reattach here is prompt rather than delayed, deliberately: this is about the
-/// ordering, and how *long* the session holds what it is owed is
+/// The reattach is prompt rather than delayed: how *long* the session holds what it
+/// is owed is
 /// [`a_session_whose_child_has_exited_keeps_its_files_and_its_status_with_nobody_attached`]'s
-/// business, which pays six seconds of wall clock for it. Paying them twice would buy
-/// the same sentence.
+/// business, and it pays six seconds of wall clock for it.
 #[test]
 fn the_exit_status_arrives_after_the_final_output() {
     let (session, mut client, _) = Session::attached("exit_order");
@@ -63,7 +61,7 @@ fn the_exit_status_arrives_after_the_final_output() {
     // satisfied by a live stream rather than by the replay this is about — which is
     // all a fixed sleep here could hope for, and silently miss on a loaded machine.
     assert!(
-        poll_until(Duration::from_secs(10), || !process_alive(shell)),
+        poll_until(SETTLE, || !process_alive(shell)),
         "the child never exited, so what the reattach below reads is a live stream \
          rather than the replay this is about"
     );
@@ -93,41 +91,27 @@ fn the_exit_status_arrives_after_the_final_output() {
 /// The whole of the `128+n` convention rests on telling those two apart, and it is
 /// the client that applies it: a shell killed by `SIGKILL` has to reach the user as
 /// 137 rather than as a program that chose to exit 9, and the only thing carrying
-/// that distinction across the wire is this one byte. `pty::exit_parts` produces it
-/// from `ExitStatus::code()` returning `None`, which nothing end to end had ever
-/// made happen — every other exit in the suite is an ordinary one, so the
-/// `Signalled` arm was reachable only from the codec tests, where it is a value in a
-/// round trip rather than a fate the daemon observed.
+/// that distinction across the wire is this one byte.
 ///
-/// A test of its own rather than a second case on
-/// [`the_exit_status_arrives_after_the_final_output`], which is about *ordering* and
-/// buys that with a shape this does not want: it waits for the child to be gone and
-/// then reattaches, so what it asserts is the replay. A second case there would
-/// assert that a second time and the live path not at all; this one stays attached,
-/// so what it pins is the frame the daemon builds on the pass that collects the
-/// status.
-///
-/// Which is what makes it the place to pin `since_exit_secs` at zero. The field is
-/// how a client tells a shell that has just finished from one that finished while
-/// the laptop was shut (§ 6.5), and only a client that watched the exit happen can
-/// say what the answer must be — everywhere else it is a duration nothing bounds. A
-/// daemon that stamped the frame when it *built* it rather than measuring from the
-/// end of file would pass every reattach test in this file and still tell every live
-/// client that its shell had exited some time ago.
+/// This client stays attached, unlike
+/// [`the_exit_status_arrives_after_the_final_output`], so what it pins is the frame
+/// the daemon builds on the pass that collects the status — which is what makes it
+/// the place to pin `since_exit_secs` at zero. That field is how a client tells a
+/// shell that has just finished from one that finished while the laptop was shut
+/// (§ 6.5), and only a client that watched the exit happen can say what the answer
+/// must be. A daemon that stamped the frame when it *built* it rather than measuring
+/// from the end of file would pass every reattach test in this file and still tell
+/// every live client that its shell had exited some time ago.
 ///
 /// `kill -9 $$` rather than a signal from outside, because `$$` is the shell the
 /// daemon is watching and `kill` is a builtin of it: no second process to find, and
-/// nothing to race. There is no final output to wait through, so the loop tolerates
-/// whatever the echo of the command line produces and stops at the fate.
+/// nothing to race.
 #[test]
 fn a_child_killed_by_a_signal_is_reported_as_signalled_rather_than_as_a_status() {
     let (_session, mut client, _) = Session::attached("exit_signalled");
 
     client.input(0, b"kill -9 $$\n");
 
-    // One deadline for the whole loop rather than a fresh one per frame, which is no
-    // bound at all: the echo of the command line arrives as several frames, and each
-    // of them would renew the patience for the fate this is waiting on.
     let deadline = Instant::now() + FRAME_PATIENCE;
     let awaiting = "the fate of a child that killed itself with SIGKILL";
     let (status, kind, since_exit_secs) = loop {
@@ -140,7 +124,7 @@ fn a_child_killed_by_a_signal_is_reported_as_signalled_rather_than_as_a_status()
                 kind,
                 since_exit_secs,
             } => break (status, kind, since_exit_secs),
-            Frame::Output { .. } | Frame::InputAck { .. } | Frame::Pong { .. } => {}
+            Frame::Output { .. } | Frame::InputAck { .. } | Frame::Pong => {}
             other => panic!("unexpected {other:?} while waiting for the exit"),
         }
     };
@@ -172,30 +156,24 @@ fn a_child_killed_by_a_signal_is_reported_as_signalled_rather_than_as_a_status()
 /// outstanding, so the pass that finally collected one no longer qualified for the
 /// clamp, and by then the master had already left the poll set with the child.
 ///
-/// What that costs is worse now than when it was found. There used to be a
-/// five-second post-exit window whose expiry was itself a wakeup, so the frame
-/// arrived three seconds late and the user saw a terminal that hung and then
-/// recovered. A session now outlives its child on the idle rule alone (§ 6.5), and
-/// nothing between here and that deadline wakes the daemon at all: with the master
-/// out of the poll set, `SIGCHLD` at its default disposition and no client traffic,
-/// the next wakeup is `IDLE_TICK` — an hour away. The user is left holding a session
-/// whose shell has finished, with no status, no closed connection and no reason
-/// given, until they type something at it.
+/// A session outlives its child on the idle rule alone (§ 6.5), and nothing between
+/// the exit and that deadline wakes the daemon: with the master out of the poll set,
+/// `SIGCHLD` at its default disposition and no client traffic, the next wakeup is
+/// `IDLE_TICK` — an hour away. The user is left holding a session whose shell has
+/// finished, with no status and no reason given, until they type something at it.
 ///
 /// Driven down the `STATUS_GRACE` path rather than through an ordinary `exit`, which
-/// reaches the same bug only when `waitpid` is not ready at PTY end of file — about
-/// one exit in three, which is a coin toss rather than a test. A child that closes
-/// the terminal *without* exiting reaches it every time: the master reports end of
-/// file at once, and `waitpid` has nothing to give up because the process is still
-/// there. So the status can only ever come from the two-second synthesis in
-/// `collect_status`, and when the frame carrying it arrives is the whole measurement.
+/// reaches the same bug only when `waitpid` is not ready at PTY end of file — a coin
+/// toss rather than a test. A child that closes the terminal *without* exiting reaches
+/// it every time: the master reports end of file at once, and `waitpid` has nothing to
+/// give up because the process is still there, so the status can only come from the
+/// two-second synthesis in `collect_status`.
 ///
-/// `exec <command>` rather than bare redirections, because redirecting 0, 1 and 2
-/// away from the slave does not take the last descriptor onto it: an interactive
-/// shell keeps one more for job control — `/dev/tty` on fd 10, under the `dash` this
-/// suite pins as `SHELL` — and the master goes on waiting. Replacing the process is
-/// what closes that one, since it is close-on-exec, and it leaves `sleep` holding
-/// nothing but `/dev/null`.
+/// `exec <command>` rather than bare redirections, because redirecting 0, 1 and 2 away
+/// from the slave does not take the last descriptor onto it: an interactive shell
+/// keeps one more for job control — `/dev/tty` on fd 10, under the `dash` this suite
+/// pins as `SHELL` — and the master goes on waiting. Replacing the process closes that
+/// one, since it is close-on-exec.
 #[test]
 fn a_synthesised_exit_status_is_sent_on_the_pass_that_collects_it() {
     /// Comfortably above the two-second `STATUS_GRACE`, and nowhere near the hour the
@@ -217,11 +195,8 @@ fn a_synthesised_exit_status_is_sent_on_the_pass_that_collects_it() {
     );
     let began = Instant::now();
 
-    // One deadline for the whole wait rather than a fresh one per frame, as everywhere
-    // else that loops on frames: the shell's own output arrives ahead of the `exec`
-    // and each frame of it would renew the patience for the `Exit` behind them. Far
-    // above `BOUND`, so what decides this test is still the measurement below — this
-    // only replaces a hang with a sentence.
+    // Far above `BOUND`, so what decides this test is still the measurement below —
+    // this only replaces a hang with a sentence.
     let deadline = Instant::now() + FRAME_PATIENCE;
     let awaiting = "the status of a child that closed the terminal without exiting";
     let (elapsed, status, kind) = loop {
@@ -234,7 +209,7 @@ fn a_synthesised_exit_status_is_sent_on_the_pass_that_collects_it() {
                 kind,
                 since_exit_secs: _,
             } => break (began.elapsed(), status, kind),
-            Frame::Output { .. } | Frame::InputAck { .. } | Frame::Pong { .. } => {}
+            Frame::Output { .. } | Frame::InputAck { .. } | Frame::Pong => {}
             other => panic!("unexpected {other:?} while waiting for the exit"),
         }
     };
@@ -282,11 +257,11 @@ fn a_shell_that_exits_behind_a_background_job_is_still_reaped() {
     // reports end of file and the daemon is never told the child has gone.
     client.input(ready.in_offset, b"sleep 300 & exit\n");
     assert!(
-        poll_until(Duration::from_secs(10), || !process_alive(shell)),
+        poll_until(SETTLE, || !process_alive(shell)),
         "the shell never exited"
     );
 
-    client.send(&Frame::Ping { nonce: 0x2031 });
+    client.send(&Frame::Ping);
     drop(client.next_of(FrameType::Pong));
 
     assert_ne!(
@@ -304,7 +279,7 @@ fn a_shell_that_exits_behind_a_background_job_is_still_reaped() {
     rustix::process::kill_process(daemon, rustix::process::Signal::TERM)
         .expect("signal the daemon");
     assert!(
-        poll_until(Duration::from_secs(10), || !process_alive(raw)),
+        poll_until(SETTLE, || !process_alive(raw)),
         "the signalled daemon never exited, so the job it was collecting is still \
          running"
     );
@@ -374,7 +349,7 @@ fn shell_of(session: &Session) -> u32 {
     let daemon = session.child.id();
     let mut shell = None;
     assert!(
-        poll_until(Duration::from_secs(10), || {
+        poll_until(SETTLE, || {
             shell = child_of(daemon);
             shell.is_some()
         }),
@@ -414,55 +389,34 @@ fn child_of(parent: u32) -> Option<u32> {
 /// dropped with no `Gap` to say so, which is the one thing § 9 forbids outright. The
 /// exit belongs to `read_pty`, which reaches `Read::Eof` only once the master is dry.
 ///
-/// That `EIO` cannot be provoked on Linux, and this test does not pretend otherwise:
-/// writing to a master whose slave has closed *succeeds* here — measured directly,
-/// and measured again for a slave that was a session leader's controlling terminal,
-/// which is the shape this daemon makes. A master reports the departure on its read
-/// side only, as the `EIO` `pty::read_pty` turns into end of file, and its write side
-/// answers a slave that is gone exactly as it answers one that is merely full, with
-/// `EAGAIN`. So the arm that was changed is unreachable from outside the process, and
-/// no end-to-end test can fail on it; showing it fails needs the fault injection § 9
-/// already keeps for the takeover ordering, which is a change to the daemon rather
-/// than to this file.
+/// The `EIO` itself cannot be provoked on Linux: writing to a master whose slave has
+/// closed succeeds, and a master reports the departure on its read side only. So what
+/// is pinned is the invariant rather than the line — the state in which an early exit
+/// would cost output, composed exactly and asserted byte for byte.
 ///
-/// What is left is worth having on its own account, because it is the invariant the
-/// removed line broke rather than the line: the state where an early exit would cost
-/// output, composed exactly rather than hoped for, and asserted byte for byte. It
-/// fails on a daemon that stamps the exit while the master still holds anything —
-/// confirmed by doing so at the very moment the old code would have, which lost 4 KiB
-/// of the 10 below.
+/// Composing it needs three things at once. The master has to be holding output nobody
+/// has read, and a daemon keeps up with a child effortlessly. `pending_input` has to be
+/// non-empty, since the daemon asks for `POLLOUT` only while something is queued. And
+/// the master has to still be *writable*, which rules out the queue
+/// [`reconnecting_does_not_raise_the_input_ceiling`] builds: input that reached the cap
+/// got there by filling the terminal, and a full terminal never reports `POLLOUT`
+/// again.
 ///
-/// Composing that state is what the rest of this is. The master has to be holding
-/// output nobody has read, and a daemon keeps up with a child effortlessly: writing
-/// megabytes at it builds no backlog at all, since the terminal ends up empty at the
-/// exit and `read_pty` reaches end of file with nothing outstanding. `pending_input`
-/// has to be non-empty, since the daemon asks for `POLLOUT` only while something is
-/// queued. And the master has to still be *writable*, which rules out the queue
-/// `reconnecting_does_not_raise_the_input_ceiling` builds:
-/// input that reached the cap got there by filling the terminal, and a full terminal
-/// never reports `POLLOUT` again.
-///
-/// So the daemon is stopped while all three are arranged around it. That is not a
-/// stand-in for a wait — it is the only way to hold a single-threaded event loop still
-/// long enough to compose a state it would otherwise pass through in microseconds, and
-/// every step is then a condition rather than a hope: the child has burst and exited
-/// (`/proc` says so), the whole burst is in the terminal's buffer (it fits, so the
-/// child never blocked on a daemon that was not running), and the keystroke is in the
-/// socket waiting to be read.
+/// So the daemon is stopped while all three are arranged around it — the only way to
+/// hold a single-threaded event loop still long enough to compose a state it would
+/// otherwise pass through in microseconds. Every step is then a condition: the child
+/// has burst and exited (`/proc` says so), the whole burst is in the terminal's buffer
+/// (it fits, so the child never blocked on a daemon that was not running), and the
+/// keystroke is in the socket waiting to be read.
 #[test]
 fn a_child_that_exits_with_input_still_queued_delivers_its_last_output_in_full() {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    use rustix::fs::Mode;
-
-    /// Bounded on both sides by the line discipline rather than by this daemon, and
-    /// sitting between the two: a read of the master is handed 4095 bytes however
-    /// large a buffer it offers, and a single write into an empty terminal is taken up
-    /// to 11776 before the writer has to wait for a reader. So the burst is more than
-    /// the couple of reads a daemon gets in before it could notice the exit — without
-    /// which there would be nothing left to lose — and less than what the child can
-    /// hand over in one go without ever waiting on a daemon that is not running, which
-    /// it would otherwise do for ever, never reaching the exit this is about.
+    /// Bounded on both sides by the line discipline: a read of the master is handed
+    /// 4095 bytes however large a buffer it offers, and a single write into an empty
+    /// terminal is taken up to 11776 before the writer has to wait for a reader. So
+    /// the burst is more than the couple of reads a daemon gets in before it could
+    /// notice the exit — without which there would be nothing left to lose — and less
+    /// than what the child can hand over in one go without waiting on a daemon that is
+    /// not running, which it would otherwise do for ever.
     const BURST: usize = 10 * 1024;
     /// Room for the burst several times over. A `Gap` here would be the ring being
     /// tight rather than the master leaving the poll set, and the assertions below
@@ -476,17 +430,13 @@ fn a_child_that_exits_with_input_still_queued_delivers_its_last_output_in_full()
     // out of order fails on the byte rather than on the total.
     let burst = Rng::new(0x1a57_0207).bytes(BURST);
     fs::write(session.root.join("burst"), &burst).expect("write what the child will emit");
-    let cue = session.root.join("cue");
-    rustix::fs::mkfifoat(rustix::fs::CWD, &cue, Mode::RUSR | Mode::WUSR)
-        .expect("create the FIFO the child waits on");
+    let cue = Cue::new(&session.root);
 
     let mut client = session.connect();
     let ok = client.hello(RESUME_FROM_START);
     // `-echo` so the keystroke below is not echoed into the stream being compared, and
     // `raw` so the line discipline neither mangles it nor throws it away — which is
-    // what makes it reach `pending_input` rather than the floor. Past the marker the
-    // child never reads its terminal again: the whole line is parsed before any of it
-    // runs, the cue comes from the FIFO, and `cat` has a file.
+    // what makes it reach `pending_input` rather than the floor.
     let ready = client.make_ready(
         "raw -echo",
         Some("read cue < cue; cat burst; exit 9"),
@@ -498,37 +448,18 @@ fn a_child_that_exits_with_input_still_queued_delivers_its_last_output_in_full()
         .expect("the daemon's own pid");
     rustix::process::kill_process(daemon, rustix::process::Signal::STOP).expect("stop the daemon");
     assert!(
-        poll_until(Duration::from_secs(10), || process_state(
-            session.child.id()
-        ) == Some('T')),
+        poll_until(SETTLE, || process_state(session.child.id()) == Some('T')),
         "the daemon never stopped, so what follows is a race rather than a setup"
     );
 
-    // Opened without blocking, so a child that never reached its own `open` fails this
-    // rather than parking it: a FIFO answers `ENXIO` until a reader is there, and the
-    // child counts as one from the moment it enters the wait.
-    let mut go = None;
-    assert!(
-        poll_until(Duration::from_secs(10), || {
-            go = fs::OpenOptions::new()
-                .write(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(&cue)
-                .ok();
-            go.is_some()
-        }),
-        "the child never reached the cue it waits on"
-    );
-    go.expect("the FIFO the wait above opened")
-        .write_all(b"go\n")
-        .expect("cue the child");
+    cue.release();
 
     // The whole burst is in the terminal's buffer by the time this comes back, and
     // nothing but the master's read side can ever produce it again. A child that has
     // exited but not been collected is a zombie, which is one of the two states this
     // reads as gone — the daemon that would reap it is stopped.
     assert!(
-        poll_until(Duration::from_secs(10), || !process_alive(shell)),
+        poll_until(SETTLE, || !process_alive(shell)),
         "the child never finished its burst and left"
     );
 
@@ -541,9 +472,6 @@ fn a_child_that_exits_with_input_still_queued_delivers_its_last_output_in_full()
 
     let mut seen: Vec<u8> = Vec::new();
     let mut offset = ready.offset;
-    // The burst arrives as dozens of frames, so patience per frame would bound none
-    // of it; one deadline for the collection is what makes a daemon that stops
-    // halfway through fail here rather than run until nextest's kill.
     let deadline = Instant::now() + FRAME_PATIENCE;
     let awaiting = "the child's last output and the exit behind it";
     let ended = loop {
@@ -571,7 +499,7 @@ fn a_child_that_exits_with_input_still_queued_delivers_its_last_output_in_full()
                 kind,
                 since_exit_secs: _,
             } => break (status, kind),
-            Frame::InputAck { .. } | Frame::Pong { .. } => {}
+            Frame::InputAck { .. } | Frame::Pong => {}
             other => panic!("unexpected {other:?} while collecting the child's last output"),
         }
     };
@@ -641,12 +569,12 @@ fn a_daemon_that_leads_a_process_group_detaches_by_forking() {
     // Bounded rather than a bare `wait`: if the fork never happened then the process
     // started here *is* the daemon, and waiting on it would hang the suite instead of
     // failing an assertion.
-    let starter_exited = poll_until(Duration::from_secs(10), || !starter.is_running());
+    let starter_exited = poll_until(SETTLE, || !starter.is_running());
 
     // `recorded` outlives the wait because the assertions below are about the pid the
     // last look found, whether or not it ever satisfied the condition.
     let mut recorded = None;
-    poll_until(Duration::from_secs(10), || {
+    poll_until(SETTLE, || {
         recorded = fs::read_to_string(&pid_file)
             .ok()
             .and_then(|text| text.trim().parse::<u32>().ok());
@@ -687,11 +615,6 @@ fn a_daemon_that_leads_a_process_group_detaches_by_forking() {
     assert_detached(&detachment, recorded, "the forked child");
 }
 
-/// `daemon::MAX_SESSIONS`, which is private to the daemon. The refusal names it, so a
-/// value that drifted apart from this fails on the message rather than silently testing
-/// nothing.
-const CEILING: usize = 64;
-
 /// Turns two different ids away at the ceiling through `mode`, and asserts that neither
 /// refusal left anything in the run directory.
 ///
@@ -700,14 +623,14 @@ const CEILING: usize = 64;
 ///
 /// Asserted twice over, because either half alone is satisfiable by the bug. That no
 /// `<id>.*` is left is the property; that the *count* has not moved is what it was for,
-/// and it is the one a reader can check against `MAX_SESSIONS` — so the second refusal
-/// has to name a different id from the first, or a lock left behind by the first would
-/// be excluded from the second's count as its own.
+/// and it is the one a reader can check against [`MAX_SESSIONS`] — so the second
+/// refusal has to name a different id from the first, or a lock left behind by the
+/// first would be excluded from the second's count as its own.
 fn refusals_at_the_session_ceiling_leave_nothing_behind(name: &str, mode: &str, refusal: i32) {
     let root = run_root(name);
     let dir = root.join("nomux");
     fs::create_dir_all(&dir).expect("create the run directory");
-    for n in 0..CEILING {
+    for n in 0..MAX_SESSIONS {
         fs::write(dir.join(format!("full{n}.sock")), b"").expect("plant a session");
     }
 
@@ -722,11 +645,11 @@ fn refusals_at_the_session_ceiling_leave_nothing_behind(name: &str, mode: &str, 
         assert_eq!(
             refused.status.code(),
             Some(refusal),
-            "a run directory holding {CEILING} sessions took another one through \
+            "a run directory holding {MAX_SESSIONS} sessions took another one through \
              `{mode}`: {complaint:?}"
         );
         assert!(
-            complaint.contains(&CEILING.to_string()),
+            complaint.contains(&MAX_SESSIONS.to_string()),
             "the refusal must name the ceiling it is enforcing, or this test is \
              measuring a different failure: {complaint:?}"
         );
@@ -743,9 +666,9 @@ fn refusals_at_the_session_ceiling_leave_nothing_behind(name: &str, mode: &str, 
     // ceiling the *next* one meets is still the ceiling.
     assert_eq!(
         session_ids(&dir).len(),
-        CEILING,
+        MAX_SESSIONS,
         "the refusals added ids to a directory that was already full, so the backstop \
-         now refuses at {CEILING} minus however many spawns have been turned away"
+         now refuses at {MAX_SESSIONS} minus however many spawns have been turned away"
     );
 }
 
@@ -872,7 +795,7 @@ fn stdio_is_silenced(targets: &[PathBuf]) -> bool {
 /// in a suite that otherwise finishes in two, and CI runs it with
 /// `--run-ignored all`.
 ///
-/// Both halves, because `Daemon::detach_limit` is a *choice* — 30 seconds where no
+/// Both halves, because `Daemon::detach_deadline` is a *choice* — 30 seconds where no
 /// PTY was ever started, seven days once one was — and the rule was the untested one
 /// of the two. A regression returning `FIRST_ATTACH_TIMEOUT` for both would reap
 /// every real user's session half a minute after they shut their laptop, and nothing
@@ -882,14 +805,10 @@ fn stdio_is_silenced(targets: &[PathBuf]) -> bool {
 #[test]
 #[ignore = "waits out the 30-second first-attach timeout; run in CI, not on every commit"]
 fn a_daemon_nobody_ever_attaches_to_reaps_itself() {
-    // The seven-day branch is set up first so that under the regression above its
-    // thirty seconds are up no later than the other session's. That ordering is not
-    // enough on its own, and measuring says so: with the regression applied by hand
-    // this session was reaped 107 ms *after* the wait below ended, so an assertion
-    // taken at that instant passed over a daemon that was already doomed. Whichever
-    // way that hundred milliseconds happens to fall is a matter of process startup
-    // against the daemon noticing a closed socket, which is not something to hang a
-    // guard on. So the assertion at the end asks for a margin instead.
+    // The seven-day branch is set up first so that under the regression its thirty
+    // seconds are up no later than the other session's. That ordering is not enough on
+    // its own — the two are within a hundred milliseconds of each other — so the
+    // assertion at the end asks for a margin instead.
     let (greeted, client, _) = Session::attached("attached_once");
     // The limit is consulted only while there is nobody attached, so a session still
     // holding its client would satisfy the assertion below by never having been asked
@@ -915,13 +834,9 @@ fn a_daemon_nobody_ever_attaches_to_reaps_itself() {
          timeout — so nothing below says anything about the limit this session is on",
         detached_at.elapsed()
     );
-    // Asked as "still here three seconds from now" rather than "here at this
-    // instant", which is what makes this falsifiable rather than nearly so: the
-    // regression reaps this session within a hundred milliseconds either side of the
-    // wait above, so only a margin tells a session on the seven-day limit from one
-    // on the thirty-second limit that has not got round to it yet. Three seconds is
-    // two orders of magnitude above that scatter and still nowhere near a limit
-    // anything here holds.
+    // "Still here three seconds from now" rather than "here at this instant", which is
+    // what makes this falsifiable: only a margin tells a session on the seven-day limit
+    // from one on the thirty-second limit that has not got round to it yet.
     //
     // Answering, not merely present: the socket file outlives the process that bound
     // it, so a daemon that died without unlinking would leave one behind. A bare
@@ -949,18 +864,6 @@ fn a_daemon_nobody_ever_attaches_to_reaps_itself() {
 /// named anything. Knowing how a job that has already run turned out is most of why
 /// anybody leaves one running.
 ///
-/// This replaced a test of the opposite property — the daemon reaping itself once
-/// that window expired — which was written for a regression in `Pty::terminate`,
-/// where an already-negative pid handed to `kill_process_group` both defeated the
-/// group kill and, `Pid::from_raw` asserting its argument is non-negative, aborted
-/// the daemon partway through `shutdown` in any debug build. That regression is real
-/// and still guarded, in both places the shutdown path is still reachable:
-/// [`a_signalled_daemon_collects_a_process_that_ignores_sighup`] drives the same
-/// `shutdown` from a signal and asserts the same files are gone, and
-/// [`a_daemon_nobody_ever_attaches_to_reaps_itself`] covers the deadline-driven reap
-/// itself — `#[ignore]`d for the thirty seconds it costs, and run in CI with
-/// `--run-ignored all`.
-///
 /// The status is distinctive because the alternative is not: `exit 0` is what the
 /// daemon synthesises for a child it never got a status for (`collect_status`), so a
 /// session that had lost the real one would still answer plausibly.
@@ -969,18 +872,12 @@ fn a_session_whose_child_has_exited_keeps_its_files_and_its_status_with_nobody_a
     /// How long the session is left with no client and no child before anything at
     /// all is asked of it.
     ///
-    /// Past the five seconds a daemon used to allow itself after its child exited,
-    /// and the one wall-clock wait in this suite that cannot be replaced by a
-    /// condition: what is under test is a deadline that is *not* there, and the only
-    /// way to see one of those is to outlast the one that used to be. A condition
-    /// would have to be a condition on the daemon doing something, and doing nothing
-    /// is the behaviour.
-    ///
-    /// Six rather than five and a bit, because the clock the daemon would have been
-    /// measuring starts at the end of file it reports and this one starts at `/proc`
-    /// agreeing the child has gone, which is the same instant only to within a
-    /// scheduling quantum. It costs the suite about a second of wall clock, nextest
-    /// running it alongside everything else.
+    /// Past the five seconds a daemon used to allow itself after its child exited, and
+    /// the one wall-clock wait in this suite that cannot be replaced by a condition:
+    /// what is under test is a deadline that is *not* there, and the only way to see
+    /// one of those is to outlast the one that used to be. Six rather than five and a
+    /// bit, because the clock the daemon would have measured starts at the end of file
+    /// it reports and this one starts at `/proc` agreeing the child has gone.
     const UNATTENDED: Duration = Duration::from_secs(6);
     /// Five ticks is 50 ms of processor time against the half second [`SPIN_WINDOW`]
     /// covers: a tenth of a core, unreachable by a daemon that is asleep.
@@ -1001,7 +898,7 @@ fn a_session_whose_child_has_exited_keeps_its_files_and_its_status_with_nobody_a
     drop(client);
 
     assert!(
-        poll_until(Duration::from_secs(10), || !process_alive(shell)),
+        poll_until(SETTLE, || !process_alive(shell)),
         "the child never exited, so the wait below is about a session that still has \
          one and says nothing about what happens to a session that does not"
     );
@@ -1084,11 +981,6 @@ struct Replay {
 /// then finds its marker missing rather than finding a passing test that read the
 /// frames in whatever order they came. Written once because the two callers differ
 /// only in how long the session had been sitting there when they arrived.
-///
-/// One deadline for the whole replay rather than one per frame: `next_frame` takes a
-/// fresh patience on every frame it is asked for, so a daemon handing one over just
-/// inside it is never late and a loop over it has no bound at all — see
-/// [`Client::frame_before`], which is where this one comes from.
 #[expect(
     clippy::panic,
     reason = "clippy.toml's allow-panic-in-tests reaches `#[test]` bodies, not the \
@@ -1120,7 +1012,7 @@ fn replay_to_the_exit(client: &mut Client) -> Replay {
                     since_exit_secs,
                 };
             }
-            Frame::InputAck { .. } | Frame::Gap { .. } | Frame::Pong { .. } => {}
+            Frame::InputAck { .. } | Frame::Gap { .. } | Frame::Pong => {}
             other => panic!("unexpected {other:?} while awaiting {awaiting}"),
         }
     }
@@ -1128,20 +1020,11 @@ fn replay_to_the_exit(client: &mut Client) -> Replay {
 
 /// `SIGTERM` must leave through the shutdown path, not the default disposition.
 ///
-/// `nomux kill` signals the daemon and gives it two seconds. Without a handler it
-/// died where it stood, so `Pty::terminate` never ran — and closing the PTY master
-/// hides that for the ordinary case, because the kernel delivers `SIGHUP` to the
-/// foreground process group on the way out. What it does not cover is a
-/// backgrounded process that ignores the hangup, which is what this starts: `trap
-/// '' HUP` before the fork, since an *ignored* disposition is inherited through
-/// `exec` where a trapped one is reset.
-///
-/// `set +m` is what puts that process where reaping can see it. An interactive
-/// shell gives every job a process group of its own, and nothing in the session
-/// ever signals those — a real gap, but a different one, and one no `SIGTERM`
-/// handler would close. With job control off the job stays in the shell's group,
-/// which is what `Pty::terminate` signals and what a script's background processes
-/// do anyway.
+/// Without a handler the daemon died where it stood, so `Pty::terminate` never ran —
+/// and closing the PTY master hides that for the ordinary case, because the kernel
+/// delivers `SIGHUP` to the foreground process group on the way out. What it does not
+/// cover is [`background_ignoring_sighup`]'s process, which only a real shutdown path
+/// collects.
 #[test]
 fn a_signalled_daemon_collects_a_process_that_ignores_sighup() {
     let (session, mut client, ok) = Session::attached("sigterm");
@@ -1175,97 +1058,15 @@ fn a_signalled_daemon_collects_a_process_that_ignores_sighup() {
     // loaded machine: an overrun there is this same bug wearing a hat.
     let pid_file = session.pid_file();
     assert!(
-        poll_until(Duration::from_secs(10), || !pid_file.exists()
-            && !session.socket.exists()),
+        poll_until(SETTLE, || !pid_file.exists() && !session.socket.exists()),
         "run files outlived the signalled daemon: socket={} pid={}",
         session.socket.exists(),
         pid_file.exists()
     );
 
     assert!(
-        poll_until(Duration::from_secs(10), || !process_alive(orphan)),
+        poll_until(SETTLE, || !process_alive(orphan)),
         "pid {orphan} outlived the session it was backgrounded in"
-    );
-}
-
-/// A session with nothing left running is torn down at once, rather than waiting
-/// out the grace period that only the stubborn case needs.
-///
-/// The grace period is 500 ms, and it used to be spent on *every* shutdown. The
-/// loop's exit condition asks the process group first and only then walks `/proc`,
-/// and an unreaped zombie is still a member of its own group — so the group probe
-/// answered "still alive" for the very child the daemon was about to collect, and
-/// the `&&` short-circuited before the `/proc` walk, which filters zombies, could
-/// disagree. On the path that matters the child *is* unreaped: `reap` runs only
-/// once the PTY has reported end of file, which on the `nomux kill` path it has
-/// not.
-///
-/// This used to assert one wall-clock number — under 400 ms — against an honest
-/// path that measures about fifty and a regression with a hard floor of five
-/// hundred. Defensible in intent and indefensible in mechanism: the bound was
-/// wedged between the two with runqueue delay, which nothing here bounds, free to
-/// move either. So the comparison is now between two shutdowns rather than between
-/// one shutdown and a constant.
-///
-/// What is asserted is the *difference*, and the arithmetic is why. The grace is an
-/// additive constant, not a factor: the stubborn shutdown costs `GRACE + W` and the
-/// quiet one `W`, for whatever the shared work `W` comes to on the day. A ratio
-/// reduces to `W < (GRACE + W)/2`, which is `W < GRACE`, an absolute half-second
-/// ceiling wearing a disguise — better than the old one, since it is anchored to a
-/// measurement rather than to a literal, but not the load-cancelling thing it looks
-/// like. The difference is `GRACE + (W_s − W_q)`, where the two `W`s are the same
-/// work on the same machine moments apart, so what has to stay small is their
-/// *spread* rather than either of them. Under the regression both shutdowns pay the
-/// grace and the difference collapses to that spread, which is what fails.
-///
-/// The two measurements are sequential rather than simultaneous — about half a
-/// second apart, since the first is the one that waits — so "the same machine" is a
-/// claim about half a second of it and not a guarantee. That is the residual risk,
-/// and it is why the load average goes into both messages.
-///
-/// The stubborn measurement is checked against the grace period first, so a run
-/// where nothing waited for anything fails as an instrument rather than passing as
-/// a result.
-#[test]
-fn a_signalled_daemon_with_a_quiet_child_does_not_wait_out_the_grace_period() {
-    /// `pty::HANGUP_GRACE`, which is private to the daemon. Used only to say that
-    /// the stubborn measurement really did wait for something.
-    const GRACE: Duration = Duration::from_millis(500);
-
-    // Set up together, and signalled together below, so the two measurements meet
-    // the same machine.
-    let (mut stubborn, mut client, ok) = Session::attached("slowkill");
-    // A process the daemon's first reach cannot collect and has to wait out, which is
-    // the whole of what the grace period below is being charged for.
-    let (_orphan, _collected) = background_ignoring_sighup(&mut client, ok.resume_from);
-
-    let (mut quiet, mut settled, _ok) = Session::attached("fastkill");
-    // So the measurement covers a session with a live shell in it, rather than the
-    // window before the child exists at all.
-    still_serving(&mut settled, "NOMUX-READY");
-
-    let stubborn = time_shutdown(&mut stubborn);
-    let quiet = time_shutdown(&mut quiet);
-    let load =
-        fs::read_to_string("/proc/loadavg").unwrap_or_else(|err| format!("unreadable: {err}"));
-
-    assert!(
-        stubborn >= GRACE,
-        "the stubborn session went in {stubborn:?}, inside the {GRACE:?} its \
-         un-hangupable child should have cost it — so it is not a grace period this \
-         run measured, and the comparison below would mean nothing. Load: {load}"
-    );
-    // `saturating_sub`, because `Duration` subtraction panics rather than going
-    // negative — and the case that would is precisely the failure, a quiet shutdown
-    // that took longer than the stubborn one.
-    assert!(
-        stubborn.saturating_sub(quiet) > GRACE / 2,
-        "a session with nothing left running took {quiet:?} to stop against \
-         {stubborn:?} for one with a process that ignores SIGHUP — a difference of \
-         {:?}, where the grace period only one of them should pay is {GRACE:?}. The \
-         two are the same shutdown, so it is being paid whether or not anything is \
-         still there. Load: {load}",
-        stubborn.saturating_sub(quiet)
     );
 }
 
@@ -1286,12 +1087,8 @@ fn a_signalled_daemon_with_a_quiet_child_does_not_wait_out_the_grace_period() {
 /// the arithmetic keeps it out of the line discipline's echo of the command itself —
 /// which would otherwise match first, carrying `$!` unexpanded.
 ///
-/// The [`Reaper`] comes back with it because everything either caller then asserts is
-/// about a process deliberately in nobody's reach: if one of those assertions fires,
-/// `sleep 300` outlives the whole suite.
-///
-/// Sent at input offset 0, which both callers can do because this is the first thing
-/// either of them puts into its session.
+/// The [`Reaper`] comes back with it because the process is deliberately in nobody's
+/// reach: if an assertion fires, `sleep 300` outlives the whole suite.
 #[expect(
     clippy::panic,
     reason = "clippy.toml's allow-panic-in-tests reaches `#[test]` bodies, not the \
@@ -1306,31 +1103,6 @@ fn background_ignoring_sighup(client: &mut Client, from: u64) -> (u32, Reaper) {
     let orphan = trailing_pid(&seen, "-NOMUX-ORPHAN-42")
         .unwrap_or_else(|| panic!("no background pid in the transcript: {seen:?}"));
     (orphan, Reaper(orphan))
-}
-
-/// Signals a daemon and reports how long it took to leave.
-///
-/// Collected here as well as timed, so the harness does not go on to `SIGKILL` a
-/// process that has already gone and the caller can compare two of these.
-fn time_shutdown(session: &mut Session) -> Duration {
-    let daemon = rustix::process::Pid::from_raw(session.child.id().cast_signed())
-        .expect("the daemon's own pid");
-    let began = Instant::now();
-    rustix::process::kill_process(daemon, rustix::process::Signal::TERM)
-        .expect("signal the daemon");
-
-    let exited = poll_until(Duration::from_secs(10), || {
-        session
-            .child
-            .try_wait()
-            .expect("wait for the daemon")
-            .is_some()
-    });
-    // Read before the assertion, since what is being measured is how long the
-    // condition took to become true.
-    let elapsed = began.elapsed();
-    assert!(exited, "the signalled daemon never exited");
-    elapsed
 }
 
 /// The run of digits immediately before `marker`, as a pid.

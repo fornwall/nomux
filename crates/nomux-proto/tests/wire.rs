@@ -1,18 +1,17 @@
 //! Byte-exact conformance to the frame table in `IMPLEMENTATION.md` § 2.2.
 //!
-//! Everything else in this crate's suite tests the codec against *itself*: encode
-//! then decode, and assert you got back what you put in. That proves the two halves
-//! agree, which is not the same as either being right. Swap `HelloOk`'s
-//! `resume_from` and `in_applied` in both directions and every round-trip test still
-//! passes — the two fields are the same width, so the frames stay symmetric while
-//! the bytes on the wire are wrong. The property tests in `codec.rs` inherit the
-//! same blind spot, because they generate frames and compare frames.
+//! Everything else in this crate's suite tests the codec against *itself*: encode then
+//! decode, and assert you got back what you put in. That proves the two halves agree,
+//! not that either is right. Swap `HelloOk`'s `resume_from` and `in_applied` in both
+//! directions and every round-trip test still passes — same width, so the frames stay
+//! symmetric while the bytes on the wire are wrong. `codec.rs` inherits that blind
+//! spot, because it generates frames and compares frames.
 //!
-//! So these vectors are written out by hand from the § 2.2 table rather than
-//! produced by the encoder, and are checked in *both* directions. They are the only
-//! thing in the repository that would notice a field order, field width or
-//! endianness change, and the only reason the client — a separate codebase reading
-//! the same table — can be built against the document instead of against this code.
+//! So these vectors are written out by hand from the § 2.2 table rather than produced
+//! by the encoder, and are checked in *both* directions. They are the only thing in the
+//! repository that would notice a field order, field width or endianness change, and
+//! the only reason the client — a separate codebase reading the same table — can be
+//! built against the document instead of against this code.
 //!
 //! A failure here is either a deliberate wire change, which is a
 //! `PROTOCOL_VERSION` bump and an edit to § 2.2, or a bug. It is never a test that
@@ -38,23 +37,19 @@ struct Vector {
     bytes: &'static [u8],
 }
 
-/// Every vector, in discriminant order.
+/// Every vector, in discriminant order. Split into groups only to keep each list
+/// readable; the tests below treat them as one table.
 ///
-/// Split into groups only to keep each list readable; the tests below treat them as
-/// one table.
-///
-/// Byte patterns are ascending and distinct per field so that a swap between two
+/// Byte patterns are ascending and distinct per field, so that a swap between two
 /// same-width neighbours — the failure a round-trip test cannot see — changes the
 /// expected bytes.
 ///
-/// Both handshake frames appear more than once, because distinct values catch a swap
-/// between two fields and do nothing about a swap *inside* one. So each repeat is
-/// chosen to disagree with the ones before it on every bit and every enumerator that
-/// has one — which is what makes § 2.3 a table this file actually checks, rather than
-/// one the codec merely agrees with itself about. Three of each, which is what
-/// [`the_vectors_pin_every_value_of_every_closed_set`] insists on: [`Linger`] has
-/// three values, and two `Hello` vectors cannot both show the bits set together and
-/// show each of them clear.
+/// Both handshake frames appear three times, because distinct values catch a swap
+/// between two fields and do nothing about a swap *inside* one: each repeat disagrees
+/// with the ones before it on every bit and every enumerator that has one. Three is
+/// what [`the_vectors_pin_every_value_of_every_closed_set`] insists on — [`Linger`] has
+/// three values, and two `Hello` vectors cannot both show the flag bits set together
+/// and show each of them clear.
 fn vectors() -> Vec<Vector> {
     let mut all = hello_vectors();
     all.extend(hello_ok_vectors());
@@ -72,7 +67,7 @@ fn hello_vectors() -> Vec<Vector> {
         // them is even representable — §2.3's "no reserved space", made in bytes.
         Vector {
             frame: Frame::Hello(Hello {
-                protocol: 5,
+                protocol: 6,
                 agent_forward: true,
                 repaint_ctrl_l: true,
                 out_offset: 0x0102_0304_0506_0708,
@@ -81,7 +76,7 @@ fn hello_vectors() -> Vec<Vector> {
             }),
             bytes: &[
                 0x01, 0x00, 0x00, 0x23, // header: type, u24 len = 35
-                0x00, 0x05, // protocol
+                0x00, 0x06, // protocol
                 0x03, // flags: bit 0 agent forward, bit 1 repaint ctrl-l
                 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // out_offset
                 0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
@@ -94,7 +89,7 @@ fn hello_vectors() -> Vec<Vector> {
         // Carries `RESUME_FROM_START` as well, which no other vector shows.
         Vector {
             frame: Frame::Hello(Hello {
-                protocol: 5,
+                protocol: 6,
                 agent_forward: true,
                 repaint_ctrl_l: false,
                 out_offset: RESUME_FROM_START,
@@ -103,7 +98,7 @@ fn hello_vectors() -> Vec<Vector> {
             }),
             bytes: &[
                 0x01, 0x00, 0x00, 0x1a, // header: type, u24 len = 26
-                0x00, 0x05, // protocol
+                0x00, 0x06, // protocol
                 0x01, // flags: bit 0 agent forward, bit 1 clear
                 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // RESUME_FROM_START
                 0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
@@ -115,7 +110,7 @@ fn hello_vectors() -> Vec<Vector> {
         // vectors above, so this is the only one that pins it clear.
         Vector {
             frame: Frame::Hello(Hello {
-                protocol: 5,
+                protocol: 6,
                 agent_forward: false,
                 repaint_ctrl_l: false,
                 out_offset: 0x8182_8384_8586_8788,
@@ -124,7 +119,7 @@ fn hello_vectors() -> Vec<Vector> {
             }),
             bytes: &[
                 0x01, 0x00, 0x00, 0x19, // header: type, u24 len = 25
-                0x00, 0x05, // protocol
+                0x00, 0x06, // protocol
                 0x00, // flags: both bits clear
                 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, // out_offset
                 0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
@@ -138,23 +133,22 @@ fn hello_vectors() -> Vec<Vector> {
 /// The daemon's answer, at all three linger states and both agent states.
 fn hello_ok_vectors() -> Vec<Vector> {
     vec![
-        // 0x02 HelloOk: u64 resume_from, u64 in_applied, winsize, u8 linger, u8
-        // flags. It carries no revision (§ 2.2), and the last two bytes are one byte
-        // each, `linger` being a field of its own rather than two bits inside the
-        // flags (§ 2.3).
+        // 0x02 HelloOk: u64 resume_from, u64 in_applied, u8 linger, u8 flags. It
+        // carries neither a revision nor a winsize (§ 2.2) — both would only repeat
+        // what the client just sent — and the last two bytes are one byte each,
+        // `linger` being a field of its own rather than two bits inside the flags
+        // (§ 2.3).
         Vector {
             frame: Frame::HelloOk(HelloOk {
                 resume_from: 0x2122_2324_2526_2728,
                 in_applied: 0x3132_3334_3536_3738,
-                win: WIN,
                 linger: Linger::Enabled,
                 agent: true,
             }),
             bytes: &[
-                0x02, 0x00, 0x00, 0x1a, // header: type, u24 len = 26
+                0x02, 0x00, 0x00, 0x12, // header: type, u24 len = 18
                 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, // resume_from
                 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, // in_applied
-                0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
                 0x02, // linger = 2 (enabled)
                 0x01, // flags: bit 0 agent
             ],
@@ -166,15 +160,13 @@ fn hello_ok_vectors() -> Vec<Vector> {
             frame: Frame::HelloOk(HelloOk {
                 resume_from: 0x4142_4344_4546_4748,
                 in_applied: 0x5152_5354_5556_5758,
-                win: WIN,
                 linger: Linger::Unknown,
                 agent: true,
             }),
             bytes: &[
-                0x02, 0x00, 0x00, 0x1a, // header: type, u24 len = 26
+                0x02, 0x00, 0x00, 0x12, // header: type, u24 len = 18
                 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, // resume_from
                 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, // in_applied
-                0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
                 0x00, // linger = 0 (unknown)
                 0x01, // flags: bit 0 agent
             ],
@@ -186,15 +178,13 @@ fn hello_ok_vectors() -> Vec<Vector> {
             frame: Frame::HelloOk(HelloOk {
                 resume_from: 0x6162_6364_6566_6768,
                 in_applied: 0x7172_7374_7576_7778,
-                win: WIN,
                 linger: Linger::Disabled,
                 agent: false,
             }),
             bytes: &[
-                0x02, 0x00, 0x00, 0x1a, // header: type, u24 len = 26
+                0x02, 0x00, 0x00, 0x12, // header: type, u24 len = 18
                 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, // resume_from
                 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, // in_applied
-                0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
                 0x01, // linger = 1 (disabled)
                 0x00, // flags: agent clear
             ],
@@ -312,20 +302,15 @@ fn control_vectors() -> Vec<Vector> {
             frame: Frame::Detach,
             bytes: &[0x0a, 0x00, 0x00, 0x00],
         },
-        // 0x0b Ping / 0x0c Pong: u64 nonce, echoed back unchanged.
+        // 0x0b Ping / 0x0c Pong: header only. The stream is ordered, so the nth Pong
+        // answers the nth Ping and there is nothing to correlate them with.
         Vector {
-            frame: Frame::Ping { nonce: 42 },
-            bytes: &[
-                0x0b, 0x00, 0x00, 0x08, //
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2a,
-            ],
+            frame: Frame::Ping,
+            bytes: &[0x0b, 0x00, 0x00, 0x00],
         },
         Vector {
-            frame: Frame::Pong { nonce: 42 },
-            bytes: &[
-                0x0c, 0x00, 0x00, 0x08, //
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2a,
-            ],
+            frame: Frame::Pong,
+            bytes: &[0x0c, 0x00, 0x00, 0x00],
         },
         // 0x0d Error: u16 code, UTF-8 message with no length prefix — it runs to
         // the end of the payload.
@@ -411,22 +396,19 @@ fn documented_bytes_decode_to_their_frames() {
     }
 }
 
-/// Every closed set on this wire is written down in bytes above, at every value it
-/// has, and the handshake vectors are written at the revision this build speaks.
-///
-/// One pass rather than a test per set: six readings of the one question, which is
-/// what the vectors leave un-pinned.
+/// Every closed set on this wire is written down in bytes above, at every value it has,
+/// and the handshake vectors are written at the revision this build speaks.
 ///
 /// Swept from each set's `ALL` rather than from a list written out here, which would
 /// stop covering the protocol the moment the protocol grew, and quietly. The two flags
-/// bytes have no `ALL` and are destructured exhaustively instead, for the same
-/// property reached the other way round: a bool added to either stops this file
-/// compiling. Both states of each, because a bit exercised at one value is pinned only
-/// against being renumbered wholesale — give `Hello` both of its flags at once and the
-/// two can trade places without moving a byte. The revision rides along because the
-/// `Hello` vectors write it out as a literal like everything else in them, which is
-/// what makes them a check on the document rather than on the encoder and equally what
-/// would let them pass at one the daemon refuses; `HelloOk` carries none (§ 2.2).
+/// bytes have no `ALL` and are destructured exhaustively instead, for the same property
+/// reached the other way round: a bool added to either stops this file compiling. Both
+/// states of each, because a bit exercised at one value is pinned only against being
+/// renumbered wholesale — give `Hello` both of its flags at once and the two can trade
+/// places without moving a byte. The revision rides along because the `Hello` vectors
+/// write it out as a literal, which is what makes them a check on the document and
+/// equally what would let them pass at one the daemon refuses; `HelloOk` carries none
+/// (§ 2.2).
 #[test]
 fn the_vectors_pin_every_value_of_every_closed_set() {
     let mut types = Vec::new();
@@ -456,7 +438,6 @@ fn the_vectors_pin_every_value_of_every_closed_set() {
             Frame::HelloOk(HelloOk {
                 resume_from: _,
                 in_applied: _,
-                win: _,
                 linger,
                 agent,
             }) => {
@@ -489,18 +470,17 @@ fn the_vectors_pin_every_value_of_every_closed_set() {
 
 /// The `len` field is a big-endian `u24`, checked past its low byte and at the cap.
 ///
-/// Every vector above carries a payload shorter than 256 bytes, so the top two
-/// bytes of its length are always zero — and an encoder that computed `len`
-/// correctly and then wrote only its low byte would satisfy all sixteen of them.
-/// The § 2.1 cap is the other half of the same gap: only a payload at the cap
-/// produces a length that reaches the top byte at all, so the largest legal frame is
-/// the one case that can show the field is three bytes wide rather than two.
-/// [`the_frozen_numbers_are_the_ones_the_document_gives`] is where `MAX_PAYLOAD`
-/// itself is held against § 2.1; this is where its encoding is.
+/// Every vector above carries a payload shorter than 256 bytes, so the top two bytes of
+/// its length are always zero — an encoder that computed `len` correctly and then wrote
+/// only its low byte would satisfy every one of them. The § 2.1 cap is the other half
+/// of the same gap: only a payload at the cap produces a length that reaches the top
+/// byte, so the largest legal frame is the one case that shows the field is three bytes
+/// wide rather than two. [`the_frozen_numbers_are_the_ones_the_document_gives`] holds
+/// `MAX_PAYLOAD` itself against § 2.1; this holds its encoding.
 ///
-/// These payloads are built rather than written out, which is why they sit here
-/// instead of in the table above. The bytes being asserted are still only the
-/// header, and still hand-written from the document.
+/// These payloads are built rather than written out, which is why they sit here rather
+/// than in the table. The bytes asserted are still only the header, still hand-written
+/// from the document.
 #[test]
 fn the_length_field_is_a_u24_past_its_low_byte() {
     // `Output` is a u64 offset followed by the bytes, so the payload runs 8 longer
@@ -542,25 +522,23 @@ fn the_length_field_is_a_u24_past_its_low_byte() {
 /// It matters because the far end is a separate codebase built from the document: a
 /// client whose § 2.2 disagrees is turned away at the handshake, and one built from a
 /// § 2.1 sending a legal 256 KiB frame collects `Error{Protocol}`. So the numbers are
-/// written out by hand here, and each carries the section it was read from — that
-/// citation is the whole difference between a failure here and one answered by
-/// editing the expectation.
+/// written out by hand, each carrying the section it was read from — that citation is
+/// the difference between a failure here and one answered by editing the expectation.
 ///
-/// A frame carries one enumerator at a time, so the vectors above pin one value of
-/// each set and a table is the only way to reach the rest; without it the daemon and
-/// this suite would both name them symbolically and so agree on any renumbering, while
-/// only the client disagreed. Both directions, for the reason the module doc gives:
+/// A frame carries one enumerator at a time, so the vectors above pin one value of each
+/// set and a table is the only way to reach the rest; without it the daemon and this
+/// suite would both name them symbolically and so agree on any renumbering, while only
+/// the client disagreed. Both directions, for the reason the module doc gives:
 /// `from_u16(as_u16(c)) == c` holds under any renumbering consistent with itself. And
-/// *which* values each set has to carry is swept from its `ALL` rather than written
-/// down twice, so one added to the protocol and not to this table fails here.
+/// *which* values each set must carry is swept from its `ALL` rather than written down
+/// twice, so one added to the protocol and not to this table fails here.
 ///
-/// The two scalars are already held against a hand-written literal somewhere — the
-/// `Hello` vectors write `PROTOCOL_VERSION` out as `5`, and the largest legal frame in
-/// [`the_length_field_is_a_u24_past_its_low_byte`] encodes its length as `0x04_00_00`
-/// — so moving either alone already fails. What that cannot see is the edit which
-/// moves the constant *and* the literals together, which is exactly what a revision
-/// bump looks like and is a change to the wire § 2.1 and § 2.2 have not been told
-/// about.
+/// The two scalars are each already held against a hand-written literal — the `Hello`
+/// vectors write `PROTOCOL_VERSION` out as `6`, and the largest legal frame in
+/// [`the_length_field_is_a_u24_past_its_low_byte`] encodes its length as `0x04_00_00` —
+/// so moving either alone already fails. What that cannot see is the edit moving the
+/// constant *and* the literals together, which is what a revision bump looks like and
+/// is a change to the wire § 2.1 and § 2.2 have not been told about.
 ///
 /// The id length § 6.3 fixes and the channel cap § 6.7 fixes are pinned this same way
 /// beside the code that enforces them, by
@@ -586,8 +564,8 @@ fn the_frozen_numbers_are_the_ones_the_document_gives() {
         (
             "PROTOCOL_VERSION",
             u64::from(PROTOCOL_VERSION),
-            5,
-            "§ 2.2 puts the current revision at 5",
+            6,
+            "§ 2.2 puts the current revision at 6",
         ),
         (
             "MAX_PAYLOAD",

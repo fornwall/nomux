@@ -52,10 +52,7 @@ control surface (frozen across versions, see IMPLEMENTATION.md 6.6):
   kill <session-id>     Terminate a session and unlink its run files
 
 options:
-  --label <text>        Display name for `list`, recorded when the session is
-  --label=<text>        created: `daemon` and `spawn` take it, `kill` ignores it,
-                        `attach` refuses it. Advisory: ids are opaque, so this is
-                        what makes an orphaned session recognisable to a human.
+  --label <text>        Display name for `list`, recorded when the session is created
   --version, -V         Print version and protocol revision
   --help, -h            Print this usage
 ";
@@ -67,7 +64,7 @@ fn main() -> ExitCode {
     };
 
     match mode.to_str() {
-        Some(word @ "list") => only(args, word, || report(control::list(), &[], 1)),
+        Some(word @ "list") => only(args, word, || report(control::list(), false)),
         Some(word @ ("--version" | "-V")) => only(args, word, || {
             println!(
                 "nomux {} (protocol {})",
@@ -80,22 +77,15 @@ fn main() -> ExitCode {
             print!("{USAGE}");
             ExitCode::SUCCESS
         }),
-        Some("daemon") => run_session_mode(Mode::Daemon, args),
-        Some("spawn") => run_session_mode(Mode::Spawn, args),
-        Some("attach") => run_session_mode(Mode::Attach, args),
-        Some("kill") => run_session_mode(Mode::Kill, args),
+        Some(word @ "daemon") => run_session_mode(Mode::Daemon, word, args),
+        Some(word @ "spawn") => run_session_mode(Mode::Spawn, word, args),
+        Some(word @ "attach") => run_session_mode(Mode::Attach, word, args),
+        Some(word @ "kill") => run_session_mode(Mode::Kill, word, args),
         _ => usage_error(Some(&format!("unknown mode `{}`", mode.display()))),
     }
 }
 
-/// Runs a mode that takes no arguments, refusing any that were passed.
-///
-/// The caller is the client, which builds these command lines itself, so an
-/// argument dropped on the floor is a bug it has no way to be told about — and the
-/// session modes already reject one they do not understand.
-///
-/// `run` is a plain `fn` pointer rather than a generic so that the four modes share
-/// a single instantiation, which the § 8 size budget cares about and this does not.
+/// Refuses arguments to a mode that takes none.
 fn only(mut args: impl Iterator<Item = OsString>, word: &str, run: fn() -> ExitCode) -> ExitCode {
     if let Some(extra) = args.next() {
         return usage_error(Some(&format!(
@@ -134,32 +124,18 @@ enum Mode {
     Kill,
 }
 
-impl Mode {
-    /// The word the user typed, for diagnostics.
-    const fn name(self) -> &'static str {
-        match self {
-            Self::Daemon => "daemon",
-            Self::Spawn => "spawn",
-            Self::Attach => "attach",
-            Self::Kill => "kill",
-        }
-    }
-}
-
-/// Dispatches the modes that take a session id.
-fn run_session_mode(mode: Mode, args: impl Iterator<Item = OsString>) -> ExitCode {
+/// Dispatches the modes that take a session id. `word` is the one `main` matched on.
+fn run_session_mode(mode: Mode, word: &str, args: impl Iterator<Item = OsString>) -> ExitCode {
     let (session, label) = match parse_session_args(args) {
         Ok(parsed) => parsed,
         Err(message) => return usage_error(Some(&message)),
     };
     let Some(session) = session else {
-        return usage_error(Some(&format!("`{}` requires a session id", mode.name())));
+        return usage_error(Some(&format!("`{word}` requires a session id")));
     };
-    // The label is recorded when the session is created (`IMPLEMENTATION.md` § 6.6),
-    // so it belongs to the two modes that create one. Refused rather than dropped on
-    // the floor: a `--label` on `attach` is a caller that still believes `attach`
-    // might create the session, and silence would leave it believing it. `kill` goes
-    // on parsing and ignoring one, § 6.6 having frozen what it accepts.
+    // Refused rather than dropped on the floor: a `--label` on `attach` is a caller
+    // that still believes `attach` might create the session. `kill` parses and ignores
+    // one, `IMPLEMENTATION.md` § 6.6 having frozen what it accepts.
     if matches!(mode, Mode::Attach) && label.is_some() {
         return usage_error(Some(
             "`attach` takes no `--label`: a label is recorded when the session is \
@@ -168,27 +144,15 @@ fn run_session_mode(mode: Mode, args: impl Iterator<Item = OsString>) -> ExitCod
     }
 
     match mode {
-        Mode::Daemon => report(daemon::run(&session, label.as_deref()), &[], 1),
+        Mode::Daemon => report(daemon::run(&session, label.as_deref()), false),
         Mode::Spawn => report(
-            attach::run(&session, attach::Intent::Create, label.as_deref()),
-            RELAY_NO_SESSION,
-            EXIT_UNATTACHABLE,
+            attach::run(&session, attach::Intent::Create(label.as_deref())),
+            true,
         ),
-        Mode::Attach => report(
-            attach::run(&session, attach::Intent::Resume, None),
-            RELAY_NO_SESSION,
-            EXIT_UNATTACHABLE,
-        ),
-        Mode::Kill => report(control::kill(&session), &[], 1),
+        Mode::Attach => report(attach::run(&session, attach::Intent::Resume), true),
+        Mode::Kill => report(control::kill(&session), false),
     }
 }
-
-/// The relay's two extra rows: `NotFound` is the session `attach` refused to invent,
-/// and `TimedOut` is a session that never answered — the daemon `spawn` could not
-/// start, or a backlog `attach` waited out. The same "not found", reached by waiting
-/// rather than by looking.
-const RELAY_NO_SESSION: &[std::io::ErrorKind] =
-    &[std::io::ErrorKind::NotFound, std::io::ErrorKind::TimedOut];
 
 /// Splits a session-mode command line into its id and optional label.
 ///
@@ -204,23 +168,25 @@ fn parse_session_args(
         let text = arg
             .to_str()
             .ok_or_else(|| format!("argument `{}` must be valid UTF-8", arg.display()))?;
-        if label.is_some() && (text == "--label" || text.starts_with("--label=")) {
-            return Err("`--label` is given once: a second would replace the first".to_owned());
-        }
-        match text.split_once('=') {
-            Some(("--label", value)) => label = Some(value.to_owned()),
-            _ if text == "--label" => {
-                label = Some(
-                    args.next()
-                        .ok_or_else(|| "`--label` requires a value".to_owned())?
-                        .to_str()
-                        .ok_or_else(|| "label must be valid UTF-8".to_owned())?
-                        .to_owned(),
-                );
-            }
+        let value = match text.split_once('=') {
+            Some(("--label", value)) => value.to_owned(),
+            _ if text == "--label" => args
+                .next()
+                .ok_or_else(|| "`--label` requires a value".to_owned())?
+                .to_str()
+                .ok_or_else(|| "label must be valid UTF-8".to_owned())?
+                .to_owned(),
             _ if text.starts_with('-') => return Err(format!("unknown option `{text}`")),
-            _ if session.is_none() => session = Some(text.to_owned()),
+            _ if session.is_none() => {
+                session = Some(text.to_owned());
+                continue;
+            }
             _ => return Err(format!("unexpected argument `{text}`")),
+        };
+        // The one spelling of "seen a `--label` already", rather than a second
+        // predicate beside the match that decides it.
+        if label.replace(value).is_some() {
+            return Err("`--label` is given once: a second would replace the first".to_owned());
         }
     }
     Ok((session, label))
@@ -232,23 +198,27 @@ fn parse_session_args(
 /// `InvalidInput` `EX_USAGE`: [`rundir::SessionPaths::new`] is the crate's only
 /// source of it, so it always means an id that could never have named a session
 /// rather than an operation that failed — a distinction the client acts on, caching
-/// "unattachable" per host and otherwise caching its own typo. The modes differ only
-/// in `no_session`, empty outside the relay, and in `otherwise`.
-fn report(
-    result: std::io::Result<()>,
-    no_session: &[std::io::ErrorKind],
-    otherwise: u8,
-) -> ExitCode {
+/// "unattachable" per host and otherwise caching its own typo. `relay` selects
+/// § 10's other table, the one `spawn` and `attach` are scored against.
+fn report(result: std::io::Result<()>, relay: bool) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("nomux: {err}");
-            ExitCode::from(if err.kind() == std::io::ErrorKind::InvalidInput {
+            let kind = err.kind();
+            ExitCode::from(if kind == std::io::ErrorKind::InvalidInput {
                 EXIT_USAGE
-            } else if no_session.contains(&err.kind()) {
+            } else if !relay {
+                1
+            } else if matches!(
+                kind,
+                // `NotFound` is the session `attach` refused to invent; `TimedOut` is
+                // one that never answered — the same "not found", reached by waiting.
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::TimedOut
+            ) {
                 EXIT_NO_SESSION
             } else {
-                otherwise
+                EXIT_UNATTACHABLE
             })
         }
     }

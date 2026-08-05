@@ -45,39 +45,46 @@ pub(crate) const WIN: WinSize = WinSize {
     ypixel: 0,
 };
 
-/// How long the harness waits for something it has asked a daemon for.
+/// How long a test waits for what a daemon owes it, whether that is one frame or a
+/// sequence of them.
 ///
-/// One value rather than one per call site: every wait here is on a daemon that is
-/// either about to answer or never going to, so the only thing a longer bound buys
-/// is patience with a slow machine — and that is the same question everywhere.
-const PATIENCE: Duration = Duration::from_secs(15);
-
-/// How long a test waits for a *sequence* of frames the daemon owes it.
-///
-/// The same fifteen seconds [`PATIENCE`] allows a single frame, spent on the whole
-/// loop rather than on each frame in it. That is the only spelling that bounds
-/// anything: patience taken per frame renews itself on every one that arrives, so a
-/// daemon dribbling output is never late by that measure and the loop runs until
-/// nextest's kill, which cannot say which wait never ended ([`Client::frame_before`]).
-/// It is one value rather than one per site for [`PATIENCE`]'s reason — every wait
-/// here is on a daemon that is either about to answer or never going to.
+/// Spent on the whole wait rather than renewed per frame: patience taken per frame
+/// renews itself on every one that arrives, so a daemon dribbling output is never
+/// late by that measure and the loop runs until the runner's kill, which cannot say
+/// which wait never ended. One value rather than one per site, since every wait here
+/// is on a daemon that is either about to answer or never going to.
 pub(crate) const FRAME_PATIENCE: Duration = Duration::from_secs(15);
+
+/// How long a test waits for something outside the protocol — a file appearing, a
+/// `/proc` state, a process going away — to catch up.
+pub(crate) const SETTLE: Duration = Duration::from_secs(10);
 
 /// How long a socket read blocks before the caller's own deadline is looked at
 /// again.
 ///
-/// Deliberately far below [`PATIENCE`], so the logical deadline is the one that
+/// Deliberately far below [`FRAME_PATIENCE`], so the logical deadline is the one that
 /// always fires: it is the only one that knows what the wait was about, where a
 /// socket that gave up first could only report an errno.
 const SOCKET_POLL: Duration = Duration::from_millis(100);
 
 /// How long [`poll_until`] waits between attempts.
 ///
-/// Short enough that a test measuring how long the daemon took is measuring the
-/// daemon rather than the sleep it overshot by — the tightest such bound in the
-/// suite is 400 ms against a 500 ms floor — and long enough that a condition which
-/// shells out to `nomux list` is not run back to back.
+/// Short enough not to add meaningfully to what is being waited for, long enough
+/// that a condition which shells out to `nomux list` is not run back to back.
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// `daemon::MAX_SESSIONS`: the ids one run directory holds before it refuses (§ 4).
+/// Private to the daemon, mirrored here, and the two must move together.
+pub(crate) const MAX_SESSIONS: usize = 64;
+
+/// `daemon::MAX_PENDING_INPUT`: what § 4.1 lets a session queue for a child that is
+/// not reading. Private to the daemon, mirrored here, and the two must move together.
+pub(crate) const MAX_PENDING_INPUT: u64 = 1 << 20;
+
+/// `conn::ABANDON_PENDING_WRITE`: the queue § 4.1 lets a client reach before it counts
+/// as gone rather than slow. Private to the daemon, mirrored here, and the two must
+/// move together.
+pub(crate) const ABANDON_PENDING_WRITE: usize = 8 << 20;
 
 /// Waits up to `within` for `condition` to hold, and reports whether it ever did.
 pub(crate) fn poll_until(within: Duration, condition: impl FnMut() -> bool) -> bool {
@@ -86,11 +93,9 @@ pub(crate) fn poll_until(within: Duration, condition: impl FnMut() -> bool) -> b
 
 /// [`poll_until`] against a deadline the caller shares between several waits.
 ///
-/// A test that waits for two things one after another with a bound each is bounded
-/// by the *sum*, which is how a test can allow itself fifty seconds against a runner
-/// that kills at forty — and then be killed with nothing to point at, which is the
-/// failure these bounds exist to replace. [`join_before`] is the same argument for
-/// threads.
+/// A test that waits for two things one after another with a bound each is bounded by
+/// their *sum*, which can outlast the runner's kill and then have nothing to point at
+/// (`.config/nextest.toml`). [`join_before`] is the same argument for threads.
 pub(crate) fn poll_by(deadline: Instant, mut condition: impl FnMut() -> bool) -> bool {
     loop {
         if condition() {
@@ -106,18 +111,10 @@ pub(crate) fn poll_by(deadline: Instant, mut condition: impl FnMut() -> bool) ->
 /// Joins `handle` against a deadline the caller shares between several waits,
 /// failing rather than parking if it will not come back.
 ///
-/// The relay tests move megabytes on four threads at once, and a relay that stalls in
-/// either direction would otherwise hang the whole run: `JoinHandle::join` has no
-/// deadline, and the guard in `.config/nextest.toml` can only kill the process
-/// without saying which wait never ended.
-///
-/// The deadline is the caller's rather than a bound per join, because a test that
-/// joins four threads one after another with a bound each is bounded by the *sum* of
-/// them — which is how the relay tests came to allow themselves two minutes against a
-/// runner that kills at forty seconds, so a relay that stalled in the last direction
-/// was killed by nextest with nothing to point at, the exact failure this exists to
-/// prevent. One deadline for the sequence keeps the promise the individual bounds
-/// were written to make. [`poll_by`] is the same argument for conditions.
+/// `JoinHandle::join` has no deadline, so a relay that stalls in either direction
+/// hangs the whole run and the guard in `.config/nextest.toml` can only kill the
+/// process without saying which wait never ended. The deadline is the caller's rather
+/// than a bound per join for [`poll_by`]'s reason.
 pub(crate) fn join_before<T>(handle: thread::JoinHandle<T>, deadline: Instant, what: &str) -> T {
     let remaining = deadline.saturating_duration_since(Instant::now());
     assert!(
@@ -155,12 +152,11 @@ pub(crate) fn read_uninterrupted(
 
 /// Writes what `socket` will take of `buf`, resuming a call a signal ended.
 ///
-/// [`read_uninterrupted`] in the other direction, and needed on its own account
-/// rather than for symmetry: the only caller is measuring how much the daemon will
-/// accept before it stops accepting, and an interruption counted as a refusal ends
-/// that measurement early — understating the answer, in the direction that makes the
-/// assertion pass. A call a signal reaches after it has transferred anything reports
-/// the short count instead, so nothing here can put a byte on the wire twice.
+/// [`read_uninterrupted`] in the other direction: the only caller measures how much the
+/// daemon will accept before it stops, and an interruption counted as a refusal
+/// understates that in the direction that makes the assertion pass. A call a signal
+/// reaches after it has transferred anything reports the short count instead, so
+/// nothing here can put a byte on the wire twice.
 fn write_uninterrupted(socket: &mut UnixStream, buf: &[u8]) -> std::io::Result<usize> {
     loop {
         match socket.write(buf) {
@@ -235,25 +231,20 @@ impl Session {
         Self::start_with_raw_ring(name, &ring_bytes.to_string())
     }
 
-    /// Starts a daemon with `NOMUX_RING_BYTES` set to exactly `value`.
-    ///
-    /// Takes the text rather than a number for the one test that is about a value
-    /// the daemon cannot parse (`IMPLEMENTATION.md` § 4), which is the thing
-    /// [`Session::start_with_ring`] cannot say.
+    /// Starts a daemon with `NOMUX_RING_BYTES` set to exactly `value`, for the one
+    /// test about a value the daemon cannot parse (`IMPLEMENTATION.md` § 4).
     pub(crate) fn start_with_raw_ring(name: &str, value: &str) -> Self {
         Self::start_with(name, value, "/bin/sh")
     }
 
-    /// Starts a daemon whose `SHELL` is `shell`, however unusable that path is.
-    ///
-    /// For the one test that is about a session that cannot be created: everything
-    /// else here wants the `/bin/sh` [`nomux_with_shell`] pins, and gets it.
+    /// Starts a daemon whose `SHELL` is `shell`, however unusable that path is, for
+    /// the one test about a session that cannot be created.
     pub(crate) fn start_with_shell(name: &str, shell: &str) -> Self {
         Self::start_with(name, &DEFAULT_TEST_RING.to_string(), shell)
     }
 
-    /// The body all three go through, so what every daemon in this suite is told —
-    /// an empty prompt, a home it can be asserted to have started in — is said once.
+    /// The body all three go through, so what every daemon in this suite is told is
+    /// said once.
     fn start_with(name: &str, ring_bytes: &str, shell: &str) -> Self {
         let root = run_root(name);
         let id = intern(name);
@@ -306,18 +297,12 @@ impl Session {
     }
 
     /// A daemon with one client attached to it, greeted from the start of both
-    /// streams.
-    ///
-    /// Start, connect, greet is how most of the suite opens, and those three lines say
-    /// nothing about the test that follows them: a session nobody has touched before,
-    /// a single client, and a `HelloOk` whose `resume_from` is where the first
-    /// [`Client::read_until`] begins. Saying it once leaves each test starting at the
-    /// thing it is actually about.
+    /// streams: how most of the suite opens.
     ///
     /// The [`Session`] comes back alongside the client because it owns the daemon and
     /// kills it on drop, so the caller has to bind it for as long as the client is
-    /// used — `let (_session, ..)` where the test never names it again, never `let (_,
-    /// ..)`, which would end the session on the spot.
+    /// used — `let (_session, ..)`, never `let (_, ..)`, which would end the session
+    /// on the spot.
     pub(crate) fn attached(name: &str) -> (Self, Client, nomux_proto::HelloOk) {
         Self::attached_with(name, 0)
     }
@@ -331,7 +316,7 @@ impl Session {
     }
 
     /// The directory the daemon publishes its five files in.
-    pub(crate) fn run_dir(&self) -> PathBuf {
+    fn run_dir(&self) -> PathBuf {
         self.root.join("nomux")
     }
 
@@ -351,21 +336,66 @@ impl Session {
         let stream = UnixStream::connect(self.agent_socket())
             .unwrap_or_else(|err| panic!("connect to the agent socket of {:?}: {err}", self.name));
         stream
-            .set_read_timeout(Some(PATIENCE))
+            .set_read_timeout(Some(FRAME_PATIENCE))
             .expect("set read timeout");
         stream
     }
 }
 
+/// A FIFO named `cue` in a session's run root, which the child blocks on until the
+/// test lets it through.
+///
+/// The child's line is `read cue < cue; <what the test is about>`: the whole line is
+/// parsed before any of it runs, so past the [`Client::make_ready`] marker the child
+/// never touches its terminal until [`Cue::release`]. That is what lets a test compose
+/// a state around a child instead of waiting for one to happen.
+pub(crate) struct Cue(PathBuf);
+
+impl Cue {
+    pub(crate) fn new(root: &Path) -> Self {
+        let path = root.join("cue");
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &path,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .expect("create the FIFO the child waits on");
+        Self(path)
+    }
+
+    /// Lets the child on.
+    ///
+    /// Opened without blocking, so a child that never reached its own `open` fails
+    /// here rather than parking the test: a FIFO answers `ENXIO` until a reader is
+    /// there, and the child counts as one from the moment it enters the wait.
+    pub(crate) fn release(self) {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut go = None;
+        assert!(
+            poll_until(FRAME_PATIENCE, || {
+                go = fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&self.0)
+                    .ok();
+                go.is_some()
+            }),
+            "the child never reached the cue it waits on"
+        );
+        go.expect("the FIFO the wait above opened")
+            .write_all(b"go\n")
+            .expect("cue the child");
+    }
+}
+
 /// Reconnects until the daemon reports a gap, and hands back the greeting that did.
 ///
-/// Whether the ring has overflowed *yet* is a question about when the daemon was
-/// last scheduled, not about the property any of these tests are pinning — so a test
-/// that sleeps and then asserts `gap` is really asserting that the machine got round
-/// to it, under nextest's full-core parallelism, while doing something else.
-/// Reconnecting until the daemon itself says so turns that into a wait on the thing
-/// being waited for, which either happens or fails with the numbers that explain why
-/// not.
+/// Whether the ring has overflowed *yet* is a question about when the daemon was last
+/// scheduled rather than about the property under test, so a sleep followed by an
+/// assertion on `gap` really asserts that the machine got round to it. Reconnecting
+/// until the daemon itself says so turns that into a wait on the thing being waited
+/// for.
 pub(crate) fn reconnect_until_gap(
     session: &Session,
     flags: u8,
@@ -496,12 +526,9 @@ pub(crate) fn while_nothing_forks<T>(f: impl FnOnce() -> T) -> T {
 /// A `nomux` invocation against the run directory under `root`, ready for whatever
 /// stdio and tuning the caller wants on top.
 ///
-/// Every mode the suite starts is started this way, so the one thing no test may
-/// forget is said once rather than at each site: the run directory, which is the
-/// whole of what the frozen control surface is told (§ 6.6). Nothing else is added
-/// here, because that is a claim about the surface rather than a convenience — an
-/// invocation handed more than the run directory is no longer the thing § 6.6
-/// describes, and [`control`] beneath would be documenting something it does not do.
+/// The run directory is the whole of what the frozen control surface is told (§ 6.6),
+/// and nothing else is added here: that is a claim about the surface rather than a
+/// convenience, and an invocation handed more is no longer the thing § 6.6 describes.
 pub(crate) fn nomux(root: &Path, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_nomux"));
     command.args(args).env("XDG_RUNTIME_DIR", root);
@@ -532,16 +559,10 @@ pub(crate) fn leads_a_process_group(command: &mut Command) {
 
 /// [`nomux`] with a `SHELL` the developer's login environment cannot vary.
 ///
-/// For every invocation that could put a shell behind a PTY — including the ones
-/// where doing so would *be* the failure, since a refusal that regressed should
-/// leave a predictable `/bin/sh` to be found rather than whatever the developer
-/// logs in with. One caller runs `list` and `kill` through here as well, because
-/// the `attach` it shares the call with is the one under test.
-///
-/// What is left on [`nomux`] alone is what could not start a shell under any
-/// regression: `list` and `kill`, and an `attach` onto a socket the test bound
-/// itself, which finds a session already there — and which, since the split, could
-/// not have started a daemon even where it did not.
+/// For every invocation that could put a shell behind a PTY — including the ones where
+/// doing so would *be* the failure, since a refusal that regressed should leave a
+/// predictable `/bin/sh` to be found rather than whatever the developer logs in with.
+/// What is left on [`nomux`] alone could not start a shell under any regression.
 pub(crate) fn nomux_with_shell(root: &Path, args: &[&str]) -> Command {
     let mut command = nomux(root, args);
     command.env("SHELL", "/bin/sh");
@@ -602,16 +623,11 @@ pub(crate) fn stdout(out: &Output) -> String {
 
 /// Waits for a file the daemon publishes on its way up.
 ///
-/// Named for the file rather than for binding a socket: two of the callers wait on a
-/// pidfile, and a failure that says the daemon "never bound" one sends the reader
-/// looking in the wrong place.
-///
-/// Not for a socket a caller then means to *connect* to — see
-/// [`wait_until_answering`], which is a different question and the one those callers
-/// are really asking.
+/// Not for a socket a caller then means to *connect* to — see [`wait_until_answering`],
+/// which is a different question.
 pub(crate) fn wait_for(path: &Path) {
     assert!(
-        poll_until(Duration::from_secs(10), || path.exists()),
+        poll_until(SETTLE, || path.exists()),
         "the daemon never created {}",
         path.display()
     );
@@ -620,19 +636,12 @@ pub(crate) fn wait_for(path: &Path) {
 /// Waits for the daemon `id` published a pidfile under `root` for, and hands back
 /// its pid alongside a guard that collects it however the test ends.
 ///
-/// For every test that brings a session up through `nomux spawn` or `nomux daemon`
-/// rather than through [`Session`], which kills its own child on drop. The daemon
-/// such a spawn produces has `setsid`ed away, so killing the relay does not reach it
-/// and no [`Spawned`] covers it: it is collected by an explicit `nomux kill` further
-/// down, and a panic before that line skips it. What is left behind then holds its
-/// run directory for the whole 30-second first-attach timeout, and the *next* run's
-/// [`sweep_finished_runs`] deletes that directory out from under it — the pid in its
-/// name having gone with this process. `PLAN.md` § P2 records the same shape of
-/// hazard for `flock`.
-///
-/// The number comes back with the guard because most callers go on to assert
-/// something about that process: which pid `list` printed, or that `kill` really
-/// stopped it.
+/// For tests that bring a session up through `nomux spawn` or `nomux daemon` rather
+/// than through [`Session`], which kills its own child on drop. Such a daemon has
+/// `setsid`ed away, so killing the relay does not reach it and no [`Spawned`] covers
+/// it: an assertion firing before the explicit `nomux kill` would leave it holding its
+/// run directory for the whole first-attach timeout, while the *next* run's
+/// [`sweep_finished_runs`] deletes that directory out from under it.
 pub(crate) fn daemon_reaper(root: &Path, id: &str) -> (u32, Reaper) {
     let pid_file = root.join("nomux").join(format!("{id}.pid"));
     wait_for(&pid_file);
@@ -700,13 +709,12 @@ pub(crate) const SPIN_WINDOW: Duration = Duration::from_millis(500);
 /// ticks `/proc` counts in.
 ///
 /// A wall-clock interval rather than a wait for a condition, since it *is* the
-/// measurement — every caller establishes the state it is measuring before it starts.
-/// User and system together, because the two states this has to tell apart are
-/// "asleep in `poll`" and "going round the loop as fast as the scheduler allows", and
-/// the second spends its time on both sides of the syscall boundary. A process that
-/// has gone reports nothing, which reads here as zero — the answer the caller's
-/// assertion wants, and one no daemon that is still there can produce falsely, since
-/// these counters never go down.
+/// measurement. User and system together, because the two states this has to tell
+/// apart are "asleep in `poll`" and "going round the loop as fast as the scheduler
+/// allows", and the second spends its time on both sides of the syscall boundary. A
+/// process that has gone reports nothing, which reads here as zero — the answer the
+/// caller's assertion wants, and one no live daemon can produce falsely, since these
+/// counters never go down.
 pub(crate) fn cpu_ticks(daemon: u32) -> u64 {
     let charged = || -> u64 {
         [StatField::UserTime, StatField::SystemTime]
@@ -735,20 +743,15 @@ pub(crate) fn process_alive(pid: u32) -> bool {
 /// Waits for a daemon to be *answering* on `path`, rather than merely to have made
 /// the name.
 ///
-/// A unix socket enters the filesystem at `bind` and starts answering at `listen`,
-/// and those are two syscalls: in between, the path exists and every `connect` is
-/// refused. So [`wait_for`] on a socket is satisfied one step before the thing every
-/// one of its callers goes on to do, and that step is wide enough to lose on a
-/// machine with more runnable threads than cores.
+/// A unix socket enters the filesystem at `bind` and starts answering at `listen`, and
+/// those are two syscalls: in between, the path exists and every `connect` is refused,
+/// so [`wait_for`] on a socket is satisfied one step early.
 ///
-/// The connection is dropped as soon as it is made, and costs the session nothing:
-/// § 6.4 has the daemon promote a connection on its `Hello` and never on the
-/// `connect`, precisely so that the liveness probe `nomux list` makes cannot evict a
-/// client. So this is not an attach, and does not stop the clock an attach stops.
+/// The connection costs the session nothing: § 6.4 has the daemon promote a connection
+/// on its `Hello` and never on the `connect`, so this is not an attach and does not
+/// stop the clock an attach stops.
 pub(crate) fn wait_until_answering(path: &Path) {
-    let answered = poll_until(Duration::from_secs(10), || {
-        UnixStream::connect(path).is_ok()
-    });
+    let answered = poll_until(SETTLE, || UnixStream::connect(path).is_ok());
     assert!(answered, "the daemon never answered on {}", path.display());
 }
 
@@ -861,29 +864,46 @@ impl Client {
 
     pub(crate) fn hello_with(&mut self, flags: u8, out_offset: u64) -> nomux_proto::HelloOk {
         self.send(&hello_frame(flags, out_offset));
-        match self.next_frame() {
-            (FrameType::HelloOk, payload) => {
-                match Frame::decode(FrameType::HelloOk, &payload).expect("decode HelloOk") {
-                    Frame::HelloOk(ok) => {
-                        self.in_offset = ok.in_applied;
-                        self.out_offset = ok.resume_from;
-                        ok
-                    }
-                    other => panic!("expected HelloOk, got {other:?}"),
-                }
+        let greeting = self.next_frame();
+        self.take_hello_ok(greeting)
+    }
+
+    /// [`Client::hello`] against a deadline the caller shares between several
+    /// greetings, for [`Client::frame_before`]'s reason: a test that reconnects two
+    /// dozen times takes a fresh [`FRAME_PATIENCE`] on each, so a daemon that stalls
+    /// on `HelloOk` is bounded only by the runner's kill — which loses whatever the
+    /// failure was going to say, the seed § 9 promises included.
+    pub(crate) fn hello_before(
+        &mut self,
+        deadline: Instant,
+        out_offset: u64,
+    ) -> nomux_proto::HelloOk {
+        self.send(&hello_frame(0, out_offset));
+        let awaiting = "a HelloOk from the daemon";
+        let greeting = self
+            .frame_before(deadline, awaiting)
+            .unwrap_or_else(|| panic!("timed out waiting for {awaiting}"));
+        self.take_hello_ok(greeting)
+    }
+
+    /// Decodes the greeting and moves this client's two offsets onto it.
+    fn take_hello_ok(&mut self, (ty, payload): (FrameType, Vec<u8>)) -> nomux_proto::HelloOk {
+        assert_eq!(ty, FrameType::HelloOk, "expected HelloOk, got {ty:?}");
+        match Frame::decode(ty, &payload).expect("decode HelloOk") {
+            Frame::HelloOk(ok) => {
+                self.in_offset = ok.in_applied;
+                self.out_offset = ok.resume_from;
+                ok
             }
-            (ty, _) => panic!("expected HelloOk, got {ty:?}"),
+            other => panic!("expected HelloOk, got {other:?}"),
         }
     }
 
     /// Puts the child's terminal into `mode`, waits for proof that it is already in
     /// effect, and leaves `then` running behind it.
     ///
-    /// The one shape every test that asserts on raw bytes needs first, and the one
-    /// the several hand-written copies of it reconciled to: `stty <mode>`, then a
-    /// marker, then whatever the test wants running — `-echo -onlcr` for a
-    /// comparison that must be literal, `raw -echo` with a `sleep` for a child that
-    /// holds the terminal without reading it.
+    /// `stty <mode>`, then a marker, then whatever the test wants running — the shape
+    /// every test that asserts on raw bytes needs first.
     ///
     /// `raw` in particular is what makes the line discipline apply back pressure
     /// rather than quietly dropping an overflow: in canonical mode a line longer than
@@ -892,23 +912,19 @@ impl Client {
     ///
     /// The marker comes *after* the `stty` because that is what makes arriving at it
     /// proof the mode is in effect rather than merely reached: input sent while the
-    /// line discipline was still canonical is discarded by it rather than delivered,
-    /// and the test would then accuse the daemon of losing what the terminal threw
-    /// away. It is built out of `$((6*7))` because the line discipline echoes the
-    /// command line itself before any of it runs — that echo carries the arithmetic
+    /// line discipline was still canonical is discarded by it rather than delivered.
+    /// It is built out of `$((6*7))` because the line discipline echoes the command
+    /// line itself before any of it runs — that echo carries the arithmetic
     /// unexpanded, so it cannot be what satisfies the wait.
     ///
     /// Nothing may follow the marker on that line, which is why [`READY_ECHO`] is a
     /// `printf` with no newline in it. [`Ready::offset`] is one past the frame the
     /// marker completed in rather than one past the marker, so a terminator behind it
-    /// is only accounted for when the daemon happened to read it in the same pass —
-    /// and the PTY makes that a race rather than a rule, since the master can be woken
-    /// between the line and the `\r\n` that `onlcr` expands behind it. What is left
-    /// over is two bytes at an offset the caller never hears about, which the next
-    /// [`Client::next_of`] drops as the session's own chatter; the read after *that*
-    /// starts two bytes short and fails the contiguity assertion in
-    /// [`Client::read_until`], accusing the daemon of a hole in a stream that never
-    /// had one. CI saw exactly that: a frame at 57 where 55 was expected.
+    /// is accounted for only when the daemon read it in the same pass — a race, since
+    /// the master can be woken between the line and the `\r\n` that `onlcr` expands
+    /// behind it. The two bytes left over are then dropped by the next
+    /// [`Client::next_of`] as session chatter, and the read after that starts short
+    /// and fails [`Client::read_until`]'s contiguity assertion.
     ///
     /// Sent at input offset 0: a session that is not ready yet has had nothing else
     /// sent to it.
@@ -930,7 +946,7 @@ impl Client {
 
     pub(crate) fn next_frame(&mut self) -> (FrameType, Vec<u8>) {
         let awaiting = "a frame from the daemon";
-        self.frame_before(Instant::now() + PATIENCE, awaiting)
+        self.frame_before(Instant::now() + FRAME_PATIENCE, awaiting)
             .unwrap_or_else(|| panic!("timed out waiting for {awaiting}"))
     }
 
@@ -945,7 +961,7 @@ impl Client {
     /// none of it leaves the caller anything to add.
     ///
     /// Reachable from the test binaries for that same first reason. A loop over
-    /// [`Client::next_frame`] takes a fresh [`PATIENCE`] on every frame, so a daemon
+    /// [`Client::next_frame`] takes a fresh [`FRAME_PATIENCE`] on every frame, so a daemon
     /// dribbling one frame just inside it is never late and the loop as a whole has
     /// no bound at all — it runs until nextest's own kill, which cannot say which
     /// wait never ended. A test reading many frames wants one deadline, and this is
@@ -1000,7 +1016,7 @@ impl Client {
     /// for a Error frame" names neither the row nor the behaviour — and every row
     /// fails identically. The sentence belongs to whoever built the table.
     fn next_of_awaiting(&mut self, want: FrameType, awaiting: &str) -> Vec<u8> {
-        let deadline = Instant::now() + PATIENCE;
+        let deadline = Instant::now() + FRAME_PATIENCE;
         loop {
             let (ty, payload) = self
                 .frame_before(deadline, awaiting)
@@ -1047,7 +1063,7 @@ impl Client {
     /// both end with a closed connection, and only one of them is the behaviour a
     /// caller is asking about.
     pub(crate) fn expect_eof(&mut self, after: &str) {
-        let deadline = Instant::now() + PATIENCE;
+        let deadline = Instant::now() + FRAME_PATIENCE;
         let mut chunk = [0u8; 8192];
         loop {
             while let Some((ty, _)) = self.take_pending_frame() {
@@ -1080,9 +1096,9 @@ impl Client {
     /// that has just waited for an ack may already hold all of it. Peeked rather than
     /// read, so the bytes stay where the kernel can still see them.
     pub(crate) fn wait_for_unread_bytes(&mut self) {
-        self.send(&Frame::Ping { nonce: 0xDEAD });
+        self.send(&Frame::Ping);
         let stream = &self.stream;
-        let queued = poll_until(PATIENCE, || has_unread_bytes(stream));
+        let queued = poll_until(FRAME_PATIENCE, || has_unread_bytes(stream));
         assert!(
             queued,
             "the daemon wrote nothing, so closing here would be an orderly FIN \
@@ -1099,41 +1115,18 @@ impl Client {
         }
     }
 
-    /// Consumes whatever the daemon has already sent, without waiting for more.
-    ///
-    /// For tests that are about to close on purpose: a socket closed with data still
-    /// unread makes the kernel send RST, and the daemon answers the `ECONNRESET` that
-    /// follows by letting the connection go without decoding what its last `fill`
-    /// had already buffered — so an `Input` frame written but not yet decoded is
-    /// lost. Not to the kernel, which delivers every byte and reports the error only
-    /// after the last of them, but to `Conn::fill` (`IMPLEMENTATION.md` § 3).
-    /// Draining first turns the close into an orderly FIN, where `fill` reports end
-    /// of file instead and those frames are decoded — so what happens to that input
-    /// is the daemon's behaviour rather than a matter of timing.
-    ///
-    /// A silent socket ends this after [`SOCKET_POLL`], which is the read timeout
-    /// every client here carries — there is nothing to shorten, because nothing waits
-    /// long in the first place.
-    pub(crate) fn drain_available(&mut self) {
-        let mut chunk = [0u8; 8192];
-        while let Ok(n) = read_uninterrupted(&mut self.stream, &mut chunk) {
-            if n == 0 {
-                break;
-            }
-            self.pending.extend_from_slice(&chunk[..n]);
-        }
-    }
-
     /// Reads until the daemon has acknowledged input through `through`, tolerating
     /// whatever else arrives on the way.
     ///
-    /// For tests that are about to disconnect on purpose: an `Input` frame that was
-    /// written but not yet *decoded* is lost when the socket closes with output
-    /// still queued — see [`Client::drain_available`] for where it actually goes —
-    /// so waiting for the ack is what makes "the daemon has this" true.
+    /// For tests that are about to disconnect on purpose: a socket closed with output
+    /// still queued makes the kernel send RST, and the daemon answers the
+    /// `ECONNRESET` by letting the connection go without decoding what `Conn::fill`
+    /// had already buffered (`IMPLEMENTATION.md` § 3) — so an `Input` frame written
+    /// but not yet decoded is lost. Waiting for the ack is what makes "the daemon has
+    /// this" true.
     pub(crate) fn wait_for_input_ack(&mut self, through: u64) {
         let awaiting = format!("an InputAck through offset {through}");
-        let deadline = Instant::now() + PATIENCE;
+        let deadline = Instant::now() + FRAME_PATIENCE;
         loop {
             let (ty, payload) = self
                 .frame_before(deadline, &awaiting)
@@ -1183,7 +1176,7 @@ impl Client {
         let mut seen = Vec::new();
         let mut offset = from;
         let awaiting = format!("{needle:?} in the session's output");
-        let deadline = Instant::now() + PATIENCE;
+        let deadline = Instant::now() + FRAME_PATIENCE;
         while let Some((ty, payload)) = self.frame_before(deadline, &awaiting) {
             match Frame::decode(ty, &payload).expect("decode frame") {
                 Frame::Output { offset: at, data } => {
@@ -1196,7 +1189,7 @@ impl Client {
                     }
                 }
                 Frame::Gap { new_base_offset } if follow_gaps => offset = new_base_offset,
-                Frame::InputAck { .. } | Frame::Pong { .. } => {}
+                Frame::InputAck { .. } | Frame::Pong => {}
                 other => panic!("unexpected frame while awaiting {needle:?}: {other:?}"),
             }
         }

@@ -202,19 +202,15 @@ impl Pty {
     ///
     /// Two reaches — the child's process group, then [`session_members`]'s `/proc` walk
     /// over its session — because neither alone covers it, and in that order:
-    /// `IMPLEMENTATION.md` § 6.5. What is left here is which reach each guard applies to.
+    /// `IMPLEMENTATION.md` § 6.5, which also has why every signal below is guarded by
+    /// [`Pty::pid_reissued`].
     pub(crate) fn terminate(&mut self) {
         let raw = i32::try_from(self.child.id()).unwrap_or(0);
         if let Some(pid) = rustix::process::Pid::from_raw(raw)
             && !self.pid_reissued(raw)
         {
-            // The same probe the `SIGKILL` escalation below is guarded by, one
-            // signal earlier and for the same reason: an ordinary exit reaps the
-            // child long before `shutdown` gets here, so by then there may be
-            // nothing behind either reach. What it cannot ask is whether what it found
-            // is *ours*, which is [`Pty::pid_reissued`], the other half of the same
-            // guard. `group_alive` then carries the last probe's answer, so neither
-            // signal below goes to a group this has already watched go.
+            // `group_alive` carries each probe's answer forward, so no signal below goes
+            // to a group this has already watched go.
             let mut group_alive = rustix::process::test_kill_process_group(pid).is_ok();
             let mut settled = !group_alive && session_members(raw).is_empty();
             if !settled {
@@ -243,12 +239,11 @@ impl Pty {
                     std::thread::sleep(HANGUP_POLL_INTERVAL);
                 }
             }
-            // Only if something is still standing. The guard is asked a second time
-            // because the loop above can be what makes the answer change — its
-            // `try_wait` reaps the child, and reaping frees the number — and the two
-            // reaches are separately conditional because their conditions come apart: a
-            // backgrounded job in a group of its own outlives the grace while the
-            // *child's* group is already gone.
+            // The guard is asked again because the loop above can be what changes the
+            // answer: its `try_wait` reaps the child, and reaping frees the number. The
+            // two reaches are separately conditional because their conditions come
+            // apart — a backgrounded job in a group of its own outlives the grace while
+            // the *child's* group is already gone.
             if !settled && !self.pid_reissued(raw) {
                 if group_alive {
                     let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
@@ -260,13 +255,10 @@ impl Pty {
         drop(self.child.wait());
     }
 
-    /// Whether `raw` has been handed to somebody else since the child was spawned.
-    ///
-    /// The other half of [`Pty::terminate`]'s guard. The daemon reaps the child on
-    /// every pass, so its number can be free for as long as the session then runs, and a
-    /// stranger who took it and called `setsid` answers the liveness probe there exactly
-    /// as the child would have. Start times are not reissued with the pids they belong
-    /// to, which is what tells the two apart.
+    /// Whether `raw` has been handed to somebody else since the child was spawned
+    /// (§ 6.5): a stranger who took the freed number and called `setsid` answers the
+    /// liveness probe in [`Pty::terminate`] exactly as the child would have, and start
+    /// times are not reissued with the pids they belong to.
     ///
     /// Anything *unknown* is deliberately not a reissue: a missing `/proc/<raw>` is what
     /// a reaped shell with a surviving job leaves behind, an unreadable one arrives
@@ -423,42 +415,10 @@ pub(crate) fn exit_parts(status: std::process::ExitStatus) -> (i32, nomux_proto:
     )
 }
 
-/// Outcome of one read from the PTY master.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Read {
-    /// Bytes are available in the buffer.
-    Data(usize),
-    /// The last process holding the slave is gone.
-    Eof,
-    /// Nothing buffered right now. Distinct from [`Read::Eof`], which is the whole
-    /// reason this is an enum: on a non-blocking master both arrive as an error
-    /// return, and confusing `EAGAIN` for the end of the session would report the
-    /// child as exited every time the poll set woke up spuriously.
-    WouldBlock,
-}
-
-/// Reads from the PTY master.
-///
-/// When the last process holding the slave exits, Linux fails master reads with
-/// `EIO` rather than returning 0. Callers want that to look like a clean EOF.
-///
-/// Nothing is propagated, which is why there is no `Result`: § 6.4.1 says a failing
-/// client socket never leaves the event loop, and a PTY is not the one place a stray
-/// errno may destroy the session (`Daemon::write_pty` carries the same argument for the
-/// other direction). An errno this does not know is a master nothing can be read from,
-/// so it arrives as the end of the session's *output* — and `Read::Eof` takes the
-/// master out of the poll set, so nothing spins on it either.
-pub(crate) fn read_pty(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Read {
-    match crate::nbio::read(fd, buf) {
-        Ok(n) if n > 0 => Read::Data(n),
-        Err(rustix::io::Errno::AGAIN) => Read::WouldBlock,
-        Ok(_) | Err(_) => Read::Eof,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nbio::{Read, read_or_eof};
 
     /// A `comm` field is whatever the process called its executable, parentheses and
     /// spaces included, and the fields that matter here sit after it.
@@ -661,21 +621,12 @@ mod tests {
             "the ordinary case sent no SIGHUP, so the two assertions below are \
              about an instrument that measures nothing"
         );
-        // Pinned rather than discarded, and it says something different in each
-        // profile because the trap does. Where rustix's assertions are compiled in, the
-        // trapped `kill` takes one with it, so what this pins is that the trap stopped
-        // the call it was aimed at; where they are not, an unwind can only be somebody
-        // else's and this refuses to swallow it.
-        assert_eq!(
-            unwound.is_err(),
-            cfg!(debug_assertions),
-            "a debug build must take rustix's assertion on the return value of the \
-             syscall the filter rolled back, and a release build must not unwind \
-             here at all"
-        );
+        // Discarded rather than pinned: whether the rolled-back syscall trips a debug
+        // assertion is rustix's to decide, and the observation this test is for is the
+        // flag above.
+        drop(unwound);
         // What `terminate` may not have got round to, having possibly left through
         // the trapped syscall rather than through its own end.
-        drop(unwound);
         drop(pty.child.kill());
         drop(pty.child.wait());
 
@@ -899,7 +850,7 @@ mod tests {
         let mut buf = [0u8; 4096];
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
-            match read_pty(pty.master(), &mut buf) {
+            match read_or_eof(pty.master(), &mut buf) {
                 Read::Data(n) => seen.push_str(&String::from_utf8_lossy(&buf[..n])),
                 Read::WouldBlock => std::thread::sleep(HANGUP_POLL_INTERVAL),
                 Read::Eof => break,

@@ -69,7 +69,7 @@ trap 'cleanup; exit 130' INT TERM HUP
 # `-p nomux --test session` rather than `--workspace`: the guard is one test in
 # crates/nomux/tests/session.rs, and this runs twice under RUSTFLAGS that share no
 # artifacts, so everything outside that target is compiled twice and run never.
-# `--workspace` also built the chaos, spawn_lock, codec and wire test binaries and
+# `--workspace` also built the chaos, control, codec and wire test binaries and
 # proptest with its dependency tree behind them. Narrowing does not lose the daemon:
 # the harness resolves it through `env!("CARGO_BIN_EXE_nomux")`, which cargo defines
 # by building the package's binary for its own integration tests.
