@@ -31,10 +31,9 @@ use std::process::ExitCode;
 /// the only one shared by every mode — `IMPLEMENTATION.md` § 10 has both tables and
 /// says why the rest of that range is left alone.
 const EXIT_USAGE: u8 = 64;
-/// The session is there but this mode cannot have it. The shell's "found but not
-/// executable", applied to a session, since these are what a client runs over an
-/// exec channel: `spawn` found the id already taken, or `attach` found a session it
-/// could not join.
+/// The session is there but this mode cannot have it: `spawn` found the id already
+/// taken, or `attach` found a session it could not join. The shell's "found but not
+/// executable", for the reason § 10 gives.
 const EXIT_UNATTACHABLE: u8 = 126;
 /// No such session — `attach` on an id nothing answers for, or a `spawn` whose daemon
 /// never started. The shell's "not found", for the reason above.
@@ -68,7 +67,7 @@ fn main() -> ExitCode {
     };
 
     match mode.to_str() {
-        Some(word @ "list") => only(args, word, || report(control::list())),
+        Some(word @ "list") => only(args, word, || report(control::list(), &[], 1)),
         Some(word @ ("--version" | "-V")) => only(args, word, || {
             println!(
                 "nomux {} (protocol {})",
@@ -113,11 +112,10 @@ fn only(mut args: impl Iterator<Item = OsString>, word: &str, run: fn() -> ExitC
 /// of — the message, the usage, and 64 — is decided once.
 fn usage_error(message: Option<&str>) -> ExitCode {
     if let Some(message) = message {
-        // Escaped here rather than at each of the five places one is built, because
-        // what every one of them quotes is a word from `argv` — text nothing validated,
-        // on its way to a terminal that would act on an `ESC ]0;` in it. `escape_debug`
-        // leaves printable UTF-8 alone, so an argument in any language still reads as
-        // what was typed.
+        // Escaped here rather than at each of the five places one is built: what all
+        // of them quote is a word from `argv`, on its way to a terminal that would
+        // act on an `ESC ]0;` in it. `escape_debug` leaves printable UTF-8 alone, so
+        // an argument in any language still reads as what was typed.
         eprintln!("nomux: {}\n", message.escape_debug());
     }
     eprint!("{USAGE}");
@@ -160,9 +158,8 @@ fn run_session_mode(mode: Mode, args: impl Iterator<Item = OsString>) -> ExitCod
     // The label is recorded when the session is created (`IMPLEMENTATION.md` § 6.6),
     // so it belongs to the two modes that create one. Refused rather than dropped on
     // the floor: a `--label` on `attach` is a caller that still believes `attach`
-    // might create the session, which is the confusion this split exists to end, and
-    // silence would leave it believing it. `kill` goes on parsing and ignoring one,
-    // because what the frozen escape hatch accepts is not this change's to narrow.
+    // might create the session, and silence would leave it believing it. `kill` goes
+    // on parsing and ignoring one, § 6.6 having frozen what it accepts.
     if matches!(mode, Mode::Attach) && label.is_some() {
         return usage_error(Some(
             "`attach` takes no `--label`: a label is recorded when the session is \
@@ -171,43 +168,27 @@ fn run_session_mode(mode: Mode, args: impl Iterator<Item = OsString>) -> ExitCod
     }
 
     match mode {
-        Mode::Daemon => report(daemon::run(&session, label.as_deref())),
-        Mode::Spawn => relayed(attach::run(
-            &session,
-            attach::Intent::Create,
-            label.as_deref(),
-        )),
-        Mode::Attach => relayed(attach::run(&session, attach::Intent::Resume, None)),
-        Mode::Kill => report(control::kill(&session)),
+        Mode::Daemon => report(daemon::run(&session, label.as_deref()), &[], 1),
+        Mode::Spawn => report(
+            attach::run(&session, attach::Intent::Create, label.as_deref()),
+            RELAY_NO_SESSION,
+            EXIT_UNATTACHABLE,
+        ),
+        Mode::Attach => report(
+            attach::run(&session, attach::Intent::Resume, None),
+            RELAY_NO_SESSION,
+            EXIT_UNATTACHABLE,
+        ),
+        Mode::Kill => report(control::kill(&session), &[], 1),
     }
 }
 
-/// Maps the relay's fate onto an exit code, per `IMPLEMENTATION.md` § 10.
-///
-/// Shared by `spawn` and `attach` because the table is one table: the two differ in
-/// which errors they can produce, never in what a given one means. `NotFound` is the
-/// session `attach` refused to invent and `TimedOut` is the daemon `spawn` could not
-/// start — the same "not found", one about a session and one about bringing it into
-/// being — while `AlreadyExists` is the id `spawn` found taken, which falls to the
-/// catch-all beside the permission and protocol refusals that were always there.
-fn relayed(result: std::io::Result<()>) -> ExitCode {
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            eprintln!("nomux: {err}");
-            ExitCode::from(match err.kind() {
-                std::io::ErrorKind::TimedOut | std::io::ErrorKind::NotFound => EXIT_NO_SESSION,
-                // A rejected session id is a malformed command line, not a session
-                // that resisted attaching: the id could never have named one. § 10
-                // gives that `EX_USAGE`, and the distinction is the client's to act
-                // on — it caches "unattachable" per host and would otherwise cache it
-                // off its own typo.
-                std::io::ErrorKind::InvalidInput => EXIT_USAGE,
-                _ => EXIT_UNATTACHABLE,
-            })
-        }
-    }
-}
+/// The relay's two extra rows: `NotFound` is the session `attach` refused to invent,
+/// and `TimedOut` is a session that never answered — the daemon `spawn` could not
+/// start, or a backlog `attach` waited out. The same "not found", reached by waiting
+/// rather than by looking.
+const RELAY_NO_SESSION: &[std::io::ErrorKind] =
+    &[std::io::ErrorKind::NotFound, std::io::ErrorKind::TimedOut];
 
 /// Splits a session-mode command line into its id and optional label.
 ///
@@ -244,22 +225,27 @@ fn parse_session_args(
 
 /// Maps a fallible operation onto an exit code, reporting failure on stderr.
 ///
-/// The whole of the `daemon`, `list` and `kill` table in `IMPLEMENTATION.md` § 10,
-/// including why the last row is deliberately coarse.
-///
-/// `InvalidInput` is `EX_USAGE` here for the reason the `attach` arm above gives:
-/// [`rundir::SessionPaths::new`] is the crate's only source of it, so it always means
-/// a session id that could never have named a session, rather than an operation that
-/// failed.
-fn report(result: std::io::Result<()>) -> ExitCode {
+/// Both of `IMPLEMENTATION.md` § 10's tables, which are one table. Every mode gives
+/// `InvalidInput` `EX_USAGE`: [`rundir::SessionPaths::new`] is the crate's only
+/// source of it, so it always means an id that could never have named a session
+/// rather than an operation that failed — a distinction the client acts on, caching
+/// "unattachable" per host and otherwise caching its own typo. The modes differ only
+/// in `no_session`, empty outside the relay, and in `otherwise`.
+fn report(
+    result: std::io::Result<()>,
+    no_session: &[std::io::ErrorKind],
+    otherwise: u8,
+) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("nomux: {err}");
             ExitCode::from(if err.kind() == std::io::ErrorKind::InvalidInput {
                 EXIT_USAGE
+            } else if no_session.contains(&err.kind()) {
+                EXIT_NO_SESSION
             } else {
-                1
+                otherwise
             })
         }
     }

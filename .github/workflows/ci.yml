@@ -37,8 +37,9 @@ env:
 # their major tag deliberately — GitHub's own, inside a trust boundary the job is
 # already entirely within.
 jobs:
-  # The prek gate, run in the same cheapest-first order. One job, so the workspace
-  # and its dependencies are compiled against a single cache.
+  # The pre-commit gate, run by prek itself rather than restated here, so the commands
+  # live in .pre-commit-config.yaml and nowhere else. One job, so the workspace and its
+  # dependencies are compiled against a single cache.
   check:
     name: fmt, clippy, tests
     runs-on: ubuntu-latest
@@ -46,9 +47,7 @@ jobs:
     # would otherwise hold the runner for the six-hour default.
     timeout-minutes: 20
     # Where the deny lives, and the reason it is here rather than in
-    # [workspace.lints] is written down in Cargo.toml: cargo inlines that table into
-    # the published manifest, so a deny there is a stranger's build failure on any
-    # toolchain newer than the pin. Here it reaches this job and nothing else.
+    # [workspace.lints] is written down in Cargo.toml.
     #
     # Job-level rather than repeated per step, so every cargo invocation below sees
     # the same value: RUSTFLAGS is part of cargo's fingerprint and of the rust-cache
@@ -63,6 +62,23 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Two files, checked against each other before anything is installed. Because the
+      # step below installs from rust-toolchain.toml, every build in this job genuinely
+      # is an MSRV build — but only while the two strings agree. Bump one alone and the
+      # declared MSRV becomes a claim nothing tests: `clippy::incompatible_msrv` reads
+      # `rust-version` and catches std-API drift, never a language or edition feature.
+      - name: rust-toolchain.toml and rust-version name the same compiler
+        run: |
+          pinned=$(awk -F'"' '/^channel *=/ { print $2; exit }' rust-toolchain.toml)
+          msrv=$(awk -F'"' '/^rust-version *=/ { print $2; exit }' Cargo.toml)
+          if [ -z "$pinned" ] || [ "$pinned" != "$msrv" ]; then
+              echo "the toolchain CI builds with is not the MSRV the crate declares:" >&2
+              echo "  rust-toolchain.toml channel: '$pinned'" >&2
+              echo "  Cargo.toml rust-version:     '$msrv'" >&2
+              echo "  move both, or the declared MSRV is tested by nothing." >&2
+              exit 1
+          fi
+
       # Bare `toolchain install` reads rust-toolchain.toml, so the 1.97.1 pin and
       # its components stay stated in exactly one place.
       - name: Install the pinned toolchain
@@ -70,45 +86,42 @@ jobs:
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-      # Prebuilt binary; `cargo install` would build nextest from source on every
+      # Prebuilt binaries; `cargo install` would build each from source on every
       # cache miss.
       - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest,cargo-deny,prek
 
-      # Every tracked `*.sh`, not `scripts/*.sh`: the prek hook matches the path
-      # suffix wherever it lands, and the gate that runs on a `--no-verify` commit is
-      # the wrong one to have checking less than the local hook does.
-      # `shell: bash` for the `-o pipefail` it brings: the default `bash -e {0}` has
-      # none, so a failing `git ls-files` would be masked by the zero `xargs` exits
-      # when handed nothing, and the step would pass having checked no files.
-      - run: git ls-files -z '*.sh' | xargs -0 -r shellcheck --shell=sh
-        shell: bash
+      # Advisories, because dependabot schedules version bumps monthly and a CVE does
+      # not wait for the month; licences and sources, because `nomux` is published and
+      # `clippy::cargo` checks manifest metadata rather than what is in the tree.
+      # Seconds against two direct dependencies.
+      - run: cargo deny check advisories bans licenses sources
 
-      - run: cargo fmt --all --check
-
-      # `-- -D warnings` on top of the job's RUSTFLAGS: clippy's own lints are emitted
-      # by clippy-driver, and the flags after `--` are the ones it applies to them.
-      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      # The gate itself, from .pre-commit-config.yaml, so a hook and the CI step
+      # enforcing it cannot say different things. `--skip cargo-nextest`: the step
+      # below runs a strict superset of that hook, and the session suite is too slow
+      # to run twice. shellcheck is preinstalled on the runner; prek builds actionlint
+      # from the version the config pins.
+      - run: prek run --all-files --skip cargo-nextest
 
       # rustdoc has its own lint namespace, so `rustdoc::broken_intra_doc_links` is
-      # reached by neither the clippy run above nor RUSTFLAGS — and this tree links
+      # reached by neither the clippy hook above nor RUSTFLAGS — and this tree links
       # between items constantly, where a renamed function turns a link into nothing
       # rather than into an error. `--document-private-items` because the binary crate
       # is almost entirely private and would otherwise be documented empty. Seconds
       # against the warm cache: only the workspace crates are rebuilt, their
-      # dependencies having been built by the step above.
+      # dependencies having been built by the step above. Not a hook, because a
+      # pre-commit run should not be waiting on rustdoc.
       - run: RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps --document-private-items
 
+      # The cargo-nextest hook's command plus the two flags that only make sense here.
       # `--run-ignored all`: the one ignored test sits out a real reaping timeout,
       # the 30 s first-attach one. Too slow for a pre-commit hook, exactly what
       # CI is for.
       # `--no-fail-fast`: one failure should not hide the state of everything
       # else, which is most of the value of a CI run over a local one.
       - run: cargo nextest run --locked --workspace --run-ignored all --no-fail-fast
-
-      # nextest cannot run doctests.
-      - run: cargo test --locked --doc --workspace
 
   # Its own job: the script rebuilds `nomux` and its session tests under
   # `--cfg nomux_fault_injection`, which shares no artifacts with the job above, and
@@ -222,6 +235,18 @@ jobs:
       - run: sh scripts/build-release.sh
         env:
           NOMUX_DEBUG: ${{ github.event_name == 'pull_request' && '0' || '1' }}
+
+      # The only place the shipping configuration is ever executed on a commit that is
+      # not a tag. Nothing in the check job builds `-Zbuild-std` with
+      # `-Cpanic=immediate-abort`, so without this a release binary that does not start
+      # at all — a miscompiled std, a seccomp filter that traps on the way up — passes
+      # every pull request and first fails on the tag that publishes it. The runner is
+      # x86_64 and the musl binary is static, so it can simply be asked. `chmod` even
+      # though `cp` carries the mode across, so the step does not rest on that.
+      - name: Run the binary that ships
+        run: |
+          chmod +x target/dist/nomux-x86_64-unknown-linux-musl
+          target/dist/nomux-x86_64-unknown-linux-musl --version
 
       # The checksums are the point of this job — the client pins one per
       # architecture — so they have to outlive the log they were printed to. On a tag
@@ -338,7 +363,17 @@ jobs:
           # checksummed separately and a glob does not know which is which — and a
           # release that carried a file no manifest covers would be a release nobody
           # could verify.
+          #
+          # Counted, because `set -e` does not see into a process substitution: an awk
+          # that failed would leave the array empty and publish a release of two
+          # manifests and no binaries — which is worse than no release, since a tag
+          # cannot be amended. Two architectures and their two companions is four.
           mapfile -t assets < <(awk '{print "dist/" $2}' dist/SHA256SUMS dist/SHA256SUMS.debug)
+          if [ "${#assets[@]}" -ne 4 ]; then
+              echo "the manifests name ${#assets[@]} files, not the expected 4:" >&2
+              printf '  %s\n' "${assets[@]}" >&2
+              exit 1
+          fi
           gh release create "$GITHUB_REF_NAME" \
               --title "$GITHUB_REF_NAME" \
               --notes-file "$notes" \

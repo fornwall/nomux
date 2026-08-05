@@ -34,8 +34,8 @@ use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use nomux_proto::{
-    ErrorCode, Frame, FrameType, HEADER_LEN, Hello, PROTOCOL_VERSION, RESUME_FROM_START, WinSize,
-    decode_header,
+    ErrorCode, Frame, FrameType, HEADER_LEN, HELLO_AGENT_FORWARD, HELLO_REPAINT_CTRL_L, Hello,
+    PROTOCOL_VERSION, RESUME_FROM_START, WinSize, decode_header,
 };
 
 pub(crate) const WIN: WinSize = WinSize {
@@ -1198,10 +1198,13 @@ pub(crate) fn shrink_send_buffer(socket: &UnixStream, bytes: libc::c_int) {
 ///
 /// One literal rather than four, since the three sites that write it straight at a
 /// socket are exactly the ones that would be missed if it ever changed.
+/// Still taken as a flags byte, because the wire bits are what the tests that write
+/// straight at a socket are pinning; [`Hello`] itself carries them apart.
 pub(crate) const fn hello_frame(flags: u8, out_offset: u64) -> Frame<'static> {
     Frame::Hello(Hello {
         protocol: PROTOCOL_VERSION,
-        flags,
+        agent_forward: flags & HELLO_AGENT_FORWARD != 0,
+        repaint_ctrl_l: flags & HELLO_REPAINT_CTRL_L != 0,
         out_offset,
         win: WIN,
         term: "xterm-256color",

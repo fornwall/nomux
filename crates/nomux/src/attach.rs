@@ -1,13 +1,11 @@
 //! The relay behind `nomux spawn` and `nomux attach`.
 //!
-//! Deliberately dumb: it moves bytes between stdio and the session socket and
-//! never parses a frame. The protocol lives only in the daemon, so this side never
-//! needs a version bump. It exists for hosts where the client cannot open a
-//! `direct-streamlocal` channel straight to the socket.
+//! Deliberately dumb: it moves bytes between stdio and the session socket and never
+//! parses a frame, so this side never needs a version bump (`IMPLEMENTATION.md` § 7).
+//! It exists for hosts where the client cannot open a `direct-streamlocal` channel
+//! straight to the socket.
 //!
-//! One relay, two ways in ([`Intent`]) — creating a session and joining one are
-//! different acts and now say so, which is the whole of the difference between the
-//! two modes. Everything past the connection is shared.
+//! One relay, two ways in ([`Intent`]). Everything past the connection is shared.
 
 use std::collections::VecDeque;
 use std::env;
@@ -22,13 +20,20 @@ use std::time::{Duration, Instant};
 use rustix::event::PollFlags;
 use rustix::pipe::SpliceFlags;
 
-use crate::rundir::{SessionPaths, nothing_is_listening};
+use crate::rundir::{SessionPaths, connect_within, nothing_is_listening};
 
 /// How long to wait for a freshly spawned daemon to bind its socket.
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Delay between connect retries while waiting for the daemon.
 const SPAWN_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// How long any one `connect` to the session socket waits out a full backlog.
+///
+/// [`connect_within`] has why every `connect` here is bounded and this one is not a
+/// plain `UnixStream::connect` (§ 6.3). Short, because the state it waits out clears
+/// in one `accept` and this is on the path of every attach.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Delay between checks for the pidfile the daemon publishes just after its socket.
 ///
@@ -47,25 +52,23 @@ const SPLICE_CHUNK: usize = 64 * 1024;
 ///
 /// The two modes are one relay and two answers to an id nothing is serving, which is
 /// the whole of the distinction (`DESIGN.md` § 5.1): `spawn` creates it, `attach`
-/// refuses. Attach-or-create was one mode with both answers and no way to tell which
-/// it had given — a client reconnecting to a session that had been reaped got a
-/// brand-new shell and no indication that it was not the old one.
+/// refuses.
 #[derive(Clone, Copy)]
 pub(crate) enum Intent {
-    /// `nomux spawn <id>`: create the session and attach to it, in one exec. Refuses
-    /// an id something is already serving.
+    /// `nomux spawn <id>`: creates the session and attaches to it in one exec, and
+    /// refuses an id something is already serving.
     Create,
-    /// `nomux attach <id>`: relay to a session that exists. Refuses one that does
-    /// not, rather than quietly starting a second.
+    /// `nomux attach <id>`: relays to a session that exists, and refuses one that
+    /// does not rather than quietly starting a second.
     Resume,
 }
 
 /// Reaches the session `session_id` names, per `intent`, and relays stdio to it.
 ///
-/// `label` is passed on to a daemon this call creates and is meaningless otherwise —
+/// `label` is passed on to a daemon this call creates and is meaningless otherwise:
 /// the label belongs to the session rather than to the connection (§ 6.6), so
-/// [`Intent::Resume`] never carries one and `main` refuses a command line that
-/// offers one.
+/// [`Intent::Resume`] never carries one and `main` refuses a command line that offers
+/// one.
 ///
 /// # Errors
 ///
@@ -82,30 +85,26 @@ pub(crate) fn run(session_id: &str, intent: Intent, label: Option<&str>) -> io::
 /// Connects to a session that is already there, and refuses to invent one that is not.
 fn resume(paths: &SessionPaths) -> io::Result<UnixStream> {
     // Checked and never created, which is `list` and `kill`'s rule (§ 6.3) and is
-    // this mode's now that it creates nothing either: being asked to join a session
-    // must not be what brings the directory it would have lived in into existence. A
-    // directory that is not there holds no session, which is the refusal below rather
-    // than a failure of its own.
+    // this mode's now that it creates nothing either. A directory that is not there
+    // holds no session, which is the refusal below rather than a failure of its own.
     match paths.check_dir() {
         Ok(()) => {}
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Err(no_such_session(paths)),
         Err(err) => return Err(err),
     }
-    match UnixStream::connect(paths.socket()) {
+    match connect_within(&paths.socket(), CONNECT_TIMEOUT) {
         Ok(stream) => Ok(stream),
         Err(err) if nothing_is_listening(&err) => Err(no_such_session(paths)),
         Err(err) => Err(err),
     }
 }
 
-/// The refusal that replaces the session an attach used to create behind the user's
-/// back.
+/// The refusal `attach` answers an id nothing is serving with.
 ///
 /// Two states reach it and it deliberately does not tell them apart: an id that never
 /// named a session here, and one whose session has been reaped. Neither is
 /// recoverable from and both want the same next command, so the difference would be
-/// resolution nobody can act on — what a client does hold is the id it minted, which
-/// is what makes this a *loud* answer rather than the silent new shell it replaces.
+/// resolution nobody can act on.
 fn no_such_session(paths: &SessionPaths) -> io::Error {
     io::Error::new(
         io::ErrorKind::NotFound,
@@ -138,37 +137,31 @@ fn already_running(paths: &SessionPaths) -> io::Error {
 /// Creates the session under an exclusive lock, and refuses an id that answers.
 ///
 /// The lock serialises concurrent spawns so two clients racing on the same id
-/// produce one daemon, not two fighting over the socket path — and now one refusal
-/// besides, since the loser finds the winner's socket and is told the id is taken.
-/// It is held to the end of the function rather than released after the spawn,
-/// because garbage collection takes the same lock (`IMPLEMENTATION.md` § 6.6): while
-/// it is held, nothing can unlink the socket this is waiting for.
+/// produce one daemon, not two fighting over the socket path. It is held to the end
+/// of the function rather than released after the spawn, because garbage collection
+/// takes the same lock (`IMPLEMENTATION.md` § 6.6): while it is held, nothing can
+/// unlink the socket this is waiting for.
 fn create(paths: &SessionPaths, label: Option<&str>) -> io::Result<UnixStream> {
-    // Before the first `connect`, not on the way to spawning a daemon. The socket
-    // this is about to hand the user's keystrokes to is a *name* in the run
-    // directory (§ 6.3), and where that directory is a symlink into somewhere
-    // another user can write, the name is theirs to make: checking only when
-    // nothing answers checks only the case where nothing was planted.
+    // Before the lock and the probe below, not on the way to spawning a daemon. The
+    // socket this is about to hand the user's keystrokes to is a *name* in the run
+    // directory (§ 6.3), and where that directory is a symlink into somewhere another
+    // user can write, the name is theirs to make: checking only when nothing answers
+    // checks only the case where nothing was planted.
     paths.ensure_dir()?;
-    match UnixStream::connect(paths.socket()) {
-        // Dropped on the spot, which costs the daemon a pending connection that
-        // closes without greeting — the same nothing `list`'s probe costs it (§ 6.4).
-        Ok(_) => return Err(already_running(paths)),
-        Err(err) if nothing_is_listening(&err) => {}
-        Err(err) => return Err(err),
-    }
 
-    // `lock_spawn` is where the subtlety lives: a collector may have unlinked
-    // `<id>.lock` while this call was blocked on it, and a lock on a file that no
-    // longer has that name is not this mutex — the next spawn would create a new
-    // file there and lock that. It checks and goes back for the real one.
+    // A collector may unlink `<id>.lock` while this call is blocked on it, which
+    // `rundir::SpawnLock` has: the lock that comes back is the one on the file now at
+    // the path.
     let _spawn_lock = paths.lock_spawn()?;
 
-    // Another spawn may have created the session while we waited for the lock, and
-    // the loser of that race is refused rather than handed the winner's session: two
-    // tabs both told they created this one is exactly the confusion the split exists
-    // to end.
-    match UnixStream::connect(paths.socket()) {
+    let socket = paths.socket();
+    // Once, and under the lock: another spawn may have created the session while we
+    // waited for it, and the loser of that race is refused rather than handed the
+    // winner's session — two tabs both told they created this one is exactly the
+    // confusion the split exists to end.
+    match connect_within(&socket, CONNECT_TIMEOUT) {
+        // Dropped on the spot, which costs the daemon a pending connection that
+        // closes without greeting — the same nothing `list`'s probe costs it (§ 6.4).
         Ok(_) => return Err(already_running(paths)),
         Err(err) if nothing_is_listening(&err) => {}
         Err(err) => return Err(err),
@@ -178,7 +171,7 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> io::Result<UnixStream> {
 
     let deadline = Instant::now() + SPAWN_TIMEOUT;
     loop {
-        match UnixStream::connect(paths.socket()) {
+        match connect_within(&socket, CONNECT_TIMEOUT) {
             Ok(stream) => {
                 await_publication(paths, deadline);
                 return Ok(stream);
@@ -206,15 +199,12 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> io::Result<UnixStream> {
 ///
 /// This is what makes the lock mean what the rest of the layout assumes it means.
 /// The daemon binds its socket before it writes the pidfile (§ 6.2), so a `connect`
-/// that succeeds says the id is claimed — not that anything on disk says so yet.
-/// Returning here the instant it succeeded would drop the lock inside that window,
-/// and "the lock is free" would not imply "the id is unclaimed": a `kill` taking it
-/// there finds a live daemon and no pid, which § 6.6 forbids it to unlink over.
+/// that succeeds says the id is claimed and not that anything on disk says so yet —
+/// and a `kill` taking the lock inside that window finds a live daemon and no pid,
+/// which § 6.6 forbids it to unlink over.
 ///
-/// Bounded by the caller's own deadline and never fatal. The pidfile belongs to
-/// `kill`, not to the relay, so a daemon that never writes one still gets its
-/// client — `kill` has its own answer for that (`control::resolve`), and it is not
-/// this connection's business.
+/// Bounded by the caller's own deadline and never fatal: a daemon that never writes
+/// one still gets its client, and `control::resolve` is what answers for it.
 fn await_publication(paths: &SessionPaths, deadline: Instant) {
     // Built once. `SessionPaths::pid` allocates, and this loop runs every
     // millisecond for as long as the caller's deadline allows.
@@ -228,8 +218,7 @@ fn await_publication(paths: &SessionPaths, deadline: Instant) {
 ///
 /// Both halves — `setsid` and `/dev/null` stdio — are the daemon's own job as of
 /// `IMPLEMENTATION.md` § 6.2, and both are still done here because it cannot reach
-/// either soon enough; that section has the two windows this closes. They cost it
-/// nothing: it finds itself already a session leader and does nothing more.
+/// either soon enough; that section has the two windows this closes.
 fn spawn_daemon(session_id: &str, label: Option<&str>) -> io::Result<Option<ChildStderr>> {
     let exe = env::current_exe()?;
     let mut command = Command::new(exe);
@@ -239,11 +228,10 @@ fn spawn_daemon(session_id: &str, label: Option<&str>) -> io::Result<Option<Chil
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         // A pipe rather than `/dev/null`, which is the only reason a failure to start
-        // has a reason attached to it. The daemon writes its diagnostics to stderr up
-        // until `release_startup_state` points the descriptor at `/dev/null` — so
-        // everything that can go wrong before a session exists arrives here, and the
-        // pipe reaching end of file is itself the daemon reporting it got past that
-        // point. Afterwards it has syslog and this end has nothing left to read.
+        // has a reason attached to it: the daemon writes its diagnostics to stderr
+        // until `release_startup_state` points the descriptor at `/dev/null` (§ 6.2),
+        // and the pipe reaching end of file is itself the daemon reporting it got
+        // past that point.
         .stderr(Stdio::piped());
     if let Some(label) = label {
         // As two arguments, never `--label=<text>`: the label is free-form text
@@ -251,10 +239,8 @@ fn spawn_daemon(session_id: &str, label: Option<&str>) -> io::Result<Option<Chil
         command.arg("--label").arg(label);
     }
 
-    // Bound out here rather than written inside the block below, for the reason
-    // `pty::Pty::spawn` gives at the same shape: unsafe context reaches lexically
-    // into a closure body, so an unsafe call added in here would compile with no
-    // block of its own and nothing would ask it for a justification.
+    // Bound out here rather than written inside the `unsafe` block below, for the
+    // reason `pty::Pty::spawn` gives at the same shape.
     let pre_exec = || -> io::Result<()> {
         rustix::process::setsid()?;
         Ok(())
@@ -272,20 +258,17 @@ fn spawn_daemon(session_id: &str, label: Option<&str>) -> io::Result<Option<Chil
 /// Read without waiting. This is only ever called once the daemon has already missed
 /// its deadline, and one that is wedged with its stderr still open must not take the
 /// relay down with it — a blocking read here would turn a five-second timeout into a
-/// hang. Anything it did write is sitting in the pipe by now.
+/// hang.
 fn daemon_complaint(stderr: Option<ChildStderr>) -> Option<String> {
     let stderr = stderr?;
     let fd = stderr.as_fd();
-    // Added to what is there rather than assigned over it. This descriptor is a
-    // freshly created pipe read end with nothing else set, so the two are the same
-    // today — but `fcntl_setfl` replaces the whole status word, and every other
-    // site in the tree does the `getfl`-then-or for a reason.
+    // Added to what is there rather than assigned over it: `fcntl_setfl` replaces the
+    // whole status word, and every other site in the tree does the `getfl`-then-or.
     let flags = rustix::fs::fcntl_getfl(fd).ok()?;
     rustix::fs::fcntl_setfl(fd, flags | rustix::fs::OFlags::NONBLOCK).ok()?;
     let mut buf = [0u8; 512];
-    // Through `nbio`, like every other read in the tree: a signal landing on this
-    // one would discard the only account of the failure anybody is going to get,
-    // and report a daemon that explained itself as one that said nothing. `EAGAIN`
+    // Through `nbio`, like every other read in the tree: a signal landing on this one
+    // would report a daemon that explained itself as one that said nothing. `EAGAIN`
     // still falls through to `None`, which is what "it wrote nothing" means here.
     let read = crate::nbio::read(fd, &mut buf).ok()?;
     let text = String::from_utf8_lossy(buf.get(..read)?).into_owned();
@@ -295,20 +278,15 @@ fn daemon_complaint(stderr: Option<ChildStderr>) -> Option<String> {
     let line = line.strip_prefix("nomux: ").unwrap_or(line);
     // Escaped, like the pidfile bodies `control` quotes with `{:?}` and for the same
     // reason: this is another process's stderr on its way to a terminal, where the
-    // `lines` above stops a second line being forged but not an `ESC ]0;` retitling the
-    // window of whoever ran the attach. `escape_debug` spends that only on what a
-    // terminal would act on — printable UTF-8 comes through as itself, so an accent in
-    // the run directory's path still reads as one.
+    // `lines` above stops a second line being forged but not an `ESC ]0;` retitling
+    // the window of whoever ran the attach.
     Some(line.escape_debug().collect())
 }
 
 /// Moves bytes between stdio and the socket until either side closes.
 fn relay(stream: &UnixStream) -> io::Result<()> {
-    // `splice` honours `SPLICE_F_NONBLOCK` only for the pipe end of the pair, so a
-    // blocking socket would park the whole relay inside the kernel with the other
-    // direction unserved — measurably, not theoretically. Everything below already
-    // reads `EAGAIN` as "not now", so switching the socket over costs nothing and
-    // is what makes the zero-copy path safe to take.
+    // The socket has to be non-blocking for the `splice` path to be safe to take
+    // (§ 7), and everything below already reads `EAGAIN` as "not now".
     stream.set_nonblocking(true)?;
 
     let stdin = io::stdin();
@@ -321,9 +299,8 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
     let mut to_stdout = Pump::default();
     let mut stdin_open = true;
     let mut socket_open = true;
-    // The third of the three, and the only one about a *destination*: the relay
-    // exists to put the session's output somewhere, so once that somewhere has no
-    // reader left it ends the loop the way the two above do.
+    // The only one of the three about a *destination*: the session's output having
+    // nowhere left to go ends the loop the way the two above do.
     let mut stdout_open = true;
 
     while stdout_open && (socket_open || to_stdout.has_data()) {
@@ -346,13 +323,9 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
         if want_stdout {
             fds.push(rustix::event::PollFd::new(&stdout_fd, PollFlags::OUT));
         }
-        // Unreachable, though not because any one entry is always there: dropping the
-        // stdout entry needs `to_stdout.wants_dest()` to be false, and
-        // [`Pump::wants_source`] is exactly `!wants_dest()`, so that same falsity is
-        // what asks the socket for `POLLIN`. Which leaves a socket already closed, and
-        // the `while` condition admits that one only while `to_stdout` has data — which
-        // is `wants_dest()` again. Kept because what it stands between is a `poll` on
-        // an empty set, which blocks for ever.
+        // Unreachable, [`Pump::wants_source`] being exactly `!wants_dest()`, and kept
+        // because what it stands between is a `poll` on an empty set, which blocks
+        // for ever.
         if fds.is_empty() {
             break;
         }
@@ -364,10 +337,9 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
             Err(rustix::io::Errno::INTR) => continue,
             Err(err) => return Err(err.into()),
         }
-        // Read back by position, which `daemon::watches` deliberately does not do:
-        // its set is variable-length. Safe here because the three conditions that
+        // Read back by position, which is safe only because the three conditions that
         // decided whether each entry was pushed are reused below rather than
-        // recomputed, so a `Pump` that changed state during `poll` cannot shift it.
+        // recomputed: a `Pump` that changed state during `poll` cannot shift it.
         let mut events = fds.iter().map(rustix::event::PollFd::revents);
         let mut revents = |registered: bool| {
             if registered {
@@ -380,9 +352,9 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
         let socket_events = revents(!socket_flags.is_empty());
         let stdout_events = revents(want_stdout);
 
-        // `ERR` alongside `HUP`, as the socket direction below and
-        // `daemon::poll_once` both have it: a source reporting only `ERR` would
-        // otherwise never be read, never be closed, and spin in the poll set.
+        // `ERR` alongside `HUP`, as `daemon::poll_once` has it: a source reporting
+        // only `ERR` would otherwise never be read, never be closed, and spin in the
+        // poll set.
         if stdin_events.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
             && !to_socket.transfer(stdin_fd, sock_fd)?
         {
@@ -396,51 +368,38 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
         {
             socket_open = false;
         }
-        // Deliberately not read back into an ending. An `EPIPE` towards the socket
-        // is a client that has gone, and the relay already ends on that: the same
-        // departure arrives as EOF from the socket's *read* side above.
-        //
         // Speculative on a non-empty buffer as well as on `POLLOUT`, which stdout
         // below deliberately is not: this descriptor was switched to non-blocking at
         // the top, so an optimistic write here either saves a wakeup or costs one
-        // `EAGAIN`.
+        // `EAGAIN`. The answer is deliberately not read back into an ending — an
+        // `EPIPE` towards the socket is a client that has gone, and the same
+        // departure arrives as EOF from the socket's *read* side above.
         if socket_events.contains(PollFlags::OUT) || to_socket.has_data() {
             let _client_still_reading = to_socket.drain_to(sock_fd)?;
         }
-        // One of the two ways a dead stdout arrives. `POLLOUT` is the only thing
-        // that clears `Pump::dest_full`, and a destination whose reader has gone
-        // never reports it — a full pipe with no reader is not writable, it is
-        // broken — so without this the relay would poll a descriptor that answers
-        // `ERR` forever and never act on it.
+        // One of the two ways a dead stdout arrives: `POLLOUT` is the only thing that
+        // clears `Pump::dest_full`, and a destination whose reader has gone never
+        // reports it — a full pipe with no reader is not writable, it is broken.
         if stdout_events.intersects(PollFlags::ERR | PollFlags::HUP) {
             stdout_open = false;
         } else if stdout_events.contains(PollFlags::OUT) {
-            // On `POLLOUT` alone, and never speculatively on a non-empty buffer the
-            // way the socket above is drained. Stdout is left in the blocking mode it
-            // was inherited in, and cannot safely be taken out of it: it may be a
-            // terminal whose open file description the user's shell shares, where
-            // `O_NONBLOCK` is not this process's to set. A write it is not ready for
-            // therefore parks the whole relay inside the kernel with the other
-            // direction unserved — exactly what the socket was switched over to
-            // avoid. Nothing is lost by waiting, because a non-empty buffer is what
-            // puts stdout in the poll set asking for `POLLOUT` in the first place, so
-            // the wait is one wakeup and never a byte.
+            // On `POLLOUT` alone, and never speculatively the way the socket above is
+            // drained. Stdout is left in the blocking mode it was inherited in and
+            // cannot safely be taken out of it — it may be a terminal whose open file
+            // description the user's shell shares — so a write it is not ready for
+            // parks the whole relay with the other direction unserved. Nothing is lost
+            // by waiting, a non-empty buffer being what put stdout in the set.
             //
-            // `EPIPE` from that write is still an ending rather than a cleared
-            // buffer, and is the other of the two ways. A unix socket whose peer has
-            // stopped reading reports itself writable and then refuses the write, so
-            // for that shape of destination this is the only place the death can be
-            // discovered: `ERR` above is what a pipe gives, and this is what a socket
-            // gives.
+            // The `EPIPE` that write can return is the other of the two ways, and for
+            // a socket-backed stdout it is the only one: that shape reports itself
+            // writable and then refuses.
             stdout_open = to_stdout.drain_to(stdout_fd)?;
         }
     }
 
-    // Nothing is owed here. Every exit from the loop leaves `to_stdout` empty
-    // whenever stdout is still open: the `while` condition keeps going round while
-    // it has data, and the `fds.is_empty()` break needs `wants_dest()` to be false,
-    // which is that same emptiness. The last batch is handed over inside the loop,
-    // on the `POLLOUT` that a non-empty buffer is what asks for.
+    // Nothing is owed here: every exit from the loop leaves `to_stdout` empty whenever
+    // stdout is still open, the `while` condition being what keeps going round while
+    // it has data and the `fds.is_empty()` break needing that same emptiness.
     Ok(())
 }
 
@@ -454,15 +413,10 @@ fn copy_in(fd: BorrowedFd<'_>, buf: &mut VecDeque<u8>) -> io::Result<bool> {
         // `ENOTCONN` where the connection is already gone by the time the read
         // lands.
         //
-        // That middle one is the ordinary way a session ends here, not an exotic
-        // one: § 4.1 stops the daemon draining a client it is holding back,
-        // `write_client` drops a peer that has stopped reading, and `shutdown`
-        // closes straight after its final flush — each of them leaves input of ours
-        // unread. Taken as a failure it costs the relay the exit status § 10 gives a
-        // delivered `Exit` frame, and costs the user whatever [`Pump::buf`] is still
-        // holding for stdout, which the loop would otherwise go back and write. The
-        // `splice` path never sees it, the first `splice` having consumed the error,
-        // so this is exactly the § 7 host whose stdio is a socketpair.
+        // That middle one is the ordinary way a session ends here rather than an
+        // exotic one — § 4.1, `write_client` and `shutdown` each leave input of ours
+        // unread — and taken as a failure it costs the relay the exit status § 10
+        // gives a delivered `Exit` frame.
         Ok(0)
         | Err(rustix::io::Errno::IO | rustix::io::Errno::CONNRESET | rustix::io::Errno::NOTCONN) => {
             Ok(false)
@@ -497,9 +451,7 @@ enum Spliced {
 ///
 /// Whether `splice` works for a pair is a property of the host rather than of this
 /// code (`IMPLEMENTATION.md` § 7), so it is discovered by trying — and only by the
-/// two errors that are that same property. Everything else is about this one
-/// moment and falls through to the copying path, which handles all of them
-/// correctly anyway.
+/// two errors that are that same property.
 fn splice_once(src: BorrowedFd<'_>, dst: BorrowedFd<'_>) -> Spliced {
     let flags = SpliceFlags::MOVE | SpliceFlags::NONBLOCK;
     loop {
@@ -510,10 +462,8 @@ fn splice_once(src: BorrowedFd<'_>, dst: BorrowedFd<'_>) -> Spliced {
             // is the destination refusing and never a source that had nothing.
             Err(rustix::io::Errno::AGAIN) => Spliced::Full,
             // `EINVAL` for a pair with neither end a pipe, `ENOSYS` for a kernel
-            // without the call: the two that say something about the pair and can
-            // therefore be believed for the rest of the run. An ending arrives here
-            // as `EPIPE` or `ECONNRESET`, and latching on one of those would give
-            // up the zero-copy path for good over a peer that had merely left.
+            // without the call: the two that say something about the pair rather than
+            // about the moment, and can therefore be believed for the rest of the run.
             Err(rustix::io::Errno::INVAL | rustix::io::Errno::NOSYS) => Spliced::Unusable,
             Err(_) => Spliced::Failed,
         };
@@ -522,23 +472,20 @@ fn splice_once(src: BorrowedFd<'_>, dst: BorrowedFd<'_>) -> Spliced {
 
 /// One direction of the relay.
 ///
-/// The two paths through it are kept from ever interleaving (`IMPLEMENTATION.md`
-/// § 7): `splice` is attempted only when the buffer is empty, and a `splice` never
-/// leaves anything behind in it, so the choice between them cannot reorder bytes.
+/// The two paths through it cannot interleave, which is `IMPLEMENTATION.md` § 7's:
+/// `splice` is attempted only while the buffer is empty and never fills it.
 #[derive(Debug, Default)]
 struct Pump {
     /// Bytes the destination would not take yet. Only ever filled by the copying
     /// path.
     buf: VecDeque<u8>,
     /// Set for good the first time `splice` refuses the *pair* rather than the
-    /// moment. Never reconsidered: neither reason it can refuse for — neither end
-    /// is a pipe, or this kernel has no `splice` — can change while the relay runs,
-    /// and retrying would buy a wasted syscall per wakeup forever.
+    /// moment. Neither reason it can refuse for can change while the relay runs, and
+    /// retrying would buy a wasted syscall per wakeup forever.
     splice_refused: bool,
     /// `splice` reported the destination full. Distinct from a non-empty buffer in
-    /// that nothing is held here; it only records that the source must be left
-    /// alone until the destination reports `POLLOUT`, since re-reading it would
-    /// spin on `EAGAIN`.
+    /// that nothing is held here: it records only that the source must be left alone
+    /// until the destination reports `POLLOUT`, re-reading it having nowhere to go.
     dest_full: bool,
 }
 
@@ -561,8 +508,8 @@ impl Pump {
 
     /// Moves one batch from `src` towards `dst`. `false` means `src` reached EOF.
     ///
-    /// Falling back within the same call keeps a host that cannot splice from
-    /// losing a wakeup to the discovery.
+    /// Falling back within the same call keeps a host that cannot splice from losing
+    /// a wakeup to the discovery.
     fn transfer(&mut self, src: BorrowedFd<'_>, dst: BorrowedFd<'_>) -> io::Result<bool> {
         if !self.splice_refused && !self.has_data() {
             match splice_once(src, dst) {
@@ -581,22 +528,17 @@ impl Pump {
     /// Hands the destination whatever is owed it, and forgets that it was full.
     /// `false` means the destination has stopped reading.
     ///
-    /// Called on `POLLOUT`, and towards the socket also speculatively whenever
-    /// something is buffered — which is safe only there, because only that
-    /// descriptor is non-blocking. Clearing [`Pump::dest_full`] is sound either way:
-    /// it only ever gates re-reading the source, and the write below is what
-    /// establishes whether the destination has room.
+    /// Clearing [`Pump::dest_full`] is sound from either of the two call sites: it
+    /// only ever gates re-reading the source, and the write below is what establishes
+    /// whether the destination has room.
     fn drain_to(&mut self, fd: BorrowedFd<'_>) -> io::Result<bool> {
         self.dest_full = false;
         match crate::nbio::drain_to(&mut self.buf, fd) {
-            // `EPIPE` is `nbio`'s to report and each caller's to interpret: to an
-            // agent channel it is a dead socket, and here it is the destination's
-            // reader having gone — an ordinary ending rather than a failure, so what
-            // was owed it is dropped and the answer comes back as `false`. Which
-            // direction that ends is `relay`'s to say and not this method's: towards
-            // the socket it is a client that has left, which the socket's own read
-            // side reports again as EOF, and towards stdout it is the relay's entire
-            // purpose gone. Both arrive here identically, and only one stops the loop.
+            // `EPIPE` is `nbio`'s to report and each caller's to interpret: here it is
+            // the destination's reader having gone — an ordinary ending rather than a
+            // failure — so what was owed it is dropped and the answer comes back as
+            // `false`. Which direction that ends is `relay`'s to say, not this
+            // method's, and only one of the two stops the loop.
             Err(rustix::io::Errno::PIPE) => {
                 self.buf.clear();
                 Ok(false)

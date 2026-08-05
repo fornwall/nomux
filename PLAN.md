@@ -48,10 +48,10 @@ protocol it speaks. Mechanics: [IMPLEMENTATION.md](IMPLEMENTATION.md).
 
 ## P1 — known gaps
 
-Nine. The first five are this surface's own: a known cost rather than a missing line
+Eight. The first four are this surface's own: a known cost rather than a missing line
 of code, a gap that cannot be closed from inside the process, a limit whose backstop
-landed and whose policy did not, the one wait on the control surface that has no
-bound, and a hole in that surface's own promise. The last four came out of a security
+landed and whose policy did not, and a hole in the control surface's own promise. The
+last four came out of a security
 review, and each is held today by something other than a check — the entry says by
 what. All were found by review or by measurement rather than by guessing, and are
 recorded with what they were measured against.
@@ -79,7 +79,8 @@ recorded with what they were measured against.
   any surviving panic produce no message, no location and no symbol to forward. What is
   left is the `SIGQUIT` core § 6.5 preserves, and that core can now be read: every
   release publishes `nomux-<target>.debug`, the same build unstripped, with its own
-  `SHA256SUMS.debug` ([IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)). It names
+  `SHA256SUMS.debug` — which CI asks for, and a local build asks for with
+  `NOMUX_DEBUG=1` ([IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)). It names
   functions rather than lines — the release profile carries no debuginfo for nomux's
   own code, so the companion's DWARF describes `std` and its `.symtab` describes the
   rest. Giving it lines as well means `debug = 1` in the release profile, which is a
@@ -96,21 +97,6 @@ recorded with what they were measured against.
   whatever it started, held for seven
   days, so what is left between the two numbers is on the far side of a boundary this
   repository cannot see.
-- **The liveness probe is the one call on the escape hatch with no deadline.** Every
-  other wait `list` and `kill` make is bounded — the spawn lock, the publish grace, the
-  two signal graces
-  ([IMPLEMENTATION.md § 6.6](IMPLEMENTATION.md#66-frozen-control-surface)) — but the
-  `connect` that decides whether a session is alive is a blocking one, and an `AF_UNIX`
-  `connect` to a listener whose backlog is full does not fail, it waits. A daemon that
-  has stopped accepting with a full queue therefore parks both modes for as long as it
-  stays that way: against a listener that never accepts, with its queue filled, `list`
-  and `kill` both come back only as rc=124 from `timeout`. It is as old as this
-  surface rather than new — the probe has been a blocking `connect` since `a886313`,
-  the commit that first wrote it — and it is the reason the backlog is the host's
-  ceiling rather than a literal ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)),
-  which is mitigation and not a fix, `somaxconn` being finite. The fix is a non-blocking
-  `connect` with a `poll` deadline, read exactly as the blocking one is: anything that
-  is not a refusal is a session too alive to unlink.
 - **An id this run directory cannot hold makes its files invisible *and*
   uncollectable.** The `sun_path` refusal in
   [IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket) is environment-dependent — the
@@ -174,9 +160,10 @@ recorded with what they were measured against.
   and the socket `0600`, and [SECURITY.md](SECURITY.md) states those as the whole of
   the authentication deliberately: reaching either already means being the user. It is
   also the whole of it — `Daemon::accept` reads no credentials — so the swapped run
-  directory above is answered by file modes alone. `control::daemon_of` already makes
-  the `getsockopt(SO_PEERCRED)` call for the pid it wants, so asserting the uid beside
-  it in `accept` is a few lines of defence in depth. shpool, the nearest comparable
+  directory above is answered by file modes alone. Nothing in the tree reads
+  `SO_PEERCRED` any more, the control surface having settled on `<id>.pid` as its one
+  witness, so this is a `getsockopt` to be written rather than one to be reused — still
+  only a few lines, and defence in depth. shpool, the nearest comparable
   project, refuses a cross-user connection outright.
 
 ## P2 — structure
@@ -184,23 +171,20 @@ recorded with what they were measured against.
 - **`Hello.flags` could be unrepresentable rather than merely checked.** `HelloOk`
   packs its one typed field (`agent: bool`) through a private `flags()`, so an invalid
   combination cannot be built; `Hello` exposes a bare `u8` and validates it on both
-  sides instead. Matching `HelloOk` would delete the encode-side check, both
-  accessors, the test that undefined bits are refused *by the encoder*, and the
-  proptest's `any_hello_flags`. It would **not** delete `HELLO_FLAG_BITS`: §2.3 makes
-  an undefined bit a protocol error however the struct is typed, so the decode side
-  keeps the constant and its check either way, exactly as `HelloOk` does today.
+  sides instead. Matching `HelloOk`, which is one bit behind its accessor, would delete
+  the encode-side check, both accessors, the test that undefined bits are refused *by
+  the encoder*, and the proptest's `any_hello_flags`. It would **not** delete
+  `HELLO_FLAG_BITS`: §2.3 makes an undefined bit a protocol error however the struct is
+  typed, so the decode side keeps the constant and its check either way, exactly as
+  `HelloOk` does today.
 
-  Half of what this used to argue has been overtaken. `HelloOk` no longer packs three
-  fields into a byte: `gap` is derived from `resume_from` and not sent at all, `linger` is
-  a byte of its own, and what is left is one bit — so "match `HelloOk`" is now a much
-  smaller claim than it was, and the `u16` this item was written against is a `u8`.
-  What has not changed is the cost: two adjacent booleans threaded through every
-  `Hello` literal and every test helper that currently forwards a `flags: u8` — a
-  wider reach than it looks, and one where `HELLO_AGENT_FORWARD` reads better than a
-  positional `true, false`. Worth doing if a third flag ever lands, but note the shape
-  changes at that point: three booleans is worse than two, so the answer then is one
-  `Copy` `HelloFlags` value with named constructors — a single argument to thread —
-  rather than N adjacent bools.
+  What holds it back is the reach. Two adjacent booleans thread through every `Hello`
+  literal and every test helper that currently forwards a `flags: u8` — wider than it
+  looks, and a place where `HELLO_AGENT_FORWARD` reads better than a positional
+  `true, false`. Worth doing if a third flag ever lands, but the shape changes at that
+  point: three booleans is worse than two, so the answer then is one `Copy`
+  `HelloFlags` value with named constructors — a single argument to thread — rather
+  than N adjacent bools.
 - **A test can hold another test's descriptor without meaning to.** `fork` duplicates
   every open descriptor, and the copy lives until the child reaches `exec` —
   close-on-exec decides when it goes, not whether it is made. Under `cargo test`, where
@@ -259,7 +243,7 @@ builder's paths, since two clean builds on one machine are byte-identical whethe
 not those paths were remapped ([IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)).
 What is left is process rather than code:
 
-- Decide when the pinned nightly moves. It is named once, in `scripts/nightly-version`, which the build script and CI both read — so a local build and the runner measure the same bytes against a baseline recorded by the same compiler. The *consistency* is no longer a rule anyone has to remember: `scripts/size-baseline` records the compiler that measured it, and a build whose compiler does not match that line is refused, or, under `NOMUX_STABLE_STD`, says so and loses the growth gate. What is still undecided is the *policy* — when to take a newer compiler at all, given that the toolchain and the baseline then move in one commit.
+- Decide when the pinned nightly moves. It is named once, in `scripts/nightly-version`, which the build script and CI both read — so a local build and the runner measure the same bytes against a baseline recorded by the same compiler. The *consistency* is no longer a rule anyone has to remember: `scripts/size-baseline` records the compiler that measured it, and a build whose compiler does not match that line is refused, `NOMUX_UPDATE_BASELINE=1` being the one way past and the one that rewrites the file. What is still undecided is the *policy* — when to take a newer compiler at all, given that the toolchain and the baseline then move in one commit.
 - Decide what the client does when a host already holds a binary whose hash it no longer recognises. The publishing half of this is done: a `v*` tag promotes the artifact the release build produced into a GitHub release carrying the shipping binaries beside `SHA256SUMS`, so the sums are permanent and public and in the format `sha256sum -c` reads, rather than only the ninety-day artifact behind a login they were before. GitHub computes its own immutable SHA-256 per asset at upload time as well, exposed as `digest` on the releases API, which covers the same bytes with something nobody can rewrite after the fact. The unstripped companions of P1 ride along, with their own `SHA256SUMS.debug`. What is missing is the consuming half: nothing in the client reads any of it, so § 8's "verify it after upload" is still unwritten, and so is the answer to the question this bullet opens with.
 
 ## P4 — test depth
@@ -269,7 +253,7 @@ What is left is process rather than code:
 - **The wire vectors cannot be run by the implementation that most needs them.**
   `crates/nomux-proto/tests/wire.rs` is written from the § 2.2 table rather than from
   the encoder, which is exactly what makes it able to catch a changed field order — and
-  it is locked inside a Rust integration test. [IMPLEMENTATION.md § 1](IMPLEMENTATION.md#1-layout)
+  it is locked inside a Rust integration test. [IMPLEMENTATION.md § 1](IMPLEMENTATION.md#1-layout-and-conventions)
   allows the client to reimplement the codec, which a mobile client in Swift or Kotlin
   will, and it cannot run any of this. Emitting the same table as a language-neutral
   fixture from the same test — hex per frame, checked in — would let an independent
@@ -284,19 +268,17 @@ What is left is process rather than code:
   the test is named after. The distinction is already on the wire: a
   `RESUME_FROM_START` greeting is answered with the ring's base, so writing a few MiB
   past the default and reading `resume_from` back says which capacity was built.
-- **One arm of the publish grace decides nothing the suite can see.** `kill` waits out a
-  `<id>.pid` that is *missing* as well as one that is empty
+- **One arm of the publish grace has to be re-established as untested.** `kill` waits
+  out a `<id>.pid` that is *missing* as well as one that is empty
   ([IMPLEMENTATION.md § 6.6](IMPLEMENTATION.md#66-frozen-control-surface)), and the
-  empty arm is pinned twice over. The missing one is not: mutating it to settle at once
-  rather than wait leaves the suite green, because the wait only decides an outcome
-  where the socket names nobody, and every test that takes a live session's pidfile away
-  leaves a socket that names its daemon. The state where it *does* decide is a
-  fork-detached daemon between its own `bind` and its `listen` — § 6.2's parent has
-  `_exit`ed, so the credentials on the socket name nothing extant and the pidfile is
-  still to come — which is the same window P1's first entry is about, one witness
-  narrower. Composing it means holding a daemon inside a few syscalls of its own
-  startup, which is why it is recorded here rather than fixed with a test that would be
-  a race.
+  empty arm is pinned twice over. The missing arm was not, and the argument for why ran
+  through the second witness: mutating it to settle at once left the suite green,
+  because the wait only changed an outcome where the socket named nobody, and every
+  test that takes a live session's pidfile away leaves a socket that named its daemon.
+  That argument has expired with the witness. Identification is `<id>.pid` alone now,
+  so a live socket and no pidfile reaches the wait every time rather than only inside
+  §6.2's fork window, and whether the suite still fails to tell the two arms apart has
+  not been re-measured. Re-run the mutation before treating this as open.
 - **`MAX_PENDING_READ` has no test and cannot easily have one.** The kernel's unix
   send buffer is roughly 212 KiB, five times tighter than the 1 MiB cap, so on a
   stock host the cap never binds and no socket-level test can pin it. Raising the
@@ -314,6 +296,7 @@ Not backlog — recorded so they are not rediscovered as gaps.
 | Cross-device handover | [DESIGN.md § 10](DESIGN.md#10-open-questions), with its three prerequisites |
 | `libvterm` overflow snapshot | [DESIGN.md § 10](DESIGN.md#10-open-questions) |
 | Ring capacity default | [DESIGN.md § 10](DESIGN.md#10-open-questions); `NOMUX_RING_BYTES` makes it tunable, but the default is unchosen. § 10 has why the memory figure that argues for keeping it small overstates what a session holds; what argues for a larger default is the case § 10 does not name — an ordinary twenty-minute disconnect across a build, which overruns 4 MiB and loses the output the reconnect was for |
+| Compressing the output ring | Measured, not guessed, at `b71db5f` — a `NOT FOR MERGE` spike whose tables `git show` still holds. A minimal `lz4_flex` costs 6,200 bytes on armv7, the target with the least headroom while it shipped, which is 1.5% of the 400 KiB cap, and buys a median 4.6x more scrollback for the same memory. So the size objection is refuted and is not why this stays out. What compression actually trades is RAM for CPU — 21x slower on the PTY push path, 2.8 ms added per MiB relayed — and the hosts where 4 MiB a session is scarce are armv7 SBCs, the same hosts where that CPU lands hardest. Where RAM is not scarce, raising the default ring capacity buys the same scrollback for zero bytes and zero cycles |
 | `daemon::run` *waiting* for the spawn lock | It takes one without blocking and goes on without one where somebody holds it. Waiting would park the session's own creation behind the `spawn` that started it, since that spawn holds this very lock on its behalf until the pidfile exists ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)) |
 | Addressing the run files through a validated directory descriptor | There is no `bindat(2)`, so the sockets must resolve by name whatever the check returns ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)) |
 

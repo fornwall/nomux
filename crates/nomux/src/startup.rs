@@ -2,10 +2,8 @@
 //! stop.
 //!
 //! Two subjects, one property: both are about the *process* rather than about the
-//! session, both run exactly once from `daemon::run`, and neither touches any
-//! daemon state.
-//!
-//! `IMPLEMENTATION.md` § 6.2 for the detachment and § 6.5 for the stop signals.
+//! session, both run exactly once from `daemon::run`, and neither touches any daemon
+//! state. `IMPLEMENTATION.md` § 6.2 for the detachment, § 6.5 for the stop signals.
 
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd, OwnedFd};
@@ -14,15 +12,13 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use rustix::fs::{Mode, OFlags};
 use rustix::pipe::PipeFlags;
 
-/// Signals that mean "stop", handled so that leaving runs the shutdown path
-/// (`IMPLEMENTATION.md` § 6.5) instead of the default disposition; `SIGQUIT` is
-/// deliberately left alone there, for the core dump it produces.
+/// Signals that mean "stop", handled so that leaving runs `IMPLEMENTATION.md`
+/// § 6.5's shutdown path instead of the default disposition.
 ///
-/// Armed right after § 6.2's detachment, which is the earliest point at which the
-/// byte a handler writes cannot be inherited by a child that never received the
-/// signal. Nothing is needed before it: the daemon holds no controlling terminal
-/// for a keystroke to arrive through, and has no PTY, no child and no run files, so
-/// dying there is indistinguishable from never having started.
+/// Armed right after § 6.2's detachment: the earliest point at which the byte a
+/// handler writes cannot be inherited by a child that never received the signal, and
+/// late enough to cost nothing, dying before it being indistinguishable from never
+/// having started.
 const STOP_SIGNALS: [libc::c_int; 2] = [libc::SIGTERM, libc::SIGINT];
 
 /// Write end of the self-pipe, as a raw descriptor because a signal handler may
@@ -32,13 +28,10 @@ static STOP_PIPE: AtomicI32 = AtomicI32::new(-1);
 /// The entirety of what happens in a signal handler: one byte down the self-pipe.
 ///
 /// Async-signal-safety is the constraint that shapes this. `write(2)` is on the
-/// permitted list, the descriptor is non-blocking so a pipe somebody has filled
-/// cannot park the daemon inside a handler, and a refused write means a byte is
-/// already waiting — which is the whole of the message. Nor can this perturb
-/// `errno`: rustix issues the syscall directly on the `linux_raw` backend, which
-/// every shipped target selects, and reports failure through its return value, so a
-/// handler landing between a failing call in the main flow and that call's `errno`
-/// read leaves it untouched.
+/// permitted list, the descriptor is non-blocking so a filled pipe cannot park the
+/// daemon inside a handler, and a refused write means a byte is already waiting —
+/// the whole of the message. Nor can this perturb `errno`: rustix issues the syscall
+/// directly on the `linux_raw` backend every shipped target selects.
 extern "C" fn note_stop_signal(_signum: libc::c_int) {
     let raw = STOP_PIPE.load(Ordering::Relaxed);
     if raw >= 0 {
@@ -51,14 +44,12 @@ extern "C" fn note_stop_signal(_signum: libc::c_int) {
 }
 
 /// Routes [`STOP_SIGNALS`] into a descriptor the poll set can watch, and hands back
-/// its read end.
-///
-/// A self-pipe rather than `signalfd` for the reason `IMPLEMENTATION.md` § 6.5
-/// gives; rustix has no binding for it either.
+/// its read end. A self-pipe rather than `signalfd` for the reason
+/// `IMPLEMENTATION.md` § 6.5 gives; rustix has no binding for it either.
 ///
 /// # Errors
 ///
-/// Fails only if the pipe cannot be created. Installing the handlers cannot report
+/// Fails only if the pipe cannot be created; installing the handlers cannot report
 /// anything, for the reason the `SAFETY` note below gives.
 pub(crate) fn arm_stop_signals() -> io::Result<OwnedFd> {
     // `CLOEXEC` so the session's child never inherits either end; `NONBLOCK` so the
@@ -90,18 +81,14 @@ pub(crate) fn arm_stop_signals() -> io::Result<OwnedFd> {
 /// (`IMPLEMENTATION.md` § 6.2, which has the order, the two shapes that need the
 /// fork, and why `SIGHUP` is ignored before any of it).
 ///
-/// Both halves, not just the session: covering `SIGHUP` alone leaves every other
-/// terminal-generated signal able to reach a daemon still in the foreground process
-/// group, so Ctrl-C kills it and `Ctrl-\` dumps its core.
-///
-/// `TIOCNOTTY` would drop the terminal without a fork and is deliberately not used.
-/// Issued by a session leader it sends `SIGHUP` and `SIGCONT` to the foreground
-/// process group — which in the case being fixed *is* this process — and it strips
-/// the controlling terminal from every other process in the session too, which is
-/// not this program's to take.
+/// `TIOCNOTTY` would drop the terminal without a fork and is deliberately not used —
+/// § 6.2 delegates the argument here. Issued by a session leader it sends `SIGHUP`
+/// and `SIGCONT` to the foreground process group, which in the case being fixed *is*
+/// this process, and it strips the controlling terminal from every other process in
+/// the session too, which is not this program's to take.
 ///
 /// Failures are not propagated. Sharing a session makes for a worse daemon, not a
-/// broken one, and refusing to start would be the worse outcome of the two.
+/// broken one.
 pub(crate) fn leave_login_session() {
     // SAFETY: `signal` with SIG_IGN on a single-threaded process with no handler
     // installed; the disposition is reset in the child before exec (see
@@ -139,14 +126,13 @@ pub(crate) fn leave_login_session() {
 ///
 /// `/dev/tty` *is* that terminal, by definition, so opening it answers the question
 /// whatever the daemon's own stdio has become — a pipe, a socket or `/dev/null` all
-/// leave the terminal attached, so no amount of asking about fd 0 would do.
-/// `O_NOCTTY` keeps § 6.2's rule that this binary never acquires one by opening it.
+/// leave the terminal attached. `O_NOCTTY` keeps § 6.2's rule that this binary never
+/// acquires one by opening it.
 ///
-/// `ENXIO` is the kernel saying there is none, and is the only definite no. Anything
-/// else — no `/dev/tty` node in a stripped container, a mode that refuses the open —
-/// leaves the question unanswered, and unanswered is taken as yes. Being wrong that
-/// way costs one `fork` on a host where the probe cannot work; being wrong the other
-/// way costs a session that a keystroke can end.
+/// `ENXIO` is the only definite no — § 6.2 delegates the argument here. Anything
+/// else, such as no `/dev/tty` node in a stripped container, is taken as yes: being
+/// wrong that way costs one `fork`, and being wrong the other way costs a session a
+/// keystroke can end.
 fn has_controlling_terminal() -> bool {
     match rustix::fs::open(
         "/dev/tty",
@@ -161,8 +147,8 @@ fn has_controlling_terminal() -> bool {
 /// Cuts the daemon loose from the rest of the state it inherited: the working
 /// directory and the standard descriptors (`IMPLEMENTATION.md` § 6.2).
 ///
-/// Failures are not propagated. A daemon that cannot `chdir` still works; refusing
-/// to start over it would be a worse outcome than the mount it might pin.
+/// Failures are not propagated: a daemon that cannot `chdir` still works, and the
+/// mount it might pin is the cheaper of the two outcomes.
 pub(crate) fn release_startup_state() {
     let _ = rustix::process::chdir("/");
     let _ = silence_stdio();
@@ -172,9 +158,9 @@ pub(crate) fn release_startup_state() {
 /// sequence so that everything which can fail with a message worth reading has
 /// already had its chance to write one (`IMPLEMENTATION.md` § 6.2).
 ///
-/// The `Result` is here to chain the four calls, not to be handled: the only caller
-/// discards it, because a daemon that could not reach `/dev/null` is a daemon that
-/// writes where it should not, which is worse than a session but better than none.
+/// The `Result` is here to chain the four calls, not to be handled: a daemon that
+/// could not reach `/dev/null` writes where it should not, which is worse than a
+/// session but better than none.
 fn silence_stdio() -> io::Result<()> {
     let null = rustix::fs::open("/dev/null", OFlags::RDWR, Mode::empty())?;
     rustix::stdio::dup2_stdin(&null)?;
@@ -205,18 +191,12 @@ mod tests {
     /// Regression: every standard descriptor is left *open* on `/dev/null`,
     /// including the one whose number `open` handed back.
     ///
-    /// Freed by hand because nothing else can, which is the same reason this is a unit
-    /// test: std reopens a standard descriptor it finds closed at startup, so no
-    /// command line reaches [`silence_stdio`] with one free.
-    ///
-    /// In a child, because fds 0..=2 belong to the process rather than to this test and
-    /// `cargo test` runs the other tests as threads in it. Freeing fd 0 hands its number
-    /// to whichever of them allocates next — measured: `conn`'s socketpair came back as
-    /// fd 0, was `dup2`ed onto `/dev/null` here, and failed with `ENOTSOCK` in a test
-    /// that has nothing to do with startup — and pointing the *process's* stdout at
-    /// `/dev/null` for that window swallowed whatever the harness was printing, so a run
-    /// could fail with no failure list at all. A child's descriptor table is its own, so
-    /// the whole of it is contained and the verdict comes back as an exit status.
+    /// Freed by hand because nothing else can, which is the same reason this is a
+    /// unit test: std reopens a standard descriptor it finds closed at startup, so no
+    /// command line reaches [`silence_stdio`] with one free. And in a child, because
+    /// fds 0..=2 belong to the process rather than to this test while `cargo test`
+    /// runs the others as threads in it — a child's descriptor table is its own, so
+    /// the verdict comes back as an exit status.
     #[test]
     fn silencing_stdio_leaves_a_freed_descriptor_open_on_dev_null() {
         // Resolved before the fork, so the child does nothing but syscalls on

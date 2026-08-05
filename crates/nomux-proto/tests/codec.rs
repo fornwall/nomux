@@ -14,8 +14,8 @@
 //! construction.
 
 use nomux_proto::{
-    ErrorCode, ExitKind, Frame, FrameType, HEADER_LEN, HELLO_AGENT_FORWARD, HELLO_REPAINT_CTRL_L,
-    Hello, HelloOk, Linger, MAX_PAYLOAD, ProtoError, WinSize, decode_header,
+    ErrorCode, ExitKind, Frame, FrameType, HEADER_LEN, Hello, HelloOk, Linger, MAX_PAYLOAD,
+    ProtoError, WinSize, decode_header,
 };
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
@@ -127,10 +127,9 @@ fn any_text() -> impl Strategy<Value = String> {
 /// Strategy for `Hello.term`.
 ///
 /// [`any_text`] minus U+0000, which the codec refuses there by design: it is valid
-/// UTF-8 that `execve` will not take, so it is not a well-formed frame. Same
-/// reasoning as [`any_hello_flags`] — this generator's job is the frames that
-/// encode, and the refusal is covered by the mutation property below and by a unit
-/// test beside the check.
+/// UTF-8 that `execve` will not take, so it is not a well-formed frame. This
+/// generator's job is the frames that encode, and the refusal is covered by the
+/// mutation property below and by a unit test beside the check.
 ///
 /// Mapped rather than filtered because `any::<char>()` deliberately samples the
 /// special values, U+0000 among them, so a filter would spend proptest's local
@@ -146,16 +145,6 @@ fn any_term() -> impl Strategy<Value = String> {
 /// Strategy for a bounded opaque payload.
 fn any_bytes() -> impl Strategy<Value = Vec<u8>> {
     prop::collection::vec(any::<u8>(), 0..=MAX_GENERATED_LEN)
-}
-
-/// Strategy for `Hello.flags`.
-///
-/// Restricted to the two defined bits, because the decoder refuses anything else
-/// by design; undefined bits are covered by the mutation property instead.
-fn any_hello_flags() -> impl Strategy<Value = u8> {
-    (any::<bool>(), any::<bool>()).prop_map(|(agent, ctrl_l)| {
-        u8::from(agent) * HELLO_AGENT_FORWARD + u8::from(ctrl_l) * HELLO_REPAINT_CTRL_L
-    })
 }
 
 /// Strategy for every [`Frame`] variant with arbitrary field values.
@@ -205,23 +194,27 @@ fn any_frame() -> impl Strategy<Value = OwnedFrame> {
         copied.prop_map(OwnedFrame::copied),
         (
             any::<u16>(),
-            any_hello_flags(),
+            any::<bool>(),
+            any::<bool>(),
             any::<u64>(),
             any_win(),
             any_term(),
         )
-            .prop_map(|(protocol, flags, out_offset, win, term)| {
-                OwnedFrame::with_text(
-                    Frame::Hello(Hello {
-                        protocol,
-                        flags,
-                        out_offset,
-                        win,
-                        term: "",
-                    }),
-                    term,
-                )
-            }),
+            .prop_map(
+                |(protocol, agent_forward, repaint_ctrl_l, out_offset, win, term)| {
+                    OwnedFrame::with_text(
+                        Frame::Hello(Hello {
+                            protocol,
+                            agent_forward,
+                            repaint_ctrl_l,
+                            out_offset,
+                            win,
+                            term: "",
+                        }),
+                        term,
+                    )
+                },
+            ),
         (any::<u64>(), any_bytes()).prop_map(|(offset, data)| OwnedFrame::with_bytes(
             Frame::Input { offset, data: b"" },
             data

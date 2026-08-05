@@ -382,6 +382,125 @@ fn input_delivered_before_a_half_close_is_applied_rather_than_dropped() {
     );
 }
 
+/// Regression: a session whose child exits while its input queue is full still
+/// answers.
+///
+/// The queue only ever drains in `write_pty`, and `Daemon::watches` keeps the master in
+/// the poll set only while `child_gone` is `None` — so from the exit onwards there is
+/// no `write_pty` to come. A queue standing at the § 4.1 cap at that moment stayed
+/// there for good, and `input_is_saturated` with it: the client is polled with an empty
+/// mask and `read_client` returns before it decodes anything, so no `Ping` is answered,
+/// a `Detach` is never seen, and a *fresh* attach is answered to its `HelloOk` and mute
+/// after it — `read_pending` decodes the greeting, and everything behind it goes
+/// through the loop that has stopped. With a client attached the session is on no
+/// deadline at all (§ 6.5), so nothing but `nomux kill` ever ended it.
+///
+/// Composed exactly rather than hoped for, and every step a condition. The child waits
+/// on a FIFO and so never touches its terminal, which is what lets the queue reach the
+/// cap; `push_until_refused` returning short of the blast is the daemon having stopped
+/// reading, which is saturation observed rather than assumed; and the cue is what makes
+/// the exit happen after it rather than at some point during it.
+///
+/// The `Ping` goes down a connection opened after the exit because that is the state a
+/// user is in — a session that looks alive, answers the handshake, and then says
+/// nothing. `Pong` rather than `Exit`, since `pump_output` sends the exit whatever the
+/// input direction is doing and so cannot tell the two daemons apart.
+#[test]
+fn a_child_that_exits_behind_a_full_input_queue_leaves_the_session_answering() {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    use rustix::fs::Mode;
+
+    /// Comfortably past the megabyte § 4.1 queues, the megabyte it buffers undecoded
+    /// and the socket buffers between them, so what stops the push is the daemon.
+    const BLAST: usize = 8 << 20;
+    /// The queue cap of § 4.1. The test means nothing unless the daemon really reached
+    /// it before the child exited: below it nothing was ever held back.
+    const CAP: u64 = 1 << 20;
+
+    let session = Session::start("exit_saturated");
+    let cue = session.root.join("cue");
+    rustix::fs::mkfifoat(rustix::fs::CWD, &cue, Mode::RUSR | Mode::WUSR)
+        .expect("create the FIFO the child waits on");
+
+    let mut client = session.connect();
+    let ok = client.hello(RESUME_FROM_START);
+    // `raw` for the back pressure it keeps (see [`Client::make_ready`]) and `-echo` so
+    // the blast is not echoed back at a peer that never reads. Past the marker the child
+    // never touches its terminal: the whole line is parsed before any of it runs, and
+    // `read` has the FIFO — so the terminal's input buffer fills, the daemon stops
+    // being able to write, and everything after that piles up in `pending_input`.
+    let ready = client.make_ready("raw -echo", Some("read cue < cue; exit 9"), ok.resume_from);
+    drop(client);
+
+    // A raw socket rather than the harness client, because what is wanted is the point
+    // at which the daemon stops taking input at all. A second of a socket that will not
+    // take another byte is a daemon that has stopped rather than one that is busy,
+    // which is the same measure the three tests above are built on.
+    let mut blaster = blaster(&session);
+    let (frames, _) = input_frames(BLAST, ready.in_offset);
+    let sent = push_until_refused(&mut blaster, &frames, Duration::from_secs(1));
+    assert!(
+        sent as u64 > CAP,
+        "the daemon took only {sent} bytes before it stopped, which all fits in the \
+         {CAP} it queues — so the queue never reached the cap and the exit below has \
+         nothing to strand"
+    );
+
+    // And now the child leaves, with the queue full behind it. Opened without blocking
+    // so a child that never reached its own `open` fails here rather than parking this:
+    // a FIFO answers `ENXIO` until a reader is there, and the child counts as one from
+    // the moment it enters the wait.
+    let mut go = None;
+    assert!(
+        poll_until(FRAME_PATIENCE, || {
+            go = fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&cue)
+                .ok();
+            go.is_some()
+        }),
+        "the child never reached the cue it waits on"
+    );
+    go.expect("the FIFO the wait above opened")
+        .write_all(b"go\n")
+        .expect("cue the child");
+
+    // A fresh attach, which is what a user reaching for a session that has gone quiet
+    // does. The greeting proves the daemon is scheduling; the `Pong` behind it is the
+    // whole of this test, since it can only come from the decode loop the full queue
+    // used to stop.
+    let mut client = session.connect();
+    client.hello(RESUME_FROM_START);
+    client.send(&Frame::Ping { nonce: 0x5A7 });
+
+    // One deadline for the whole loop rather than a fresh one per frame: the replay and
+    // the `Exit` arrive ahead of the `Pong` and each would renew the patience for it.
+    let deadline = Instant::now() + FRAME_PATIENCE;
+    let awaiting = "a Pong from a session whose child exited behind a full input queue";
+    loop {
+        let (ty, payload) = client.frame_before(deadline, awaiting).unwrap_or_else(|| {
+            panic!(
+                "the daemon never answered: {sent} bytes of input were still queued for \
+                 a child that has gone, so it is holding this client out of its own \
+                 decode loop for as long as the session lasts"
+            )
+        });
+        match Frame::decode(ty, &payload).expect("decode") {
+            Frame::Pong { nonce } => {
+                assert_eq!(nonce, 0x5A7, "the Pong must answer the Ping this sent");
+                break;
+            }
+            Frame::Output { .. }
+            | Frame::Gap { .. }
+            | Frame::InputAck { .. }
+            | Frame::Exit { .. } => {}
+            other => panic!("unexpected {other:?} while awaiting {awaiting}"),
+        }
+    }
+}
+
 /// A peer that writes without ever reading is let go of, rather than queued for
 /// without bound (`IMPLEMENTATION.md` § 4.1).
 ///

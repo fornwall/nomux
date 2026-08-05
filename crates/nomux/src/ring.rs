@@ -17,9 +17,8 @@ pub(crate) struct Ring {
 impl Ring {
     /// Creates a ring retaining at most `capacity` bytes, and never fewer than one.
     ///
-    /// The clamp is unreachable — `daemon::ring_capacity` filters zero, and says why
-    /// it must go on doing so — but clamping rather than asserting keeps an abort
-    /// site out of a `panic = "abort"` binary.
+    /// The clamp is unreachable — `daemon::ring_capacity` filters zero — but clamping
+    /// rather than asserting keeps an abort site out of a `panic = "abort"` binary.
     #[must_use]
     pub(crate) fn new(capacity: usize) -> Self {
         let capacity = capacity.max(1);
@@ -49,8 +48,7 @@ impl Ring {
     pub(crate) fn push(&mut self, data: &[u8]) {
         // One number for both sides of the eviction: what falls out of the window is
         // `retained + new - capacity` however it splits between the buffer's head and
-        // this write's own, and `base` advances by the whole of it. Counting only one
-        // of the two leaves `base` too low.
+        // this write's own, and `base` advances by the whole of it.
         let overflow = (self.buf.len() + data.len()).saturating_sub(self.capacity);
         let from_buf = overflow.min(self.buf.len());
         self.base += overflow as u64;
@@ -63,11 +61,11 @@ impl Ring {
     /// underlying deque.
     ///
     /// `from` is clamped to [`Ring::base`], so a caller that has fallen behind
-    /// resumes at the oldest retained byte — check [`Ring::base`] first if that
-    /// needs reporting as a gap.
+    /// resumes at the oldest retained byte — check [`Ring::base`] first if that needs
+    /// reporting as a gap.
     ///
-    /// The two stay in stream order: either may be empty, the *first* one included
-    /// once `from` is past the front half, so a caller walking them must skip an
+    /// The two stay in stream order, and either may be empty — including the *first*,
+    /// once `from` is past the front half — so a caller walking them must skip an
     /// empty part rather than stop at one.
     #[must_use]
     pub(crate) fn slices_from(&self, from: u64) -> [&[u8]; 2] {
@@ -107,11 +105,10 @@ mod tests {
 
     /// An oversized write discards what was retained *as well as* its own head.
     ///
-    /// A `base` left too low puts a caught-up client above it, so the overflow is
-    /// invisible, no `Gap` is sent, and the client splices a stream with a hole in it
-    /// onto its scrollback believing it contiguous. That is the one failure the whole
-    /// design exists to prevent, so it is pinned at the arithmetic rather than end to
-    /// end.
+    /// A `base` left too low puts a caught-up client above it, so no `Gap` is sent and
+    /// the client splices a stream with a hole in it onto its scrollback believing it
+    /// contiguous — the one failure the whole design exists to prevent, so it is
+    /// pinned at the arithmetic rather than end to end.
     #[test]
     fn an_oversized_write_accounts_for_what_it_evicts() {
         let mut ring = Ring::new(4);

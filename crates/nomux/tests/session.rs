@@ -1731,7 +1731,8 @@ fn a_version_mismatch_refuses_the_newcomer_without_evicting_the_client() {
     let mut newcomer = session.connect();
     newcomer.send(&Frame::Hello(Hello {
         protocol: PROTOCOL_VERSION + 1,
-        flags: 0,
+        agent_forward: false,
+        repaint_ctrl_l: false,
         out_offset: RESUME_FROM_START,
         win: harness::WIN,
         term: "xterm-256color",

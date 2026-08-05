@@ -1,10 +1,8 @@
 //! The daemon half of agent forwarding (`IMPLEMENTATION.md` § 6.7).
 //!
-//! The daemon owns `$RUNDIR/<id>.agent` for the session's whole life and proxies
-//! every connection to it onto the protocol as a sub-channel; the client answers
-//! from its own key store. Nothing here parses the `ssh-agent` protocol — a
-//! channel is a byte pipe, exactly like the PTY stream — and nothing here talks to
-//! the client, so the frame traffic stays in one place, in `daemon.rs`.
+//! Nothing here parses the `ssh-agent` protocol — a channel is a byte pipe, exactly
+//! like the PTY stream — and nothing here talks to the client, so the frame traffic
+//! stays in one place, in `daemon.rs`.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -16,20 +14,16 @@ use std::path::{Path, PathBuf};
 /// Most concurrent agent channels one session will serve
 /// (`IMPLEMENTATION.md` § 6.7).
 ///
-/// `ssh-agent` exchanges are short and serial in practice; the cap bounds what a
-/// runaway child can force the daemon and client to track. Daemon policy rather than
-/// anything the wire imposes — no frame field is bounded by it — so it is enforced
-/// here, in the `accept` that turns it down. `pub(crate)` because `daemon` sizes its
-/// poll set against it.
+/// Daemon policy rather than anything the wire imposes — no frame field is bounded by
+/// it — so it is enforced here, in the `accept` that turns it down. `pub(crate)`
+/// because `daemon` sizes its poll set against it.
 pub(crate) const MAX_AGENT_CHANNELS: u32 = 8;
 
 /// Most a single channel may hold for a local peer that has stopped reading
 /// (`IMPLEMENTATION.md` § 6.7).
 ///
-/// The ceiling that matters is the product: eight channels all at the limit is
-/// 2 MiB, half the default ring rather than a rounding error against it — so this is
-/// sized to bound a runaway child, not to disappear beside the session's other
-/// memory.
+/// The ceiling that matters is the product: eight channels all at the limit is 2 MiB,
+/// half the default ring rather than a rounding error against it.
 const MAX_CHANNEL_QUEUE: usize = 256 * 1024;
 
 /// Outcome of one attempt to take a connection off the agent socket.
@@ -55,7 +49,8 @@ pub(crate) enum Flush {
     /// reached the waiting process. Forget it *without* telling the client, which
     /// closed it and is not waiting to hear so.
     Finished,
-    /// The write failed; the local peer is gone and the client needs telling.
+    /// The write failed on a channel the client still holds; the local peer is gone
+    /// and the client needs telling.
     Failed,
     /// No such channel — it closed while a frame for it was in flight.
     Gone,
@@ -104,12 +99,10 @@ impl Agent {
     /// Propagates bind, permission and non-blocking failures. The caller degrades
     /// to a session without forwarding rather than refusing to start.
     pub(crate) fn bind(path: &Path) -> io::Result<Self> {
-        // Only ever reached while holding this session's id, and the daemon
-        // unlinks its run files on exit, so anything still here is a leftover.
+        // Only ever reached while holding this session's id, so anything still here is
+        // a leftover.
         drop(fs::remove_file(path));
-        // Never briefly world-connectable: this is the socket that hands out
-        // signatures, so the window between `bind` and a `chmod` is the one that
-        // would matter most.
+        // Never briefly world-connectable: this is the socket that hands out signatures.
         let listener = crate::rundir::bind_socket_private(path)?;
         listener.set_nonblocking(true)?;
         Ok(Self {
@@ -134,14 +127,10 @@ impl Agent {
 
     /// Every live channel as `(id, fd, wants_write, wants_read)`, for the poll set.
     ///
-    /// A closing channel wants no reads, and asking for them would spin the loop at
-    /// full tilt: `close_from_client` shuts the read half down, and a unix socket in
-    /// that state reports itself readable on every pass for ever, while [`Agent::read`]
-    /// declines to act on it. With the peer's buffer full there is no `POLLOUT` to
-    /// make progress against either, so the daemon would burn a core until the peer
-    /// started reading. Such a channel always has something queued — `close_from_client`
-    /// forgets it on the spot otherwise — so it stays in the poll set on `POLLOUT`
-    /// alone, which is the only thing that can still move it.
+    /// A closing channel wants no reads, and asking for them would spin the loop at full
+    /// tilt: `close_from_client` shuts the read half down, and a unix socket in that
+    /// state reports itself readable on every pass for ever. It stays in the poll set on
+    /// `POLLOUT` alone, which is the only thing that can still move it.
     pub(crate) fn watches(&self) -> impl Iterator<Item = (u32, BorrowedFd<'_>, bool, bool)> {
         self.channels.iter().map(|chan| {
             (
@@ -155,11 +144,9 @@ impl Agent {
 
     /// The still-open channel with this id.
     ///
-    /// A scan rather than a keyed lookup: the list is capped at
-    /// [`MAX_AGENT_CHANNELS`], so there are at most eight entries to walk — and a
-    /// `BTreeMap` over them measured 8 KiB of monomorphised B-tree on `x86_64`,
-    /// against the 400 KiB budget of `IMPLEMENTATION.md` § 8. The obvious
-    /// improvement costs more than the search it saves.
+    /// A scan rather than a keyed lookup: the list is capped at [`MAX_AGENT_CHANNELS`],
+    /// and a `BTreeMap` over eight entries measured 8 KiB of monomorphised B-tree on
+    /// `x86_64` against the 400 KiB budget of `IMPLEMENTATION.md` § 8.
     fn channel(&mut self, id: u32) -> Option<&mut Channel> {
         self.channels.iter_mut().find(|chan| chan.id == id)
     }
@@ -167,16 +154,14 @@ impl Agent {
     /// Accepts one connection, returning the channel to announce.
     ///
     /// `serving` is whether a client is attached and greeted. When it is not, the
-    /// connection is accepted and dropped on the spot, as is one past the channel
-    /// cap; `IMPLEMENTATION.md` § 6.7 says why closing beats queueing for both.
+    /// connection is accepted and dropped on the spot, as is one past the channel cap
+    /// (§ 6.7).
     ///
     /// Never fails the session. `EMFILE`, `ECONNABORTED` and friends belong to one
     /// connection; propagating them would cost the session its agent socket for good,
-    /// with `SSH_AUTH_SOCK` in the child still pointing at it. They are still told
-    /// apart from an empty backlog, because only one of the two leaves a connection
-    /// queued behind it — and a queued connection keeps this descriptor readable, so
-    /// answering it with a bare return is a loop that spins for as long as the
-    /// shortage lasts.
+    /// with `SSH_AUTH_SOCK` in the child still pointing at it. They are still told apart
+    /// from an empty backlog, because only one of the two leaves a connection queued
+    /// behind it, and a queued connection keeps this descriptor readable.
     pub(crate) fn accept(&mut self, serving: bool) -> Accept {
         let stream = match self.listener.accept() {
             Ok((stream, _)) => stream,
@@ -215,13 +200,11 @@ impl Agent {
 
     /// The next id no live channel holds, or `None` if every candidate is taken.
     ///
-    /// A wrapping search rather than a bare increment. Ids are handed out for the
-    /// whole life of a session that may run for a week, and a counter that stopped at
-    /// `u32::MAX` disabled forwarding for the rest of it — silently, since
-    /// `SSH_AUTH_SOCK` goes on naming a socket that accepts and closes. What § 6.7
-    /// needs is that no *live* channel's id is reissued, which this keeps: at most
-    /// [`MAX_AGENT_CHANNELS`] are live, so one of any nine consecutive candidates is
-    /// free and `None` cannot be reached from a caller that respects the cap.
+    /// A wrapping search rather than a bare increment: ids are handed out for the whole
+    /// life of a session that may run for a week. What § 6.7 needs is that no *live*
+    /// channel's id is reissued, which this keeps — at most [`MAX_AGENT_CHANNELS`] are
+    /// live, so one of any nine consecutive candidates is free and `None` cannot be
+    /// reached from a caller that respects the cap.
     fn take_id(&mut self) -> Option<u32> {
         for _ in 0..=MAX_AGENT_CHANNELS {
             let id = self.next_id;
@@ -241,13 +224,10 @@ impl Agent {
             return Read::Closed;
         };
         // A channel the client has closed has had its read half shut down by
-        // `close_from_client`, and a socket in that state reports itself readable on
-        // every pass and answers every read with the end of file we ourselves caused.
-        // Taking that at face value would close the channel with its queue still
-        // unwritten — dropping the very reply `Flush::Finished` exists to deliver —
-        // and would answer the client with an `AgentClose` for a channel it closed
-        // itself and has already forgotten. What is left is the write side, which the
-        // queue keeps asking `poll` about until it drains or the peer refuses it.
+        // `close_from_client`, so it answers every read with the end of file we
+        // ourselves caused. Taking that at face value would drop the very reply
+        // [`Flush::Finished`] exists to deliver, and would tell the client of a close
+        // it made itself.
         if chan.closing {
             return Read::WouldBlock;
         }
@@ -268,16 +248,14 @@ impl Agent {
     ///
     /// Returns `false` if the data would take the queue past [`MAX_CHANNEL_QUEUE`],
     /// which means the caller should close the channel. An agent exchange is a few
-    /// hundred bytes; a queue this size is a local process that has stopped reading,
-    /// and the daemon must not hold megabytes per channel on its behalf.
+    /// hundred bytes; a queue this size is a local process that has stopped reading.
     pub(crate) fn deliver(&mut self, id: u32, data: &[u8]) -> bool {
         let Some(chan) = self.channel(id) else {
             return true;
         };
-        // Before the bytes are taken rather than after. Tested afterwards, the frame
-        // that crosses the cap is queued anyway — `MAX_PAYLOAD` of it, 256 KiB — so
-        // the peak was twice the constant per channel and twice the product its own
-        // comment is written against.
+        // Before the bytes are taken rather than after: tested afterwards, the frame
+        // that crosses the cap is queued anyway, and the peak is the cap plus a whole
+        // `MAX_PAYLOAD`.
         if chan.pending.len() + data.len() > MAX_CHANNEL_QUEUE {
             return false;
         }
@@ -290,11 +268,19 @@ impl Agent {
         let Some(chan) = self.channel(id) else {
             return Flush::Gone;
         };
-        if crate::nbio::drain_to(&mut chan.pending, chan.stream.as_fd()).is_err() {
-            return Flush::Failed;
-        }
-        if chan.closing && chan.pending.is_empty() {
-            Flush::Finished
+        let failed = crate::nbio::drain_to(&mut chan.pending, chan.stream.as_fd()).is_err();
+        if chan.closing {
+            // A write that failed ends this channel exactly as a drained queue does: the
+            // rest of it has nowhere left to go either way, and the client closed this
+            // channel and has already forgotten it — so [`Flush::Failed`] here would have
+            // the daemon answer with an `AgentClose` for a channel it no longer has.
+            if failed || chan.pending.is_empty() {
+                Flush::Finished
+            } else {
+                Flush::Open
+            }
+        } else if failed {
+            Flush::Failed
         } else {
             Flush::Open
         }
@@ -354,10 +340,8 @@ mod tests {
         }
     }
 
-    /// Regression: the queue was bounded *after* the bytes were taken, so the frame
-    /// that crossed the cap was queued anyway — a per-channel peak of
-    /// `MAX_CHANNEL_QUEUE + MAX_PAYLOAD`, and eight of those is 4 MiB against the
-    /// 2 MiB the constant's own comment sizes the session's memory against.
+    /// Regression: eight channels at the old peak of `MAX_CHANNEL_QUEUE + MAX_PAYLOAD`
+    /// is 4 MiB, against the 2 MiB the constant's own comment sizes the session against.
     #[test]
     fn a_channel_queue_is_bounded_before_the_bytes_are_taken() {
         let root = Scratch::new("agent-queue");
@@ -384,9 +368,8 @@ mod tests {
     }
 
     /// Regression: ids were a bare counter that refused every connection from
-    /// `u32::MAX` on. Enough open/close cycles from a child therefore disabled
-    /// forwarding for the rest of a session that may live for a week — silently,
-    /// since `SSH_AUTH_SOCK` goes on naming a socket that accepts and closes.
+    /// `u32::MAX` on, and did it silently — `SSH_AUTH_SOCK` goes on naming a socket
+    /// that accepts and closes.
     #[test]
     fn channel_ids_wrap_rather_than_running_out() {
         let root = Scratch::new("agent-ids");
@@ -416,14 +399,10 @@ mod tests {
         );
     }
 
-    /// The cap held against the document rather than against itself.
-    ///
-    /// Every agent-channel test counts to `MAX_AGENT_CHANNELS` and asks for one more, so
-    /// all of them pass at whatever value it happens to hold — measured at 6, they did.
-    /// It matters because the far end is a separate codebase built from the document:
-    /// § 6.7 fixes the cap at 8, which is what a client sizes its own channel table
-    /// against. The number is written out by hand, since it has to come from the document
-    /// rather than from the code under test.
+    /// The cap held against the document rather than against itself: every other
+    /// agent-channel test counts to `MAX_AGENT_CHANNELS` and asks for one more, so all of
+    /// them pass at whatever value it happens to hold. The far end is a separate codebase
+    /// built from § 6.7, so the number is written out by hand here.
     #[test]
     fn the_channel_cap_is_the_one_the_document_gives() {
         assert_eq!(
@@ -433,8 +412,8 @@ mod tests {
         );
     }
 
-    /// An empty backlog is the ordinary answer on a non-blocking listener, and must
-    /// not be reported as the failure that takes the socket out of the poll set.
+    /// An empty backlog must not be reported as the failure that takes the socket out
+    /// of the poll set.
     #[test]
     fn an_empty_backlog_is_not_a_failure_to_back_off_from() {
         let root = Scratch::new("agent-idle");

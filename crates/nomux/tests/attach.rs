@@ -402,6 +402,100 @@ fn entries(dir: &std::path::Path) -> Vec<String> {
     names
 }
 
+/// Binds `path` and makes every later `connect` to it wait rather than be answered.
+///
+/// What a daemon whose event loop has stopped calling `accept` looks like from
+/// outside, and the only way to produce it: a backlog of zero still takes one
+/// connection — the kernel refuses at *more* than the backlog, not at it — so one
+/// queued `connect` is the whole wedge. The same two syscalls as `spawn_lock.rs`'s
+/// wedge, which cannot be shared: the harness is what both files import, and this
+/// belongs to neither of them alone.
+///
+/// Both ends are handed back because both are load-bearing: closing the listener
+/// refuses the queue instead of holding it, and closing the queued connection empties
+/// the backlog again.
+fn wedge_socket(path: &std::path::Path) -> (UnixListener, UnixStream) {
+    use std::os::fd::AsRawFd;
+
+    let listener = UnixListener::bind(path).expect("plant a listening socket");
+    // SAFETY: `listen` is passed a descriptor the borrow above keeps open across the
+    // call, and a backlog. `UnixListener` has no safe spelling of a second `listen` —
+    // `bind` chose the backlog and nothing revisits it.
+    let shrunk = unsafe { libc::listen(listener.as_raw_fd(), 0) };
+    assert_eq!(
+        shrunk,
+        0,
+        "shrink the backlog: {}",
+        std::io::Error::last_os_error()
+    );
+    let queued = UnixStream::connect(path).expect("fill the backlog");
+    (listener, queued)
+}
+
+/// Regression: `attach` onto a session socket whose backlog is full gives up on a
+/// deadline rather than parking in `connect(2)`.
+///
+/// An `AF_UNIX` `connect` to a listener that has stopped calling `accept` *blocks*
+/// rather than being refused (§ 6.3), and the rule that follows from it covers `list`,
+/// `kill` and every attach on that id. This mode was the one still connecting without
+/// a deadline: a daemon that has stopped accepting — flushing a departing client,
+/// stopped, wedged — and a client that reconnects on every network change is a queue
+/// that fills, and the user's next tab then hangs with no output and no error, which
+/// is the one failure the relay has no way to report.
+///
+/// `the_control_surface_does_not_park_on_a_socket_whose_backlog_is_full` in
+/// `spawn_lock.rs` holds the same line for the other two modes.
+///
+/// 127 rather than 126, on § 10's table: a backlog that never drained is not evidence
+/// of death (§ 6.3), so this is the "come back for this one" a session that is not
+/// there earns, and never the host `DESIGN.md` § 7 has a client give up on.
+#[test]
+fn attach_does_not_park_on_a_socket_whose_backlog_is_full() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = run_root("attach_wedged");
+    let dir = root.join("nomux");
+    fs::create_dir_all(&dir).expect("create the run directory");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+        .expect("tighten the run directory");
+    let _wedged = wedge_socket(&dir.join("wedged.sock"));
+
+    let mut attaching = Spawned::spawn(
+        nomux(&root, &["attach", "wedged"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
+    assert!(
+        poll_until(RELAY_PATIENCE, || !attaching.is_running()),
+        "`nomux attach` never came back from a `connect` to a session socket whose \
+         backlog is full"
+    );
+    let refused = attaching
+        .into_exited()
+        .wait_with_output()
+        .expect("collect what the attach said");
+
+    assert_eq!(
+        refused.status.code(),
+        Some(127),
+        "a session that would not answer is one to come back for: {:?}",
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("backlog is full"),
+        "and the refusal must name the state it gave up on, since nothing else on \
+         this host will say so: {:?}",
+        stderr(&refused)
+    );
+    assert!(
+        stdout(&refused).is_empty(),
+        "stdout is where § 5.1 has the client read the bootstrap line, so an attach \
+         that reached no session must leave it alone: {:?}",
+        stdout(&refused)
+    );
+}
+
 /// Exercises the path a real bootstrap takes: `nomux spawn` on an id nothing is
 /// serving, which must start a daemon under the flock and then carry the
 /// conversation.

@@ -2,13 +2,9 @@
 //! their login shell.
 //!
 //! Read straight out of `/etc/passwd` rather than through `getpwuid`, for the reason
-//! `IMPLEMENTATION.md` § 6.1.1 gives. Both callers treat a miss as "fall back",
-//! never as an error:
-//!
-//! - shell selection, where `$SHELL` from the SSH login is the primary source
-//! - the username for the linger check ([`crate::linger`]), where `$USER` is
-//!
-//! so a directory-backed user still gets a working session.
+//! `IMPLEMENTATION.md` § 6.1.1 gives. Both callers — shell selection and the linger
+//! check's username ([`crate::linger`]) — have an environment variable to fall back
+//! on, so a miss is never an error and a directory-backed user still gets a session.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -24,10 +20,7 @@ const PASSWD: &str = "/etc/passwd";
 pub(crate) struct Entry {
     /// Login name. Text, unlike the shell below, because its one use is as a
     /// filename component that [`crate::linger`] compares against `$USER` — which
-    /// arrives through `env::var` and so could not carry non-UTF-8 bytes either. A
-    /// name outside UTF-8 therefore costs its own line and no other, which `useradd`
-    /// holding login names to the portable filename character set makes a bound
-    /// rather than a case worth serving.
+    /// arrives through `env::var` and so could not carry non-UTF-8 bytes either.
     pub name: String,
     /// Login shell, absent when the field is empty — which conventionally means
     /// `/bin/sh` and is left for the caller to decide.
@@ -46,10 +39,9 @@ pub(crate) fn current() -> Option<Entry> {
 /// Finds the first entry for `uid` in the contents of a password file.
 ///
 /// Parsed as bytes rather than decoded first. `/etc/passwd` has a field structure
-/// but no encoding: one GECOS field written in Latin-1 is enough to fail a UTF-8
-/// decode of the *whole file*, and that failure is global and quiet — a miss is
-/// indistinguishable from "no such uid", so everyone on the host silently drops to
-/// `/bin/sh`.
+/// but no encoding: one GECOS field written in Latin-1 fails a UTF-8 decode of the
+/// *whole file*, quietly and for everyone, a miss being indistinguishable from "no
+/// such uid".
 ///
 /// Malformed lines are skipped rather than rejected: a database with one bad line
 /// is not a reason to refuse someone a shell.
@@ -63,21 +55,19 @@ fn lookup(contents: &[u8], uid: u32) -> Option<Entry> {
         // Field 1 is the password placeholder, 3 the gid, 4 the GECOS comment and
         // 5 the home directory; only the uid and the shell are wanted.
         let _password = fields.next()?;
-        // Decoding the uid gives up nothing, a field outside UTF-8 being no more a
-        // number than `notanumber` is. Strict, because reading a malformed field as
-        // zero would hand root the broken line.
+        // Strict, because reading a malformed uid field as zero would hand root the
+        // broken line.
         if str::from_utf8(fields.next()?).ok()?.parse::<u32>().ok()? != uid {
             return None;
         }
         let shell = fields.nth(3).filter(|shell| !shell.is_empty());
-        // Decoded here, after the uid has already matched, so that a name this
-        // daemon cannot represent disqualifies at most the one line carrying it.
+        // Decoded after the uid has matched, so that a name this daemon cannot
+        // represent disqualifies at most the one line carrying it.
         let name = str::from_utf8(name).ok().filter(|name| !name.is_empty())?;
         Some(Entry {
             name: name.to_owned(),
             // A shell path is whatever bytes the filesystem holds, so it is handed
-            // back as those rather than through a string — which would be this same
-            // bug one field over.
+            // back as those rather than through a string.
             shell: shell.map(|shell| PathBuf::from(OsStr::from_bytes(shell))),
         })
     })
@@ -133,9 +123,9 @@ mod tests {
         );
     }
 
-    /// The reason any of this is parsed as bytes: `ö` as the single byte 0xF6 is a
-    /// GECOS field in Latin-1, which is what an account predating the host's move
-    /// to UTF-8 still carries. Decoding the file as text fails on all of it at once.
+    /// The reason any of this is parsed as bytes: `ö` as the single byte 0xF6 is what
+    /// an account predating the host's move to UTF-8 still carries, and decoding the
+    /// file as text fails on all of it at once.
     #[test]
     fn a_latin_1_gecos_field_costs_nobody_their_shell() {
         let contents = b"bjorn:x:1000:1000:Bj\xf6rn Str\xf6m:/home/bjorn:/bin/bash\n\
@@ -168,9 +158,7 @@ mod tests {
     }
 
     /// The deliberate limit of holding [`Entry::name`] as a `String`: a login name
-    /// outside UTF-8 loses its own line, and only its own line. Such a user has no
-    /// working `$USER` to fall back to either, so the linger answer would be
-    /// unknown for them regardless.
+    /// outside UTF-8 loses its own line, and only its own line.
     #[test]
     fn a_name_outside_utf8_skips_only_its_own_line() {
         let contents = b"o\xffdd:x:9:9::/home/odd:/bin/dash\n\
@@ -179,9 +167,9 @@ mod tests {
         assert_eq!(lookup(contents, 10).unwrap().name, "real");
     }
 
-    /// The newline is a terminator here rather than a separator, but nothing
-    /// enforces that: a hand-edited database can end mid-line, and a CRLF one would
-    /// otherwise hand back a shell path with a carriage return on the end.
+    /// Nothing enforces the newline being a terminator: a hand-edited database can
+    /// end mid-line, and a CRLF one would otherwise hand back a shell path with a
+    /// carriage return on the end.
     #[test]
     fn the_last_line_parses_however_it_ends() {
         for contents in [

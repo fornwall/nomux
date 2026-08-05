@@ -1,17 +1,14 @@
 //! Best-effort syslog, for the half of the daemon's life that has nowhere else to
 //! write.
 //!
-//! `startup::silence_stdio` points the daemon's three descriptors at `/dev/null`,
-//! correctly: under `attach` they are the SSH channel carrying the client's frame
-//! stream, and a diagnostic written there would land in the middle of it. From that
-//! moment the daemon has no terminal, and a process with no terminal is what syslog
-//! is for.
+//! `startup::silence_stdio` points the daemon's three descriptors at `/dev/null` —
+//! under `attach` they are the SSH channel carrying the client's frame stream — and
+//! a process with no terminal is what syslog is for.
 //!
-//! A datagram to `/dev/log`, which is the whole implementation. That path is the
-//! traditional socket and also what `systemd-journald` provides for compatibility,
-//! so one code path reaches journald, rsyslog and busybox alike — and reaching it
-//! costs no new dependency, no new port and no privilege the daemon does not
-//! already have.
+//! A datagram to `/dev/log`, which is the whole implementation: the traditional
+//! socket and also what `systemd-journald` provides for compatibility, so one code
+//! path reaches journald, rsyslog and busybox alike at no new dependency and no
+//! privilege the daemon does not already have.
 //!
 //! What is *not* here is as deliberate as what is. Nothing this module sends carries
 //! PTY bytes or a session's `--label`: the label is free-form text from a tab title,
@@ -20,10 +17,9 @@
 //! be announcing itself by name. Session ids are opaque and go out; labels stay in
 //! the run directory.
 //!
-//! It does not cover an abort. The shipping build is `-Cpanic=immediate-abort` and
-//! `strip = "symbols"` (`IMPLEMENTATION.md` § 8), so an allocation failure produces
-//! no message for anything to forward. That case still belongs to the `SIGQUIT` core
-//! § 6.5 preserves.
+//! It does not cover an abort: the shipping build strips symbols and aborts on panic
+//! (`IMPLEMENTATION.md` § 8), so an allocation failure produces no message for
+//! anything to forward, and that case belongs to the `SIGQUIT` core § 6.5 preserves.
 
 use std::os::unix::net::UnixDatagram;
 
@@ -50,21 +46,17 @@ enum Severity {
 /// because it could not describe itself would be worse than one nobody can diagnose.
 /// This is the same trade `silence_stdio` makes with its discarded `Result`.
 ///
-/// No timestamp and no hostname, which is a choice rather than an omission: rendering
-/// an RFC 3164 timestamp means local time, local time means a timezone database, and
-/// that is real weight against the § 8 budget to restate something the collector
-/// stamps anyway from the moment it receives the datagram. `journald`, `rsyslog` and
-/// `busybox syslogd` all fill both in for a message that carries neither.
+/// No timestamp and no hostname, which is a choice rather than an omission: an
+/// RFC 3164 timestamp means local time, local time means a timezone database, and
+/// that is real weight against the § 8 budget to restate what the collector stamps
+/// anyway — `journald`, `rsyslog` and `busybox syslogd` all fill both in.
 fn send(severity: Severity, message: &str) {
     let priority = FACILITY_USER * 8 + severity as u8;
     // Filtered by the function `list` filters a label with, and applied to the whole
-    // assembled line, which is what makes it enough: the text beside a session id is
-    // usually an `io::Error` carrying the run directory somebody else chose through
-    // `XDG_RUNTIME_DIR`, and the id itself is not always validated either — `daemon::run`
-    // reports a startup failure before anything has looked at its argument, so a
-    // malformed id reaches here verbatim. A newline in a datagram is how one log line
-    // becomes two, the second saying whatever its author wanted; a journal is read on a
-    // terminal, so a bidi override reorders one exactly as it would a listing.
+    // assembled line: the text beside a session id is usually an `io::Error` carrying
+    // a run directory somebody else chose, and the id is not always validated either
+    // — `daemon::run` reports a startup failure before anything has looked at its
+    // argument. A newline in a datagram is how one log line becomes two.
     let line = format!(
         "<{priority}>nomux[{pid}]: {message}",
         pid = std::process::id(),
@@ -103,10 +95,7 @@ mod tests {
     }
 
     /// The listing and the journal are both read on a terminal, so a line bound for
-    /// one has to be filtered exactly as a label bound for the other is. This is what
-    /// they were not: this module dropped `Cc` alone while `list` had already learnt
-    /// about the bidi overrides, and a run directory named through `XDG_RUNTIME_DIR`
-    /// reaches here inside an `io::Error`.
+    /// one has to be filtered exactly as a label bound for the other is.
     #[test]
     fn a_log_line_is_filtered_exactly_as_a_label_is() {
         for message in [

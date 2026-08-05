@@ -10,12 +10,12 @@ mod harness;
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use nomux_proto::{Frame, FrameType, HELLO_AGENT_FORWARD, RESUME_FROM_START};
 
-use harness::{Session, cpu_ticks, read_uninterrupted, socket_capacity};
+use harness::{FRAME_PATIENCE, Session, cpu_ticks, read_uninterrupted, socket_capacity};
 
 /// A session created without the flag serves no socket at all: forwarding bypasses
 /// the user's `ForwardAgent` decision, so it must never be on by default.
@@ -304,6 +304,91 @@ fn agent_channel_ids_are_never_reused() {
         previous = chan;
         drop(agent);
         assert_eq!(client.next_chan(FrameType::AgentClose), chan);
+    }
+}
+
+/// Regression: a write that fails on a channel the client has already closed is not
+/// announced back to it.
+///
+/// `Agent::flush` reported a failed write as `Flush::Failed` whatever the channel's
+/// state, and the daemon answers that with an `AgentClose` — for a channel the client
+/// closed itself and has already forgotten, which is what `Flush::Finished` exists to
+/// say instead. Ids are never reissued, so the frame names nothing the client can look
+/// up, and a client that treats an unknown channel as a protocol error loses the
+/// session over it.
+///
+/// The state is the one `close_from_client` leaves behind when its flush does not
+/// finish: a queue too big for the peer's socket, the client's close on top of it, and
+/// then the local `ssh-add` exiting with the reply still owed. The next `POLLOUT` on
+/// that channel is an `EPIPE`.
+///
+/// Nothing arrives to be asserted about, so the assertion is over a window with a fence
+/// at each end: the close is acted on before the peer goes, and the marker after it can
+/// only be answered by a daemon that has been round its loop since. Every frame in
+/// between is read, and an `AgentClose` among them is the bug.
+#[test]
+fn a_failed_write_on_a_closed_agent_channel_is_never_announced() {
+    /// One `AgentData` frame per round, well short of `MAX_CHANNEL_QUEUE`, which the
+    /// daemon would answer by closing the channel and taking the state away.
+    const CHUNK: usize = 32 * 1024;
+    /// How far past what the peer's socket will hold the client sends: what is left
+    /// over is what the daemon still owes when the peer goes.
+    const OVERSHOOT: usize = 96 * 1024;
+
+    let (session, mut client, ok) = Session::attached_with("agent_epipe", HELLO_AGENT_FORWARD);
+    let ready = client.make_ready("-echo", None, ok.resume_from);
+
+    let capacity = socket_capacity();
+    let agent = session.connect_agent();
+    let chan = client.next_chan(FrameType::AgentOpen);
+
+    // A frame at a time, each fenced by a round trip the daemon can only answer by
+    // having read it, so the queue crosses what the socket holds without ever crossing
+    // the cap that would close the channel.
+    let filler = vec![b'e'; CHUNK];
+    let mut sent = 0usize;
+    while sent < capacity + OVERSHOOT {
+        client.send(&Frame::AgentData {
+            chan,
+            data: &filler,
+        });
+        sent += filler.len();
+        client.send(&Frame::Ping { nonce: 0x0C10 });
+        drop(client.next_of(FrameType::Pong));
+    }
+
+    // Nothing answers an `AgentClose`, so the round trip through the child behind it is
+    // what says the daemon has acted on it — and the channel outlives it, since the
+    // queue above is provably more than the peer has taken.
+    client.send(&Frame::AgentClose { chan });
+    let before = b"echo NOMUX-CLOSE-ACTED-ON\n";
+    client.input(ready.in_offset, before);
+    let (_, from) = client.read_until("NOMUX-CLOSE-ACTED-ON", ready.offset);
+
+    // The `ssh-add` on the other end exits with the reply still queued.
+    drop(agent);
+
+    client.input(
+        ready.in_offset + before.len() as u64,
+        b"echo NOMUX-STILL-SERVING\n",
+    );
+    let deadline = Instant::now() + FRAME_PATIENCE;
+    let mut seen = String::new();
+    while !seen.contains("NOMUX-STILL-SERVING") {
+        let (ty, payload) = client
+            .frame_before(deadline, "the session's answer after the peer went")
+            .expect("the daemon went quiet with a failed write still to account for");
+        assert_ne!(
+            ty,
+            FrameType::AgentClose,
+            "the daemon answered a failed write with an AgentClose for channel {chan}, \
+             which the client closed itself and has already forgotten"
+        );
+        if let Ok(Frame::Output { offset, data }) = Frame::decode(ty, &payload)
+            && offset >= from
+        {
+            seen.push_str(&String::from_utf8_lossy(data));
+        }
     }
 }
 

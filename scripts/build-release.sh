@@ -16,13 +16,6 @@
 # rather than floating because the SHA-256 the client pins would drift under one that floats.
 # To build with another, edit that one-line file — `git status` then shows you did, which an
 # environment override would not.
-#
-# NOMUX_STABLE_STD=1 builds the released std instead and is expected to miss the cap. It is
-# a measurement tool, not an escape hatch: the tree is already buildable without nightly by
-# plain `cargo build --release --target ...`. What this uniquely does is re-derive § 8's
-# stable-vs-nightly size table with the leak check and the checksums around it, which § 8
-# invites readers to do rather than trust the prose. Those figures are not the release's, so
-# the run loses the growth gate and refuses NOMUX_UPDATE_BASELINE=1.
 set -eu
 
 die() {
@@ -56,13 +49,6 @@ update_baseline="${NOMUX_UPDATE_BASELINE:-0}"
 # builds, and only the publishing path keeps what they produce.
 companions="${NOMUX_DEBUG:-0}"
 
-# Recording a stable-std build would raise every baseline past the point where a later
-# regression could reach the threshold: the gate would run and never fire again.
-if [ "$update_baseline" = 1 ] && [ "${NOMUX_STABLE_STD:-0}" = 1 ]; then
-    die "NOMUX_UPDATE_BASELINE=1 refuses a NOMUX_STABLE_STD=1 build: its figures are" \
-        "  not the release's, and recording them would leave the growth gate unable to fire."
-fi
-
 # Read before building: finding a typo here after the cross builds have run is finding it too
 # late. Missing, malformed, and a header whose data lines were dropped are one condition —
 # the gate has no reference — and all refused rather than reported as a first build. The last
@@ -86,28 +72,23 @@ fi
 # Through RUSTUP_TOOLCHAIN rather than a `+toolchain` argument, so every rustc and cargo
 # call below agrees which one it is — including the `--print sysroot` whose answer gets
 # remapped, which would otherwise name the stable sysroot while nightly did the building.
-if [ "${NOMUX_STABLE_STD:-0}" = 1 ]; then
-    build_std=0
-    toolchain=$(rustup show active-toolchain | cut -d' ' -f1)
-else
-    build_std=1
-    # One file, read here and by CI, so a laptop and the runner measure the same bytes by
-    # construction: a literal in ci.yml against a floating `nightly` here once meant the
-    # documented local run measured whatever compiler the day handed it. It holds the name and
-    # nothing else — this reader takes it verbatim while CI round-trips it through the
-    # line-oriented $GITHUB_OUTPUT, so anything the two could read differently is rejected there.
-    nightly=''
-    if [ -r "$nightly_file" ]; then
-        nightly=$(cat "$nightly_file")
-    fi
-    if [ -z "$nightly" ]; then
-        die "no toolchain name in ${nightly_file#"$repo"/}, which names the release" \
-            "  compiler. Restore it, or set NOMUX_STABLE_STD=1 to measure without it."
-    fi
-    RUSTUP_TOOLCHAIN="$nightly"
-    export RUSTUP_TOOLCHAIN
-    toolchain="$nightly"
+#
+# One file, read here and by CI, so a laptop and the runner measure the same bytes by
+# construction: a literal in ci.yml against a floating `nightly` here once meant the
+# documented local run measured whatever compiler the day handed it. It holds the name and
+# nothing else — this reader takes it verbatim while CI round-trips it through the
+# line-oriented $GITHUB_OUTPUT, so anything the two could read differently is rejected there.
+nightly=''
+if [ -r "$nightly_file" ]; then
+    nightly=$(cat "$nightly_file")
 fi
+if [ -z "$nightly" ]; then
+    die "no toolchain name in ${nightly_file#"$repo"/}, which names the release" \
+        "  compiler. Restore it: nothing else in the tree says which one ships."
+fi
+RUSTUP_TOOLCHAIN="$nightly"
+export RUSTUP_TOOLCHAIN
+toolchain="$nightly"
 
 # The resolved compiler, never the name it was asked for: `nightly` floats, and two builds
 # a day apart can both answer to that name and disagree about every figure below.
@@ -117,29 +98,18 @@ version=$(rustc --version)
 # one place a stable toolchain can now get in: it passes every check below, which looks at the
 # sysroot and so says nothing about the channel, then dies minutes into the first cross build
 # nowhere near the cause. Asked of rustc, not matched on the name, so a linked nightly stands.
-if [ "$build_std" = 1 ]; then
-    case "$version" in
-    *-nightly* | *-dev*) ;;
-    *) die "$toolchain is not a nightly toolchain: $version" \
-            "  the shipping build rebuilds std with panics compiled out, which only" \
-            "  nightly accepts. Name a nightly in ${nightly_file#"$repo"/}, or set" \
-            "  NOMUX_STABLE_STD=1 and expect to miss the size budget." ;;
-    esac
-fi
+case "$version" in
+*-nightly* | *-dev*) ;;
+*) die "$toolchain is not a nightly toolchain: $version" \
+        "  the shipping build rebuilds std with panics compiled out, which only" \
+        "  nightly accepts. Name a nightly in ${nightly_file#"$repo"/}." ;;
+esac
 
 # The gate holds this build's bytes against another build's, which is a comparison only if one
 # compiler produced both: a bump moves these by hundreds of bytes against a threshold of a few
 # thousand. So the baseline records the compiler that wrote it, and nightly-version and
 # size-baseline are checked against each other rather than trusted to move in one commit.
-#
-# A stable-std run measures a different standard library, so its bytes are not the baseline's
-# to hold against at all. Keyed on build_std, not on a version mismatch: a baseline that had
-# lost its `# Measured on` line would otherwise leave the gate on and reporting GROWN against
-# figures this script has just called incomparable.
-skip_growth=0
-if [ "$build_std" != 1 ]; then
-    skip_growth=1
-elif [ "$update_baseline" != 1 ]; then
+if [ "$update_baseline" != 1 ]; then
     measured_by=$(awk '/^#[[:space:]]*Measured on/ {
         getline; sub(/^#[[:space:]]*/, ""); print; exit }' "$baseline_file")
     if [ -n "$measured_by" ] && [ "$measured_by" != "$version" ]; then
@@ -163,9 +133,12 @@ us=$(printf '\037')
 # even though cargo already passes workspace paths relative, so a future path-dependent
 # dependency cannot quietly reintroduce the problem.
 sysroot=$(rustc --print sysroot)
-# Beside the toolchain's own `rust-lld`, so it is the same LLVM that linked and it reads every
+# Beside the toolchain's own `rust-lld`, so it is the same LLVM that linked and they read every
 # target the cross builds emit. Resolved after the toolchain is chosen, which decides which.
+# `llvm-readobj` rather than `llvm-readelf`: llvm-tools ships only the former, and it is the
+# same program — readelf is that binary under another name, differing in default output style.
 objcopy="$(rustc --print target-libdir)/../bin/llvm-objcopy"
+readobj="$(rustc --print target-libdir)/../bin/llvm-readobj"
 # Its own target directory: the companion differs by one rustc flag, so sharing one would make
 # each build invalidate the other's cache and turn every one of them cold.
 companion_dir="${CARGO_TARGET_DIR:-$repo/target}/companion"
@@ -178,31 +151,29 @@ remap="$remap$us--remap-path-prefix=$repo=/nomux"
 # it prevents is the one thing this project cannot ship: a binary with runtime dependencies on
 # a host we know nothing about, discovered at a user's shell rather than here.
 rustflags="-Clink-self-contained=yes$us-Ctarget-feature=+crt-static$us$remap"
-if [ "$build_std" = 1 ]; then
-    rustflags="$rustflags$us-Zunstable-options$us-Cpanic=immediate-abort"
-    set -- -Z build-std=std,panic_abort
-else
-    set --
-fi
+rustflags="$rustflags$us-Zunstable-options$us-Cpanic=immediate-abort"
+set -- -Z build-std=std,panic_abort
 
 # build-std compiles std from source but still links the musl CRT objects and libc.a out of
-# the target's rust-std component, so it is needed either way. Checked here because cargo's
-# failure without it is an unreadable wall of linker errors.
+# the target's rust-std component, so the component is needed even so. Checked here because
+# cargo's failure without it is an unreadable wall of linker errors.
 for target in $targets; do
     libdir=$(rustc --print target-libdir --target "$target" 2>/dev/null) || libdir=''
     if [ -z "$libdir" ] || [ ! -e "$libdir/self-contained/libc.a" ]; then
         die "no rust-std for $target" "  rustup target add --toolchain $toolchain $target"
     fi
 done
-if [ "$build_std" = 1 ] && [ ! -e "$sysroot/lib/rustlib/src/rust/library/std/Cargo.toml" ]; then
+if [ ! -e "$sysroot/lib/rustlib/src/rust/library/std/Cargo.toml" ]; then
     die "build-std needs the standard library sources." \
         "  rustup component add --toolchain $toolchain rust-src"
 fi
-# llvm-objcopy compares the two builds below and ships with the toolchain rather than the
-# host: one target is cross-compiled, and a host binutils that cannot read aarch64 is the
-# ordinary case rather than the odd one.
-if [ "$companions" = 1 ] && [ ! -x "$objcopy" ]; then
-    die "the debug companions are checked against the binaries they describe." \
+# These ship with the toolchain rather than the host: one target is cross-compiled, and a host
+# binutils that cannot read aarch64 is the ordinary case rather than the odd one. llvm-readobj
+# is wanted on every run — check_static below is what makes the crt-static flag a fact rather
+# than a request — and llvm-objcopy only when the companions are built.
+if [ ! -x "$readobj" ] || { [ "$companions" = 1 ] && [ ! -x "$objcopy" ]; }; then
+    die "every binary is checked for runtime dependencies before it ships, and a debug" \
+        "  companion against the binary it describes." \
         "  rustup component add --toolchain $toolchain llvm-tools"
 fi
 
@@ -233,11 +204,28 @@ check_leaks() {
     done
 }
 
+# The rustflags above ask for a static binary; this is what says one came out. Asking is not
+# the same as getting — a target spec that ignored crt-static, a dependency that pulled in a
+# dynamic libc — and the failure lands at a stranger's shell, on a host we know nothing about,
+# rather than here. A static-pie carries neither a PT_INTERP segment naming a loader nor a
+# DT_NEEDED entry naming a library; either one means something has to be present on that host.
+# Read into a variable first, so a readobj that fails is `set -e` rather than a grep that
+# matches nothing and calls the binary clean.
+check_static() {
+    elf=$("$readobj" --program-headers --dynamic-table "$1")
+    if printf '%s\n' "$elf" | grep -qE 'PT_INTERP|NEEDED'; then
+        die "FAIL: ${1##*/} is dynamically linked:" \
+            "$(printf '%s\n' "$elf" | grep -E 'PT_INTERP|NEEDED')" \
+            "      it needs those present on a host nobody has looked at."
+    fi
+}
+
 for target in $targets; do
     echo "building $target ($toolchain)..." >&2
     CARGO_ENCODED_RUSTFLAGS="$rustflags" cargo build --locked --release --target "$target" --bin nomux "$@" >&2
     cp "${CARGO_TARGET_DIR:-$repo/target}/$target/release/nomux" "$dist/nomux-$target"
     check_leaks "$dist/nomux-$target"
+    check_static "$dist/nomux-$target"
 
     if [ "$companions" = 1 ]; then
         echo "building $target debug companion..." >&2
@@ -319,13 +307,12 @@ for target in $targets; do
         # rendering and never the thing tested: the gate compares diff*100 against
         # base*max_growth_pct, the same question without rounding — `sh` has no floating point
         # to round with — so a figure displaying as exactly the threshold is decided by the
-        # bytes. Growth only; a shrink is what this project wants. Under skip_growth it is still
-        # printed — what another std costs is the point of those runs — but is not a verdict.
+        # bytes. Growth only; a shrink is what this project wants.
         sign='+'
         if [ "$diff" -lt 0 ]; then sign='-'; fi
         tenths=$(((diff < 0 ? -diff : diff) * 1000 / base))
         pct="$sign$((tenths / 10)).$((tenths % 10))%"
-        if [ "$update_baseline" != 1 ] && [ "$skip_growth" != 1 ] && [ "$diff" -gt 0 ] &&
+        if [ "$update_baseline" != 1 ] && [ "$diff" -gt 0 ] &&
             [ $((diff * 100)) -gt $((base * max_growth_pct)) ]; then
             verdict="$verdict GROWN"
             grown="$grown $target"
@@ -383,9 +370,6 @@ if [ -n "$over_budget" ] || [ -n "$grown" ]; then
         echo "FAIL: grown more than $max_growth_pct% against ${baseline_file#"$repo"/}:$grown" >&2
         echo "      find what did it — the cost is paid on every cold upload — or accept it" >&2
         echo "      deliberately with NOMUX_UPDATE_BASELINE=1 and commit the new baseline." >&2
-    fi
-    if [ "$build_std" = 0 ]; then
-        echo "note: NOMUX_STABLE_STD=1 build; the shipping build uses build-std." >&2
     fi
     exit 1
 fi

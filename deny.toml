@@ -1,0 +1,42 @@
+# cargo-deny, run by .github/workflows/ci.yml's check job as
+# `cargo deny check advisories bans licenses sources`.
+#
+# .github/dependabot.yml schedules version bumps monthly, which is a cadence rather
+# than a gate: an advisory published the day after a run waits four weeks for a bump
+# nobody has told dependabot to make. This fails the build instead. `nomux` is
+# published, so licences are a real question here too, and `clippy::cargo` does not
+# ask it — it checks this crate's manifest metadata, not what the tree pulls in.
+#
+# No `[graph] targets`, deliberately: every target is checked rather than the two that
+# ship, so the windows crates errno pulls in are in scope. An advisory or a licence
+# that would stop a `cargo install` on someone else's platform is one this repository
+# would rather hear about than not.
+
+[advisories]
+version = 2
+# Deny by default. `ignore` stays empty: with two direct dependencies, an advisory is
+# something to fix rather than something to carry, and an entry here would need a date
+# and a reason beside it.
+ignore = []
+
+[licenses]
+version = 2
+# Exactly what the tree resolves to today, and nothing held in reserve: an unmatched
+# entry here is a warning, and a licence that is not here is a decision someone makes
+# in a diff rather than one already made for them. rustix and linux-raw-sys offer
+# `Apache-2.0 WITH LLVM-exception` as well; the plain Apache-2.0 in their `OR` is what
+# is taken, so the exception does not need listing.
+allow = ["Apache-2.0", "MIT"]
+
+[bans]
+# `clippy::cargo` allows multiple_crate_versions as unactionable in any real tree, and
+# this agrees rather than contradicting it: duplicates are reported, not failed.
+multiple-versions = "warn"
+
+[sources]
+# crates.io and nothing else. A git dependency would put a moving ref inside a binary
+# whose SHA-256 the client pins.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

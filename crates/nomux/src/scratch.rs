@@ -5,16 +5,9 @@
 //! The integration tests get `CARGO_TARGET_TMPDIR` and a run root of their own
 //! (`tests/harness/mod.rs`). Cargo sets that variable for integration tests and
 //! benches only — measured, not assumed: `option_env!` reads `None` from here — so
-//! the unit tests in `src/` have nowhere but `env::temp_dir()`, which is the
-//! developer's ambient `$TMPDIR` shared with everything else on the host. Both
-//! halves of the harness's naming argument are therefore load-bearing here.
-//!
-//! What that cost, measured before this existed: `/tmp/nomux-226959-rundir-symlink`
-//! and `/tmp/nomux-615195-rundir-mode` were still there a day after the run that
-//! made them, because the cleanup sat on the success path and those runs had
-//! failed. The second was left at mode `d-wx------`, which its own owner cannot
-//! open — and which `remove_dir_all` therefore cannot empty either, so it would
-//! have survived any amount of tidying up that did not know to repair it first.
+//! the unit tests in `src/` have nowhere but the developer's ambient `$TMPDIR`,
+//! shared with everything else on the host. Both halves of the harness's naming
+//! argument are therefore load-bearing here.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -28,15 +21,13 @@ const REMOVABLE: u32 = 0o700;
 /// Serialises everything in this process whose result depends on the umask.
 ///
 /// `rundir::with_umask` sets a process-wide umask for the length of one call, which
-/// was sound while nothing in the crate was multi-threaded. `cargo test` is: it runs
-/// these tests as threads in one process, so two of those calls interleave and the
-/// second restores the *first's* mask — leaving the process at `0177` for good, after
-/// which every directory made here is `0600` and nothing can be created under it.
-/// `cargo nextest` gives each test a process and never sees it.
+/// was sound while nothing in the crate was multi-threaded. `cargo test` is: two of
+/// those calls interleave and the second restores the *first's* mask, leaving the
+/// process at `0177` for good. `cargo nextest` gives each test a process and never
+/// sees it.
 ///
-/// Held by `with_umask` and by every directory this module creates, which is the whole
-/// of what a test process creates whose mode it does not set itself. `#[cfg(test)]`
-/// throughout, so a shipped build carries none of it.
+/// Held by `with_umask` and by every directory this module creates, which is the
+/// whole of what a test process creates whose mode it does not set itself.
 ///
 /// Poisoning is ignored: a taker that panicked was a failing assertion, not a broken
 /// lock, and refusing everyone after it would turn one red test into all of them.
@@ -61,8 +52,7 @@ impl Scratch {
     /// An empty scratch directory named for `name` and for this process.
     ///
     /// The wipe on the way in stays even though the name carries this process's pid,
-    /// for the reason the integration harness gives: pids are reused, and a run that
-    /// crashed hard between the sweep and here leaves its directory behind.
+    /// for the reason the integration harness gives: pids are reused.
     pub(crate) fn new(name: &str) -> Self {
         sweep_finished_runs();
         let dir = std::env::temp_dir().join(format!("nomux-{}-{name}", std::process::id()));
@@ -80,10 +70,8 @@ impl Scratch {
         self.0.join(tail)
     }
 
-    /// A directory at `tail`, created the way the root was.
-    ///
-    /// For test bodies that need one of their own: a bare `fs::create_dir_all` in one
-    /// is exactly what [`umask_lock`] exists to stop.
+    /// A directory at `tail`, created the way the root was: a bare
+    /// `fs::create_dir_all` in a test body is what [`umask_lock`] exists to stop.
     pub(crate) fn dir(&self, tail: &str) -> PathBuf {
         let path = self.join(tail);
         create_dir(&path);
@@ -101,21 +89,18 @@ impl Drop for Scratch {
 /// Puts `dir` and every directory under it back into a mode that can be removed.
 ///
 /// The mode tests deliberately leave directories nobody can open, including their
-/// owner, and `remove_dir_all` has to read a directory to empty it. Restoring here
-/// rather than at the end of the test body is what makes it happen on the path that
-/// matters — the one where an assertion has already fired.
+/// owner, and `remove_dir_all` has to read a directory to empty it.
 ///
 /// Symlinks are not followed, which is the same promise `ensure_dir_at` makes. The
 /// recursion gets that from `read_dir`; the entry point has to buy it, because
 /// `set_permissions` is `chmod(2)`, which follows, and Linux has no `lchmod`. Both
 /// callers hand this a path somebody else may have replaced, so without the check a
-/// link planted at one of those names is a `chmod` of whatever it points at — `EPERM`
-/// as an ordinary user, and successful as root, which `rundir`'s tests treat as a
-/// supported way to run this suite.
+/// link planted at one of those names is a `chmod` of whatever it points at —
+/// successful as root, which `rundir`'s tests treat as a supported way to run this
+/// suite.
 fn make_removable(dir: &Path) {
     // `symlink_metadata`, so the answer is about the name rather than about what it
-    // resolves to — and anything that is not a directory of ours has neither a mode
-    // worth repairing nor entries to recurse into.
+    // resolves to.
     if !fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir()) {
         return;
     }
@@ -135,10 +120,9 @@ fn make_removable(dir: &Path) {
 
 /// Removes the scratch directories of test processes that have exited.
 ///
-/// The pid in the name is what lets two runs proceed at once, and it is equally
-/// what stops a run from reusing what the last one left. A directory goes only once
-/// `/proc` says its process is gone — a live pid is either this one or a run in
-/// flight, and taking either away is the exact fault the naming exists to prevent.
+/// A directory goes only once `/proc` says its process is gone: a live pid is either
+/// this one or a run in flight, and taking either away is the exact fault the pid in
+/// the name exists to prevent.
 fn sweep_finished_runs() {
     let temp = std::env::temp_dir();
     let Ok(entries) = fs::read_dir(&temp) else {
@@ -173,10 +157,6 @@ mod tests {
     /// one alone is a fault: a `chmod` that follows a link is somebody else's file at
     /// [`REMOVABLE`], and a guard that turns any of them away is a scratch directory
     /// left behind on every run that fails.
-    ///
-    /// The paths somebody else may have replaced are `Scratch::new`'s, under a shared
-    /// sticky `/tmp`, and [`sweep_finished_runs`]'s, over every `nomux-<dead-pid>-*`
-    /// name it finds there.
     #[test]
     fn make_removable_repairs_a_directory_and_does_not_follow_a_link_to_one() {
         let root = Scratch::new("scratch-make-removable");
@@ -187,8 +167,8 @@ mod tests {
         let link = root.join("link");
         std::os::unix::fs::symlink(&victim, &link).expect("plant a link where a run dir goes");
 
-        // A real directory, shut the way the mode tests leave one — and shut from the
-        // inside out, since the outer one has to be open to create the inner.
+        // A real directory, shut the way the mode tests leave one, from the inside
+        // out since the outer has to be open to create the inner.
         let nested = root.dir("dir/nested");
         let dir = root.join("dir");
         fs::set_permissions(&nested, fs::Permissions::from_mode(0o300)).expect("shut the inner");

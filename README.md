@@ -12,19 +12,32 @@ reporting and scrollback all work unchanged — up to the ring's capacity; a
 disconnect that outlasts it is reported as an explicit gap rather than silently
 truncated.
 
-```
-nomux daemon <session-id>   Own a PTY session (normally spawned by `spawn`)
-nomux spawn <session-id>    Create a session and relay stdio to it; fails if it exists
-nomux attach <session-id>   Relay stdio to an existing session; fails if it does not
-nomux list                  List sessions in the run directory
-nomux kill <session-id>     Terminate a session and unlink its run files
+`nomux --help`, verbatim, because a paraphrase here is a second copy that drifts:
 
-  --label <text>            Display name for `list`, recorded when the session is
-                            created, so `daemon` and `spawn` take it and `attach`
-                            refuses one; `kill` parses it and ignores it
-  --version, -V             Print version and protocol revision
-  --help, -h                Print this usage
 ```
+usage: nomux <mode> [session-id] [--label <text>]
+
+modes:
+  daemon <session-id>   Own a PTY session (normally spawned by `spawn`)
+  spawn <session-id>    Create a session and relay stdio to it; fails if it exists
+  attach <session-id>   Relay stdio to an existing session; fails if it does not
+
+control surface (frozen across versions, see IMPLEMENTATION.md 6.6):
+  list                  List sessions in the run directory
+  kill <session-id>     Terminate a session and unlink its run files
+
+options:
+  --label <text>        Display name for `list`, recorded when the session is
+                        created, so `daemon` and `spawn` take it and `attach` does
+                        not. Advisory: ids are opaque, so this is what makes an
+                        orphaned session recognisable to a human.
+  --version, -V         Print version and protocol revision
+  --help, -h            Print this usage
+```
+
+Two things that text does not say: `--label=<text>` is accepted as well as the
+two-word form, and `kill` parses a label and ignores it, the frozen surface accepting
+what it always accepted.
 
 Four properties drive the design. They are the system's — this binary and the client
 that pushes and drives it, versioned as one unit — and two of them, the resume path
@@ -49,69 +62,15 @@ carries no stability guarantee.
 
 ## How it works
 
-One session's whole life, in the calls that make it. The daemon leaves the login
-session before it publishes its pid, so no hangup and no keystroke can reach it, and
-it opens every terminal `O_NOCTTY` so it never acquires one: the only controlling
-terminal here is the child's, taken on the PTY slave in a session of its own. That
-detachment and the stop pipe are both best-effort. Topology and states are
+The daemon leaves the login session before it publishes its pid, so no hangup and no
+keystroke can reach it, and it opens every terminal `O_NOCTTY` so it never acquires
+one: the only controlling terminal here is the child's, taken on the PTY slave in a
+session of its own. That detachment and the stop pipe are both best-effort. A session
+outlives its child, so the exit status and the last of the output are still there for
+a client that arrives days later. Topology and states are
 [DESIGN.md § 4](DESIGN.md#4-architecture) and [§ 5](DESIGN.md#5-session-lifecycle);
 the poll set, and the reasoning behind every call, is
 [IMPLEMENTATION.md § 6](IMPLEMENTATION.md#6-daemon).
-
-```mermaid
-sequenceDiagram
-  participant C as client over ssh
-  participant D as nomux daemon
-  participant T as PTY
-  participant S as shell
-
-  Note over C,D: sshd opens direct-streamlocal to id.sock where it can
-  Note over C,D: elsewhere nomux spawn or attach relays, on every connection
-  C->>D: nomux spawn, nothing answering, creates one under id.lock
-  D->>D: bind id.sock, then SIGHUP to SIG_IGN
-  D->>D: getsid, then /dev/tty if it already leads one
-  D->>D: setsid, or fork, _exit the parent, then setsid
-  Note over D: session leader, no ctty, all ttys O_NOCTTY
-  D->>D: stop self-pipe, id.pid, chdir /, detach stdio
-  C->>D: connect, which only makes it pending
-  C->>D: Hello with TERM and winsize, which attaches
-  D->>T: openpt, grantpt, unlockpt, ptsname
-  D->>T: master O_NONBLOCK, then open the slave
-  D->>T: TIOCSWINSZ before the child can look
-  D->>S: fork, with the slave as 0 1 2
-  S->>S: setsid, own session and group
-  S->>T: TIOCSCTTY on the slave
-  S->>S: SIGHUP to SIG_DFL, execve, dashed argv0
-  Note over S: session and group leader, ctty is the slave
-  D->>D: close its own slave fds, or no EIO comes
-  D->>C: HelloOk with resume_from
-  loop the poll loop, until a stop condition fires
-    C->>D: Input frames
-    D->>T: write the master
-    T-->>D: read the master into the ring
-    D->>C: Output frames and InputAck
-    opt a client may leave, and another arrive
-      C--xD: HUP or a half-close
-      C->>D: a later nomux attach connects, pending again
-      C->>D: its Hello takes the session over
-    end
-    opt once, when the child lets go
-      S->>S: exits
-      T-->>D: EIO on the master, taken as end of file
-      D->>S: waitpid, retried each pass, invented past 2 s
-      D->>C: the rest of the output, then one Exit
-      Note over D: status, ring and daemon held, still in the loop
-    end
-  end
-  Note over C,D: a stop signal or a week idle reach here, child gone or not
-  D->>S: SIGHUP to the group, then each /proc session member
-  D->>S: 500 ms grace, then SIGKILL if still standing
-  D->>S: kill and reap the child either way
-  opt if id.lock is free
-    D->>D: unlink the run files, id.lock last
-  end
-  Note over C,D: a later attach finds nothing and says so, never a fresh shell
-```
 
 ## Build
 
@@ -121,7 +80,7 @@ Nothing has to be installed by hand: the toolchain is pinned in
 ```sh
 git clone https://github.com/fornwall/nomux && cd nomux
 cargo build     # rustup installs the pinned 1.97.1 on first use
-cargo test      # the whole suite, doctests included, about 10 s
+cargo test      # the whole suite, doctests included, about 20 s
 ```
 
 Both runners are supported, and the line above is the one to start with. The tree is
@@ -133,34 +92,51 @@ new tests.
 ```sh
 cargo install cargo-nextest
 cargo clippy --workspace --all-targets
-cargo nextest run --workspace
+cargo nextest run --workspace   # the same suite, about 6 s
 ```
 
-Commits are gated by [prek](https://github.com/j178/prek) on shellcheck, formatting,
-clippy, tests and doctests:
+Commits are gated by [prek](https://github.com/j178/prek) on actionlint, shellcheck,
+formatting, clippy, tests and doctests:
 
 ```sh
 prek install            # once, per clone
 prek run --all-files    # run the gate manually
 ```
 
-The hooks trigger on `*.rs`, `*.toml` and `Cargo.lock` — manifests included, because
-the lint configuration lives in `Cargo.toml` — and on `*.sh`, because the release
-build and the takeover guard are shell and no Rust hook would ever look at them.
-Every hook is `language: system`, so prek installs nothing on their behalf:
-`shellcheck` and `cargo-nextest` have to be on `$PATH` already, or the first run of
-the gate in a fresh clone fails on a missing command rather than on anything in the
-tree.
+`.pre-commit-config.yaml` is the gate, and it is the single source of truth for those
+six: CI runs `prek run --all-files` rather than restating the commands, so a hook and
+the step enforcing it cannot drift apart. It skips the one hook whose CI step is a
+strict superset — the suite is too slow to run twice.
 
-Two things are deliberately left out of the pre-commit gate and run in CI instead,
-because both cost far more than a commit should:
+The hooks trigger on `*.rs`, `*.toml` and `Cargo.lock` — manifests included, because
+the lint configuration lives in `Cargo.toml` — on `*.sh`, because the release build
+and the takeover guard are shell and no Rust hook would ever look at them, and on
+`.github/workflows/*.yml`, which is where the shell no `*.sh` glob reaches actually
+lives. Every hook but one is `language: system` and expects its tool on `$PATH`
+already, so a fresh clone missing `shellcheck` or `cargo-nextest` fails on the missing
+command rather than on anything in the tree. The exception is `actionlint`, pinned by
+version and built by prek itself, so a laptop and the runner lint against the same
+release rather than against whatever each happens to have.
+
+Four things are deliberately left out of the pre-commit gate and run in CI instead:
 
 ```sh
-cargo nextest run --workspace --run-ignored all   # includes the 30 s first-attach reap
-sh scripts/verify-takeover-guard.sh               # rebuilds under fault injection
+cargo deny check advisories bans licenses sources    # config in deny.toml
+RUSTDOCFLAGS='-D warnings' cargo doc --document-private-items
+cargo nextest run --workspace --run-ignored all      # includes the 30 s first-attach reap
+sh scripts/verify-takeover-guard.sh                  # rebuilds under fault injection
 ```
 
-CI runs a third thing that is in neither list: the whole musl release build below.
+The last two cost far more than a commit should. The first two cost seconds and are
+out for a different reason: advisories go stale on the calendar rather than on the
+diff, so the answer depends on the day and not on the commit, and rustdoc is a lint
+namespace neither clippy nor `RUSTFLAGS` reaches — which matters in a tree that links
+between items constantly, where a renamed function turns a link into nothing rather
+than into an error. CI also asserts that `rust-toolchain.toml` and `Cargo.toml`'s
+`rust-version` name the same compiler, since the declared MSRV is only tested while
+those two strings agree.
+
+CI runs one more thing that is in neither list: the whole musl release build below.
 It needs a nightly compiler and the two musl targets installed, which makes it the one
 check the local hooks genuinely cannot stand in for.
 
@@ -193,9 +169,8 @@ rustup target add --toolchain "$nightly" \
 ```
 
 Why the standard library is rebuilt at all, why `scripts/nightly-version` pins a
-dated nightly rather than a floating one, and what `NOMUX_STABLE_STD=1` and
-`NOMUX_UPDATE_BASELINE=1` are for are
-[IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)'s; when that pin moves is
+dated nightly rather than a floating one, and what `NOMUX_UPDATE_BASELINE=1` is for
+are [IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)'s; when that pin moves is
 [PLAN.md § P3](PLAN.md#p3--release-process)'s.
 
 `llvm-tools` is for the debug companions below, which `NOMUX_DEBUG=1` asks for;

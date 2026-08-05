@@ -19,8 +19,8 @@
 //! needs relaxing.
 
 use nomux_proto::{
-    ErrorCode, ExitKind, Frame, FrameType, HEADER_LEN, HELLO_AGENT_FORWARD, HELLO_REPAINT_CTRL_L,
-    Hello, HelloOk, Linger, MAX_PAYLOAD, PROTOCOL_VERSION, RESUME_FROM_START, WinSize,
+    ErrorCode, ExitKind, Frame, FrameType, HEADER_LEN, Hello, HelloOk, Linger, MAX_PAYLOAD,
+    PROTOCOL_VERSION, RESUME_FROM_START, WinSize,
 };
 
 /// Distinct in all four fields on purpose: `cols`, `rows`, `xpixel` and `ypixel`
@@ -50,8 +50,8 @@ struct Vector {
 /// Both handshake frames appear more than once, because distinct values catch a swap
 /// between two fields and do nothing about a swap *inside* one. A flag bit or an
 /// enumerator exercised at a single value is pinned only against being renumbered
-/// wholesale: give `Hello.flags` both of its bits at once and the two constants can
-/// trade places without moving a byte. So each repeat is chosen to disagree with the
+/// wholesale: give `Hello` both of its flags at once and their two bits can trade
+/// places without moving a byte. So each repeat is chosen to disagree with the
 /// ones before it on every bit and every enumerator that has one — which is what
 /// makes § 2.3 a table this file actually checks, rather than one the codec merely
 /// agrees with itself about. Each of the two takes three: [`Linger`] has three values
@@ -71,16 +71,13 @@ fn vectors() -> Vec<Vector> {
 fn hello_vectors() -> Vec<Vector> {
     vec![
         // 0x01 Hello: u16 proto, u8 flags, u64 out_offset, winsize, u16 term_len,
-        // term bytes.
-        //
-        // The revision is two bytes and the flags one, so the pair are no longer the
-        // same shape and no swap between them is even representable — which is the
-        // §2.3 point that there is no reserved space, made in bytes: two flag bits
-        // live in a byte, not in a word with fourteen spare.
+        // term bytes. The revision is two bytes and the flags one, so no swap between
+        // them is even representable — §2.3's "no reserved space", made in bytes.
         Vector {
             frame: Frame::Hello(Hello {
                 protocol: 5,
-                flags: HELLO_AGENT_FORWARD | HELLO_REPAINT_CTRL_L,
+                agent_forward: true,
+                repaint_ctrl_l: true,
                 out_offset: 0x0102_0304_0506_0708,
                 win: WIN,
                 term: "xterm-256color",
@@ -95,15 +92,14 @@ fn hello_vectors() -> Vec<Vector> {
                 b'x', b't', b'e', b'r', b'm', b'-', b'2', b'5', b'6', b'c', b'o', b'l', b'o', b'r',
             ],
         },
-        // 0x01 Hello again, with bit 0 alone. Against the vector above this is
-        // what pins *which* bit is which: there, both are set, so exchanging the
-        // two constants leaves 0x0003 unchanged. Carries `RESUME_FROM_START` as
-        // well, the § 2.2 sentinel for "I have no state, send me whatever you
-        // have", which no other vector shows on the wire.
+        // 0x01 Hello again, with bit 0 alone, which is what pins *which* bit is
+        // which: above, both are set, so exchanging the two leaves 0x03 unchanged.
+        // Carries `RESUME_FROM_START` as well, which no other vector shows.
         Vector {
             frame: Frame::Hello(Hello {
                 protocol: 5,
-                flags: HELLO_AGENT_FORWARD,
+                agent_forward: true,
+                repaint_ctrl_l: false,
                 out_offset: RESUME_FROM_START,
                 win: WIN,
                 term: "vt100",
@@ -118,14 +114,13 @@ fn hello_vectors() -> Vec<Vector> {
                 b'v', b't', b'1', b'0', b'0',
             ],
         },
-        // 0x01 Hello a third time, with both flag bits clear. Bit 0 is set in both
-        // of the vectors above, so this is the only one that pins it in the clear
-        // state: without it an encoder that always asserted the bit moves no byte
-        // either of the others compares.
+        // 0x01 Hello a third time, with both bits clear. Bit 0 is set in both of the
+        // vectors above, so this is the only one that pins it clear.
         Vector {
             frame: Frame::Hello(Hello {
                 protocol: 5,
-                flags: 0,
+                agent_forward: false,
+                repaint_ctrl_l: false,
                 out_offset: 0x8182_8384_8586_8788,
                 win: WIN,
                 term: "dumb",
@@ -146,14 +141,10 @@ fn hello_vectors() -> Vec<Vector> {
 /// The daemon's answer, at all three linger states and both agent states.
 fn hello_ok_vectors() -> Vec<Vector> {
     vec![
-        // 0x02 HelloOk: u64 resume_from, u64 in_applied, winsize, u8 linger,
-        // u8 flags. It carries no revision — the daemon has already refused a
-        // `Hello.protocol` that is not its own by the time it answers, so a copy here
-        // could only echo the number the client just sent (§ 2.2).
-        //
-        // The last two bytes are one byte each: `linger` is a field of its own rather
-        // than two bits inside `flags`, so its wire form is the discriminant § 2.3
-        // gives it and nothing is shifted.
+        // 0x02 HelloOk: u64 resume_from, u64 in_applied, winsize, u8 linger, u8
+        // flags. It carries no revision (§ 2.2), and the last two bytes are one byte
+        // each, `linger` being a field of its own rather than two bits inside the
+        // flags (§ 2.3).
         Vector {
             frame: Frame::HelloOk(HelloOk {
                 resume_from: 0x2122_2324_2526_2728,
@@ -192,11 +183,8 @@ fn hello_ok_vectors() -> Vec<Vector> {
             ],
         },
         // 0x02 HelloOk a third time, for the one linger value the other two leave
-        // out. Reading `Disabled` off the other two — 0 and 2 are pinned, so 1 is
-        // the only number left — is a deduction rather than a test, and it stops
-        // being available the day the field grows a fourth value. This is also the
-        // only vector in the file with the agent bit clear, so `agent` is pinned in
-        // both directions and not just when set.
+        // out: reading `Disabled` off them as the number left over is a deduction
+        // rather than a test. Also the only vector with the agent bit clear.
         Vector {
             frame: Frame::HelloOk(HelloOk {
                 resume_from: 0x6162_6364_6566_6768,
@@ -480,61 +468,51 @@ fn every_linger_state_has_a_vector() {
     }
 }
 
-/// Every defined `Hello.flags` bit appears both set and clear across the vectors.
+/// Every `Hello` flag appears both set and clear across the vectors.
 ///
-/// The sweep the other three have, for the one closed set on this wire with no
-/// `ALL` to drive it: a bit exercised at a single value is pinned only against
-/// being renumbered wholesale, so an encoder that always asserted it would move no
-/// byte any other test here compares.
-///
-/// *Which* bits are defined is asked of the encoder rather than listed out, since a
-/// hand-written list stops covering the protocol the moment the protocol grows —
-/// the reason [`every_frame_type_has_a_vector`] is driven from [`FrameType::ALL`].
+/// The sweep the `ALL`-driven ones have, for a closed set with no `ALL` to drive it:
+/// a flag exercised at a single value is pinned only against being renumbered
+/// wholesale, so an encoder that always asserted its bit would move no byte any
+/// other test here compares.
 #[test]
 fn every_hello_flag_bit_is_pinned_in_both_states() {
-    let flags: Vec<u8> = vectors()
-        .iter()
-        .filter_map(|v| match v.frame {
-            Frame::Hello(hello) => Some(hello.flags),
-            _ => None,
-        })
-        .collect();
+    let mut flags = Vec::new();
 
-    for bit in (0..u8::BITS).map(|shift| 1u8 << shift) {
-        let defined = Frame::Hello(Hello {
-            protocol: 5,
-            flags: bit,
-            out_offset: 0,
-            win: WIN,
-            term: "",
-        })
-        .encode(&mut Vec::new())
-        .is_ok();
-        if !defined {
-            continue;
+    for vector in vectors() {
+        // Destructured exhaustively for the reason
+        // [`every_hello_ok_flag_is_pinned_in_both_states`] gives.
+        if let Frame::Hello(Hello {
+            protocol: _,
+            agent_forward,
+            repaint_ctrl_l,
+            out_offset: _,
+            win: _,
+            term: _,
+        }) = vector.frame
+        {
+            flags.push([agent_forward, repaint_ctrl_l]);
         }
+    }
+
+    for (bit, name) in [(0, "agent_forward"), (1, "repaint_ctrl_l")] {
         assert!(
-            flags.iter().any(|f| f & bit != 0),
-            "no Hello vector sets flag bit {bit:#04x}"
+            flags.iter().any(|set| set[bit]),
+            "no Hello vector sets {name}"
         );
         assert!(
-            flags.iter().any(|f| f & bit == 0),
-            "no Hello vector clears flag bit {bit:#04x}"
+            flags.iter().any(|set| !set[bit]),
+            "no Hello vector clears {name}"
         );
     }
 }
 
-/// Every `HelloOk` flag bit appears set and clear across the vectors.
+/// Every `HelloOk` flag appears set and clear across the vectors.
 ///
-/// [`every_hello_flag_bit_is_pinned_in_both_states`] for the other flags field.
-/// The three vectors above do cover both states today, and say so in their
-/// comments — one of them notes it is "the only vector in the file with the agent
-/// bit clear" — but prose is not what fails when an edit drops that vector, and a bit
-/// left set in every vector is pinned only against being renumbered wholesale.
+/// [`every_hello_flag_bit_is_pinned_in_both_states`] for the other flags byte. The
+/// three vectors above do cover both states today and say so in their comments, but
+/// prose is not what fails when an edit drops that vector.
 ///
-/// Swept over the booleans rather than over bit positions, because unlike
-/// `Hello.flags` the field is typed: [`HelloOk`] carries `agent` as a `bool`, and
-/// `Linger` — which is now a byte of its own — is covered by
+/// `Linger` is a byte of its own and is covered by
 /// [`every_linger_state_has_a_vector`].
 #[test]
 fn every_hello_ok_flag_is_pinned_in_both_states() {
@@ -712,10 +690,9 @@ fn the_length_field_is_a_u24_past_its_low_byte() {
 /// client whose § 2.2 disagrees is turned away at the handshake; one built from § 2.1
 /// sending a legal 256 KiB frame collects `Error{Protocol}`.
 ///
-/// The id length § 6.3 fixes and the channel cap § 6.7 fixes were rows here too, and
-/// left with the constants: neither is on the wire, and each is now pinned this same
-/// way beside the code that enforces it, by
-/// `rundir::tests::the_session_id_bound_is_the_one_the_document_gives` and
+/// Two rows, because only these two are on the wire. The id length § 6.3 fixes and
+/// the channel cap § 6.7 fixes are pinned this same way beside the code that enforces
+/// them, by `rundir::tests::the_session_id_bound_is_the_one_the_document_gives` and
 /// `agent::tests::the_channel_cap_is_the_one_the_document_gives`.
 ///
 /// The numbers are written out by hand, since they have to come from the document

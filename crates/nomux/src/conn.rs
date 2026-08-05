@@ -2,9 +2,9 @@
 //!
 //! Reads accumulate until a whole frame is available; writes accumulate until the
 //! socket accepts them. Decoding copies each payload into caller-owned scratch so the
-//! borrow of the receive buffer ends before the frame is handled — cheap, because
-//! that direction only ever carries keystrokes and control frames. The output
-//! direction, where volume lives, is encoded straight from the ring.
+//! borrow of the receive buffer ends before the frame is handled — cheap, because that
+//! direction only ever carries keystrokes and control frames. The output direction,
+//! where volume lives, is encoded straight from the ring.
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -18,26 +18,18 @@ const MAX_PENDING_WRITE: usize = 1 << 20;
 
 /// Queue size at which a client is treated as gone rather than slow.
 ///
-/// [`MAX_PENDING_WRITE`] does not cover the frames that *answer* a client, which are
-/// not optional and are queued regardless, so a peer that writes without ever
-/// reading grows this queue without bound (§ 4.1). Well clear of
-/// [`MAX_PENDING_WRITE`] plus one output chunk, so only those unanswered control
-/// frames can reach it.
+/// The second of § 4.1's two bounds, and the one [`MAX_PENDING_WRITE`] cannot be:
+/// the frames that *answer* a client are not optional and are queued regardless of
+/// it, so a peer that writes without ever reading grows this queue without bound.
 const ABANDON_PENDING_WRITE: usize = 8 << 20;
 
 /// Stop reading from the socket once this much undecoded input is already buffered.
 ///
 /// [`Conn::fill`] loops until `EAGAIN`, and against a peer that keeps writing that
 /// loop has no natural end: every chunk it takes frees exactly that much room in the
-/// kernel's buffer for the peer to refill. The cap turns it back into back pressure,
-/// leaving the bytes where the peer blocks on them — load-bearing rather than
-/// defensive, because nothing empties this buffer while the daemon has stopped
-/// *decoding* for a full PTY queue (`IMPLEMENTATION.md` § 4.1).
-///
-/// It has to stay clear of `HEADER_LEN + MAX_PAYLOAD`: a frame that cannot be
-/// buffered whole is a frame [`Conn::take_frame`] never completes. The two sides live
-/// in different crates, so that relationship is pinned below as a compile error
-/// rather than left to whoever next raises `MAX_PAYLOAD`.
+/// kernel's buffer for the peer to refill. The cap is what leaves the bytes where the
+/// peer blocks on them instead — load-bearing rather than defensive, because nothing
+/// empties this buffer while the daemon has stopped *decoding* (§ 4.1).
 const MAX_PENDING_READ: usize = 1 << 20;
 
 const _: () = assert!(
@@ -50,11 +42,9 @@ const _: () = assert!(
 /// Both directions carry one, and both would otherwise grow without bound across a
 /// long session: neither cursor ever moves backwards, so the bytes below it are dead
 /// the moment they are passed. The empty case is separated because clearing is free
-/// where draining is not.
-///
-/// The condition is a *ratio* rather than a number of bytes, which is what makes the
-/// cost O(1) amortised on the replay path — `IMPLEMENTATION.md` § 4.1 has the
-/// derivation, and the fixed-threshold n²/2c it avoids.
+/// where draining is not, and the condition is a *ratio* rather than a number of
+/// bytes, which is what makes the cost O(1) amortised on the replay path
+/// (`IMPLEMENTATION.md` § 4.1 has the derivation).
 fn compact(buf: &mut Vec<u8>, pos: &mut usize) {
     if *pos == buf.len() {
         buf.clear();
@@ -121,23 +111,22 @@ impl Conn {
         self.tx.len() - self.tx_pos >= MAX_PENDING_WRITE
     }
 
-    /// Whether this peer has stopped reading altogether.
-    ///
-    /// Past [`ABANDON_PENDING_WRITE`] it is not slow but gone; that constant says why
-    /// [`Conn::is_write_saturated`] cannot be the only bound.
+    /// Whether this peer has stopped reading altogether: past
+    /// [`ABANDON_PENDING_WRITE`] it is not slow but gone, which that constant has.
     #[must_use]
     pub(crate) const fn is_write_hopeless(&self) -> bool {
         self.tx.len() - self.tx_pos >= ABANDON_PENDING_WRITE
     }
 
-    /// Queues a frame, discarding the encode result.
+    /// Queues a frame, and reports whether anything was queued.
     ///
-    /// The encode failures — an oversized payload, an undefined flag bit, a `TERM`
-    /// this side would not accept back — are all unreachable: every caller here
-    /// chunks to at most [`MAX_PAYLOAD`], every caller in the daemon queues a
-    /// fixed-size control frame, and both pass flags this crate defines.
-    pub(crate) fn send(&mut self, frame: &Frame<'_>) {
-        let _ = frame.encode(&mut self.tx);
+    /// The encode failures — an oversized payload, a `TERM` this side would not
+    /// accept back — are both unreachable: every caller here chunks to at most
+    /// [`MAX_PAYLOAD`], and every caller in the daemon queues a control frame whose
+    /// size it fixed itself. Reported rather than discarded for
+    /// [`Conn::send_output`], the one caller that has something to get wrong about it.
+    pub(crate) fn send(&mut self, frame: &Frame<'_>) -> bool {
+        frame.encode(&mut self.tx).is_ok()
     }
 
     /// Queues raw output bytes as one or more `Output` frames, splitting at
@@ -150,13 +139,18 @@ impl Conn {
         let chunk = MAX_PAYLOAD as usize - 8;
         for part in data.chunks(chunk) {
             // Re-checked per chunk, not just before the call: the ring can be far
-            // larger than the queue budget, and a single pump would otherwise
-            // queue the whole of it for a client that has stopped reading. The
-            // caller resumes from the returned offset.
+            // larger than the queue budget, and a single pump would otherwise queue
+            // the whole of it for a client that has stopped reading. The caller
+            // resumes from the returned offset.
             if self.is_write_saturated() {
                 break;
             }
-            self.send(&Frame::Output { offset, data: part });
+            // Ahead of the offset rather than beside it. A frame that was not queued
+            // is one the client never sees, and an offset moved over it is the daemon
+            // certain it delivered bytes that are now unreachable in the ring.
+            if !self.send(&Frame::Output { offset, data: part }) {
+                break;
+            }
             offset += part.len() as u64;
         }
         offset
@@ -180,8 +174,7 @@ impl Conn {
     ///
     /// The daemon stops decoding while the PTY queue is full (`IMPLEMENTATION.md`
     /// § 4.1), which can leave whole frames here that no second `POLLIN` will ever
-    /// announce. This is what tells the event loop to come back for them once the
-    /// queue has room, instead of waiting for a wakeup that is not coming.
+    /// announce: this is what sends the event loop back for them.
     #[must_use]
     pub(crate) const fn has_buffered_input(&self) -> bool {
         self.rx_pos < self.rx.len()
@@ -240,8 +233,7 @@ impl Conn {
         // Bounded because the peer being flushed has frequently stopped reading
         // (§ 6.4), and against the whole call rather than each `write` (§ 6.5):
         // `SO_SNDTIMEO` restarts per syscall, so a peer reading a trickle keeps
-        // resetting it and the eight megabytes this tolerates before giving up on a
-        // client take as long as that peer likes.
+        // resetting it.
         self.stream.set_nonblocking(false)?;
         let deadline = std::time::Instant::now() + FINAL_FLUSH_TIMEOUT;
         while self.tx_pos < self.tx.len() {
@@ -268,10 +260,9 @@ impl Conn {
     /// (§ 6.4) — then flushes.
     ///
     /// Consumes the connection, which is what makes "last" true rather than merely
-    /// intended: [`Conn::flush_final`] puts the socket back into blocking mode, and
-    /// on its timeout path it returns with the queue untouched and the socket still
-    /// blocking. Handing that back to a non-blocking event loop is the one mistake
-    /// available here, and taking `self` is what removes it.
+    /// intended: [`Conn::flush_final`] returns on its timeout path with the queue
+    /// untouched and the socket back in blocking mode, and handing that to a
+    /// non-blocking event loop is the one mistake available here.
     pub(crate) fn send_last(mut self, frame: &Frame<'_>) {
         self.tx.clear();
         self.tx_pos = 0;
@@ -280,9 +271,7 @@ impl Conn {
     }
 
     /// Removes one complete frame from the receive buffer, copying its payload into
-    /// `scratch`.
-    ///
-    /// Returns `None` when no complete frame is buffered yet.
+    /// `scratch`, or `None` where no complete frame is buffered yet.
     ///
     /// # Errors
     ///
@@ -316,8 +305,7 @@ mod tests {
     use std::time::Instant;
 
     use nomux_proto::{
-        ErrorCode, HELLO_AGENT_FORWARD, Hello, HelloOk, Linger, PROTOCOL_VERSION, ProtoError,
-        RESUME_FROM_START, WinSize,
+        ErrorCode, Hello, HelloOk, Linger, PROTOCOL_VERSION, ProtoError, RESUME_FROM_START, WinSize,
     };
 
     use super::*;
@@ -363,7 +351,8 @@ mod tests {
             }),
             Frame::Hello(Hello {
                 protocol: PROTOCOL_VERSION,
-                flags: HELLO_AGENT_FORWARD,
+                agent_forward: true,
+                repaint_ctrl_l: false,
                 out_offset: RESUME_FROM_START,
                 win: WIN,
                 term: "xterm-256color",

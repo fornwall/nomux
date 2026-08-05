@@ -730,6 +730,108 @@ fn a_daemon_that_leads_a_process_group_detaches_by_forking() {
     assert_detached(&detachment, recorded, "the forked child");
 }
 
+/// Regression: a spawn refused at the session ceiling leaves nothing behind, so the
+/// backstop cannot ratchet against itself.
+///
+/// The daemon takes `<id>.lock` before it counts the ids in the run directory, which is
+/// what § 6.3 asks of it — the count has to happen where nothing else is publishing.
+/// Taking that lock *creates* the file, and `rundir::session_id_of` reads a bare
+/// `<id>.lock` as a session, so a refusal that returned without removing it added a
+/// counted id to the directory. Every rejected spawn of a new id then made the next one
+/// count one higher, and a run directory that started one over the ceiling walked away
+/// from it: 64, 65, 66, with only `nomux list` able to bring it back.
+///
+/// Asserted twice over, because either half alone is satisfiable by the bug. That no
+/// `<id>.*` is left is the property; that the *count* has not moved is what it was for,
+/// and it is the one a reader can check against `MAX_SESSIONS` — so the second refusal
+/// has to name a different id from the first, or a lock left behind by the first would
+/// be excluded from the second's count as its own.
+///
+/// The sessions are planted as `<id>.sock` files rather than started: 64 daemons is 64
+/// shells and 64 rings, and what is being counted is names on disk (§ 6.3).
+#[test]
+fn a_spawn_refused_at_the_session_ceiling_leaves_no_lock_behind() {
+    /// `daemon::MAX_SESSIONS`, which is private to the daemon. The refusal names it,
+    /// so a value that drifted apart from this fails on the message rather than
+    /// silently testing nothing.
+    const CEILING: usize = 64;
+
+    let root = run_root("ceiling_lock");
+    let dir = root.join("nomux");
+    fs::create_dir_all(&dir).expect("create the run directory");
+    for n in 0..CEILING {
+        fs::write(dir.join(format!("full{n}.sock")), b"").expect("plant a session");
+    }
+
+    let ids = ["over1", "over2"];
+    for id in ids {
+        let refused = harness::collect(
+            nomux_with_shell(&root, &["daemon", id])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        );
+        assert!(
+            !refused.status.success(),
+            "a run directory holding {CEILING} sessions took another one"
+        );
+        let complaint = harness::stderr(&refused);
+        assert!(
+            complaint.contains(&CEILING.to_string()),
+            "the refusal must name the ceiling it is enforcing, or this test is \
+             measuring a different failure: {complaint:?}"
+        );
+        assert_eq!(
+            session_files(&dir, id),
+            Vec::<String>::new(),
+            "the refused spawn left files behind, which `list` and this daemon both \
+             read as a session that is there"
+        );
+    }
+
+    // What the leak actually cost, and the half that says why it mattered: the
+    // directory holds exactly what it held before either spawn was refused, so the
+    // ceiling the *next* one meets is still the ceiling.
+    assert_eq!(
+        session_ids(&dir).len(),
+        CEILING,
+        "the refusals added ids to a directory that was already full, so the backstop \
+         now refuses at {CEILING} minus however many spawns have been turned away"
+    );
+}
+
+/// Every file in `dir` belonging to session `id`, by name.
+fn session_files(dir: &Path, id: &str) -> Vec<String> {
+    let mut found: Vec<String> = fs::read_dir(dir)
+        .expect("read the run directory")
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.split_once('.')
+                .is_some_and(|(found, _)| found == id)
+                .then_some(name)
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// The distinct session ids `dir` holds, by the rule `rundir::session_id_of` counts
+/// them with: whatever precedes the first `.`.
+fn session_ids(dir: &Path) -> Vec<String> {
+    let mut ids: Vec<String> = fs::read_dir(dir)
+        .expect("read the run directory")
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.split_once('.').map(|(id, _)| id.to_owned())
+        })
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
 /// Whether `pid` has finished detaching itself (§ 6.2): a session of its own, and
 /// nothing left of the stdio it was handed.
 fn has_detached(pid: u32) -> bool {

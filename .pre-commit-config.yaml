@@ -2,16 +2,39 @@
 #   prek install            install .git/hooks/pre-commit
 #   prek run --all-files    run every hook over the whole tree
 #
+# This file is the gate. .github/workflows/ci.yml runs `prek run --all-files` rather
+# than restating these commands, so a hook and the CI step that enforces it cannot
+# drift apart; the two things CI adds on top — rustdoc, and the ignored test — are
+# there as steps of their own because neither belongs in a pre-commit hook.
+#
 # Hooks are ordered cheapest-first so an obvious failure reports fast.
 # They trigger on Rust sources and on manifests, since the lint configuration
 # itself lives in Cargo.toml.
 #
-# `--locked` on every compiling cargo hook, matching .github/workflows/ci.yml: without
-# it a hook may quietly update Cargo.lock to make itself pass. `cargo fmt` resolves
-# nothing and rejects the flag outright, so it is the one hook without it.
+# `--locked` on every compiling cargo hook: without it a hook may quietly update
+# Cargo.lock to make itself pass. `cargo fmt` resolves nothing and rejects the flag
+# outright, so it is the one hook without it.
 repos:
   - repo: local
     hooks:
+      # ci.yml carries ~90 lines of embedded shell that the hook below never sees —
+      # it matches `*.sh`. actionlint shellchecks every `run:` block and validates the
+      # workflow schema besides, which is the half of that file nothing else reads.
+      #
+      # Pinned by version and built by prek rather than taken from $PATH, so the
+      # runner and a laptop lint against the same release: actionlint's checks are
+      # what fails a build, and a newer one finding more is a green PR going red on
+      # someone else's machine.
+      - id: actionlint
+        name: actionlint
+        entry: actionlint
+        language: golang
+        additional_dependencies: ["github.com/rhysd/actionlint/cmd/actionlint@v1.7.12"]
+        files: '^\.github/workflows/.*\.ya?ml$'
+        pass_filenames: false
+
+      # Every tracked `*.sh`, matched by path suffix wherever it lands, rather than
+      # `scripts/*.sh`.
       - id: shellcheck
         name: shellcheck
         entry: shellcheck --shell=sh
@@ -25,10 +48,8 @@ repos:
         files: '(\.rs|\.toml)$|^Cargo\.lock$'
         pass_filenames: false
 
-      # `-- -D warnings` rather than a deny in [workspace.lints]: cargo inlines that
-      # table into the published manifest, so a deny there fails a stranger's
-      # `cargo install` on any toolchain newer than the pin. Cargo.toml says it at
-      # length. Here it gates only this tree, which is the whole intent.
+      # `-- -D warnings` rather than a deny in [workspace.lints], for the reason
+      # Cargo.toml gives: a deny there escapes the repository, this one gates the tree.
       - id: cargo-clippy
         name: cargo clippy
         entry: cargo clippy --locked --workspace --all-targets -- -D warnings

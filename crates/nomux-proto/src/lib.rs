@@ -17,31 +17,11 @@ pub use frame::{
 
 /// Protocol revision. Bumped on any wire change, including compatible ones.
 ///
-/// Revision 2 gave both flag fields meaning: agent forwarding and repaint policy
-/// in `Hello`, linger state and agent status in `HelloOk`. Revision 3 took
-/// `Hello.in_offset` back out, the daemon never having read it — `DESIGN.md` § 10
-/// owns why it was there and is where it comes back.
-///
-/// Revision 4 took out everything else with no reader. `HelloOk.protocol` could only
-/// ever echo the `Hello.protocol` the daemon had just accepted; `HelloOk.gap` is
-/// [`HelloOk::gap`], a comparison against a number the client sent; and
-/// `OutputAck.consumed_through` was eight bytes the daemon's empty arm never looked
-/// at. It also unpacked [`Linger`] out of `HelloOk`'s flags byte into a byte of its
-/// own — one byte back for about fifty lines of shifting, and the end of a `pub`
-/// `as_byte`/`from_byte` pair that was not the wire form — and narrowed
-/// `Hello.flags` to the `u8` its two bits fit in.
-///
-/// Revision 5 added `Exit.since_exit_secs`, which is what a session outliving its
-/// child made worth carrying: the status a client collects may now be days old rather
-/// than seconds, and "the build finished" and "the build finished on Tuesday" are
-/// different things to show a user.
-///
-/// The number itself is pinned against `IMPLEMENTATION.md` § 2.2 by
-/// `the_frozen_numbers_are_the_ones_the_document_gives`. The handshake vectors spell
-/// it out as a literal rather than symbolically, and
-/// `the_handshake_vectors_are_written_at_the_revision_this_build_speaks` is what
-/// holds those two together — so a bump has to move the constant, the vectors and the
-/// document, in that order of complaint.
+/// `IMPLEMENTATION.md` § 2.2 owns the history. The number is held against that
+/// section by `the_frozen_numbers_are_the_ones_the_document_gives` and against the
+/// handshake vectors' literal by
+/// `the_handshake_vectors_are_written_at_the_revision_this_build_speaks`, so a bump
+/// has to move the constant, the vectors and the document.
 pub const PROTOCOL_VERSION: u16 = 5;
 
 /// Fixed frame header size, so reads are a two-stage `read_exact`.
@@ -50,21 +30,13 @@ pub const HEADER_LEN: usize = 4;
 /// Largest permitted payload. Bounds the peer's ability to force an allocation.
 pub const MAX_PAYLOAD: u32 = 256 * 1024;
 
-// A discriminant list is written down once, and everything mechanically derived
-// from it — the enum, both directions of the conversion, and the `ALL` the suites
-// sweep — is generated from it, so the four cannot drift apart. `Frame::decode`
-// matches on `FrameType` exhaustively, so a variant added to the list stops the
-// build until the payload side has learnt to read one; a hand-written `from_byte`
-// ending in a catch-all `_ => None` stops nothing, and leaves an end that can
-// *send* the new frame but never *receives* one.
-//
-// `IMPLEMENTATION.md` § 2.3 applies the same closed-set rule to `Error.code`,
-// `Exit.kind` and the linger field, so those go through this macro too rather than
-// through three more hand-written matches — see `frame.rs`. Hence the parameters:
-// the sets differ in their repr and in what the two accessors are called. The
-// encode direction is a cast, which is why each list's numbers are declared as real
-// discriminants under `#[repr($repr)]` rather than as the arms of a second match
-// that could disagree with the first.
+// A discriminant list is written down once, and everything derived from it — the
+// enum, both directions of the conversion, and the `ALL` the suites sweep — is
+// generated, so the four cannot drift apart. A hand-written `from_byte` ending in a
+// catch-all `_ => None` leaves an end that can *send* a new frame but never
+// *receives* one. `IMPLEMENTATION.md` § 2.3 applies the same closed-set rule to
+// `Error.code`, `Exit.kind` and the linger field, hence the parameters: those sets
+// differ in their repr and in what the accessors are called.
 macro_rules! wire_enum {
     (
         $(#[$enum_meta:meta])*
@@ -78,11 +50,9 @@ macro_rules! wire_enum {
         }
 
         impl $name {
-            /// Every variant, in wire order.
-            ///
-            /// Public because the crate's integration tests sweep it, and a test that
-            /// has to be told about a new variant is a test that will eventually not
-            /// be told about one.
+            /// Every variant, in wire order. Public because the integration tests
+            /// sweep it, a test that has to be told about a new variant being one
+            /// that will eventually not be told about one.
             pub const ALL: [Self; [$(Self::$variant),+].len()] = [$(Self::$variant),+];
 
             /// Returns the wire discriminant.
