@@ -17,19 +17,22 @@
 
 mod harness;
 
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
+use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use nomux_proto::{
-    ErrorCode, Frame, FrameType, HELLO_REPAINT_CTRL_L, Hello, Linger, PROTOCOL_VERSION,
-    RESUME_FROM_START, WinSize,
+    ErrorCode, Frame, FrameType, HEADER_LEN, HELLO_REPAINT_CTRL_L, Hello, Linger, PROTOCOL_VERSION,
+    RESUME_FROM_START, WinSize, decode_header,
 };
 
 use harness::{
-    Client, FRAME_PATIENCE, Rng, Session, hello_frame, poll_by, poll_until, reconnect_until_gap,
-    still_serving,
+    Client, FRAME_PATIENCE, Rng, Session, Spawned, hello_frame, nomux_with_shell, poll_by,
+    poll_until, read_uninterrupted, reconnect_until_gap, run_root, still_serving,
 };
 
 #[test]
@@ -1273,4 +1276,106 @@ fn an_abrupt_client_disconnect_does_not_kill_the_session() {
 
     client.input(ok.in_applied, b"echo NOMUX-STILL-HERE\n");
     client.read_until("NOMUX-STILL-HERE", ok.resume_from);
+}
+
+/// A daemon started with the standard descriptors closed still serves its session.
+///
+/// `IMPLEMENTATION.md` § 6.2 documents `nomux daemon <id>` typed by hand as a supported
+/// way to start one, and a shell hands it whatever descriptor table it likes:
+///
+/// ```text
+/// nomux daemon x 0<&- 1>&- 2>&-
+/// ```
+///
+/// What that risks is the daemon silencing itself. The kernel gives out the lowest free
+/// number, so with those three free the session socket would take fd 1 and the stop
+/// pipe's read end fd 2 — and § 6.2's detachment `dup2`s `/dev/null` over all three on
+/// its way past, which leaves the worst state this program has: the id claimed by a
+/// daemon nothing can reach, `poll` finding `/dev/null` ready for ever, every `accept`
+/// failing behind the backoff, and the pipe that says "stop" reading as though it had.
+///
+/// It does not happen, because std's runtime fills those three before `main` ever runs
+/// (`startup::silence_stdio` has the argument). That is a guarantee from outside this
+/// tree and invisible inside it, which is exactly why the property is asserted rather
+/// than reasoned about — and nothing else in this suite starts a daemon with a
+/// descriptor table of its own.
+///
+/// The greeting is the assertion rather than a `connect`, deliberately: the socket
+/// answers between the bind and the detachment, so a connection alone can be satisfied
+/// by the very window this is about. A `HelloOk` needs the event loop to be polling the
+/// socket the daemon actually bound.
+#[test]
+fn a_daemon_whose_standard_descriptors_are_closed_still_serves_its_session() {
+    let root = run_root("nostdio");
+    let mut command = nomux_with_shell(&root, &["daemon", "nsd"]);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: the closure runs in the forked child before exec, so it must be
+    // async-signal-safe. `close` is, and nothing here allocates or takes a lock. std has
+    // already put the three `Stdio::null()`s in place by this point — that ordering is
+    // what leaves this the last word on them, and it is what the shell above does too.
+    unsafe {
+        command.pre_exec(|| {
+            for fd in [0, 1, 2] {
+                libc::close(fd);
+            }
+            Ok(())
+        });
+    }
+    // Killed however this test ends: the daemon is this process's own child, having no
+    // reason to fork — it is not a process-group leader, so `setsid` takes.
+    let _daemon = Spawned::spawn(&mut command);
+
+    let socket = root.join("nomux").join("nsd.sock");
+    assert!(
+        poll_by(Instant::now() + FRAME_PATIENCE, || greeted(&socket)),
+        "the daemon never answered a Hello on {}, so it is holding the id with nothing \
+         able to reach it",
+        socket.display()
+    );
+}
+
+/// Whether a daemon on `socket` answers a `Hello` with a `HelloOk`.
+///
+/// By hand rather than through a [`Client`], which only a [`Session`] hands out: what is
+/// under test is a daemon started with a descriptor table of the test's own. Every
+/// failure is a "no" rather than a panic, the caller asking this repeatedly of a session
+/// that may not be up yet — and a daemon that answers the `connect` and then goes is
+/// exactly the state being ruled out rather than an error.
+fn greeted(socket: &Path) -> bool {
+    let Ok(mut stream) = UnixStream::connect(socket) else {
+        return false;
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("set a read timeout");
+    let mut hello = Vec::new();
+    hello_frame(0, RESUME_FROM_START)
+        .encode(&mut hello)
+        .expect("encode a Hello");
+    if stream.write_all(&hello).is_err() {
+        return false;
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut seen = Vec::new();
+    while seen.len() < HEADER_LEN {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        let mut chunk = [0u8; HEADER_LEN];
+        match read_uninterrupted(&mut stream, &mut chunk) {
+            Ok(0) => return false,
+            Ok(n) => seen.extend_from_slice(chunk.get(..n).unwrap_or(&[])),
+            // The read timeout expiring, which is the deadline above's to answer.
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+            Err(_) => return false,
+        }
+    }
+    let Some(head) = seen.get(..HEADER_LEN).and_then(|head| head.try_into().ok()) else {
+        return false;
+    };
+    decode_header(head).is_ok_and(|header| header.ty == FrameType::HelloOk)
 }

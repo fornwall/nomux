@@ -858,20 +858,32 @@ pub(crate) fn sanitize_label(label: &str) -> String {
 /// side bounds both; the read side cannot assume it did, the daemon that wrote either being
 /// any version and a stray shell redirect into the run directory not a daemon at all.
 ///
-/// Nothing but a regular file is read from, and that is what makes one read enough: a regular
-/// file hands back what was asked for or reaches its end, where a FIFO hands back whatever
-/// its writer has delivered so far — `"327"` ahead of `"70419\n"` is a prefix [`parse_pid`]
-/// cannot tell from a whole pidfile, and `kill` would signal 327. The `fstat` refuses that;
-/// `O_NONBLOCK` keeps the `open` of such a file from waiting for a writer that never comes;
-/// `O_NOFOLLOW` keeps the name from resolving somewhere else. [`crate::nbio::read`] covers
-/// the signal that would otherwise cut the read short.
+/// Read until the file ends or `buf` is full, so what comes back is a prefix of the *file*
+/// rather than of one `read(2)`. That a regular file hands back everything asked for is a
+/// property of local filesystems and not of the call: § 6.3's fallback run directory is
+/// under `$HOME`, which is NFS or FUSE often enough, and a short read there is exactly the
+/// failure [`MAX_PID_LEN`] exists to prevent and cannot see — `"3277"` out of `"32770419\n"`
+/// is a smaller, plausible, **live** pid, and `kill` would signal it. Looping also makes the
+/// reading [`parse_pid`] and `control::unidentified` put on a full buffer exact: a body that
+/// reached the bound is a file with more in it, and nothing else now is.
+///
+/// Nothing but a regular file is read from, which looping does not make safe to relax. A
+/// FIFO hands back whatever its writer has delivered so far and `O_NONBLOCK` answers the
+/// next call `EAGAIN` rather than the rest of the number, so the same prefix would arrive —
+/// as a failure, rather than as `327` for `kill` to signal. The `fstat` refuses the file
+/// class outright and says which it was; `O_NONBLOCK` also keeps the `open` of such a file
+/// from waiting for a writer that never comes; `O_NOFOLLOW` keeps the name from resolving
+/// somewhere else. [`crate::nbio::read`] covers the signal that would otherwise cut a read
+/// short.
 ///
 /// # Errors
 ///
 /// Propagates the `open`, so a caller can tell a file that is absent from one it may not
 /// read — the difference between a daemon that has not published yet and one `kill` must
-/// refuse to touch. Anything that is not a regular file is [`io::ErrorKind::InvalidInput`],
-/// worded for the one caller that reports it, `control::running_but`.
+/// refuse to touch. Propagates a read that failed part-way for the same reason, a body
+/// assembled around a hole being worse than none. Anything that is not a regular file is
+/// [`io::ErrorKind::InvalidInput`], worded for the one caller that reports it,
+/// `control::running_but`.
 pub(crate) fn read_prefix<'a>(path: &Path, buf: &'a mut [u8]) -> io::Result<&'a [u8]> {
     let fd = rustix::fs::open(
         path,
@@ -885,8 +897,17 @@ pub(crate) fn read_prefix<'a>(path: &Path, buf: &'a mut [u8]) -> io::Result<&'a 
             "it is not a regular file, so a read of it is a prefix rather than a body",
         ));
     }
-    let read = crate::nbio::read(fd.as_fd(), buf)?;
-    Ok(buf.get(..read).unwrap_or(&[]))
+    let mut filled = 0;
+    while filled < buf.len() {
+        let read = crate::nbio::read(fd.as_fd(), buf.get_mut(filled..).unwrap_or(&mut []))?;
+        if read == 0 {
+            break;
+        }
+        // Clamped like every returned count in this tree: a count past what was asked for
+        // would slice out of bounds, and this binary is built `panic = "abort"`.
+        filled = filled.saturating_add(read).min(buf.len());
+    }
+    Ok(buf.get(..filled).unwrap_or(&[]))
 }
 
 /// Reads a session's label, bounded by what the layout permits.
@@ -1299,6 +1320,76 @@ mod tests {
             parse_pid(padded.as_bytes()),
             None,
             "and neither is a body that reached the bound at all"
+        );
+    }
+
+    /// A body longer than one `read(2)` still arrives whole.
+    ///
+    /// The first half is an ordinary file, where what the loop must not do is lose,
+    /// duplicate or transpose anything on its way into the buffer. The second is a
+    /// genuinely short read, which nothing this test can mount will produce and which
+    /// is the whole reason there is a loop: procfs serves `smaps` out of a one-page
+    /// `seq_file` buffer, so a `read` that asked for more comes back at the page with
+    /// the rest of the file still there. That is the shape an NFS or FUSE `$HOME` can
+    /// give `<id>.pid` (§ 6.3), and one `fstat` calls a regular file either way — where
+    /// a prefix of `<id>.pid` is a smaller, plausible, live pid ([`read_prefix`]).
+    #[test]
+    fn a_body_longer_than_one_read_still_arrives_whole() {
+        let root = Scratch::new("rundir-longbody");
+        let path = root.join("body");
+        // Not a repeated byte: a chunk lost, doubled or delivered out of order would
+        // pass a comparison against one of those.
+        let written: Vec<u8> = (0..64u32 * 1024)
+            .map(|n| u8::try_from(n % 251).unwrap())
+            .collect();
+        fs::write(&path, &written).unwrap();
+        let mut buf = vec![0u8; written.len() + 1];
+        assert_eq!(
+            read_prefix(&path, &mut buf).unwrap(),
+            written,
+            "the file must arrive exactly as it was written"
+        );
+
+        // Stood down from visibly rather than silently, at either of the two ways a host
+        // can fail to serve one in pieces: a skip nobody can see is a pass.
+        let smaps = Path::new("/proc/self/smaps");
+        let Ok(fd) = rustix::fs::open(smaps, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
+        else {
+            eprintln!(
+                "skipped: this host has no {}, so nothing here hands back a regular file in pieces",
+                smaps.display()
+            );
+            return;
+        };
+        let mut once = vec![0u8; 1 << 20];
+        let first = crate::nbio::read(fd.as_fd(), &mut once).expect("one read of it");
+        let more = crate::nbio::read(fd.as_fd(), &mut once).expect("a second read of it");
+        drop(fd);
+        if more == 0 {
+            eprintln!(
+                "skipped: {} came back whole in one read of {first} bytes, so this host \
+                 cannot show what the loop is for",
+                smaps.display()
+            );
+            return;
+        }
+
+        let mut buf = vec![0u8; 1 << 20];
+        let bound = buf.len();
+        let body = read_prefix(smaps, &mut buf).expect("read the whole of it");
+        assert!(
+            body.len() > first,
+            "the body stopped where one read did, at {} bytes of a file with more in it",
+            body.len()
+        );
+        assert!(
+            body.len() < bound,
+            "the read filled the buffer, so it says nothing about reaching the end"
+        );
+        assert_eq!(
+            body.last(),
+            Some(&b'\n'),
+            "and it ended where the kernel had finished a line rather than mid-record"
         );
     }
 

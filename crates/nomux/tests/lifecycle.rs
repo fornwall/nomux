@@ -708,6 +708,105 @@ fn a_relay_refused_at_the_session_ceiling_leaves_no_lock_behind() {
     refusals_at_the_session_ceiling_leave_nothing_behind("ceiling_relay", "spawn", 127);
 }
 
+/// Regression: a spawn whose socket cannot be bound leaves nothing behind either.
+///
+/// The scrub the two tests above pin covers the ceiling and stops there, and the bind is
+/// the very next way out of the locked region — a full disk, a descriptor shortage, a
+/// quota, a name planted where `<id>.sock` goes. It returned through `?`, past the
+/// removal, leaving the 0-byte `<id>.lock` `try_lock_spawn` had just created: one more
+/// counted id, and § 6.3's ratchet open again by a quieter route. Quieter because it
+/// needs no full directory to show up in — every refused bind on a fresh id adds a
+/// session `nomux list` reports and the next daemon counts, until something collects it.
+///
+/// The lever is a directory where the socket goes, which needs no fault injection and
+/// fails the daemon on its own path: `connect` to a name that is not a socket is refused,
+/// which is the whole of what § 6.6 means by stale, and the removal that answer licenses
+/// comes back `EISDIR`. What is asserted is the directory rather than the five names,
+/// since the property is that a refusal touched nothing at all.
+#[test]
+fn a_spawn_whose_socket_cannot_be_bound_leaves_no_lock_behind() {
+    let root = run_root("bind_lock");
+    let dir = root.join("nomux");
+    fs::create_dir_all(&dir).expect("create the run directory");
+    fs::create_dir(dir.join("wedged.sock")).expect("plant a name no bind can take");
+    let before = entries(&dir);
+
+    let refused = harness::collect(
+        nomux_with_shell(&root, &["daemon", "wedged"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
+
+    let complaint = harness::stderr(&refused);
+    assert_eq!(
+        refused.status.code(),
+        Some(1),
+        "a daemon claimed an id whose socket it could not bind: {complaint:?}"
+    );
+    assert_eq!(
+        entries(&dir),
+        before,
+        "the refused spawn left files behind, and a bare `<id>.lock` is one that both \
+         `list` and the next daemon read as a session that is there: {complaint:?}"
+    );
+}
+
+/// The other side of that scrub, and why it cannot be unconditional: a daemon refused
+/// because a live session already holds the id must leave that session's `<id>.lock`
+/// alone.
+///
+/// The refusal arrives at the same place by the same route — the bind, this time
+/// answering `AddrInUse` because the probe found somebody listening — but the lock this
+/// daemon took on its way in is the *live* session's, created when that daemon claimed
+/// the id and outliving it for the whole session. Removed, it stops being a mutex at all
+/// (`rundir::SpawnLock`): the next `spawn` and the next `kill` each create a file at the
+/// same path, lock that, and are both certain they hold the only lock there is.
+///
+/// Green against the defect as well as against the fix, which is the point of it: it is
+/// the fix that could break this, and nothing else in the suite would notice.
+#[test]
+fn a_daemon_refused_by_a_live_session_leaves_that_session_its_lock() {
+    let session = Session::start("dup_id");
+    let lock = session
+        .root
+        .join("nomux")
+        .join(format!("{}.lock", session.id));
+    assert!(
+        lock.exists(),
+        "the live session left no spawn lock, so nothing below is about one"
+    );
+
+    let refused = harness::collect(
+        nomux_with_shell(&session.root, &["daemon", &session.id])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
+
+    let complaint = harness::stderr(&refused);
+    assert_eq!(
+        refused.status.code(),
+        Some(1),
+        "a second daemon took an id a live session is answering on: {complaint:?}"
+    );
+    assert!(
+        complaint.contains("already running"),
+        "the refusal must be the live session's, or this says nothing about the arm it \
+         is written for: {complaint:?}"
+    );
+    assert!(
+        lock.exists(),
+        "the refused daemon removed the live session's spawn lock, which leaves § 6.3's \
+         serialisation with nothing to serialise on: {complaint:?}"
+    );
+
+    // And the session it collided with is untouched by the collision.
+    let mut client = session.connect();
+    client.hello(RESUME_FROM_START);
+    still_serving(&mut client, "NOMUX-AFTER-DUP");
+}
+
 /// Every file in `dir` belonging to session `id`, by name.
 fn session_files(dir: &Path, id: &str) -> Vec<String> {
     entries(dir)

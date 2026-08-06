@@ -251,10 +251,10 @@ fn a_daemon_holds_the_spawn_lock_while_it_claims_the_id() {
 /// What each mode does *after* the deadline is the second half of the assertion and is
 /// not the same answer: a probe that timed out is not evidence of death (§ 6.3), so
 /// `list` reports the session as live with no pid to print, `kill` refuses and leaves
-/// every file where it is, and `attach` gives § 10's 127 — "come back for this one" —
-/// rather than the 126 `DESIGN.md` § 7 has a client give a whole host up on.
-/// Collecting on a probe that never reached the socket would be the escape hatch
-/// unlinking a session whose daemon is merely busy.
+/// every file where it is, and `attach` gives § 10's 126 — found and not this mode's to
+/// have — rather than the 127 that would tell `DESIGN.md` § 7's client its own id named
+/// nothing here. Collecting on a probe that never reached the socket would be the escape
+/// hatch unlinking a session whose daemon is merely busy.
 #[test]
 fn nothing_parks_on_a_socket_whose_backlog_is_full() {
     let deadline = Instant::now() + PATIENCE;
@@ -290,8 +290,11 @@ fn nothing_parks_on_a_socket_whose_backlog_is_full() {
     );
     assert_eq!(
         attached.status.code(),
-        Some(127),
-        "a session that would not answer is one to come back for: {:?}",
+        Some(126),
+        "a session that would not answer is still a session, so the id was found and \
+         merely could not be joined; 127 here is `attach` telling a client that the \
+         session it is watching does not exist, which § 7 has it act on as its own \
+         mistake: {:?}",
         stderr(&attached)
     );
     assert!(

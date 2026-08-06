@@ -210,8 +210,13 @@ fn report(result: std::io::Result<()>, relay: bool) -> ExitCode {
                 1
             } else if matches!(
                 kind,
-                // `NotFound` is the session `attach` refused to invent; `TimedOut` is
-                // one that never answered — the same "not found", reached by waiting.
+                // `NotFound` is the session `attach` refused to invent; `TimedOut` is a
+                // daemon `spawn` started that never bound — the same "not found",
+                // reached by waiting. The other wait that runs out is a `connect` to a
+                // socket somebody bound and stopped accepting on, which is a session
+                // and not a missing one; that this line cannot tell the two apart is
+                // why both modes rename it first, through `attach::may_be_running` and
+                // `attach::unattachable`, and never leave it as `TimedOut`.
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::TimedOut
             ) {
                 EXIT_NO_SESSION

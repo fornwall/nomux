@@ -80,7 +80,17 @@ jobs:
       # not wait for the month; licences and sources, because the binary ships other
       # people's object code and `clippy::cargo` checks this crate's manifest metadata
       # rather than what is in the tree. Seconds against two direct dependencies.
-      - run: cargo deny check advisories bans licenses sources
+      #
+      # `--locked` for the reason .pre-commit-config.yaml gives every compiling hook, and
+      # more sharply here: cargo-deny shells out to `cargo metadata`, which resolves a
+      # stale lock into a fresh one to make itself work — and this is the job's first
+      # cargo, so every `--locked` below would then be asserting against a lock this step
+      # had just written. A flag rather than a reordering, which the next step added here
+      # would have to know about.
+      #
+      # Before the subcommand: it is an option of `cargo-deny` itself, and `check` rejects
+      # it outright, so a misplaced one fails the job rather than quietly doing nothing.
+      - run: cargo deny --locked check advisories bans licenses sources
 
       # The released binary, by checksum. Built from source it would need a Go
       # toolchain — the only one this tree has any use for — and the image's Go is an

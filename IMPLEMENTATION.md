@@ -214,6 +214,14 @@ since those frames were never acknowledged and §3 has the client resending from
 pending rather than as the client, so `list` and §6.3's spawn race are unaffected, and
 `nomux kill` is a signal (§6.5).
 
+**A detaching client's send queue is dropped rather than flushed.** `Daemon::drop_client`
+pushes out what the socket takes and lets the rest go: it is all per-connection state a
+reattach recomputes — `sent_through` rewinds to what the arriving client consumed (§4.2),
+`exit_sent` clears (§6.5) — so what the client comes back to is the ring, not the queue.
+Waiting would be the whole event loop blocked for `FINAL_FLUSH_TIMEOUT`, PTY drain
+included, at exactly the moment the peer has stopped reading. Only the two departures with
+nothing behind them keep the blocking flush: §6.4's eviction and §6.5's shutdown.
+
 ### 4.2 Attach with `from < base()`
 
 ```
@@ -270,7 +278,9 @@ missing or unrunnable. Warm cost: zero extra round trips. `$MODE` is `spawn` or 
 ([DESIGN.md § 4](DESIGN.md#4-architecture)), a substitution rather than a second command,
 the client knowing which because it knows whether it holds a session for this tab. The
 fields are `uname`'s — `Linux`, `x86_64` — because `sh` emits the line before any binary
-exists; confirming that an *uploaded* artifact runs is `--version`'s job.
+exists; confirming that an *uploaded* artifact runs is `--version`'s job, one line on
+stdout and exit 0: `nomux <version> (protocol <revision>)`, the crate's version and the
+`PROTOCOL_VERSION` of §2.2.
 
 ### 5.2 Upload and attach in one round trip
 
@@ -405,6 +415,10 @@ exception, `Stdio::piped()`: everything that fails before
 pipe reaching end of file says the daemon got past that point, after which it has syslog
 (§11). `chdir "/"` and the `/dev/null` redirection are that same call, past the pidfile
 and the spawn lock, and after the run-directory paths are resolved and the socket bound.
+That redirection survives a hand-started `nomux daemon <id> 0<&- 1>&- 2>&-` only because
+those three numbers were never free: the Rust runtime opens `/dev/null` onto any of them
+`main` would have inherited closed, so the lowest number a `bind` here can be given is 3
+and the `dup2`s cannot silence the listener.
 
 Signal dispositions: `SIGHUP` ignored, and restored to `SIG_DFL` in the child before
 `exec` (§6.1). `SIGTERM` and `SIGINT` handled rather than ignored (§6.5), armed after the
@@ -441,7 +455,8 @@ validate, and an invalid id is a hard error, never sanitised into something vali
 Path precedence, first **absolute** one winning:
 
 1. `$XDG_RUNTIME_DIR/nomux/<id>.sock` — tmpfs, but removed on last logout unless linger is on.
-2. `$XDG_STATE_HOME/nomux/run/<id>.sock`, default `~/.local/state/nomux/run/`.
+2. `$XDG_STATE_HOME/nomux/run/<id>.sock`.
+3. `$HOME/.local/state/nomux/run/<id>.sock`.
 
 A source that names a relative or empty path is skipped; where none of the three names an
 absolute one, every mode fails with that (§10). The resolved directory is held for the
@@ -449,11 +464,11 @@ session's whole life, §6.2 moving the process to `/` partway through it.
 
 `SessionPaths::new` applies a second refusal that depends on which source the directory
 came from. A `sun_path` is 108 bytes including its terminator, so the directory, a `/`,
-the id and `.label` — six bytes, the longest of the five suffixes — have to fit in 107:
-under `/run/user/1000` that allows an id of 80 and the 64-byte ceiling binds first, while
-under the fallback the longest is `77 - len($HOME)`. **A refused id is therefore not
-necessarily a bad id**, which is what §10 has to turn into an exit code and what a client
-must not cache as a property of the id. Taking the bound against `.label` leaves
+the id and a six-byte suffix — `.label` and `.agent`, the joint longest of the five — have
+to fit in 107: under `/run/user/1000` that allows an id of 80 and the 64-byte ceiling
+binds first, while under the fallback the longest is `77 - len($HOME)`. **A refused id is
+therefore not necessarily a bad id**, which is what §10 has to turn into an exit code and
+what a client must not cache as a property of the id. Taking the bound there leaves
 `<id>.sock` a byte shorter still, which is what lets §6.6's probe read every `connect`
 failure it is not told about as a live session rather than an address it could not build.
 The refusal lands there rather than at the `bind`, because `list` and `kill` read an
@@ -469,8 +484,14 @@ on. Filesystem sockets only, never abstract ones
 what `UnixListener::bind` passes on Linux, is a request `listen(2)` clamps to
 `net.core.somaxconn`, and §6.2's re-listen must not restate it as a literal. An `AF_UNIX`
 `connect` to a full backlog blocks rather than being refused, so every connect goes
-through `rundir::connect_within` — 2 s for `list`, `kill` and the relay, 1 s for the
-daemon's own stale-socket probe.
+through `rundir::connect_within` — 2 s for `kill` and the relay, 1 s for the daemon's own
+stale-socket probe, and nothing at all for `list`, which acts only on the staleness a
+first attempt already settles and would otherwise spend two seconds per wedged daemon to
+print the same line. Going the other way, an `accept` that fails for anything but an empty
+backlog or a signal takes the listener out of the poll set for `ACCEPT_BACKOFF`, 100 ms,
+rather than propagating: a descriptor shortage leaves the connection queued, so the
+descriptor stays readable and `poll` returns at once on every pass, and standing back is
+the only way not to spin on it.
 
 The run directory is *checked* rather than merely created, because on every run but the
 first it already exists and that says nothing about what it is. Opened
@@ -506,9 +527,11 @@ past **64**, `MAX_SESSIONS` — a backstop under the client-side cap
 [DESIGN.md § 5.1](DESIGN.md#51-identity) argues for. It counts names and not siblings; its
 own id never counts; a directory that will not read is not a refusal. The count is taken
 inside the spawn lock's region, but that lock is a `try_lock`, so two starts can read the
-same 63 and both proceed: **64 is a backstop a race can cross, not a ceiling.** A refusal
-unlinks the `<id>.lock` this process created and still holds, `session_id_of` counting a
-bare lock as a session.
+same 63 and both proceed: **64 is a backstop a race can cross, not a ceiling.** Every
+refusal returning from inside that region — the count above and the bind behind it —
+unlinks the `<id>.lock` this process *created* and still holds, `session_id_of` counting a
+bare lock as a session. Created is the whole of it: an id a live session already holds has
+a lock of its own, and the `AddrInUse` refusal must leave it where it is.
 
 ### 6.4 Multiple clients
 
@@ -629,9 +652,10 @@ $RUNDIR/<id>.agent   ssh-agent socket, 0600 (§6.7)
 ```
 
 The two plain files either mode reads by hand — `<id>.pid` and `<id>.label` — go through
-one bounded helper (`rundir::read_prefix`) and are never read whole, opened
-`O_NONBLOCK | O_NOFOLLOW` against a FIFO or a symlink left at either name. The two ends
-are deliberately asymmetric: a label that reaches its bound is truncated and costs a
+one bounded helper (`rundir::read_prefix`), which reads to the file's end or to that bound
+and never past it, looping because one `read` is not a whole body on every filesystem, and
+opens `O_NONBLOCK | O_NOFOLLOW` against a FIFO or a symlink left at either name. The two
+ends are deliberately asymmetric: a label that reaches its bound is truncated and costs a
 column, where a pid body reaching **32 bytes is refused outright**, a prefix ending
 mid-number being a smaller, plausible, live pid rather than the number on disk.
 
@@ -696,7 +720,7 @@ Three tab-separated columns per session, one line each, no header:
 
 - **Order is ascending by id**: `rundir::session_ids` sorts and dedups what `read_dir` hands back, which is neither sorted nor stable.
 - **`<pid>` is a literal `?`** wherever the identification above yields no pid.
-- **`<label>` is empty** where there is no label, where it could not be read, or where it was not valid UTF-8. The trailing tab is still written, so a line always has three fields and a consumer can split on the count.
+- **`<label>` is empty** where there is no label or it could not be read. Bytes that are not valid UTF-8 arrive as U+FFFD rather than emptying the field, a read cut at the bound being able to split a character the daemon wrote whole. The trailing tab is still written, so a line always has three fields and a consumer can split on the count.
 - **Dead sessions are collected, not printed.** An entry whose socket refuses is unlinked during the sweep and never reaches stdout, so what `list` prints is the live set.
 - **Exit 0 is not "sessions exist."** No run directory, an empty one, or one `read_dir` could not open prints nothing and exits 0 (§10 has the rest of the table).
 - `EPIPE` on stdout — `nomux list | head` — stops the printing but **not** the sweep, so a stale session is never left behind because the reader went away.
@@ -754,7 +778,7 @@ one relay and two answers to an id nothing is serving
 ([DESIGN.md § 4](DESIGN.md#4-architecture)). Deliberately dumb:
 
 - `poll` on stdin/stdout and the socket, moving bytes with `splice(2)` and falling back to a userspace copy.
-- No frame parsing. A small userspace buffer per direction, used only where `splice` is unavailable; nothing protocol-shaped is ever held.
+- No frame parsing. A small userspace buffer per direction, used where `splice` is unavailable and again on any transient failure of it; nothing protocol-shaped is ever held.
 - Connects to the session's socket. Where nothing answers, `spawn` starts the daemon (§6.3) and waits for it, and `attach` refuses (§10).
 - Half-close propagation: EOF on stdin → `shutdown(SHUT_WR)` on the socket, keep draining the other direction.
 
@@ -864,8 +888,8 @@ the fate of *the relay*, not of the child:
 | --- | --- |
 | 0 | The relay ended cleanly: the client detached, the session ended and the `Exit` frame was delivered, the daemon refused the greeting and closed — the relay is frame-blind, so it drains to EOF and reports nothing — or the relay's own stdout was closed by its reader |
 | 64 | Malformed invocation (`EX_USAGE`), `--label` on `attach` included, or an id this run directory has no room for — the smaller table below has the difference |
-| 126 | This mode cannot have the session: `spawn` found the id already taken, `attach` found one it could not join (permissions), **or the run directory itself was refused** (§6.3) — group-writable, another uid's, unopenable, or not resolvable at all — where no session is involved and neither mode gets as far as one |
-| 127 | No such session: `attach` on an id nothing answers for, or a `spawn` whose daemon never started |
+| 126 | This mode cannot have the session: `spawn` found the id already taken, `attach` found one it could not join (permissions), either mode met a socket that would not answer at all — a full backlog, an `EACCES`, a descriptor limit — since a probe that establishes neither death nor life is evidence *of* a session and never of a missing one (§6.3), or the run directory itself was refused (§6.3) — group-writable, another uid's, unopenable, or not resolvable at all — where no session is involved and neither mode gets as far as one |
+| 127 | No such session: `attach` on an id nothing answers for — a `connect` refused, or a socket no longer there at all, the two probe results that say the daemon is gone — or a `spawn` whose daemon never started |
 
 The child's own status is **not** propagated through this exit code, and the `128+n`
 convention is the client's to apply; the status arrives in the `Exit` frame (§2.2), which

@@ -38,7 +38,7 @@ use harness::{
     Rng, Session, Spawned, accept_within, collect, control, daemon_reaper, entries,
     has_unread_bytes, hello_frame, join_before, nomux, nomux_with_shell, poll_by, poll_until,
     process_state, push_until_refused, read_uninterrupted, run_root, shrink_send_buffer, stderr,
-    stdout, still_serving, succeeded, while_nothing_forks, write_frame,
+    stdout, still_serving, succeeded, wedge_socket, while_nothing_forks, write_frame,
 };
 
 /// A daemon that cannot publish `<id>.pid` refuses to start rather than serving a
@@ -200,6 +200,81 @@ fn spawn_refuses_an_id_something_is_already_serving() {
     let mut client = session.connect();
     client.hello(RESUME_FROM_START);
     still_serving(&mut client, "NOMUX-SURVIVED");
+}
+
+/// Regression: a session whose backlog is full is a session, so `spawn` must report it
+/// as one and must not take its `<id>.lock` away.
+///
+/// A daemon that has stopped calling `accept` is alive in every sense the layout cares
+/// about: it holds the socket, it holds the user's shell, and a client already attached
+/// is still being served. What it does not do is answer a probe — an `AF_UNIX` `connect`
+/// to a full backlog blocks rather than being refused, so `rundir::connect_within` gives
+/// up after two seconds and reports `TimedOut`, which is evidence that somebody bound
+/// this socket and is therefore evidence of *life*.
+///
+/// `spawn` read it as neither and got both halves of the answer wrong. The refusal came
+/// back as 127, which `DESIGN.md` § 7 has the client cache as "nothing here" and come
+/// back for, over a session that is merely busy; and the one release point keyed on
+/// `AlreadyExists` alone, so a probe that had established nothing was treated as one
+/// that had established death and `<id>.lock` was unlinked — a run file of a live
+/// session, which § 6.6 forbids outright. Mutual exclusion survived it, `SpawnLock`
+/// re-checking the file at the path, so nothing louder than this would ever have said
+/// so.
+///
+/// Both halves are asserted because they fail apart: renaming the refusal without moving
+/// the unlink still destroys the file, and moving the unlink without renaming the
+/// refusal still sends the client away. The whole directory is compared rather than the
+/// one name, which is also what says no second daemon was started behind an id that
+/// already has one. `attach`'s row against the same wedge is `control.rs`'s, that being
+/// where the refusals the relay modes share with `list` and `kill` live.
+#[test]
+fn spawn_refuses_a_wedged_session_without_unlinking_the_lock_it_took() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = run_root("spawn_wedged");
+    let dir = root.join("nomux");
+    fs::create_dir_all(&dir).expect("create the run directory");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+        .expect("tighten the run directory");
+    // Both ends held to the end of the test: `wedge_socket` says why letting either go
+    // turns the block this is about back into an ordinary refusal.
+    let _wedged = wedge_socket(&dir.join("wedged.sock"));
+
+    let refused = collect(
+        nomux_with_shell(&root, &["spawn", "wedged"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
+    let left = entries(&dir);
+
+    assert_eq!(
+        refused.status.code(),
+        Some(126),
+        "an id something is holding must be refused as found-but-not-ours even when \
+         what holds it will not answer, since a client that retries meets the same \
+         session: {:?}",
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("backlog is full"),
+        "and the refusal must name the state it gave up on, since nothing else on this \
+         host will say so: {:?}",
+        stderr(&refused)
+    );
+    assert_eq!(
+        left,
+        ["wedged.lock", "wedged.sock"],
+        "a probe that established nothing is licence for no unlink (§ 6.6) and for no \
+         second daemon, so a wedged session must be left exactly as it was found, plus \
+         the lock this spawn took"
+    );
+    assert!(
+        stdout(&refused).is_empty(),
+        "stdout is where § 5.1 has the client read the bootstrap line, so a refused \
+         spawn must leave it alone: {:?}",
+        stdout(&refused)
+    );
 }
 
 /// `attach` refuses an id nothing answers for instead of inventing a session behind

@@ -91,7 +91,7 @@ fn resume(paths: &SessionPaths) -> io::Result<UnixStream> {
     match liveness(&paths.socket(), CONNECT_TIMEOUT) {
         Liveness::Alive(stream) => Ok(stream),
         Liveness::Stale(_) => Err(no_such_session(paths)),
-        Liveness::Unknown(err) => Err(err),
+        Liveness::Unknown(err) => Err(unattachable(paths, &err)),
     }
 }
 
@@ -113,6 +113,34 @@ fn no_such_session(paths: &SessionPaths) -> io::Error {
     )
 }
 
+/// The refusal to join an id whose socket answered neither death nor life.
+///
+/// [`no_such_session`] on the other half of the probe, and the two must stay apart: § 6.3
+/// makes a `connect` that failed for anything but a refusal evidence of nothing, and the
+/// wedged daemon settles which way that doubt falls. An `AF_UNIX` `connect` to a full
+/// backlog blocks rather than being refused, so [`crate::rundir::connect_within`] gives up
+/// with `TimedOut` over a socket somebody bound and stopped accepting on — evidence *of* a
+/// session, and answering it with § 10's "no such session" had `DESIGN.md` § 7's client
+/// read a live session as an id it had got wrong.
+///
+/// `ResourceBusy` where [`may_be_running`] says `AlreadyExists`, both being 126 through
+/// `main`'s reporter: existing is the one thing `attach` wanted, so "already exists"
+/// answers a question only the creating mode asks. What this met is what
+/// `control::hold_spawn_lock` reports with the same kind — something holds the session,
+/// and waiting did not outlast it.
+fn unattachable(paths: &SessionPaths, err: &io::Error) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::ResourceBusy,
+        format!(
+            "session {id} could not be joined: {sock} could not be probed, so that nothing \
+             is serving it was never established: {err}. `nomux list` says what this host \
+             is holding",
+            id = paths.id(),
+            sock = paths.socket().display(),
+        ),
+    )
+}
+
 /// The refusal to create an id something is already serving.
 ///
 /// `spawn` is the one mode that says what a session *is*, so meeting a live one is the
@@ -123,6 +151,30 @@ fn already_running(paths: &SessionPaths) -> io::Error {
         format!(
             "session {id} already exists: something answers on {sock}. `nomux attach {id}` \
              joins it, and `nomux kill {id}` ends it",
+            id = paths.id(),
+            sock = paths.socket().display(),
+        ),
+    )
+}
+
+/// The refusal to create an id whose socket answered neither death nor life.
+///
+/// [`already_running`]'s kind on weaker evidence, which is § 6.3's rule read from the
+/// creating side: a `connect` that failed for anything but a refusal establishes
+/// nothing, and `spawn` may only bring into being an id it can say is free. The wedged
+/// daemon is the case that settles the wording — an `AF_UNIX` `connect` to a full
+/// backlog blocks rather than being refused, so [`crate::rundir::connect_within`]'s own
+/// `TimedOut` reports a socket somebody bound and stopped accepting on, which is
+/// evidence *of* a session. Answering that with § 10's "no such session" told a client
+/// to cache a live session as gone; `AlreadyExists` is 126, the code `DESIGN.md` § 7
+/// has it stop on.
+fn may_be_running(paths: &SessionPaths, err: &io::Error) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "session {id} may already exist: {sock} could not be probed, so that it is \
+             free was never established: {err}. `nomux attach {id}` joins it if it is \
+             there, and `nomux list` says what this host is holding",
             id = paths.id(),
             sock = paths.socket().display(),
         ),
@@ -149,17 +201,16 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> io::Result<UnixStream> {
     // the path.
     let _spawn_lock = paths.lock_spawn()?;
 
-    // One release point for every way the attempt can fail, so no exit path can forget
-    // it. Still under the lock, `_spawn_lock` outliving this expression. `AlreadyExists`
-    // is the one failure that leaves a session behind, where the name is that session's.
-    spawn_and_join(paths, label).inspect_err(|err| {
-        if err.kind() != io::ErrorKind::AlreadyExists {
-            release_lock_name(paths);
-        }
-    })
+    // Whether a failure gives `<id>.lock` back is that failure's own to say and cannot be
+    // decided out here off the error: the two below that establish the id is nobody's
+    // call [`released`] themselves, and every other way out leaves the name alone. It was
+    // one release point for all of them, which is the shape that unlinked a run file of a
+    // live session — an exit that established nothing was told it had established death.
+    // Still under the lock wherever it lands, `_spawn_lock` outliving the call.
+    spawn_and_join(paths, label)
 }
 
-/// The body of [`create`], as one fallible call so its lock has a single owner.
+/// The body of [`create`], as one call so that lock has a single owner.
 fn spawn_and_join(paths: &SessionPaths, label: Option<&str>) -> io::Result<UnixStream> {
     let socket = paths.socket();
     // Once, and under the lock: another spawn may have created the session while we
@@ -171,10 +222,16 @@ fn spawn_and_join(paths: &SessionPaths, label: Option<&str>) -> io::Result<UnixS
         // closes without greeting — the same nothing `list`'s probe costs it (§ 6.4).
         Liveness::Alive(_) => return Err(already_running(paths)),
         Liveness::Stale(_) => {}
-        Liveness::Unknown(err) => return Err(err),
+        Liveness::Unknown(err) => return Err(may_be_running(paths, &err)),
     }
 
-    let complaint = spawn_daemon(paths.id(), label)?;
+    let complaint = match spawn_daemon(paths.id(), label) {
+        Ok(complaint) => complaint,
+        // The one failure with nothing of anyone's behind it: no daemon was started, and
+        // the probe above has just said nobody else is serving the id either, so the
+        // name is this call's own to give back.
+        Err(err) => return Err(released(paths, err)),
+    };
 
     let deadline = Instant::now() + SPAWN_TIMEOUT;
     loop {
@@ -190,23 +247,35 @@ fn spawn_and_join(paths: &SessionPaths, label: Option<&str>) -> io::Result<UnixS
                         || format!("daemon for session {id} did not start"),
                         |said| format!("daemon for session {id} did not start: {said}"),
                     );
-                    return Err(io::Error::new(io::ErrorKind::TimedOut, complaint));
+                    let refusal = io::Error::new(io::ErrorKind::TimedOut, complaint);
+                    return Err(released(paths, refusal));
                 }
                 std::thread::sleep(SPAWN_POLL_INTERVAL);
             }
-            Liveness::Unknown(err) => return Err(err),
+            // The daemon this call started may be the very thing that would not answer,
+            // so this says as little about the id as the probe before the spawn did —
+            // and the name is left alone for that reason rather than for the other one.
+            Liveness::Unknown(err) => return Err(may_be_running(paths, &err)),
         }
     }
 }
 
-/// Gives back the `<id>.lock` this call created, on the way out of a spawn that left no
-/// session behind.
+/// Gives back the `<id>.lock` this call created and hands `err` on.
 ///
 /// A leftover name is one `session_id_of` counts as a session, so without this every
 /// spawn refused at § 6.3's ceiling would raise the count that refused it — and only
 /// this process, still holding the lock, can undo that.
-fn release_lock_name(paths: &SessionPaths) {
+///
+/// Called from the two exits that established the id is nobody's and from nowhere else,
+/// because the stronger rule is § 6.6's — a live session's files are never unlinked —
+/// and an exit that established neither death nor life may not act against it. Which
+/// exit it is cannot be read off the error, which is the whole reason this is a call
+/// rather than a wrapper the caller applies to every failure: the deadline above and
+/// [`crate::rundir::connect_within`] both report `TimedOut`, one over a socket nothing
+/// ever bound and one over a socket somebody bound and stopped accepting on.
+fn released(paths: &SessionPaths, err: io::Error) -> io::Error {
     drop(fs::remove_file(paths.lock()));
+    err
 }
 
 /// Keeps the spawn lock until the daemon this spawn started has published

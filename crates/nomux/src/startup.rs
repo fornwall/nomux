@@ -143,6 +143,16 @@ pub(crate) fn release_startup_state() {
 
 /// Points the three standard descriptors at `/dev/null`, last of all for the reason
 /// § 6.2 gives.
+///
+/// What makes that safe is not the ordering, which cannot help: by here the daemon has
+/// bound its socket and armed its stop pipe, and nothing below can tell an inherited
+/// terminal from a descriptor of its own. It is that these three numbers were never
+/// free — std's runtime opens `/dev/null` onto any of them that `main` would have
+/// inherited closed, and aborts rather than starting without them, so the lowest free
+/// number a `bind` here can be given is 3. Started as § 6.2's `nomux daemon x 0<&- 1>&-
+/// 2>&-` without that, the listener would land on fd 1 and the pipe's read end on fd 2,
+/// and the `dup2`s below would silence both — an id claimed by a daemon nothing can
+/// ever reach. `tests/session.rs` starts one that way and greets it.
 fn silence_stdio() -> io::Result<()> {
     let null = rustix::fs::open("/dev/null", OFlags::RDWR, Mode::empty())?;
     rustix::stdio::dup2_stdin(&null)?;

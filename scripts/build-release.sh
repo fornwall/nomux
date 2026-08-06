@@ -300,13 +300,20 @@ for target in $targets; do
         over_budget="$over_budget $target"
     fi
 
-    # A target the baseline has never seen is reported, not punished: a newly added architecture
-    # has nothing to have grown against, and failing it would mean the only way to add one is
-    # with the escape hatch already set.
+    # One missing entry is the dropped-header case above, one target at a time: it parses, it
+    # passes, and it leaves the gate running with nothing to run against. A newly added
+    # architecture reads identically — but adding one is already a commit that touches this
+    # file, so it costs that commit the escape hatch rather than costing every lost line its
+    # gate. The 400 KiB cap still applies, so the exposure is bounded, but only just: at
+    # ~175 KiB a target could more than double before the cap noticed.
     base=$(printf '%s\n' "$baselines" | awk -v t="$target" '$1 == t { print $2; exit }')
     if [ -z "$base" ]; then
         pct='new'
-        unknown="$unknown $target"
+        # Silent on the run that sets the flag: it is about to record this very size.
+        if [ "$update_baseline" != 1 ]; then
+            verdict="$verdict NO BASELINE"
+            unknown="$unknown $target"
+        fi
     else
         diff=$((bytes - base))
         # The magnitude is divided as a positive number and the sign carried separately, because
@@ -336,13 +343,6 @@ else
     echo "artifacts and SHA256SUMS in ${dist#"$repo"/} (NOMUX_DEBUG=1 adds companions)"
 fi
 
-# Not on the run that already sets the flag: it records these very sizes below, or says why
-# it did not, and naming a flag someone has set reads as not having noticed.
-if [ -n "$unknown" ] && [ "$update_baseline" != 1 ]; then
-    echo "note: no baseline entry for:$unknown" >&2
-    echo "      recorded as new; rerun with NOMUX_UPDATE_BASELINE=1 to record the sizes." >&2
-fi
-
 if [ "$update_baseline" = 1 ]; then
     if [ -n "$over_budget" ]; then
         # These figures would make the next build's delta look healthy while the binary is
@@ -369,7 +369,7 @@ if [ "$update_baseline" = 1 ]; then
     fi
 fi
 
-if [ -n "$over_budget" ] || [ -n "$grown" ]; then
+if [ -n "$over_budget" ] || [ -n "$grown" ] || [ -n "$unknown" ]; then
     if [ -n "$over_budget" ]; then
         echo "FAIL: over the $((max_bytes / 1024)) KiB budget of IMPLEMENTATION.md § 8:$over_budget" >&2
     fi
@@ -377,6 +377,12 @@ if [ -n "$over_budget" ] || [ -n "$grown" ]; then
         echo "FAIL: grown more than $max_growth_pct% against ${baseline_file#"$repo"/}:$grown" >&2
         echo "      find what did it — the cost is paid on every cold upload — or accept it" >&2
         echo "      deliberately with NOMUX_UPDATE_BASELINE=1 and commit the new baseline." >&2
+    fi
+    if [ -n "$unknown" ]; then
+        echo "FAIL: no entry in ${baseline_file#"$repo"/} for:$unknown" >&2
+        echo "      the growth gate has nothing to hold this build against. Restore the line" >&2
+        echo "      if it was dropped or its target misspelled; if the architecture is new," >&2
+        echo "      rerun with NOMUX_UPDATE_BASELINE=1 and commit the recorded sizes." >&2
     fi
     exit 1
 fi

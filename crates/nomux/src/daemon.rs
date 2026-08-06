@@ -216,16 +216,26 @@ fn start(session_id: &str, label: Option<&str>) -> io::Result<()> {
     let paths = SessionPaths::new(session_id)?;
     paths.ensure_dir()?;
 
+    // Asked before the lock creates the file, and the whole of what licenses removing it
+    // below: `<id>.lock` outlives the daemon that made it, so a name already here is the
+    // standing of whoever holds the id — the live session the `AddrInUse` arm of
+    // `bind_socket` reports — and no refusal of ours may take that away. An answer that
+    // cannot be read counts as somebody's, which is the direction that removes nothing.
+    let lock_is_ours = !fs::exists(paths.lock()).unwrap_or(true);
+
     // Held across the whole of claiming the id, which turns on the evidence `list` and
     // `kill` read. Never blocking, and going ahead unlocked rather than refusing (§ 6.3).
     let publishing = paths.try_lock_spawn();
+    // Standing to remove `<id>.lock` on the way out, and it takes both halves: a lock
+    // that came back, over a name this call is what put there.
+    let scrub_lock = publishing.is_some() && lock_is_ours;
 
     // Inside that locked region and before the bind, per § 6.3: taking the lock created
-    // `<id>.lock`, which counts as a session, so a refusal that left it behind would
-    // ratchet this backstop against itself. Only where a lock came back, and still held.
+    // `<id>.lock`, which `session_id_of` counts as a session, so a refusal that left it
+    // behind would ratchet this backstop against itself.
     let dir = paths.dir();
     if at_session_ceiling(dir, paths.id()) {
-        if publishing.is_some() {
+        if scrub_lock {
             drop(fs::remove_file(paths.lock()));
         }
         return Err(io::Error::new(
@@ -242,7 +252,19 @@ fn start(session_id: &str, label: Option<&str>) -> io::Result<()> {
     // The whole of the bind before the fork: past § 6.2's fork the process a caller is
     // waiting on has already `_exit`ed with a status of its own, so every errno after it
     // reads as success — a session that never started, reported as started.
-    let listener = bind_socket(&paths)?;
+    //
+    // Matched rather than `?`d for the same reason the ceiling above scrubs: this is the
+    // *next* way out of the locked region, and a `?` here left the created `<id>.lock`
+    // behind on every full disk, descriptor shortage and unbindable `<id>.sock`.
+    let listener = match bind_socket(&paths) {
+        Ok(listener) => listener,
+        Err(err) => {
+            if scrub_lock {
+                drop(fs::remove_file(paths.lock()));
+            }
+            return Err(err);
+        }
+    };
 
     // One fallible region rather than a cleanup per call site: nothing past the bind can
     // be reported, so whatever fails inside `publish`, what it published goes.
@@ -1241,18 +1263,19 @@ impl Daemon {
         }
     }
 
-    /// Pushes out what is queued, letting the connection go if it cannot be served.
+    /// Pushes out what is queued, letting the connection go if it cannot be served: the
+    /// socket has failed outright, or the peer is past `ABANDON_PENDING_WRITE` and so is
+    /// not reading at all (§ 4.1).
     ///
-    /// Neither condition here wants [`Daemon::drop_client`]'s final flush: the socket has
-    /// already failed, or the peer is past `ABANDON_PENDING_WRITE` and so is not reading
-    /// (§ 4.1), where `flush_final` would park the daemon for its 500 ms deadline.
+    /// Out through [`Daemon::drop_client`] like every other departure — the flush inside
+    /// it costs one refused write on a socket that has just refused one, against two
+    /// paths that would otherwise have to be kept saying the same thing.
     fn write_client(&mut self) {
         let Some(client) = self.client.as_mut() else {
             return;
         };
         if client.conn.flush_some().is_err() || client.conn.is_write_hopeless() {
-            self.client = None;
-            self.on_detached();
+            self.drop_client();
         }
     }
 
@@ -1264,9 +1287,23 @@ impl Daemon {
         }
     }
 
+    /// Lets the attached client go, with only what the socket takes this instant.
+    ///
+    /// Dropping the rest of that queue costs the client nothing it cannot ask for again.
+    /// Everything in it is either per-connection bookkeeping a reattach redoes —
+    /// `sent_through` rewinds to where the arriving client says it *consumed* to (§ 4.2),
+    /// `exit_sent` clears, so the ring and the `Exit` behind it are queued afresh
+    /// (§ 6.5) — or an answer to a frame that connection will not send again. It is
+    /// `send_last`'s argument for throwing its own queue away, and it holds here for the
+    /// same reason: the ring outlives the connection.
+    ///
+    /// Waiting instead is what cannot be afforded. [`Conn::flush_last`] goes blocking for
+    /// up to 500 ms, and this loop is the only thing draining the PTY (§ 4.1) — so a
+    /// detach from a peer that has stopped reading, which is the departure this project
+    /// exists to survive, stops the user's child dead for that half second.
     fn drop_client(&mut self) {
         if let Some(mut client) = self.client.take() {
-            drop(client.conn.flush_final());
+            drop(client.conn.flush_some());
             self.on_detached();
         }
     }
@@ -1284,7 +1321,15 @@ impl Daemon {
     }
 
     fn shutdown(&mut self) {
-        self.drop_client();
+        // The one *departure* [`Daemon::drop_client`]'s argument does not reach: nothing
+        // survives this to replay from, the ring and the run files going with the
+        // process, so what the client is owed is owed now. § 6.5's 500 ms is spent here
+        // and in `send_last`'s eviction and nowhere else — inside `nomux kill`'s two
+        // seconds, with the child's signals still to come.
+        if let Some(client) = self.client.take() {
+            client.conn.flush_last();
+            self.on_detached();
+        }
         self.pending = None;
         if let Some(mut pty) = self.pty.take() {
             pty.terminate();

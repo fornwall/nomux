@@ -48,8 +48,10 @@ Four open; the last two came out of a security review.
 - An abort says nothing from inside the process (`-Cpanic=immediate-abort`,
   `strip = "symbols"`); what is left is the `SIGQUIT` core against the
   `nomux-<target>.debug` companion ([IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)).
-- Every ordinary departure costs up to 500 ms in `Conn::flush_final` and departures are
-  unbounded; the socket's `0600` makes that process this uid's.
+- A takeover and the daemon's own shutdown each spend up to 500 ms in `Conn::flush_final`,
+  and takeovers are unbounded; the socket's `0600` makes that process this uid's. An
+  ordinary detach no longer pays it: `Daemon::drop_client` delivers what the socket takes
+  and drops the rest, which a reattach replays from the ring.
 
 ## P3 — release process
 
@@ -94,8 +96,9 @@ Recorded so they are not rediscovered as gaps.
   `NOMUX_RING_BYTES` already tunes it: larger reserves address space no administrator
   agreed to, smaller loses a twenty-minute disconnect across a build.
 - **Compressing the output ring.** Measured at `b71db5f` (`git show` holds the tables):
-  `lz4_flex` buys scrollback but is far slower on the PTY push path, worst on the armv7
-  SBCs where 4 MiB a session is scarce — a larger default ring buys the same for nothing.
+  `lz4_flex` buys a median 4.6x scrollback for 6–8 KiB of binary and costs 21x on the PTY
+  push path — 2.8 ms a MiB on the x86_64 the throughput was taken on. It trades memory for
+  CPU, and a larger default ring buys the same scrollback for neither.
 - **Server-side screen snapshot on overflow.** The second server-side emulator
   [DESIGN.md § 3](DESIGN.md#3-key-properties) rejects: deterministic but not exact, and
   the visible screen only. `libvterm` would be the first C object in a tree whose musl

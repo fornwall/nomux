@@ -230,10 +230,14 @@ impl Conn {
     /// Pushes out whatever is queued, giving up [`FINAL_FLUSH_TIMEOUT`] after it
     /// started.
     ///
+    /// Private, and reached only by the two consuming callers below: it goes *blocking*,
+    /// so for as long as it runs the caller's event loop is not running — no PTY drained,
+    /// no reaping — and its timeout path hands back a socket still in that mode.
+    ///
     /// # Errors
     ///
     /// Propagates write failures, including the deadline expiring.
-    pub(crate) fn flush_final(&mut self) -> io::Result<()> {
+    fn flush_final(&mut self) -> io::Result<()> {
         // Bounded because the peer being flushed has frequently stopped reading
         // (§ 6.4), and against the whole call rather than each `write` (§ 6.5):
         // `SO_SNDTIMEO` restarts per syscall, so a peer reading a trickle keeps
@@ -257,6 +261,19 @@ impl Conn {
         self.tx.clear();
         self.tx_pos = 0;
         self.stream.flush()
+    }
+
+    /// Delivers what is queued and closes, waiting up to [`FINAL_FLUSH_TIMEOUT`] for a
+    /// peer that is not taking it.
+    ///
+    /// For the one departure with nothing behind it: the session's own shutdown (§ 6.5),
+    /// where the ring this queue could have been replayed from goes with the daemon. An
+    /// ordinary detach leaves through `Daemon::drop_client`, which may not stop the
+    /// world for half a second on the way.
+    ///
+    /// Consumed rather than borrowed for [`Conn::send_last`]'s reason.
+    pub(crate) fn flush_last(mut self) {
+        drop(self.flush_final());
     }
 
     /// Sends `frame` as the last thing this connection will ever carry, discarding

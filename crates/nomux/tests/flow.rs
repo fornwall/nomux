@@ -18,7 +18,7 @@
 mod harness;
 
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
@@ -26,9 +26,14 @@ use nomux_proto::{Frame, FrameType, HEADER_LEN, RESUME_FROM_START, decode_header
 
 use harness::{
     ABANDON_PENDING_WRITE, Cue, FRAME_PATIENCE, MAX_PENDING_INPUT, SPIN_WINDOW, Session, cpu_ticks,
-    hello_frame, poll_until, push_until_refused, read_uninterrupted, still_serving, wait_for,
-    write_frame,
+    hello_frame, poll_by, poll_until, push_until_refused, read_uninterrupted, socket_capacity,
+    still_serving, wait_for, write_frame,
 };
+
+/// `conn::MAX_PENDING_WRITE`: what § 4.1 lets a client fall behind by before the daemon
+/// stops queueing output for it. Private to the daemon and mirrored here as the harness
+/// mirrors its neighbours; this is the one test that has to add it to a queue budget.
+const MAX_PENDING_WRITE: usize = 1 << 20;
 
 /// The PTY master is non-blocking, so a child that has stopped reading cannot
 /// wedge the daemon.
@@ -511,6 +516,133 @@ fn a_client_that_never_reads_its_answers_is_dropped_rather_than_queued_for() {
     let mut client = session.connect();
     client.hello(RESUME_FROM_START);
     still_serving(&mut client, "NOMUX-AFTER-ABANDON");
+}
+
+/// Regression: an ordinary detach must not stop the child.
+///
+/// `drop_client` handed the departing connection to `Conn::flush_final`, which puts the
+/// socket back in blocking mode and spends up to 500 ms pushing what is queued at a peer
+/// that has stopped reading. This event loop is single-threaded, so for the whole of that
+/// the PTY is not read — and a terminal holds about twelve kilobytes, so the child is
+/// stopped inside `write` for as long as it lasts. The trigger is precisely the case this
+/// project exists for: a client whose relay stdout has stalled on a sleeping radio,
+/// detaching.
+///
+/// Nothing in that queue was worth the wait. `sent_through`, `in_applied` and `exit_sent`
+/// are per connection, so a client that comes back is served the ring from where it
+/// *consumed* to and handed the exit behind it again (§ 4.2, § 6.5): what is queued is a
+/// copy of state the session still holds, which is `send_last`'s argument for throwing
+/// its own queue away.
+///
+/// One detach costs at most half a second, and no bound this suite could carry would tell
+/// half a second of that from half a second of a loaded machine — so the rounds below buy
+/// a floor instead. Each leaves the daemon holding more than the socket will take and then
+/// half-closes, and under the defect each of those is a whole `FINAL_FLUSH_TIMEOUT` that
+/// the budget below cannot be reached through. What is measured is still the child:
+/// chunks of terminal output it has got rid of, counted from the far side of the PTY,
+/// where a daemon that is not running is the only thing that can hold them up.
+#[test]
+fn detaching_a_stalled_client_does_not_stop_the_child() {
+    /// Rounds of attach, stall and detach. Twelve seconds of flush deadline under the
+    /// defect, against a `BUDGET` half that.
+    const ROUNDS: usize = 24;
+    /// How long the child has to get `PROGRESS` chunks away, counted from before the
+    /// rounds start — so a run that spends it all inside the daemon's goodbyes fails on
+    /// the child having gone nowhere rather than on the clock.
+    const BUDGET: Duration = Duration::from_secs(6);
+    /// Chunks the child must be through. Far above the handful the defect lets past
+    /// between two parked flushes — five, measured — and a fraction of what a daemon that
+    /// stays in its loop does in the time: `CHUNK` times this is thirteen megabytes of
+    /// terminal, which takes well under a second of the six.
+    const PROGRESS: u64 = 200;
+    /// One chunk, past the twelve kilobytes a line discipline takes from a single write
+    /// before the writer has to wait for a reader — so every one of them is the child
+    /// asking the daemon to be running.
+    const CHUNK: usize = 64 * 1024;
+
+    let session = Session::start("detach_stall");
+    // Read into a shell variable once, so a round of the child's loop is two builtins and
+    // no fork: what is being counted is the terminal rather than `/bin/cat`.
+    fs::write(session.root.join("filler"), vec![b'y'; CHUNK]).expect("write the child's chunk");
+
+    let mut client = session.connect();
+    let ok = client.hello(RESUME_FROM_START);
+    // `raw` for the back pressure it keeps (see [`Client::make_ready`]): in canonical mode
+    // an overlong line is discarded rather than held, and the child would never have to
+    // wait for the daemon at all.
+    client.make_ready(
+        "raw -echo",
+        Some("chunk=$(cat filler); while :; do printf %s \"$chunk\"; printf . >> ticks; done"),
+        ok.resume_from,
+    );
+    // Before the rounds, so each of them arrives at a session with nobody attached: a
+    // takeover leaves through `send_last`, whose own bounded flush is § 6.4's deliberate
+    // one and would put a deadline into this measurement that belongs to another test.
+    drop(client);
+
+    let ticks = session.root.join("ticks");
+    let done = || fs::metadata(&ticks).map_or(0, |meta| meta.len());
+
+    // Twice what a peer that never reads can be handed, so the leftover at the moment of
+    // the half-close is more than the socket will take however the reads and writes
+    // interleaved — the state a blocking final flush waits out. Measured rather than
+    // assumed, per [`socket_capacity`].
+    let held = socket_capacity();
+    let queued = 2 * held + MAX_PENDING_WRITE;
+    assert!(
+        queued < ABANDON_PENDING_WRITE,
+        "a round would leave {queued} bytes queued — the pongs this peer will not take, \
+         plus the output § 4.1 lets it fall behind by — which is at the \
+         {ABANDON_PENDING_WRITE} where the daemon lets go for being hopeless instead, a \
+         departure with no flush in it at all"
+    );
+    let mut ping = Vec::new();
+    Frame::Ping.encode(&mut ping).expect("encode a ping");
+    let pings = ping.repeat((2 * held).div_ceil(ping.len()));
+
+    let began = done();
+    let deadline = Instant::now() + BUDGET;
+    // Held to the end: closing one of these with the daemon's answers still unread turns
+    // its next write into an `EPIPE`, which is the daemon *not* waiting for anything and
+    // so the opposite of what each round is composing.
+    let _stalled: Vec<UnixStream> = (0..ROUNDS)
+        .map(|_| stalled_detach(&session, &pings))
+        .collect();
+
+    assert!(
+        poll_by(deadline, || done() >= began + PROGRESS),
+        "the child got {} chunks of terminal output away in {BUDGET:?} across {ROUNDS} \
+         detaches, out of the {PROGRESS} it is asked for: the daemon stops draining its \
+         PTY while it says goodbye, and the user's shell stops with it",
+        done() - began
+    );
+}
+
+/// One round of [`detaching_a_stalled_client_does_not_stop_the_child`]: a client that
+/// greets, is handed more than it will ever take, and half-closes without reading a byte
+/// — § 7's relay detaching with its own output stalled behind it.
+///
+/// The socket is handed back rather than dropped, for the reason the caller keeps it.
+fn stalled_detach(session: &Session, pings: &[u8]) -> UnixStream {
+    use std::net::Shutdown;
+
+    let mut socket = UnixStream::connect(&session.socket).expect("connect");
+    write_frame(&mut socket, &hello_frame(0, RESUME_FROM_START));
+    // Blocking, and so paced by the daemon: a round can only hand its pings over as fast
+    // as they are read, which is what makes the loop above cost one whole flush deadline
+    // per round under the defect rather than firing every round into a socket buffer.
+    // Each one comes back as a `Pong` — the answers § 4.1 has the daemon queue whatever
+    // its output policy says, and the only queue a test can size exactly.
+    socket
+        .write_all(pings)
+        .expect("hand the daemon more answers than this peer will take");
+    // The half-close § 7 has the relay make on stdin EOF, which is how the daemon hears
+    // this client leave. The read half stays open, so the peer is still there and still
+    // not reading: the state a final flush has to wait out in full.
+    socket
+        .shutdown(Shutdown::Write)
+        .expect("half-close the way the relay does");
+    socket
 }
 
 /// At least `at_least` bytes of encoded `Input` frames starting at `from`, and one
