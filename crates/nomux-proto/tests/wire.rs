@@ -67,7 +67,7 @@ fn hello_vectors() -> Vec<Vector> {
         // them is even representable — §2.3's "no reserved space", made in bytes.
         Vector {
             frame: Frame::Hello(Hello {
-                protocol: 6,
+                protocol: 7,
                 agent_forward: true,
                 repaint_ctrl_l: true,
                 out_offset: 0x0102_0304_0506_0708,
@@ -76,7 +76,7 @@ fn hello_vectors() -> Vec<Vector> {
             }),
             bytes: &[
                 0x01, 0x00, 0x00, 0x23, // header: type, u24 len = 35
-                0x00, 0x06, // protocol
+                0x00, 0x07, // protocol
                 0x03, // flags: bit 0 agent forward, bit 1 repaint ctrl-l
                 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // out_offset
                 0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
@@ -89,7 +89,7 @@ fn hello_vectors() -> Vec<Vector> {
         // Carries `RESUME_FROM_START` as well, which no other vector shows.
         Vector {
             frame: Frame::Hello(Hello {
-                protocol: 6,
+                protocol: 7,
                 agent_forward: true,
                 repaint_ctrl_l: false,
                 out_offset: RESUME_FROM_START,
@@ -98,7 +98,7 @@ fn hello_vectors() -> Vec<Vector> {
             }),
             bytes: &[
                 0x01, 0x00, 0x00, 0x1a, // header: type, u24 len = 26
-                0x00, 0x06, // protocol
+                0x00, 0x07, // protocol
                 0x01, // flags: bit 0 agent forward, bit 1 clear
                 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // RESUME_FROM_START
                 0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
@@ -110,7 +110,7 @@ fn hello_vectors() -> Vec<Vector> {
         // vectors above, so this is the only one that pins it clear.
         Vector {
             frame: Frame::Hello(Hello {
-                protocol: 6,
+                protocol: 7,
                 agent_forward: false,
                 repaint_ctrl_l: false,
                 out_offset: 0x8182_8384_8586_8788,
@@ -119,7 +119,7 @@ fn hello_vectors() -> Vec<Vector> {
             }),
             bytes: &[
                 0x01, 0x00, 0x00, 0x19, // header: type, u24 len = 25
-                0x00, 0x06, // protocol
+                0x00, 0x07, // protocol
                 0x00, // flags: both bits clear
                 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, // out_offset
                 0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
@@ -192,8 +192,8 @@ fn hello_ok_vectors() -> Vec<Vector> {
     ]
 }
 
-/// The two byte streams and their acknowledgements, plus the frames that describe
-/// the shape of the terminal carrying them.
+/// The two byte streams and the acknowledgement one of them carries, plus the frames
+/// that describe the shape of the terminal carrying them.
 fn stream_vectors() -> Vec<Vector> {
     vec![
         // 0x03 Input: u64 offset, bytes.
@@ -230,27 +230,21 @@ fn stream_vectors() -> Vec<Vector> {
                 0x1b, 0x5b, 0x32, 0x4a,
             ],
         },
-        // 0x06 OutputAck: no payload. What the frame does is arrive (§ 3), so like
-        // `Detach` below it is nothing but its header.
-        Vector {
-            frame: Frame::OutputAck,
-            bytes: &[0x06, 0x00, 0x00, 0x00],
-        },
-        // 0x07 Resize: winsize, bare.
+        // 0x06 Resize: winsize, bare.
         Vector {
             frame: Frame::Resize(WIN),
             bytes: &[
-                0x07, 0x00, 0x00, 0x08, //
+                0x06, 0x00, 0x00, 0x08, //
                 0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80,
             ],
         },
-        // 0x08 Gap: u64 new_base_offset.
+        // 0x07 Gap: u64 new_base_offset.
         Vector {
             frame: Frame::Gap {
                 new_base_offset: 8192,
             },
             bytes: &[
-                0x08, 0x00, 0x00, 0x08, //
+                0x07, 0x00, 0x00, 0x08, //
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00,
             ],
         },
@@ -260,7 +254,7 @@ fn stream_vectors() -> Vec<Vector> {
 /// Session lifecycle and liveness.
 fn control_vectors() -> Vec<Vector> {
     vec![
-        // 0x09 Exit: i32 status, u8 kind (0 exited, 1 signalled), u32
+        // 0x08 Exit: i32 status, u8 kind (0 exited, 1 signalled), u32
         // since_exit_secs. The kind byte sits *between* the two four-byte fields and
         // does not stop them being exchanged, so the pair are given values that
         // disagree in every byte here and are all-ones against all-zeros below —
@@ -273,7 +267,7 @@ fn control_vectors() -> Vec<Vector> {
                 since_exit_secs: 0x0a0b_0c0d,
             },
             bytes: &[
-                0x09, 0x00, 0x00, 0x09, //
+                0x08, 0x00, 0x00, 0x09, //
                 0x00, 0x00, 0x00, 0x82, // status
                 0x01, // signalled
                 0x0a, 0x0b, 0x0c, 0x0d, // since_exit_secs
@@ -291,28 +285,28 @@ fn control_vectors() -> Vec<Vector> {
                 since_exit_secs: 0,
             },
             bytes: &[
-                0x09, 0x00, 0x00, 0x09, //
+                0x08, 0x00, 0x00, 0x09, //
                 0xff, 0xff, 0xff, 0xff, // status
                 0x00, // exited
                 0x00, 0x00, 0x00, 0x00, // since_exit_secs
             ],
         },
-        // 0x0a Detach: no payload at all either, so the frame is its header.
+        // 0x09 Detach: no payload at all, so the frame is nothing but its header.
         Vector {
             frame: Frame::Detach,
-            bytes: &[0x0a, 0x00, 0x00, 0x00],
+            bytes: &[0x09, 0x00, 0x00, 0x00],
         },
-        // 0x0b Ping / 0x0c Pong: header only. The stream is ordered, so the nth Pong
+        // 0x0a Ping / 0x0b Pong: header only. The stream is ordered, so the nth Pong
         // answers the nth Ping and there is nothing to correlate them with.
         Vector {
             frame: Frame::Ping,
-            bytes: &[0x0b, 0x00, 0x00, 0x00],
+            bytes: &[0x0a, 0x00, 0x00, 0x00],
         },
         Vector {
             frame: Frame::Pong,
-            bytes: &[0x0c, 0x00, 0x00, 0x00],
+            bytes: &[0x0b, 0x00, 0x00, 0x00],
         },
-        // 0x0d Error: u16 code, UTF-8 message with no length prefix — it runs to
+        // 0x0c Error: u16 code, UTF-8 message with no length prefix — it runs to
         // the end of the payload.
         Vector {
             frame: Frame::Error {
@@ -320,7 +314,7 @@ fn control_vectors() -> Vec<Vector> {
                 message: "taken over",
             },
             bytes: &[
-                0x0d, 0x00, 0x00, 0x0c, // header: len = 2 + 10
+                0x0c, 0x00, 0x00, 0x0c, // header: len = 2 + 10
                 0x00, 0x02, // Takeover
                 b't', b'a', b'k', b'e', b'n', b' ', b'o', b'v', b'e', b'r',
             ],
@@ -328,33 +322,31 @@ fn control_vectors() -> Vec<Vector> {
     ]
 }
 
-/// The agent sub-channels of § 6.7, the one place this protocol multiplexes.
+/// The single serialized agent pipe of § 6.7.
 fn agent_vectors() -> Vec<Vector> {
     vec![
-        // 0x0e AgentOpen: u32 chan. Four bytes, not eight — the one place an id
-        // on this wire is not a u64.
+        // 0x0d AgentOpen: header only. One connection is served at a time, so there is
+        // nothing to name, and the frame is the boundary rather than an address.
         Vector {
-            frame: Frame::AgentOpen { chan: 3 },
-            bytes: &[0x0e, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x03],
+            frame: Frame::AgentOpen,
+            bytes: &[0x0d, 0x00, 0x00, 0x00],
         },
-        // 0x0f AgentData: u32 chan, opaque bytes. The payload here is a real
-        // `ssh-agent` request — length 1, type 11 (REQUEST_IDENTITIES) — to make
+        // 0x0e AgentData: opaque bytes, the whole payload. What is written here is a
+        // real `ssh-agent` request — length 1, type 11 (REQUEST_IDENTITIES) — to make
         // the point that the daemon never parses it.
         Vector {
             frame: Frame::AgentData {
-                chan: 3,
                 data: b"\x00\x00\x00\x01\x0b",
             },
             bytes: &[
-                0x0f, 0x00, 0x00, 0x09, // header: len = 4 + 5
-                0x00, 0x00, 0x00, 0x03, // chan
+                0x0e, 0x00, 0x00, 0x05, // header: len = 5
                 0x00, 0x00, 0x00, 0x01, 0x0b,
             ],
         },
-        // 0x10 AgentClose: u32 chan.
+        // 0x0f AgentClose: header only, like the open it answers.
         Vector {
-            frame: Frame::AgentClose { chan: 3 },
-            bytes: &[0x10, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x03],
+            frame: Frame::AgentClose,
+            bytes: &[0x0f, 0x00, 0x00, 0x00],
         },
     ]
 }
@@ -516,34 +508,15 @@ fn the_length_field_is_a_u24_past_its_low_byte() {
     }
 }
 
-/// Every number this wire freezes, held against the document rather than against
-/// itself.
-///
-/// It matters because the far end is a separate codebase built from the document: a
-/// client whose § 2.2 disagrees is turned away at the handshake, and one built from a
-/// § 2.1 sending a legal 256 KiB frame collects `Error{Protocol}`. So the numbers are
-/// written out by hand, each carrying the section it was read from — that citation is
-/// the difference between a failure here and one answered by editing the expectation.
+/// Every number this wire freezes, written out by hand with the section it was read
+/// from, so a failure here is the code moving away from the document.
 ///
 /// A frame carries one enumerator at a time, so the vectors above pin one value of each
-/// set and a table is the only way to reach the rest; without it the daemon and this
-/// suite would both name them symbolically and so agree on any renumbering, while only
-/// the client disagreed. Both directions, for the reason the module doc gives:
-/// `from_u16(as_u16(c)) == c` holds under any renumbering consistent with itself. And
-/// *which* values each set must carry is swept from its `ALL` rather than written down
-/// twice, so one added to the protocol and not to this table fails here.
-///
-/// The two scalars are each already held against a hand-written literal — the `Hello`
-/// vectors write `PROTOCOL_VERSION` out as `6`, and the largest legal frame in
-/// [`the_length_field_is_a_u24_past_its_low_byte`] encodes its length as `0x04_00_00` —
-/// so moving either alone already fails. What that cannot see is the edit moving the
-/// constant *and* the literals together, which is what a revision bump looks like and
-/// is a change to the wire § 2.1 and § 2.2 have not been told about.
-///
-/// The id length § 6.3 fixes and the channel cap § 6.7 fixes are pinned this same way
-/// beside the code that enforces them, by
-/// `rundir::tests::the_session_id_bound_is_the_one_the_document_gives` and
-/// `agent::tests::the_channel_cap_is_the_one_the_document_gives`.
+/// set and a table is the only way to reach the rest; *which* values it must carry is
+/// swept from each set's `ALL`, so one added to the protocol and not to this table fails
+/// here. The two scalars are already pinned by the vectors' literals, but only alongside
+/// them: the edit that moves the constant *and* the literals together is a revision bump
+/// § 2.1 and § 2.2 have not been told about.
 #[test]
 fn the_frozen_numbers_are_the_ones_the_document_gives() {
     /// One closed set, written the way § 2.2 writes it.
@@ -564,8 +537,8 @@ fn the_frozen_numbers_are_the_ones_the_document_gives() {
         (
             "PROTOCOL_VERSION",
             u64::from(PROTOCOL_VERSION),
-            6,
-            "§ 2.2 puts the current revision at 6",
+            7,
+            "§ 2.2 puts the current revision at 7",
         ),
         (
             "MAX_PAYLOAD",

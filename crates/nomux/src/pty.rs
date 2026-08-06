@@ -68,9 +68,8 @@ impl Pty {
         unlockpt(&master)?;
         let slave_path = ptsname(&master, Vec::new())?;
 
-        // Non-blocking master (§ 6.1), so that a child which has stopped reading cannot
-        // wedge the event loop; unwritten input waits in `pending_input` instead. The
-        // slave is a separate open and stays blocking, as the child expects of its stdio.
+        // Non-blocking master (§ 6.1). The slave is a separate open and stays blocking,
+        // as the child expects of its stdio.
         let flags = rustix::fs::fcntl_getfl(&master)?;
         rustix::fs::fcntl_setfl(&master, flags | OFlags::NONBLOCK)?;
 
@@ -107,8 +106,7 @@ impl Pty {
         let slave_fd = slave.as_raw_fd();
         // Bound out here rather than written inside the `unsafe` block below, and
         // load-bearing for it: unsafe context reaches lexically into a closure body, so
-        // every unsafe call in here would compile with no block of its own and
-        // `undocumented_unsafe_blocks` would have nothing to fire on.
+        // the calls in here would need no block of their own for the lint to fire on.
         let pre_exec = move || {
             rustix::process::setsid()?;
             // SAFETY: `slave_fd` is open in the child, inherited across fork.
@@ -271,9 +269,7 @@ impl Pty {
 
 /// The start time of the process holding `pid`, in clock ticks since boot.
 ///
-/// The other half of a pid's identity, and never read for its value: two of these are
-/// only ever compared. Field 22, counted through the same fixed-width tail
-/// [`stat_session`] reads.
+/// Never read for its value: two of these are only ever compared.
 fn start_time(pid: i32) -> Option<u64> {
     stat_start_time(&std::fs::read(format!("/proc/{pid}/stat")).ok()?)
 }
@@ -420,8 +416,6 @@ mod tests {
     use super::*;
     use crate::nbio::{Read, read_or_eof};
 
-    /// A `comm` field is whatever the process called its executable, parentheses and
-    /// spaces included, and the fields that matter here sit after it.
     #[test]
     fn a_stat_line_parses_past_a_hostile_process_name() {
         let ordinary = b"42 (bash) S 1 42 42 34816 99 4194304 0 0";
@@ -436,9 +430,8 @@ mod tests {
             "the session must come from after the *last* paren"
         );
 
-        // A `comm` the kernel does not escape and UTF-8 cannot hold. Read as a
-        // string the whole line is undecodable, so this process would survive
-        // `nomux kill` while the daemon reported a clean shutdown.
+        // A `comm` the kernel does not escape and UTF-8 cannot hold: read as a string
+        // the whole line is undecodable.
         let not_utf8 = b"42 (ba\xffsh) S 1 42 42 34816 99 4194304 0 0";
         assert_eq!(
             stat_session(not_utf8),

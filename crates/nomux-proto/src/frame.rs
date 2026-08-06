@@ -60,9 +60,8 @@ pub const HELLO_REPAINT_CTRL_L: u8 = 1 << 1;
 /// Bits defined in `Hello`'s flags byte. Anything else set is a protocol error.
 const HELLO_FLAG_BITS: u8 = HELLO_AGENT_FORWARD | HELLO_REPAINT_CTRL_L;
 
-/// Refuses a [`Hello::term`] carrying an interior NUL, on the way *out* as well as
-/// in, for the reason `IMPLEMENTATION.md` § 2.2 gives: nothing else catches it, and
-/// let through it surfaces as `Error{Internal}` from the child's `execve`.
+/// Refuses a [`Hello::term`] carrying an interior NUL, on the way *out* as well as in,
+/// for the reason `IMPLEMENTATION.md` § 2.2 gives.
 fn checked_term(term: &str) -> Result<(), ProtoError> {
     if term.as_bytes().contains(&0) {
         return Err(ProtoError::Malformed("TERM contains a NUL byte"));
@@ -108,9 +107,8 @@ impl Hello<'_> {
 wire_enum! {
     /// Whether the daemon's session outlives the user's last logout.
     ///
-    /// The daemon cannot stop `logind` from killing it at logout, so it reports the
-    /// state and the client warns (`IMPLEMENTATION.md` § 6.2). A byte of [`HelloOk`]
-    /// in its own right rather than two bits inside its flags, per § 2.3.
+    /// Reported rather than worked around, and a byte of [`HelloOk`] in its own right
+    /// rather than bits inside its flags (`IMPLEMENTATION.md` § 6.2, § 2.3).
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     Linger: u8, as_byte / from_byte,
     /// Not determined: no `systemd`, or its state is unreadable. Do not warn —
@@ -147,9 +145,8 @@ impl HelloOk {
     /// Whether output was dropped before [`HelloOk::resume_from`], leaving the stream
     /// discontinuous for a client that asked to resume at `out_offset`.
     ///
-    /// Derived rather than carried: each of `IMPLEMENTATION.md` § 4.2's branches
-    /// already decides it, and the client already holds the `out_offset` it sent.
-    /// § 4.2 carries the argument.
+    /// Derived rather than carried on the wire, for the reason `IMPLEMENTATION.md`
+    /// § 2.3 gives.
     #[must_use]
     pub const fn gap(&self, out_offset: u64) -> bool {
         self.resume_from > out_offset
@@ -195,13 +192,6 @@ pub enum Frame<'a> {
         /// Raw bytes from the PTY master.
         data: &'a [u8],
     },
-    /// Advisory acknowledgement of consumed output.
-    ///
-    /// Payload-free: the daemon tracks what it has sent by itself and never trims the
-    /// ring on an ack (`IMPLEMENTATION.md` § 3, § 4), so what this frame does is
-    /// *arrive* — it wakes the loop and lets a replay that stopped on a full socket
-    /// resume.
-    OutputAck,
     /// New terminal dimensions.
     Resize(WinSize),
     /// Output was discarded by ring overflow.
@@ -234,23 +224,19 @@ pub enum Frame<'a> {
         /// Human-readable detail.
         message: &'a str,
     },
-    /// A process connected to the session's agent socket.
-    AgentOpen {
-        /// Daemon-allocated channel id.
-        chan: u32,
-    },
-    /// Opaque `ssh-agent` bytes for one channel.
+    /// A process connected to the session's agent socket, and the client is to open one
+    /// of its own to the real agent.
+    ///
+    /// Carries nothing, one connection being served at a time, and kept even so where
+    /// [`Frame::AgentData`] alone would nearly serve (`IMPLEMENTATION.md` § 6.7).
+    AgentOpen,
+    /// Opaque `ssh-agent` bytes for the connection being served.
     AgentData {
-        /// Channel id.
-        chan: u32,
         /// Bytes, never parsed by the daemon.
         data: &'a [u8],
     },
-    /// One agent channel is finished.
-    AgentClose {
-        /// Channel id.
-        chan: u32,
-    },
+    /// The served connection is finished.
+    AgentClose,
 }
 
 impl<'a> Frame<'a> {
@@ -263,7 +249,6 @@ impl<'a> Frame<'a> {
             Self::Input { .. } => FrameType::Input,
             Self::InputAck { .. } => FrameType::InputAck,
             Self::Output { .. } => FrameType::Output,
-            Self::OutputAck => FrameType::OutputAck,
             Self::Resize(_) => FrameType::Resize,
             Self::Gap { .. } => FrameType::Gap,
             Self::Exit { .. } => FrameType::Exit,
@@ -271,9 +256,9 @@ impl<'a> Frame<'a> {
             Self::Ping => FrameType::Ping,
             Self::Pong => FrameType::Pong,
             Self::Error { .. } => FrameType::Error,
-            Self::AgentOpen { .. } => FrameType::AgentOpen,
+            Self::AgentOpen => FrameType::AgentOpen,
             Self::AgentData { .. } => FrameType::AgentData,
-            Self::AgentClose { .. } => FrameType::AgentClose,
+            Self::AgentClose => FrameType::AgentClose,
         }
     }
 
@@ -350,18 +335,12 @@ impl<'a> Frame<'a> {
                 out.push(kind.as_byte());
                 out.extend_from_slice(&since_exit_secs.to_be_bytes());
             }
-            Self::Detach | Self::OutputAck | Self::Ping | Self::Pong => {}
+            Self::Detach | Self::Ping | Self::Pong | Self::AgentOpen | Self::AgentClose => {}
             Self::Error { code, message } => {
                 out.extend_from_slice(&code.as_u16().to_be_bytes());
                 out.extend_from_slice(message.as_bytes());
             }
-            Self::AgentOpen { chan } | Self::AgentClose { chan } => {
-                out.extend_from_slice(&chan.to_be_bytes());
-            }
-            Self::AgentData { chan, data } => {
-                out.extend_from_slice(&chan.to_be_bytes());
-                out.extend_from_slice(data);
-            }
+            Self::AgentData { data } => out.extend_from_slice(data),
         }
         Ok(())
     }
@@ -435,7 +414,6 @@ impl<'a> Frame<'a> {
             FrameType::InputAck => Self::InputAck {
                 applied_through: r.u64()?,
             },
-            FrameType::OutputAck => Self::OutputAck,
             FrameType::Resize => Self::Resize(r.win()?),
             FrameType::Gap => Self::Gap {
                 new_base_offset: r.u64()?,
@@ -455,12 +433,9 @@ impl<'a> Frame<'a> {
                 message: core::str::from_utf8(r.rest())
                     .map_err(|_| ProtoError::Malformed("error message is not UTF-8"))?,
             },
-            FrameType::AgentOpen => Self::AgentOpen { chan: r.u32()? },
-            FrameType::AgentClose => Self::AgentClose { chan: r.u32()? },
-            FrameType::AgentData => Self::AgentData {
-                chan: r.u32()?,
-                data: r.rest(),
-            },
+            FrameType::AgentOpen => Self::AgentOpen,
+            FrameType::AgentClose => Self::AgentClose,
+            FrameType::AgentData => Self::AgentData { data: r.rest() },
         };
 
         // Every fixed-size frame must have consumed its payload exactly; the

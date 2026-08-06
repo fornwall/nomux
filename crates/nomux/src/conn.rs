@@ -11,14 +11,11 @@ use std::os::unix::net::UnixStream;
 
 use nomux_proto::{Frame, FrameType, HEADER_LEN, Header, MAX_PAYLOAD, decode_header};
 
-/// Stop queueing output once this much is already waiting for a slow client; the
-/// ring absorbs the PTY regardless, so a stalled client costs a gap and never a
-/// blocked child (`IMPLEMENTATION.md` § 4.1).
+/// Stop queueing output once this much is already waiting for a slow client
+/// (`IMPLEMENTATION.md` § 4.1).
 const MAX_PENDING_WRITE: usize = 1 << 20;
 
-/// Queue size at which a client is treated as gone rather than slow: the frames that
-/// *answer* a client are queued regardless of [`MAX_PENDING_WRITE`], so a peer that
-/// writes without ever reading grows this queue without bound (§ 4.1).
+/// Queue size at which a client is treated as gone rather than slow (§ 4.1).
 const ABANDON_PENDING_WRITE: usize = 8 << 20;
 
 /// Stop reading from the socket once this much undecoded input is already buffered.
@@ -119,8 +116,7 @@ impl Conn {
         self.tx.len() - self.tx_pos >= MAX_PENDING_WRITE
     }
 
-    /// Whether this peer has stopped reading altogether: past
-    /// [`ABANDON_PENDING_WRITE`] it is not slow but gone, which that constant has.
+    /// Whether this peer has stopped reading altogether ([`ABANDON_PENDING_WRITE`]).
     #[must_use]
     pub(crate) const fn is_write_hopeless(&self) -> bool {
         self.tx.len() - self.tx_pos >= ABANDON_PENDING_WRITE
@@ -166,10 +162,10 @@ impl Conn {
 
     /// Queues agent bytes as one or more `AgentData` frames, splitting at
     /// [`MAX_PAYLOAD`].
-    pub(crate) fn send_agent_data(&mut self, chan: u32, data: &[u8]) {
-        // Leave room for the 4-byte channel id that shares the payload.
-        for part in data.chunks(MAX_PAYLOAD as usize - 4) {
-            self.send(&Frame::AgentData { chan, data: part });
+    pub(crate) fn send_agent_data(&mut self, data: &[u8]) {
+        // The whole payload is the bytes, so the chunk is the cap itself.
+        for part in data.chunks(MAX_PAYLOAD as usize) {
+            self.send(&Frame::AgentData { data: part });
         }
     }
 
@@ -365,7 +361,6 @@ mod tests {
                 data: payload,
             },
             Frame::AgentData {
-                chan: 3,
                 data: &payload[..7],
             },
         ]

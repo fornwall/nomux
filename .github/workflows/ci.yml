@@ -40,9 +40,7 @@ env:
 # their major tag deliberately — GitHub's own, inside a trust boundary the job is
 # already entirely within.
 jobs:
-  # The pre-commit gate, run by prek itself rather than restated here, so the commands
-  # live in .pre-commit-config.yaml and nowhere else. One job, so the workspace and its
-  # dependencies are compiled against a single cache.
+  # One job, so the workspace and its dependencies are compiled against a single cache.
   check:
     name: fmt, clippy, tests
     runs-on: ubuntu-latest
@@ -161,22 +159,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Read rather than repeated here: scripts/build-release.sh defaults to the same
-      # file, so this job and a laptop build use one compiler and their sizes are
-      # comparable against a baseline recorded by it. A literal here would let the two
-      # drift, which is how a local run comes to fail on growth nobody introduced.
+      # Read rather than repeated here, so this job and a laptop build use one compiler
+      # and their sizes are comparable (scripts/build-release.sh says why).
       #
-      # A plain assignment rather than `echo "...=$(cat ...)"`, because the default
-      # shell is `bash -e` without `pipefail`: a failing substitution inside `echo`
-      # does not fail `echo`, so a renamed or missing file left this step green with
-      # an empty value — for the one file that names the release compiler. `set -e`
-      # does fail an assignment whose substitution failed.
+      # A plain assignment, not `echo "version=$(cat ...)"`: the default shell is
+      # `bash -e` without `pipefail`, so a failed substitution inside `echo` would leave
+      # this step green with an empty value. `set -e` does fail the assignment form.
       #
-      # An output rather than $GITHUB_ENV, which would put the toolchain name in the
-      # environment of every later step including the build, where nothing should be
-      # reading a compiler from anywhere but the pinned file. As an output it reaches
-      # only the step below, so build-release.sh reads scripts/nightly-version itself
-      # — the same branch a laptop build takes.
+      # An output rather than $GITHUB_ENV, so it reaches only the step below and nothing
+      # else in the job can read a compiler from anywhere but the pinned file.
       - name: Read the pinned release nightly
         id: nightly
         run: |

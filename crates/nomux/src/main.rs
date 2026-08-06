@@ -98,8 +98,8 @@ fn only(mut args: impl Iterator<Item = OsString>, word: &str, run: fn() -> ExitC
 
 /// Prints `message` where there is one, then the usage, and reports `EX_USAGE`.
 ///
-/// Every way to misuse the command line ends here, so what a usage error consists
-/// of — the message, the usage, and 64 — is decided once.
+/// Every way to misuse the command line ends here, so what a usage error consists of
+/// is decided once.
 fn usage_error(message: Option<&str>) -> ExitCode {
     if let Some(message) = message {
         // Escaped here rather than at each of the five places one is built: what all
@@ -183,8 +183,6 @@ fn parse_session_args(
             }
             _ => return Err(format!("unexpected argument `{text}`")),
         };
-        // The one spelling of "seen a `--label` already", rather than a second
-        // predicate beside the match that decides it.
         if label.replace(value).is_some() {
             return Err("`--label` is given once: a second would replace the first".to_owned());
         }

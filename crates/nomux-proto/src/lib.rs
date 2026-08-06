@@ -17,11 +17,9 @@ pub use frame::{
 
 /// Protocol revision. Bumped on any wire change, including compatible ones.
 ///
-/// `IMPLEMENTATION.md` § 2.2 owns the history. The number is held against that
-/// section by `the_frozen_numbers_are_the_ones_the_document_gives` and against the
-/// handshake vectors' literal by `the_vectors_pin_every_value_of_every_closed_set`,
-/// so a bump has to move the constant, the vectors and the document.
-pub const PROTOCOL_VERSION: u16 = 6;
+/// `IMPLEMENTATION.md` § 2.2 owns the history, and `tests/wire.rs` holds the constant,
+/// the vectors and the document to each other: a bump has to move all three.
+pub const PROTOCOL_VERSION: u16 = 7;
 
 /// Fixed frame header size, so reads are a two-stage `read_exact`.
 pub const HEADER_LEN: usize = 4;
@@ -90,28 +88,26 @@ wire_enum! {
     InputAck = 0x04,
     /// PTY output, at an absolute offset in the output stream.
     Output = 0x05,
-    /// Client has consumed output. Advisory, payload-free, and never trims the ring.
-    OutputAck = 0x06,
     /// Window size change, applied via `TIOCSWINSZ`.
-    Resize = 0x07,
+    Resize = 0x06,
     /// Output was discarded by ring overflow; the stream is discontinuous.
-    Gap = 0x08,
+    Gap = 0x07,
     /// The child process terminated.
-    Exit = 0x09,
+    Exit = 0x08,
     /// Client leaves without terminating the session.
-    Detach = 0x0a,
+    Detach = 0x09,
     /// Liveness probe.
-    Ping = 0x0b,
+    Ping = 0x0a,
     /// Liveness response.
-    Pong = 0x0c,
+    Pong = 0x0b,
     /// Daemon-side failure; the connection closes after this.
-    Error = 0x0d,
-    /// A process connected to the session's agent socket; open a peer channel.
-    AgentOpen = 0x0e,
-    /// Opaque `ssh-agent` protocol bytes for one agent channel.
-    AgentData = 0x0f,
-    /// One agent channel is finished, in either direction.
-    AgentClose = 0x10,
+    Error = 0x0c,
+    /// A process connected to the session's agent socket; open one to the real agent.
+    AgentOpen = 0x0d,
+    /// Opaque `ssh-agent` protocol bytes for the connection being served.
+    AgentData = 0x0e,
+    /// The served connection is finished, in either direction.
+    AgentClose = 0x0f,
 }
 
 /// A decoded frame header.

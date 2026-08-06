@@ -156,12 +156,12 @@ A forwarded `ssh-agent` socket belongs to one SSH connection and is unlinked whe
 closes, so a persistent session loses the agent on first reconnect — `git push` and
 nested `ssh` break for the rest of its life, the most-complained-about `tmux` behaviour
 and one that would undercut §5.3. nomux forwards the agent **itself**: the daemon owns
-a socket for the session's whole life and proxies each connection to the client as a
-protocol sub-channel, answered from the client's own key store. Nothing dangles or
-needs refreshing, and no environment has to be re-read — which the warm path (§6.1)
+a socket for the session's whole life and proxies one connection at a time to the client
+over the session's own stream, answered from the client's own key store. Nothing dangles
+or needs refreshing, and no environment has to be re-read — which the warm path (§6.1)
 could not do anyway, running no process on the server.
 
-- The protocol gains sub-channels ([IMPLEMENTATION.md § 6.7](IMPLEMENTATION.md#67-agent-forwarding)) — the one place the design multiplexes, a deliberate and bounded exception.
+- The agent is a **single serialized pipe**, not a sub-channel: one peer served at a time, the next left waiting in the listen backlog ([IMPLEMENTATION.md § 6.7](IMPLEMENTATION.md#67-agent-forwarding)). So §2's refusal to multiplex holds with no exception at all, and what it costs is a bounded wait — bounded because a stalled peer is given up after a minute, generous enough that the client can put a signature in front of a human first.
 - It works **without** `ForwardAgent`, bypassing a deliberate user decision, so it is opt-in per host and off by default.
 - Because the client sees every request it *can* prompt per signature or name the asking session, which plain `ssh -A` can never do.
 - It **loses** OpenSSH's destination constraints: `ssh-add -h` binds a key to a hop and `ssh(1)` enforces that with `session-bind@openssh.com` down each forwarded agent connection, but the daemon here is an opaque byte pipe and the client re-originates against the real agent, so without a synthesised binding for the session's hop a constrained key is refused outright or used with its constraint silently unapplied ([IMPLEMENTATION.md § 6.7](IMPLEMENTATION.md#67-agent-forwarding)). The per-host opt-in is the compensating control.

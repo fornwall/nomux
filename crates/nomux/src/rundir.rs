@@ -70,10 +70,6 @@ fn write_private(path: &Path, body: &[u8]) -> io::Result<()> {
 }
 
 /// Binds a unix socket at exactly [`SOCKET_MODE`], never briefly wider ([`with_umask`]).
-///
-/// # Errors
-///
-/// Propagates the `bind`.
 pub(crate) fn bind_socket_private(path: &Path) -> io::Result<UnixListener> {
     with_umask(SOCKET_MODE, || UnixListener::bind(path))
 }
@@ -257,10 +253,6 @@ fn absolute_env(key: &str) -> Option<std::ffi::OsString> {
 ///
 /// The precedence and the reason for each half are § 6.3's, as is the rule
 /// [`absolute_env`] applies to every source.
-///
-/// # Errors
-///
-/// Fails when none of `XDG_RUNTIME_DIR`, `XDG_STATE_HOME` or `HOME` is an absolute path.
 pub(crate) fn run_dir() -> io::Result<PathBuf> {
     if let Some(dir) = absolute_env("XDG_RUNTIME_DIR") {
         return Ok(PathBuf::from(dir).join("nomux"));
@@ -282,10 +274,6 @@ pub(crate) fn run_dir() -> io::Result<PathBuf> {
 /// That check runs first, so the ordinary case costs one `open` and one `fstat`, and a
 /// plain file at the path is reported as what it is rather than as an `EEXIST` naming
 /// nothing.
-///
-/// # Errors
-///
-/// See [`check_run_dir`], plus a directory that cannot be created.
 fn ensure_dir_at(dir: &Path) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     match check_run_dir(dir) {
@@ -313,13 +301,10 @@ fn ensure_dir_at(dir: &Path) -> io::Result<()> {
 /// who else may create names in it. The file type is the kernel's answer rather than a
 /// second `fstat` of ours, which could disagree with the descriptor it describes.
 ///
-/// The descriptor is dropped at the end and the run files go on being opened by path,
-/// deliberately: there is no `bindat(2)`, so the two sockets that decide who a session talks
-/// to must be resolved by name whatever this returns (§ 6.3), and holding it would pin the
-/// filesystem § 6.2 lets go of. What is established is one link — nobody but this uid can
-/// put a name in *this* directory. Every component above it is trusted, so a parent somebody
-/// else can write to is a run directory they can replace, a gap `DESIGN.md` § 8 states
-/// rather than closes.
+/// The descriptor is dropped at the end and the run files go on being opened by name
+/// (§ 6.3), deliberately: holding it would pin the filesystem § 6.2 lets go of. What is
+/// established is one link — nobody but this uid can put a name in *this* directory — and
+/// every component above it is trusted, a gap `DESIGN.md` § 8 states rather than closes.
 ///
 /// # Errors
 ///
@@ -429,15 +414,10 @@ fn refuse_errno(dir: &Path, err: rustix::io::Errno, problem: &str) -> io::Error 
 
 /// Returns whether `id` is usable as a session id.
 ///
-/// Ids are minted by the client and used directly as filename components, so the accepted
-/// set is deliberately narrow — 1..=64 bytes of `[A-Za-z0-9_-]`, never a leading `-` (§ 6.3)
-/// — which makes path traversal impossible by construction rather than by escaping. The
-/// leading `-` is the command line's bound rather than the filesystem's: `main` reads any
-/// argument beginning with one as an option, so such an id could be minted and then never
-/// spawned, attached or killed.
-///
-/// An invalid id is a hard error at both ends and is never sanitised: rewriting one into a
-/// valid id would silently attach the user to the wrong session.
+/// § 6.3 has the accepted set and both bounds behind it — one the filesystem's, one the
+/// command line's, `main` reading any leading-`-` argument as an option. Never sanitised
+/// into something valid: rewriting an id would silently attach the user to the wrong
+/// session.
 #[must_use]
 fn is_valid_session_id(id: &str) -> bool {
     !id.is_empty()
@@ -451,13 +431,8 @@ fn is_valid_session_id(id: &str) -> bool {
 /// The session a name in the run directory belongs to, if it belongs to one.
 ///
 /// The inverse of [`SessionPaths::with_extension`], and the one rule by which anything here
-/// learns an id from a directory rather than from a caller.
-///
-/// A glob rather than an enumeration, since § 6.6 freezes those five names and not the
-/// *set*: an id whose last remaining file is a name this build never heard of is an id it
-/// never learns, so the `kill` that would clear it can never be typed. The id is what
-/// precedes the **first** `.`, not a prefix — `sess.sock` and `sess2.sock` are two
-/// sessions — and a name with no `.` is nobody's.
+/// learns an id from a directory rather than from a caller — the glob § 6.6 rests growth on,
+/// so the id is what precedes the **first** `.` and a name with no `.` is nobody's.
 ///
 /// Validated before it is handed back ([`is_valid_session_id`], § 6.3): every caller derives
 /// a path, a probe or a signal from it, and these bytes came out of a directory.
@@ -546,10 +521,8 @@ impl SessionPaths {
     /// Creates the run directory with owner-only permissions, and refuses one that is not
     /// this user's alone.
     ///
-    /// # Errors
-    ///
-    /// See [`ensure_dir_at`], which holds the whole of this so that a test can point it at
-    /// a directory of its own.
+    /// [`ensure_dir_at`] holds the whole of this so that a test can point it at a directory
+    /// of its own.
     pub(crate) fn ensure_dir(&self) -> io::Result<()> {
         ensure_dir_at(&self.dir)
     }
@@ -598,10 +571,6 @@ impl SessionPaths {
     ///
     /// Advisory throughout: a failure here costs `list` a column and nothing else, so the
     /// caller is expected to ignore it rather than refuse a session over a decoration.
-    ///
-    /// # Errors
-    ///
-    /// Propagates failures to create or write the file.
     pub(crate) fn write_label(&self, label: &str) -> io::Result<()> {
         let label = sanitize_label(label);
         if label.is_empty() {
@@ -687,8 +656,6 @@ impl SessionPaths {
             });
             let fd = match opened {
                 Ok(fd) => fd,
-                // Only a failure of the *file* licenses proceeding without a lock, and
-                // [`no_lock_here`] is the whole of that list.
                 Err(err) => return no_lock_here(err).then(SpawnLock::unavailable),
             };
             loop {
@@ -727,8 +694,6 @@ impl SessionPaths {
     /// The first failure that is not an absence, once every path has been tried. § 6.6
     /// says why absence is success here and why anything else has to reach `kill`.
     pub(crate) fn unlink_all_locked(&self, _lock: &SpawnLock) -> io::Result<()> {
-        // Every path is attempted before the first failure is returned: they are
-        // independent, and stopping at one would leave the rest of a session behind.
         let mut failure = Ok(());
         for path in self.removal_order() {
             if let Err(err) = fs::remove_file(path)
@@ -766,8 +731,7 @@ impl SessionPaths {
                 }
             }
         }
-        // `<id>.lock` last, and the ordering is load-bearing: the instant that name is
-        // gone the caller's lock guards nothing ([`SpawnLock`]), so the unlinks still to
+        // `<id>.lock` last (§ 6.3), and the ordering is load-bearing: the unlinks still to
         // come would land on a session somebody else has legitimately brought up — and
         // silently, for `<id>.label` and for the `<id>.agent` socket the child's
         // `SSH_AUTH_SOCK` still points at.
@@ -816,12 +780,10 @@ const fn no_lock_here(err: rustix::io::Errno) -> bool {
 ///
 /// It also stands for the *absence* of a lock, on a host that has none to give —
 /// `<id>.lock` at a mode nobody can open, or a filesystem that rejects `flock` outright.
-/// Proceeding without one is deliberate: a lock this process cannot obtain by any means is
-/// one no other process here can be holding either, since every one of them reaches it
-/// through [`SessionPaths::acquire`], on the same file, under the same uid — so refusing
-/// would buy nothing and would cost § 6.6's escape hatch its ability to collect a session
-/// that is genuinely dead. [`no_lock_here`] is the list of errnos that are a failure of the
-/// *file* in that sense.
+/// Proceeding without one is § 6.3's last rule, and it holds only because every acquirer
+/// reaches the lock through [`SessionPaths::acquire`], on the same file, under the same
+/// uid. [`no_lock_here`] is the list of errnos that are a failure of the *file* in that
+/// sense.
 #[derive(Debug)]
 pub(crate) struct SpawnLock {
     /// The locked descriptor: `close(2)` on it releases the lock, so it is held for that.
@@ -892,12 +854,9 @@ pub(crate) fn sanitize_label(label: &str) -> String {
 
 /// Reads a bounded prefix of the regular file at `path`, and hands back what arrived.
 ///
-/// Both files the frozen control surface reads by hand — `<id>.label` and `<id>.pid` — come
-/// through here, and neither is read whole. The write side bounds both; the read side cannot
-/// assume it did, this being the frozen layout (§ 6.6): the daemon that wrote the file may be
-/// any version, and a stray shell redirect into the run directory is not a daemon at all.
-/// `list` and `kill` would stop working on such a host if a file left there decided how much
-/// memory they faulted in, or could park them in a syscall with no end.
+/// Both files the frozen control surface reads by hand come through here (§ 6.6). The write
+/// side bounds both; the read side cannot assume it did, the daemon that wrote either being
+/// any version and a stray shell redirect into the run directory not a daemon at all.
 ///
 /// Nothing but a regular file is read from, and that is what makes one read enough: a regular
 /// file hands back what was asked for or reaches its end, where a FIFO hands back whatever
@@ -950,9 +909,8 @@ pub(crate) fn read_label(path: &Path) -> String {
 ///
 /// Zero and negatives are refused: `kill(2)` reads those as a whole process group and as
 /// every process the caller may signal. A body that reached [`MAX_PID_LEN`] is refused for
-/// § 6.6's sharper reason — it is the prefix of a file whose end was never seen, so a number
-/// still running at the last byte is a truncation of somebody else's pid. The layout puts a
-/// pid and a newline there, eleven bytes at the widest, so nothing legitimate reaches it.
+/// § 6.6's asymmetry — it is the prefix of a file whose end was never seen. The layout puts
+/// a pid and a newline there, eleven bytes at the widest, so nothing legitimate reaches it.
 pub(crate) fn parse_pid(body: &[u8]) -> Option<i32> {
     if body.len() >= MAX_PID_LEN {
         return None;
@@ -1027,9 +985,7 @@ mod tests {
     }
 
     /// Three answers for one field, separated by what can still be done about the
-    /// mode: repaired wherever the owner can open the directory, refused where group
-    /// or other can write to it, and refused where nobody can open it at all. The
-    /// three loops below are those three answers; [`check_run_dir`] argues them.
+    /// mode; the three loops below are those answers and [`check_run_dir`] argues them.
     #[test]
     fn a_run_directory_mode_is_repaired_where_it_can_be_and_refused_where_it_cannot() {
         let root = Scratch::new("rundir-mode");
@@ -1405,10 +1361,8 @@ mod tests {
                 "{sneaky:?} reached the terminal"
             );
         }
-        // Either side of the three ranges, so the filter is not simply eating `Cf`.
-        // That it is not is the decision [`sanitize_text`] argues: ZWJ and ZWNJ are
-        // `Cf` and are how correctly typed labels are spelled, so the line is drawn at
-        // the classes that reorder or hide rather than around the category.
+        // Either side of the three ranges, so the filter is not simply eating `Cf` —
+        // the line [`sanitize_text`] draws, and why it is drawn there.
         assert_eq!(
             sanitize_label("\u{61b}a\u{2065}a\u{206a}"),
             "\u{61b}a\u{2065}a\u{206a}"

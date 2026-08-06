@@ -1,8 +1,8 @@
 //! The daemon half of agent forwarding (`IMPLEMENTATION.md` § 6.7).
 //!
-//! Nothing here parses the `ssh-agent` protocol — a channel is a byte pipe, exactly
-//! like the PTY stream — and nothing here talks to the client, so the frame traffic
-//! stays in one place, in `daemon.rs`.
+//! Nothing here parses the `ssh-agent` protocol — the served connection is a byte pipe,
+//! exactly like the PTY stream — and nothing here talks to the client, so the frame
+//! traffic stays in one place, in `daemon.rs`.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -10,31 +10,44 @@ use std::io;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::nbio::Read;
 
-/// Most concurrent agent channels one session will serve
+/// Most the served connection may hold for a local peer that has stopped reading
 /// (`IMPLEMENTATION.md` § 6.7).
 ///
-/// Daemon policy rather than anything the wire imposes — no frame field is bounded by
-/// it — so it is enforced here, in the `accept` that turns it down. `pub(crate)`
-/// because `daemon` sizes its poll set against it.
-pub(crate) const MAX_AGENT_CHANNELS: u32 = 8;
-
-/// Most a single channel may hold for a local peer that has stopped reading
-/// (`IMPLEMENTATION.md` § 6.7).
-///
-/// The ceiling that matters is the product: eight channels all at the limit is 2 MiB,
-/// half the default ring rather than a rounding error against it.
+/// An agent exchange is a few hundred bytes, so this is already three orders of
+/// magnitude past anything legitimate; what it bounds is the peer that has stopped
+/// reading altogether, at a quarter of the default ring rather than beside it.
 const MAX_CHANNEL_QUEUE: usize = 256 * 1024;
+
+/// How long the served connection may move no byte in either direction before the
+/// daemon gives it up (`IMPLEMENTATION.md` § 6.7).
+///
+/// Nothing here parses the agent protocol, so a peer stalled mid-request is
+/// indistinguishable from one legitimately waiting on a slow reply — and the client may
+/// be putting a signature in front of a human to approve, which is why the window is a
+/// generous minute against the sub-second an exchange actually takes. Without it one
+/// peer that connects and never closes holds every later agent user off for the life of
+/// the session, there being only the one slot.
+///
+/// Measured from the last byte rather than from the accept: `ssh(1)` holds a single
+/// agent connection across a whole authentication and issues several requests down it,
+/// which a first-byte deadline would cut off partway.
+#[expect(
+    clippy::duration_suboptimal_units,
+    reason = "Duration::from_mins is unstable on the pinned 1.97.1 toolchain"
+)]
+const AGENT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Outcome of one attempt to take a connection off the agent socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Accept {
-    /// A channel was opened, and the client is owed an `AgentOpen` for it.
-    Opened(u32),
-    /// Nothing came of this pass: an empty backlog, or a connection closed on the
-    /// spot because nothing could serve it.
+    /// A connection is being served, and the client is owed an `AgentOpen`.
+    Opened,
+    /// Nothing came of this pass: an empty backlog, a connection closed on the spot
+    /// because nothing could serve it, or a slot that was already taken.
     Idle,
     /// The `accept` failed for something that will still be there on the next pass,
     /// so the listener has to leave the poll set for a while — `daemon`'s
@@ -42,44 +55,47 @@ pub(crate) enum Accept {
     Failed,
 }
 
-/// Outcome of one attempt to drain a channel's queue.
+/// Outcome of one attempt to drain the queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Flush {
     /// Still in use, whether or not anything is left queued.
     Open,
-    /// Nothing more will be written: the client closed this channel and the last of
-    /// what it sent has reached the waiting process, or there is no such channel
+    /// Nothing more will be written: the client closed this connection and the last of
+    /// what it sent has reached the waiting process, or there is no connection at all
     /// because it closed while a frame for it was in flight. Forget it *without*
     /// telling the client, which closed it and is not waiting to hear so.
     Finished,
-    /// The write failed on a channel the client still holds; the local peer is gone
+    /// The write failed on a connection the client still holds; the local peer is gone
     /// and the client needs telling.
     Failed,
 }
 
-/// One proxied connection to the agent socket.
+/// The one proxied connection to the agent socket.
 #[derive(Debug)]
 struct Channel {
-    id: u32,
     stream: UnixStream,
     /// Bytes from the client waiting for the local socket to accept them.
     pending: VecDeque<u8>,
     /// The client closed its end; drop once `pending` has drained.
     closing: bool,
+    /// When this connection is given up as stalled: [`AGENT_IDLE_TIMEOUT`] past the
+    /// last byte that moved in either direction.
+    idle_deadline: Instant,
 }
 
-/// The agent socket and its live channels.
+impl Channel {
+    /// Pushes the idle deadline out, for a byte that has just moved either way.
+    fn touch(&mut self) {
+        self.idle_deadline = Instant::now() + AGENT_IDLE_TIMEOUT;
+    }
+}
+
+/// The agent socket and the one connection it is serving.
 #[derive(Debug)]
 pub(crate) struct Agent {
     listener: UnixListener,
     path: PathBuf,
-    channels: Vec<Channel>,
-    /// Where [`Agent::take_id`] starts looking for the next id to hand out. No id is
-    /// ever reused while a channel holds it, so a close and an open crossing in
-    /// flight cannot be confused for each other.
-    next_id: u32,
-    /// Whether the cap has already been reported; once is an attachment's worth.
-    capped: bool,
+    channel: Option<Channel>,
 }
 
 impl Agent {
@@ -99,9 +115,7 @@ impl Agent {
         Ok(Self {
             listener,
             path: path.to_path_buf(),
-            channels: Vec::new(),
-            next_id: 1,
-            capped: false,
+            channel: None,
         })
     }
 
@@ -117,37 +131,59 @@ impl Agent {
         self.listener.as_fd()
     }
 
-    /// Every live channel as `(id, fd, wants_write, wants_read)`, for the poll set.
+    /// Whether a connection is being served, and so whether the listener has a slot.
+    #[must_use]
+    pub(crate) const fn is_serving(&self) -> bool {
+        self.channel.is_some()
+    }
+
+    /// The served connection as `(fd, wants_write, wants_read)`, for the poll set.
     ///
-    /// A closing channel wants no reads, and asking for them would spin the loop at full
-    /// tilt: `close_from_client` shuts the read half down, and a unix socket in that
+    /// A closing connection wants no reads, and asking for them would spin the loop at
+    /// full tilt: `close_from_client` shuts the read half down, and a unix socket in that
     /// state reports itself readable on every pass for ever. It stays in the poll set on
     /// `POLLOUT` alone, which is the only thing that can still move it.
-    pub(crate) fn watches(&self) -> impl Iterator<Item = (u32, BorrowedFd<'_>, bool, bool)> {
-        self.channels.iter().map(|chan| {
-            (
-                chan.id,
-                chan.stream.as_fd(),
-                !chan.pending.is_empty(),
-                !chan.closing,
-            )
-        })
+    pub(crate) fn watch(&self) -> Option<(BorrowedFd<'_>, bool, bool)> {
+        let chan = self.channel.as_ref()?;
+        Some((chan.stream.as_fd(), !chan.pending.is_empty(), !chan.closing))
     }
 
-    /// The still-open channel with this id.
+    /// When the served connection falls due for [`Agent::close_if_idle`] — the wakeup
+    /// the poll loop has to arrange, nothing else being able to make it arrive.
+    #[must_use]
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        Some(self.channel.as_ref()?.idle_deadline)
+    }
+
+    /// Gives the served connection up if it has moved no byte in either direction since
+    /// [`AGENT_IDLE_TIMEOUT`] before `now`, reporting whether the client is owed an
+    /// `AgentClose` for it.
     ///
-    /// A scan rather than a keyed lookup: the list is capped at [`MAX_AGENT_CHANNELS`],
-    /// and a `BTreeMap` over eight entries measured 8 KiB of monomorphised B-tree on
-    /// `x86_64` against the 400 KiB budget of `IMPLEMENTATION.md` § 8.
-    fn channel(&mut self, id: u32) -> Option<&mut Channel> {
-        self.channels.iter_mut().find(|chan| chan.id == id)
+    /// `now` is the caller's rather than this function's, so the poll loop tests every
+    /// deadline of one pass against one clock reading, and a test can put the deadline
+    /// behind it without waiting out a minute.
+    pub(crate) fn close_if_idle(&mut self, now: Instant) -> bool {
+        if self.deadline().is_none_or(|at| now < at) {
+            return false;
+        }
+        // A connection the client closed itself is one it has already forgotten, so
+        // abandoning the undeliverable rest of its queue is not news to send back — the
+        // argument [`Flush::Finished`] makes, arrived at by the clock instead. The slot
+        // still has to come back, which is why the clock reaches it at all.
+        let owed = self.channel.as_ref().is_some_and(|chan| !chan.closing);
+        let _ = self.forget();
+        owed
     }
 
-    /// Accepts one connection, returning the channel to announce.
+    /// Accepts one connection, if the slot is free.
     ///
     /// `serving` is whether a client is attached and greeted. When it is not, the
-    /// connection is accepted and dropped on the spot, as is one past the channel cap
-    /// (§ 6.7).
+    /// connection is accepted and dropped on the spot (§ 6.7).
+    ///
+    /// One at a time, and a second connection is left where it is rather than turned
+    /// away: `daemon`'s `watch_for` keeps the listener out of the poll set while this is
+    /// serving, on the same terms and for the same reason as the session listener, so
+    /// what waits in the backlog is greeted when the slot frees.
     ///
     /// Never fails the session. `EMFILE`, `ECONNABORTED` and friends belong to one
     /// connection; propagating them would cost the session its agent socket for good,
@@ -155,6 +191,9 @@ impl Agent {
     /// from an empty backlog, because only one of the two leaves a connection queued
     /// behind it, and a queued connection keeps this descriptor readable.
     pub(crate) fn accept(&mut self, serving: bool) -> Accept {
+        if self.is_serving() {
+            return Accept::Idle;
+        }
         let stream = match self.listener.accept() {
             Ok((stream, _)) => stream,
             // The listener is non-blocking, so an empty backlog is an ordinary
@@ -173,61 +212,21 @@ impl Agent {
         if !serving || stream.set_nonblocking(true).is_err() {
             return Accept::Idle;
         }
-        // Nothing but a detach frees the slot of a closed channel whose peer stopped
-        // reading, and the queue dropped with it is one that peer's socket buffer had no
-        // room for — bytes already in that buffer survive the close and are still read.
-        if self.channels.len() >= MAX_AGENT_CHANNELS as usize
-            && let Some(at) = self.channels.iter().position(|chan| chan.closing)
-        {
-            drop(self.channels.remove(at));
-        }
-        if self.channels.len() >= MAX_AGENT_CHANNELS as usize {
-            if !std::mem::replace(&mut self.capped, true) {
-                let id = crate::rundir::session_id_of(&self.path).unwrap_or_default();
-                crate::syslog::error(id, "agent socket: every channel is in use");
-            }
-            return Accept::Idle;
-        }
-        // Unreachable past the cap above — see [`Agent::take_id`] — and answered by
-        // dropping this one connection rather than by a panic if it ever is not.
-        let Some(id) = self.take_id() else {
-            return Accept::Idle;
-        };
-        self.channels.push(Channel {
-            id,
+        self.channel = Some(Channel {
             stream,
             pending: VecDeque::new(),
             closing: false,
+            idle_deadline: Instant::now() + AGENT_IDLE_TIMEOUT,
         });
-        Accept::Opened(id)
+        Accept::Opened
     }
 
-    /// The next id no live channel holds, or `None` if every candidate is taken.
-    ///
-    /// A wrapping search rather than a bare increment: ids are handed out for the whole
-    /// life of a session that may run for a week. What § 6.7 needs is that no *live*
-    /// channel's id is reissued, which this keeps — at most [`MAX_AGENT_CHANNELS`] are
-    /// live, so one of any nine consecutive candidates is free and `None` cannot be
-    /// reached from a caller that respects the cap.
-    fn take_id(&mut self) -> Option<u32> {
-        for _ in 0..=MAX_AGENT_CHANNELS {
-            let id = self.next_id;
-            // Round to 1 rather than to 0, which no channel has ever worn: it stays
-            // free to read as "no channel" wherever one of these is written down.
-            self.next_id = self.next_id.checked_add(1).unwrap_or(1);
-            if !self.channels.iter().any(|chan| chan.id == id) {
-                return Some(id);
-            }
-        }
-        None
-    }
-
-    /// Reads from one channel's socket.
-    pub(crate) fn read(&mut self, id: u32, buf: &mut [u8]) -> Read {
-        let Some(chan) = self.channel(id) else {
+    /// Reads from the served connection's socket.
+    pub(crate) fn read(&mut self, buf: &mut [u8]) -> Read {
+        let Some(chan) = self.channel.as_mut() else {
             return Read::Eof;
         };
-        // A channel the client has closed has had its read half shut down by
+        // A connection the client has closed has had its read half shut down by
         // `close_from_client`, so it answers every read with the end of file we
         // ourselves caused. Taking that at face value would drop the very reply
         // [`Flush::Finished`] exists to deliver, and would tell the client of a close
@@ -235,19 +234,22 @@ impl Agent {
         if chan.closing {
             return Read::WouldBlock;
         }
-        crate::nbio::read_or_eof(chan.stream.as_fd(), buf)
+        let read = crate::nbio::read_or_eof(chan.stream.as_fd(), buf);
+        if matches!(read, Read::Data(_)) {
+            chan.touch();
+        }
+        read
     }
 
-    /// Queues bytes from the client for one channel's socket.
+    /// Queues bytes from the client for the served connection's socket.
     ///
-    /// Unknown ids are dropped silently: the channel closed while the frame was in
-    /// flight, which is normal and not the client's fault.
+    /// Bytes for a connection that is already gone are dropped silently: it closed while
+    /// the frame was in flight, which is normal and not the client's fault.
     ///
     /// Returns `false` if the data would take the queue past [`MAX_CHANNEL_QUEUE`],
-    /// which means the caller should close the channel. An agent exchange is a few
-    /// hundred bytes; a queue this size is a local process that has stopped reading.
-    pub(crate) fn deliver(&mut self, id: u32, data: &[u8]) -> bool {
-        let Some(chan) = self.channel(id) else {
+    /// which means the caller should close the connection.
+    pub(crate) fn deliver(&mut self, data: &[u8]) -> bool {
+        let Some(chan) = self.channel.as_mut() else {
             return true;
         };
         // Before the bytes are taken rather than after: tested afterwards, the frame
@@ -257,20 +259,26 @@ impl Agent {
             return false;
         }
         chan.pending.extend(data);
+        chan.touch();
         true
     }
 
-    /// Writes what it can of one channel's queue.
-    pub(crate) fn flush(&mut self, id: u32) -> Flush {
-        let Some(chan) = self.channel(id) else {
+    /// Writes what it can of the queue.
+    pub(crate) fn flush(&mut self) -> Flush {
+        let Some(chan) = self.channel.as_mut() else {
             return Flush::Finished;
         };
+        let before = chan.pending.len();
         let failed = crate::nbio::drain_to(&mut chan.pending, chan.stream.as_fd()).is_err();
+        if chan.pending.len() != before {
+            chan.touch();
+        }
         if chan.closing {
-            // A write that failed ends this channel exactly as a drained queue does: the
-            // rest of it has nowhere left to go either way, and the client closed this
-            // channel and has already forgotten it — so [`Flush::Failed`] here would have
-            // the daemon answer with an `AgentClose` for a channel it no longer has.
+            // A write that failed ends this connection exactly as a drained queue does:
+            // the rest of it has nowhere left to go either way, and the client closed
+            // this connection and has already forgotten it — so [`Flush::Failed`] here
+            // would have the daemon answer with an `AgentClose` it no longer has a
+            // connection for.
             if failed || chan.pending.is_empty() {
                 Flush::Finished
             } else {
@@ -283,42 +291,35 @@ impl Agent {
         }
     }
 
-    /// Marks a channel closed by the client. Its queue is flushed first, so a reply
-    /// the client has already sent still reaches the waiting process.
-    pub(crate) fn close_from_client(&mut self, id: u32) {
-        if let Some(chan) = self.channel(id) {
+    /// Marks the served connection closed by the client. Its queue is flushed first, so
+    /// a reply the client has already sent still reaches the waiting process.
+    pub(crate) fn close_from_client(&mut self) {
+        if let Some(chan) = self.channel.as_mut() {
             chan.closing = true;
             drop(chan.stream.shutdown(std::net::Shutdown::Read));
         }
-        if self.flush(id) != Flush::Open {
-            let _ = self.forget(id);
+        if self.flush() != Flush::Open {
+            let _ = self.forget();
         }
     }
 
-    /// Drops a channel, closing its socket. Returns whether it was still open —
+    /// Drops the served connection, closing its socket. Returns whether there was one —
     /// the caller uses that to decide whether the client needs telling, since a
-    /// channel the client itself closed needs no answer.
-    pub(crate) fn forget(&mut self, id: u32) -> bool {
-        let Some(at) = self.channels.iter().position(|chan| chan.id == id) else {
-            return false;
-        };
-        drop(self.channels.remove(at));
-        true
-    }
-
-    /// Drops every channel, for when the client goes away.
+    /// connection the client itself closed needs no answer.
     ///
-    /// Nothing can answer an in-flight request once the client is gone, and the
-    /// process waiting on it should learn that now rather than at reattach.
-    pub(crate) fn forget_all(&mut self) {
-        self.channels.clear();
-        self.capped = false;
+    /// Also how a departing client releases the slot: nothing can answer an in-flight
+    /// request once the client is gone, and the process waiting on it should learn that
+    /// now rather than at reattach.
+    pub(crate) fn forget(&mut self) -> bool {
+        self.channel.take().is_some()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::io::Write;
 
     use crate::scratch::Scratch;
 
@@ -328,85 +329,189 @@ mod tests {
     }
 
     /// Connects to `agent` as the child's `ssh-add` would and takes the connection,
-    /// handing back the peer end — which the caller must keep, or the channel closes
+    /// handing back the peer end — which the caller must keep, or the connection closes
     /// under it.
-    fn open(agent: &mut Agent) -> (UnixStream, u32) {
+    fn open(agent: &mut Agent) -> UnixStream {
         let peer = UnixStream::connect(agent.path()).expect("connect to the agent socket");
-        match agent.accept(true) {
-            Accept::Opened(id) => (peer, id),
-            other => panic!("a connection with a client attached must open a channel: {other:?}"),
-        }
+        assert_eq!(
+            agent.accept(true),
+            Accept::Opened,
+            "a connection with a client attached and the slot free must be served"
+        );
+        peer
     }
 
-    /// Regression: eight channels at the old peak of `MAX_CHANNEL_QUEUE + MAX_PAYLOAD`
-    /// is 4 MiB, against the 2 MiB the constant's own comment sizes the session against.
+    /// Regression: the old peak was `MAX_CHANNEL_QUEUE + MAX_PAYLOAD`, a quarter more
+    /// than the constant's own comment sizes the session against.
     #[test]
     fn a_channel_queue_is_bounded_before_the_bytes_are_taken() {
         let root = Scratch::new("agent-queue");
         let mut agent = bind_in(&root, "q.agent");
-        let (_peer, id) = open(&mut agent);
+        let _peer = open(&mut agent);
 
         assert!(
-            agent.deliver(id, &vec![0u8; MAX_CHANNEL_QUEUE - 1]),
+            agent.deliver(&vec![0u8; MAX_CHANNEL_QUEUE - 1]),
             "a queue below the cap is served"
         );
         assert!(
-            agent.deliver(id, &[0u8]),
+            agent.deliver(&[0u8]),
             "and one that lands exactly on it still is"
         );
         assert!(
-            !agent.deliver(id, &vec![0u8; 64 * 1024]),
+            !agent.deliver(&vec![0u8; 64 * 1024]),
             "the frame that would cross the cap is refused"
         );
         assert_eq!(
-            agent.channels[0].pending.len(),
+            agent
+                .channel
+                .as_ref()
+                .expect("the served connection")
+                .pending
+                .len(),
             MAX_CHANNEL_QUEUE,
             "and none of it is queued: the peak is the cap, not the cap plus a payload"
         );
     }
 
-    /// Regression: ids were a bare counter that refused every connection from
-    /// `u32::MAX` on, and did it silently — `SSH_AUTH_SOCK` goes on naming a socket
-    /// that accepts and closes.
+    /// A second connection is not refused while one is served — it waits in the backlog
+    /// and is greeted, with everything it wrote meanwhile, once the slot frees.
+    ///
+    /// The bytes are what make this a test of *waiting*: a connection the daemon had
+    /// accepted and dropped would take them with it, and `ssh-add` would see a socket
+    /// that answers and then hangs up rather than one that takes a moment.
     #[test]
-    fn channel_ids_wrap_rather_than_running_out() {
-        let root = Scratch::new("agent-ids");
-        let mut agent = bind_in(&root, "w.agent");
-        agent.next_id = u32::MAX - 1;
+    fn a_second_connection_waits_in_the_backlog_rather_than_being_refused() {
+        let root = Scratch::new("agent-serialized");
+        let mut agent = bind_in(&root, "s.agent");
+        let _first = open(&mut agent);
 
-        // The peer ends are held for the whole test: a channel whose peer has gone is
-        // one the search may legitimately reuse the id of.
-        let mut opened: Vec<(UnixStream, u32)> = Vec::new();
-        for _ in 0..MAX_AGENT_CHANNELS {
-            opened.push(open(&mut agent));
-        }
+        let mut second =
+            UnixStream::connect(agent.path()).expect("connect a second time to the agent socket");
+        second
+            .write_all(b"\0\0\0\x01\x0b")
+            .expect("write a request");
         assert_eq!(
-            opened.iter().map(|(_, id)| *id).collect::<Vec<u32>>(),
-            vec![u32::MAX - 1, u32::MAX, 1, 2, 3, 4, 5, 6],
-            "the cursor must carry on past the end of the range rather than stop at it"
+            agent.accept(true),
+            Accept::Idle,
+            "a connection arriving while one is served must be left where it is"
         );
 
-        // Pointed back at ids that are all still live, the search has to walk past
-        // them: reuse is only ever of an id no channel holds.
-        assert!(agent.forget(3), "free one of the eight");
-        agent.next_id = 1;
-        let (_peer, reused) = open(&mut agent);
+        assert!(agent.forget(), "the first connection frees the slot");
         assert_eq!(
-            reused, 3,
-            "the search must skip every live id and take only the one that was freed"
+            agent.accept(true),
+            Accept::Opened,
+            "and the one that waited is taken next"
+        );
+
+        let mut buf = [0u8; 8];
+        assert!(
+            matches!(agent.read(&mut buf), Read::Data(5) if &buf[..5] == b"\0\0\0\x01\x0b"),
+            "the request written while it waited must still be there to read"
         );
     }
 
-    /// The cap held against the document rather than against itself: every other
-    /// agent-channel test counts to `MAX_AGENT_CHANNELS` and asks for one more, so all of
-    /// them pass at whatever value it happens to hold. The far end is a separate codebase
-    /// built from § 6.7, so the number is written out by hand here.
+    /// A served connection that says nothing is given up at its deadline, so the peer
+    /// behind it in the backlog is not held off for the life of the session.
     #[test]
-    fn the_channel_cap_is_the_one_the_document_gives() {
-        assert_eq!(
-            MAX_AGENT_CHANNELS, 8,
-            "MAX_AGENT_CHANNELS is {MAX_AGENT_CHANNELS}, and IMPLEMENTATION.md § 6.7 caps a \
-             session at 8 concurrent agent channels"
+    fn a_silent_served_connection_is_given_up_at_its_deadline() {
+        let root = Scratch::new("agent-stalled");
+        let mut agent = bind_in(&root, "t.agent");
+        let _peer = open(&mut agent);
+
+        let due = agent
+            .deadline()
+            .expect("a served connection has a deadline");
+        assert!(
+            !agent.close_if_idle(
+                due.checked_sub(Duration::from_nanos(1))
+                    .expect("a moment earlier")
+            ),
+            "a connection inside its window is not stalled yet"
+        );
+        assert!(
+            agent.close_if_idle(due),
+            "and one that reaches it is closed, with the client owed the news"
+        );
+        assert!(!agent.is_serving(), "the slot is free again");
+        assert!(
+            !agent.close_if_idle(due + AGENT_IDLE_TIMEOUT),
+            "an empty slot is nothing to announce a second close for"
+        );
+    }
+
+    /// The slot comes back from a connection the client closed against a peer that
+    /// stopped reading — and silently, that client having forgotten it already.
+    ///
+    /// The same argument `Flush::Finished` makes: an `AgentClose` here answers a close
+    /// the client made itself, and it is the clock rather than a write that gives up on
+    /// the queue behind it.
+    #[test]
+    fn a_stalled_close_frees_the_slot_without_announcing_itself() {
+        let root = Scratch::new("agent-stalled-close");
+        let mut agent = bind_in(&root, "c.agent");
+        let _peer = open(&mut agent);
+
+        // Filled until this host's socket buffer stops taking it, rather than to some
+        // number guessed at here: what the close below needs is a queue that cannot
+        // drain, and only the kernel knows when that is.
+        loop {
+            assert!(
+                agent.deliver(&vec![b'q'; 64 * 1024]),
+                "the queue is emptied every round, so the cap is never in question"
+            );
+            assert_eq!(agent.flush(), Flush::Open, "the peer is still there");
+            if !agent
+                .channel
+                .as_ref()
+                .expect("the served connection")
+                .pending
+                .is_empty()
+            {
+                break;
+            }
+        }
+        agent.close_from_client();
+        assert!(
+            agent.is_serving(),
+            "a queue that cannot drain holds the slot"
+        );
+
+        let due = agent.deadline().expect("and so still has a deadline");
+        assert!(
+            !agent.close_if_idle(due),
+            "the slot comes back with nothing said about it"
+        );
+        assert!(!agent.is_serving(), "but it does come back");
+    }
+
+    /// The window is against the last byte, not against the accept: `ssh(1)` holds one
+    /// agent connection across a whole authentication and issues several requests down
+    /// it, so a first-byte deadline would cut a working exchange off partway.
+    #[test]
+    fn traffic_either_way_pushes_the_idle_deadline_out() {
+        let root = Scratch::new("agent-traffic");
+        let mut agent = bind_in(&root, "r.agent");
+        let mut peer = open(&mut agent);
+
+        let accepted_at = agent
+            .deadline()
+            .expect("a served connection has a deadline");
+        assert!(agent.deliver(b"\0\0\0\x05\x0c-reply"), "the client answers");
+        assert!(
+            !agent.close_if_idle(accepted_at),
+            "a reply from the client is traffic, and the old deadline must not close it"
+        );
+
+        let moved_at = agent.deadline().expect("still served");
+        peer.write_all(b"\0\0\0\x01\x0b").expect("a second request");
+        let mut buf = [0u8; 8];
+        assert!(
+            matches!(agent.read(&mut buf), Read::Data(5)),
+            "and reaches us"
+        );
+        assert!(
+            !agent.close_if_idle(moved_at),
+            "so is a second request from the peer, which is the ssh(1) case"
         );
     }
 

@@ -246,9 +246,8 @@ fn input_delivered_before_a_half_close_is_applied_rather_than_dropped() {
             frames.get(sent..).unwrap_or_default(),
             Duration::from_secs(1),
         );
-        // Where the last whole frame the daemon took ends, as an input offset. The
-        // push stops wherever the daemon stopped taking, routinely mid-frame, and a
-        // part-frame is owed to nobody — `take_frame` never completes one.
+        // Where the last whole frame the daemon took ends, as an input offset — see
+        // `whole` above for why a byte count is not that.
         let applied_end = whole
             .iter()
             .rev()
@@ -349,9 +348,8 @@ fn a_child_that_exits_behind_a_full_input_queue_leaves_the_session_answering() {
     drop(client);
 
     // A raw socket rather than the harness client, because what is wanted is the point
-    // at which the daemon stops taking input at all. A second of a socket that will not
-    // take another byte is a daemon that has stopped rather than one that is busy,
-    // which is the same measure the three tests above are built on.
+    // at which the daemon stops taking input at all — the same measure the three tests
+    // above are built on.
     let mut blaster = blaster(&session);
     let (frames, _) = input_frames(BLAST, ready.in_offset);
     let sent = push_until_refused(&mut blaster, &frames, Duration::from_secs(1));

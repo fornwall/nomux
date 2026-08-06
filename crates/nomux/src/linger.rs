@@ -1,13 +1,8 @@
 //! Whether this session survives the user's last logout.
 //!
-//! `IMPLEMENTATION.md` § 6.2 has most of it: why `loginctl enable-linger` is the only
-//! fix and the user's to run, why the two files below are read instead of asking
-//! `loginctl`, and what the marker's absence means. What it does not say is the
-//! mechanism, and the mechanism is what rules out doing anything here rather than
-//! reporting: `KillUserProcesses=yes` kills every process in the user's *slice* at
-//! logout, daemon included, and no amount of double-forking evades it.
-//!
-//! [`username`] has the order the last two sources are consulted in.
+//! `IMPLEMENTATION.md` § 6.2 has the rest. What it does not say is why nothing here can
+//! do more than report: `KillUserProcesses=yes` kills every process in the user's
+//! *slice* at logout, daemon included, and no amount of double-forking evades it.
 
 use std::fs;
 use std::io;
@@ -26,8 +21,7 @@ const LINGER_DIR: &str = "/var/lib/systemd/linger";
 /// Reports whether this user's processes outlive their session.
 pub(crate) fn detect() -> Linger {
     if !Path::new(SYSTEMD_MARKER).is_dir() {
-        // No `logind`, so nothing kills the daemon at logout and there is nothing
-        // for the client to warn about.
+        // No `logind`, so nothing kills the daemon at logout and nothing to warn about.
         return Linger::Unknown;
     }
     let Some(user) = username() else {
@@ -36,12 +30,10 @@ pub(crate) fn detect() -> Linger {
     state_of(Path::new(LINGER_DIR), &user)
 }
 
-/// Classifies one user's linger marker.
+/// Classifies one user's linger marker (`IMPLEMENTATION.md` § 6.2).
 ///
-/// Absence is the answer rather than a failure (`IMPLEMENTATION.md` § 6.2), and
-/// `logind` creates `LINGER_DIR` lazily, so a host where nobody lingers has no
-/// directory at all. Only a lookup that fails for some *other* reason — a permission
-/// change, a bind mount over the path — is unknown.
+/// `logind` creates `LINGER_DIR` lazily, so a host where nobody lingers has no directory
+/// at all and the whole lookup, not just the file, comes back `NotFound`.
 fn state_of(dir: &Path, user: &str) -> Linger {
     match fs::metadata(dir.join(user)) {
         Ok(_) => Linger::Enabled,
@@ -52,10 +44,8 @@ fn state_of(dir: &Path, user: &str) -> Linger {
 
 /// The login name, used as a filename component under [`LINGER_DIR`].
 ///
-/// The password database first, because it is authoritative and cannot contain a
-/// name that is not this user's; `$USER` second, for directory-backed accounts that
-/// have no line in `/etc/passwd`. Anything usable as a path traversal is refused
-/// outright — the value is joined onto a system directory.
+/// `IMPLEMENTATION.md` § 6.2 has the source order and the refusals. The environment is a
+/// fallback rather than a peer: directory-backed accounts have no line in `/etc/passwd`.
 fn username() -> Option<String> {
     passwd::current()
         .map(|entry| entry.name)
@@ -88,12 +78,9 @@ mod tests {
         assert_eq!(state_of(dir.path(), "someone_else"), Linger::Disabled);
     }
 
-    /// A host where no one has ever enabled lingering has no directory, which is
-    /// still a definite "off" rather than an unknown.
-    ///
-    /// Under a scratch directory that does exist, so the absence being asked about
-    /// is `LINGER_DIR` itself rather than `$TMPDIR` — and so the guard has something
-    /// to collect either way.
+    /// Asked under a scratch directory that does exist, so the absence being asked
+    /// about is `LINGER_DIR` itself rather than `$TMPDIR` — and so the guard has
+    /// something to collect either way.
     #[test]
     fn a_missing_directory_is_disabled_not_unknown() {
         let root = Scratch::new("linger-absent");

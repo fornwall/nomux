@@ -44,11 +44,7 @@ use harness::{
 
 /// How long any one test here may spend waiting, across every wait it makes.
 ///
-/// One deadline per test rather than one bound per wait, which is what
-/// `.config/nextest.toml` asks for: a test that waits for three things one after
-/// another with a bound each is bounded by their *sum*, and a sum past the runner's
-/// termination is a kill from outside with nothing to point at — the exact failure
-/// these bounds exist to replace.
+/// One figure per test rather than one per wait, for `harness::poll_by`'s reason.
 const PATIENCE: Duration = Duration::from_secs(30);
 
 /// A `list` that finds the spawn lock held leaves the whole entry alone, and
@@ -265,7 +261,7 @@ fn nothing_parks_on_a_socket_whose_backlog_is_full() {
     let session = StaleSession::empty("lk24");
     let _wedged = wedge_socket(&session.socket());
     let ran = |args: &[&str]| {
-        ran_by(&session.root, args, deadline).unwrap_or_else(|| {
+        ran_by(&mut nomux(&session.root, args), deadline).unwrap_or_else(|| {
             panic!("`nomux {args:?}` parked on a session socket whose backlog is full")
         })
     };
@@ -1081,10 +1077,9 @@ fn the_control_surface_does_not_park_on_a_run_file_that_is_a_fifo() {
     }
 
     // Backgrounded against a deadline: the defect is a wait with no end, and a test
-    // that waits for it is one that never fails. Both share it, since a bound each is
-    // a bound on their sum ([`PATIENCE`]).
-    let listed = ran_by(&session.run.root, &["list"], deadline);
-    let killed = ran_by(&session.run.root, &["kill", "lk13"], deadline);
+    // that waits for it is one that never fails. Both share it ([`PATIENCE`]).
+    let listed = ran_by(&mut nomux(&session.run.root, &["list"]), deadline);
+    let killed = ran_by(&mut nomux(&session.run.root, &["kill", "lk13"]), deadline);
 
     // Before the assertions, so a failure cannot leave a session behind. The pid goes
     // back where the daemon published it, since a FIFO is no pidfile and the pidfile
@@ -1121,16 +1116,19 @@ fn the_control_surface_does_not_park_on_a_run_file_that_is_a_fifo() {
     );
 }
 
-/// Runs one mode against a deadline, and hands back `None` if it never came back.
+/// Runs `command` against a deadline, and hands back `None` if it never came back.
 ///
 /// For the defects that are a wait with no end: a test that simply waits for the
 /// process is one that hangs instead of failing, and nextest's own timeout kills the
 /// runner without saying which call never returned. The deadline is the caller's
-/// rather than a bound per run, for [`PATIENCE`]'s reason — both callers make two of
-/// these one after another.
-fn ran_by(root: &Path, args: &[&str], deadline: Instant) -> Option<Output> {
+/// rather than a bound per run, per [`PATIENCE`].
+///
+/// The `Command` is the caller's too, because [`PlantedRunDir::run`] needs a `SHELL`
+/// on modes that could reach one and the rest must not be handed anything § 6.6 does
+/// not give them.
+fn ran_by(command: &mut Command, deadline: Instant) -> Option<Output> {
     let mut running = Spawned::spawn(
-        nomux(root, args)
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped()),
@@ -1606,8 +1604,9 @@ impl StaleSession {
 /// `fork` duplicates the descriptor into every other test's children, and `flock(2)`
 /// holds the lock until *all* of those duplicates are closed — but releases it on an
 /// explicit `LOCK_UN` through any one of them, because they share one open file
-/// description. So this is the answer `PLAN.md` § P2 prefers, the same shape as
-/// `abandon_socket`'s `shutdown`: no stray copy can undo it.
+/// description. So this is the same shape as `abandon_socket`'s `shutdown` — the release
+/// is a property of the object rather than of a descriptor, and no stray copy can undo
+/// it.
 struct HeldLock(File);
 
 impl HeldLock {
@@ -1705,26 +1704,22 @@ impl PlantedRunDir {
     /// that never closes and nothing to make it stop waiting. The bound is what
     /// turns the defect this test is about into a failed assertion rather than a
     /// test run that never ends.
+    ///
+    /// With a shell even for `list` and `kill`, because the three modes they share
+    /// this with are the ones that must not reach one — and if any ever does, it
+    /// should find a predictable `/bin/sh` rather than whatever the developer logs in
+    /// with.
     fn run(&self, args: &[&str]) -> Output {
-        let mut child = Spawned::spawn(
-            // With a shell even for `list` and `kill`, because the three modes they
-            // share this with are the ones that must not reach one — and if any ever
-            // does, it should find a predictable `/bin/sh` rather than whatever the
-            // developer logs in with.
-            nomux_with_shell(&self.root.join("xdg"), args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped()),
-        );
-        assert!(
-            poll_until(Duration::from_secs(10), || !child.is_running()),
-            "`nomux {args:?}` never returned, so it is still relaying to a \
-             socket somebody else planted"
-        );
-        child
-            .into_exited()
-            .wait_with_output()
-            .expect("collect nomux output")
+        ran_by(
+            &mut nomux_with_shell(&self.root.join("xdg"), args),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "`nomux {args:?}` never returned, so it is still relaying to a \
+                 socket somebody else planted"
+            )
+        })
     }
 
     /// Whether the planted socket was left entirely alone. Asked only after the
@@ -1742,8 +1737,7 @@ impl PlantedRunDir {
 /// The `shutdown` is the whole of the difference, and it is not belt and braces: a
 /// listening socket goes on accepting for as long as *any* descriptor onto it
 /// survives, and another test's `fork` in flight is holding one. `shutdown` belongs
-/// to the socket rather than to the descriptor, so no duplicate can undo it
-/// (`PLAN.md` § P2).
+/// to the socket rather than to the descriptor, so no duplicate can undo it.
 fn abandon_socket(path: &Path) {
     let listener = UnixListener::bind(path).expect("bind a socket to abandon");
     // SAFETY: `shutdown` is passed a descriptor the borrow above keeps open across
@@ -1785,8 +1779,7 @@ enum Flock {
 /// them. `/proc/locks` lists queued requests alongside granted ones, so both are
 /// conditions to wait on.
 ///
-/// The deadline is the caller's, per [`PATIENCE`]: this is one of several waits every
-/// caller makes, and a bound of its own would only add to their sum.
+/// The deadline is the caller's, per [`PATIENCE`].
 fn wait_until_flock(state: Flock, dev: u64, ino: u64, what: &str, deadline: Instant) {
     let reached = poll_by(deadline, || {
         // A kernel without `/proc/locks` cannot be waited on, and the assertions

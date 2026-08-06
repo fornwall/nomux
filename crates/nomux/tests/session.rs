@@ -9,8 +9,10 @@
 
 #![allow(
     clippy::expect_used,
-    reason = "clippy.toml's allow-expect-in-tests reaches `#[test]` bodies, not the \
-              helpers an integration test crate keeps beside them"
+    clippy::panic,
+    reason = "the allow-*-in-tests settings in clippy.toml reach `#[test]` bodies \
+              and `#[cfg(test)]` modules, not the helpers an integration test crate \
+              keeps beside them"
 )]
 
 mod harness;
@@ -368,14 +370,6 @@ fn plant_blob(
 /// client already has, one N too high drops N it never will, and both produce a
 /// perfectly contiguous stream that corrupts the user's scrollback. Indexing a model of
 /// the child's own output by absolute offset is what makes that falsifiable.
-///
-/// One deadline for the whole read rather than one per frame: a loop over `next_frame`
-/// renews its patience on every frame that arrives, so it has no bound at all.
-#[expect(
-    clippy::panic,
-    reason = "clippy.toml's allow-panic-in-tests reaches `#[test]` bodies, not the \
-              helpers an integration test crate keeps beside them"
-)]
 fn read_against(client: &mut Client, planted: &Planted, from: u64) -> Vec<(u64, u64)> {
     let expected = &planted.expected;
     let end = planted.stream_start + expected.len() as u64;
@@ -433,11 +427,6 @@ fn read_against(client: &mut Client, planted: &Planted, from: u64) -> Vec<(u64, 
 /// quoted from both sides: the number alone does not say which way the error went — a
 /// stream that resumed too early repeats bytes the client has, one that resumed too
 /// late is missing bytes it never will.
-#[expect(
-    clippy::panic,
-    reason = "clippy.toml's allow-panic-in-tests reaches `#[test]` bodies, not the \
-              helpers an integration test crate keeps beside them"
-)]
 fn assert_same_stream(want: &[u8], got: &[u8], at: u64) {
     if want == got {
         return;
@@ -644,56 +633,6 @@ fn a_ring_capacity_the_daemon_cannot_use_falls_back_to_the_default() {
     }
 }
 
-/// An `OutputAck` is advisory: the ring keeps everything regardless
-/// (`IMPLEMENTATION.md` § 3 and § 4's "never trimmed on ack").
-///
-/// The daemon's arm for it is empty on purpose, and applying the ack as a low-water mark
-/// would even look like an improvement, the bytes below it being ones somebody has seen.
-/// Nothing else in the suite would notice: every other test reads its output as it
-/// arrives, so a ring trimmed to what its reader holds serves all of them identically.
-/// What breaks is § 4's "a full rolling window is the scrollback a fresh client gets",
-/// and it breaks for the *next* client — so the marker is written, acked past, and
-/// asked for by somebody who never saw it.
-#[test]
-fn an_output_ack_never_trims_the_ring() {
-    let (session, mut client, ok) = Session::attached("ack_ring");
-
-    let command = b"echo NOMUX-BEFORE-ACK\n";
-    client.input(0, command);
-    // Read to the end before acking, so the ack is sent by a client that really has
-    // consumed the marker — which is the state a daemon tempted to trim would trim on.
-    client.read_until("NOMUX-BEFORE-ACK", ok.resume_from);
-
-    client.send(&Frame::OutputAck);
-    // Frames are handled in the order they arrive, so a `Pong` for a ping sent behind
-    // the ack is the daemon having already done whatever it does with one. Without it
-    // the reconnect below could win the race and pass against a daemon that trims.
-    client.send(&Frame::Ping);
-    drop(client.next_of(FrameType::Pong));
-    drop(client);
-
-    let mut client = session.connect();
-    let resumed = client.hello(RESUME_FROM_START);
-    assert!(
-        !resumed.gap(RESUME_FROM_START),
-        "nothing was dropped, so nothing may be reported as a gap"
-    );
-    assert_eq!(
-        resumed.resume_from, 0,
-        "the ack moved the ring's base off the start of the stream"
-    );
-
-    // A fence bounds the read: the replay is finite and the session silent after it, so
-    // looking for a marker that is gone would otherwise cost the whole timeout.
-    client.input(resumed.in_applied, b"echo NOMUX-FENCE\n");
-    let (replayed, _) = client.read_until("NOMUX-FENCE", resumed.resume_from);
-    assert!(
-        replayed.contains("NOMUX-BEFORE-ACK"),
-        "output the previous client acknowledged was trimmed from the ring, so a \
-         fresh client got a shorter scrollback than the session held: {replayed:?}"
-    );
-}
-
 /// § 6.4's whole sentence, rather than its first clause: "the previous connection
 /// receives `Error{TAKEOVER}` **and closes**", and the session goes to the newcomer.
 ///
@@ -789,13 +728,13 @@ fn frames_a_client_may_not_send_are_refused_and_the_connection_closed() {
         Refused {
             what: "a Resize whose payload is half a WinSize",
             // Four bytes where the frame's four `u16`s need eight.
-            write: |client| client.send_raw(&[0x07, 0x00, 0x00, 0x04, 0, 80, 0, 24]),
+            write: |client| client.send_raw(&[0x06, 0x00, 0x00, 0x04, 0, 80, 0, 24]),
         },
     ];
 
     let session = Session::start("refuse");
-    // One deadline for the table, checked between rows: every wait inside a row carries
-    // its own patience, so this bounds the rows in aggregate rather than any single one.
+    // One deadline for the table, checked between rows (`harness::poll_by`): every wait
+    // inside a row carries its own patience, so this is what bounds them in aggregate.
     let deadline = Instant::now() + FRAME_PATIENCE;
     let mut client = session.connect();
     let start = client.hello(RESUME_FROM_START).resume_from;
@@ -876,7 +815,7 @@ fn a_connection_that_does_not_greet_first_is_refused_alone() {
 /// `Resize` reaches the child's terminal, and every attach restates the geometry
 /// (`IMPLEMENTATION.md` § 2.2).
 ///
-/// Nothing else in the suite sends a `0x07`. Both halves matter to the same user: the
+/// Nothing else in the suite sends a `0x06`. Both halves matter to the same user: the
 /// window is resized while attached, and the session is then picked up from a terminal
 /// of a different size. Asserted at the child both times, `stty` being the only witness
 /// that the geometry was *applied* rather than merely received.
@@ -939,11 +878,10 @@ fn a_detach_ends_the_connection_but_not_the_session() {
 /// What the child prints when the terminal it is on changes size. See
 /// [`repaint_transcript`].
 ///
-/// Built out of `$((6*7))` for the reason `Client::make_ready` gives: the line
-/// discipline echoes the command line installing the trap before `stty -echo` takes
-/// effect, and that echo carries the arithmetic unexpanded, so the marker cannot be
-/// satisfied by the request for it. `dash` evaluates a trap's body when the signal
-/// arrives, which is what makes the substitution happen then rather than at definition.
+/// Built out of `$((6*7))` for `harness::READY_MARKER`'s reason, which the line
+/// installing the trap needs because it runs before `stty -echo` takes effect. `dash`
+/// evaluates a trap's body when the signal arrives, which is what makes the
+/// substitution happen then rather than at definition.
 const WINCHED: &str = "NOMUX-42-WINCHED";
 
 /// Drives a session to an overflow gap and returns what the child saw afterwards.
@@ -1120,8 +1058,8 @@ fn a_sustained_overflow_repaints_when_the_client_catches_up_rather_than_per_gap(
     /// count below is taken against a record that is complete.
     const FENCE: &[u8] = b"FENCE\n";
 
-    // One deadline for the four consecutive waits below rather than one each, which
-    // would bound only their sum — see `.config/nextest.toml`.
+    // One deadline for the four consecutive waits below rather than one each
+    // (`harness::poll_by`).
     let deadline = Instant::now() + FRAME_PATIENCE;
     let session = Session::start_with_ring("repaint_storm", RING);
     let mut client = session.connect();

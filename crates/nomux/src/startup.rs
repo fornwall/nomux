@@ -41,11 +41,9 @@ extern "C" fn note_stop_signal(_signum: libc::c_int) {
 ///
 /// # Errors
 ///
-/// Fails only if the pipe cannot be created; installing the handlers cannot report
-/// anything, for the reason the `SAFETY` note below gives.
+/// Fails only if the pipe cannot be created.
 pub(crate) fn arm_stop_signals() -> io::Result<OwnedFd> {
-    // `CLOEXEC` so the session's child never inherits either end; `NONBLOCK` so the
-    // handler above cannot block on the write.
+    // `CLOEXEC` so the session's child never inherits either end.
     let (read, write) = rustix::pipe::pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK)?;
 
     // The write end is leaked on purpose: a signal can arrive at any point up to
@@ -115,10 +113,8 @@ pub(crate) fn leave_login_session() {
     let _ = rustix::process::setsid();
 }
 
-/// Whether this process has a controlling terminal.
-///
-/// Put to `/dev/tty` as § 6.2 requires, with `O_NOCTTY` so that asking never acquires
-/// one.
+/// Whether this process has a controlling terminal. `O_NOCTTY` so that asking never
+/// acquires one.
 ///
 /// `ENXIO` is the only definite no — § 6.2 delegates the argument here. Anything
 /// else, such as no `/dev/tty` node in a stripped container, is taken as yes: being
@@ -146,7 +142,7 @@ pub(crate) fn release_startup_state() {
 }
 
 /// Points the three standard descriptors at `/dev/null`, last of all for the reason
-/// § 6.2 gives. The `Result` chains the four calls rather than being handled.
+/// § 6.2 gives.
 fn silence_stdio() -> io::Result<()> {
     let null = rustix::fs::open("/dev/null", OFlags::RDWR, Mode::empty())?;
     rustix::stdio::dup2_stdin(&null)?;

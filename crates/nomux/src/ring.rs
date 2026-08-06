@@ -10,6 +10,9 @@ use std::collections::VecDeque;
 #[derive(Debug)]
 pub(crate) struct Ring {
     buf: VecDeque<u8>,
+    /// Not `buf.capacity()`: `VecDeque::with_capacity` allocates *at least* what was
+    /// asked for, so reading the window back off the allocation would silently enlarge
+    /// it to whatever the allocator rounded up to.
     capacity: usize,
     base: u64,
 }
@@ -88,8 +91,6 @@ mod tests {
         ring.slices_from(offset).concat()
     }
 
-    /// The clamp `Ring::new` exists to make unreachable: a zero capacity must retain a
-    /// byte rather than reach an abort site in a `panic = "abort"` binary.
     #[test]
     fn a_zero_capacity_retains_one_byte_rather_than_aborting() {
         let mut ring = Ring::new(0);

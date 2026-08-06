@@ -4,12 +4,15 @@
 //! on-disk layout — never a protocol frame, never `PROTOCOL_VERSION`.
 
 use std::io::{self, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rustix::process::{Pid, Signal, kill_process, test_kill_process};
+use rustix::process::{
+    Pid, PidfdFlags, Signal, kill_process, pidfd_open, pidfd_send_signal, test_kill_process,
+};
 
 use crate::rundir::{
     MAX_PID_LEN, MAX_SESSION_ID_LEN, SessionPaths, SpawnLock, check_run_dir, connect_within,
@@ -121,8 +124,10 @@ pub(crate) fn list() -> io::Result<()> {
         }
         let mut buf = [0u8; MAX_PID_LEN];
         let (filed, _) = pidfile(&paths.pid(), &mut buf).unwrap_or_default();
-        let pid = chosen(&paths, filed)
-            .map_or_else(|| "?".to_owned(), |pid| pid.as_raw_nonzero().to_string());
+        let pid = chosen(&paths, filed).map_or_else(
+            || "?".to_owned(),
+            |chosen| chosen.pid.as_raw_nonzero().to_string(),
+        );
         // Sanitised on read as well as on write (§ 6.6): the daemon that wrote it may
         // be any version.
         let label = read_label(&paths.label());
@@ -154,11 +159,12 @@ pub(crate) fn kill(session_id: &str) -> io::Result<()> {
     // to a kill it was never the target of. What the lock does not exclude is a daemon
     // started by hand, which is why the unlink probes again rather than trusting this.
     let lock = hold_spawn_lock(&paths)?;
-    if let Some(pid) = resolve(&paths)? {
-        let _ = kill_process(pid, Signal::TERM);
+    if let Some(chosen) = resolve(&paths)? {
+        chosen.signal(Signal::TERM);
         // Liveness first, deadline second, so a daemon that let go on the last interval
-        // is not signalled again: the pid it published is reusable the moment it is
-        // reaped, and `SIGKILL` is the one signal nothing survives.
+        // is not signalled again: on a host reduced to [`Reach::Number`] the pid it
+        // published is reusable the moment it is reaped, and `SIGKILL` is the one signal
+        // nothing survives.
         let mut deadline = Instant::now() + TERM_GRACE;
         let mut killed = false;
         loop {
@@ -181,10 +187,10 @@ pub(crate) fn kill(session_id: &str) -> io::Result<()> {
                          pid {pid}, so that pid is not the process serving it; leaving \
                          it alone rather than unlinking a live session's files",
                         id = paths.id(),
-                        pid = pid.as_raw_nonzero(),
+                        pid = chosen.pid.as_raw_nonzero(),
                     )));
                 }
-                let _ = kill_process(pid, Signal::KILL);
+                chosen.signal(Signal::KILL);
                 killed = true;
                 deadline = Instant::now() + KILL_GRACE;
             }
@@ -238,12 +244,10 @@ fn hold_spawn_lock(paths: &SessionPaths) -> io::Result<SpawnLock> {
 ///
 /// Liveness first, and only then the pid: a daemon that died without unlinking leaves its
 /// pidfile behind and the kernel reuses pids, so signalling a number read off disk
-/// unchecked is how `nomux kill` terminates an unrelated process of the user's.
-///
-/// # Errors
-///
-/// Reports the reason a live session's pid could not be had.
-fn resolve(paths: &SessionPaths) -> io::Result<Option<Pid>> {
+/// unchecked is how `nomux kill` terminates an unrelated process of the user's. What
+/// comes back is a [`Chosen`] rather than the number itself, because the same reuse
+/// happens again between here and each of the two signals.
+fn resolve(paths: &SessionPaths) -> io::Result<Option<Chosen>> {
     let deadline = Instant::now() + PUBLISH_GRACE;
     loop {
         if matches!(liveness(&paths.socket(), PROBE_TIMEOUT), Liveness::Stale(_)) {
@@ -280,21 +284,113 @@ fn pidfile<'a>(path: &Path, buf: &'a mut [u8; MAX_PID_LEN]) -> io::Result<(Optio
     Ok((parse_pid(body).and_then(extant), body))
 }
 
-/// The published pid, where `/proc` does not rule it out.
+/// The process `kill` acts on: the number the pidfile named, and a hold on the process
+/// that number meant when it was read.
+///
+/// The two are not the same thing, and that is the whole reason this is a struct. A pid
+/// is a number the kernel is free to reissue the moment its process is reaped, while
+/// [`kill`] signals twice with a grace of [`TERM_GRACE`] in between and reads `/proc`
+/// before either. Everything it establishes is about a process; everything a number can
+/// deliver is about whoever wears it at the instant of the call.
+#[derive(Debug)]
+struct Chosen {
+    /// What the refusals print and what `list` shows: a descriptor is nothing a user can
+    /// carry to another command, so the number is still the whole of what is reportable.
+    pid: Pid,
+    /// What the signals go through.
+    reach: Reach,
+}
+
+/// What there is to reach a [`Chosen`] process *with*.
+#[derive(Debug)]
+enum Reach {
+    /// A descriptor onto the process the number named when it was opened. It goes on
+    /// meaning that one process for as long as it is held, so a signal through it either
+    /// arrives there or answers `ESRCH` — never at whoever the kernel handed the number
+    /// to in between.
+    Pidfd(OwnedFd),
+    /// The number, and the race that comes with it: between the checks that identified a
+    /// process and the signal sent to its pid, that process can exit and the number be
+    /// reissued to an unrelated one, which is then what stops. Only for a host with no
+    /// `pidfd_open` — see [`pin`], which is also where that is weighed.
+    Number,
+    /// Neither, so nothing is signalled and [`kill`] establishes what became of the
+    /// session by probing the socket alone. Reached where the process was gone before it
+    /// could be held, which is not a state anything here needs to report: a daemon that
+    /// has exited is the postcondition arriving early.
+    Nothing,
+}
+
+impl Chosen {
+    /// Signals the daemon, through whichever of the three [`Reach`] gave.
+    ///
+    /// The outcome is dropped because there is none worth reading: a process that took
+    /// the first signal and died answers the second with `ESRCH`, which is this working
+    /// rather than failing, and [`kill`] settles what actually happened by probing the
+    /// socket either way.
+    fn signal(&self, sig: Signal) {
+        match &self.reach {
+            Reach::Pidfd(pidfd) => drop(pidfd_send_signal(pidfd, sig)),
+            Reach::Number => drop(kill_process(self.pid, sig)),
+            Reach::Nothing => {}
+        }
+    }
+}
+
+/// Takes hold of the process a number names, before anything at all is established about
+/// it.
+///
+/// The order is the whole of this. Every check [`chosen`] then makes reads `/proc/<pid>`,
+/// and a check made through a number can only describe whoever wears it at the instant of
+/// the read — so pinning first is what makes the check and the signal be about one
+/// process. Reuse before this call leaves the impostor to fail the check below and
+/// nothing is signalled; reuse after it leaves this descriptor still meaning the process
+/// that passed. The one impostor that could pass is a second `nomux daemon <id>`, and the
+/// spawn lock `kill` holds across all of it excludes that (§ 6.3).
+///
+/// A descriptor is had without permission to signal, which is why [`extant`] still asks
+/// that separately.
+fn pin(pid: Pid) -> Reach {
+    match pidfd_open(pid, PidfdFlags::empty()) {
+        Ok(pidfd) => Reach::Pidfd(pidfd),
+        // The three that say this host has no `pidfd_open` rather than anything about
+        // this process, and § 8 puts this binary on whatever host the user has: `ENOSYS`
+        // from a kernel below 5.3, and `EINVAL` or `EPERM` from a sandbox refusing the
+        // call outright, neither of which anything passed here can earn — the flags are
+        // empty and a `Pid` is positive by construction, and opening a descriptor takes
+        // no permission. On such a host the race above is back and there is no second way
+        // to close it: § 6.6 freezes the pidfile as a number and nothing else, so nothing
+        // the daemon published at start can be compared against what is here now. A
+        // `kill` that refused to work at all would be the worse answer.
+        Err(rustix::io::Errno::NOSYS | rustix::io::Errno::INVAL | rustix::io::Errno::PERM) => {
+            Reach::Number
+        }
+        // `ESRCH` — the process is already gone, which is the kernel answering rather
+        // than declining, and every remaining errno is one this cannot tell from it. None
+        // may fall back: signalling a bare number is exactly what the fallback above
+        // accepts a race to do, and doing it here would accept that race under the one
+        // condition — a number whose process is reaped — that makes it certain.
+        Err(_) => Reach::Nothing,
+    }
+}
+
+/// The published pid, where `/proc` does not rule it out, held by the process rather than
+/// by the number ([`pin`]).
 ///
 /// Shared by both modes, so the number `list` prints is the number `kill` would signal —
 /// which matters most in the case `kill` refuses, since it recommends no repair there and
-/// a user who wants to act asks `list` what to signal.
+/// a user who wants to act asks `list` what to signal. `list` pays for a descriptor it
+/// then drops unread, which is one syscall a session and the price of the two modes
+/// answering out of the same code.
 ///
-/// Only a *positive* "it is not" declines it, which is § 6.6's weighing: refusing on
-/// "could not tell" would strand every session whose daemon sits behind `hidepid`.
-///
-/// It asks what a process *is*, not which holds the *fd*: matching a `sockfs` inode would
-/// mean parsing `/proc/net/unix` on the surface that has to keep working anywhere, and
-/// what that gives up — a second `nomux daemon <id>` that is not this one — § 6.3's bind
-/// already makes unreachable.
-fn chosen(paths: &SessionPaths, filed: Option<Pid>) -> Option<Pid> {
-    filed.filter(|pid| is_daemon_for(*pid, paths.id()) != Some(false))
+/// § 6.6 has the rest of the weighing: only a *positive* "it is not" declines the pid, and
+/// what is deliberately not asked is which process holds the *socket*.
+fn chosen(paths: &SessionPaths, filed: Option<Pid>) -> Option<Chosen> {
+    let pid = filed?;
+    // Held before it is examined and never after: these two lines are in this order for
+    // [`pin`]'s reason and for no other, and swapping them gives the window back.
+    let reach = pin(pid);
+    (is_daemon_for(pid, paths.id()) != Some(false)).then_some(Chosen { pid, reach })
 }
 
 /// A number that still names a process this user may signal, or nothing.
@@ -338,9 +434,8 @@ fn is_daemon_for(pid: Pid, id: &str) -> Option<bool> {
 
 /// Whether a NUL-separated command line is `<exe> daemon <id>`, however it was spelled.
 ///
-/// Parsed the way [`main::parse_session_args`](crate::main) parses it, rather than
-/// searched: a search answers to any command line that merely *contains* both words, and
-/// `--label` puts caller-supplied text into that same argv.
+/// Parsed the way [`main::parse_session_args`](crate::main) parses it rather than searched,
+/// which is § 6.6's rule and its reason.
 ///
 /// Read against whatever `/proc` holds rather than against what this build can produce,
 /// which is why an `attach --label` still parses here after `main` stopped accepting one.
@@ -368,11 +463,8 @@ fn refuse(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-/// The refusal to touch a live session whose pid is not knowable.
-///
-/// It names the pidfile because that is the one thing the user can repair, and it says
-/// what was *not* done, since "kill failed" reads like "the session is still running" —
-/// which is exactly right here, and is the point.
+/// The refusal to touch a live session whose pid is not knowable. It names the pidfile
+/// because that is the one thing the user can repair.
 fn running_but(paths: &SessionPaths, problem: &str) -> io::Error {
     refuse(format!(
         "session {id} is running, but {pid}: {problem}; leaving it alone rather than \
@@ -385,10 +477,9 @@ fn running_but(paths: &SessionPaths, problem: &str) -> io::Error {
 /// Why [`chosen`] came back with nothing over a session that is answering, in the words
 /// [`running_but`] finishes.
 ///
-/// The three read very differently to whoever has to act on them, and only the middle one —
-/// a body that reached the bound ([`parse_pid`]) — is a file to repair. That one is quoted
-/// as bytes rather than as a number: its end was never read, so showing a pid and calling it
-/// unusable would be worse than showing none.
+/// A body that reached the bound ([`parse_pid`]) is quoted as bytes rather than as a
+/// number: its end was never read, so showing a pid and calling it unusable would be worse
+/// than showing none.
 fn unidentified(id: &str, filed: Option<Pid>, body: &[u8]) -> String {
     let quoted = String::from_utf8_lossy(body);
     match filed {
@@ -407,12 +498,10 @@ fn unidentified(id: &str, filed: Option<Pid>, body: &[u8]) -> String {
     }
 }
 
-/// The refusal to decide a session's fate on a probe that never reached it.
-///
-/// § 6.3 makes an `EACCES`, a descriptor limit and an undrained backlog evidence of
-/// neither death nor life, so none may be built into a refusal that says a session is
-/// *answering*. Naming the errno is the whole of what is known, and the useful half:
-/// each is repairable from outside.
+/// The refusal to decide a session's fate on a probe that never reached it: § 6.3 makes an
+/// `EACCES`, a descriptor limit and an undrained backlog evidence of neither death nor
+/// life, so none may be built into a refusal that says a session is *answering*. Naming the
+/// errno is the whole of what is known, and each is repairable from outside.
 fn unprobeable(paths: &SessionPaths, problem: &io::Error) -> io::Error {
     refuse(format!(
         "session {id}: {sock} could not be probed, so whether it has stopped was never \
@@ -425,10 +514,9 @@ fn unprobeable(paths: &SessionPaths, problem: &io::Error) -> io::Error {
 
 /// The refusal to collect a session that answered again under the lock.
 ///
-/// Rare by construction and reported rather than swallowed, because it reads two ways: a
-/// daemon that bound the id inside this locked region is a live session to leave alone,
-/// and it is also this `kill` having been overtaken by a spawn. Running the command again
-/// is the whole of the repair.
+/// Reported rather than swallowed, because it reads two ways: a daemon that bound the id
+/// inside this locked region is a live session to leave alone, and it is also this `kill`
+/// having been overtaken by a spawn, which running the command again repairs.
 fn bound_since(paths: &SessionPaths) -> io::Error {
     io::Error::new(
         io::ErrorKind::AddrInUse,
@@ -473,12 +561,110 @@ pub(crate) fn liveness(socket: &Path, within: Duration) -> Liveness {
 
 #[cfg(test)]
 mod tests {
-    use super::names_daemon_for;
+    use std::process::{Command, Stdio};
+
+    use rustix::io::Errno;
+    use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
+
+    use super::{Reach, names_daemon_for, pin};
 
     /// Joins argv the way `/proc/<pid>/cmdline` presents it, minus the trailing NUL
     /// that [`is_daemon_for`](super::is_daemon_for) has already trimmed.
     fn cmdline(args: &[&str]) -> Vec<u8> {
         args.join("\0").into_bytes()
+    }
+
+    /// Whether this host has `pidfd_open` at all, asked of the syscall rather than
+    /// through [`pin`](super::pin): the two tests below stand down where it does not,
+    /// and a skip the code under test can talk its way into is no skip — a `pin` that
+    /// had stopped opening descriptors entirely would otherwise turn both green.
+    ///
+    /// Pid 1 is the one number that always names a process in whatever pid namespace
+    /// this runs in, and no permission is needed to hold a descriptor onto it, so the
+    /// only thing left for a failure to mean is the call not being there.
+    ///
+    /// The reason is printed rather than swallowed, since a skip nobody can see is a
+    /// pass — which is how a suite comes to run a check it never exercises.
+    fn kernel_has_pidfds(what: &str) -> bool {
+        let opened = pidfd_open(Pid::INIT, PidfdFlags::empty());
+        if let Err(err) = &opened {
+            eprintln!("skipped: this host has no pidfds ({err}), so {what}");
+        }
+        opened.is_ok()
+    }
+
+    /// A descriptor onto a process goes on meaning that process and no other: once it
+    /// has exited *and been reaped*, a signal through it answers `ESRCH` rather than
+    /// reaching whoever the kernel handed the number to next.
+    ///
+    /// This is the property [`kill`](super::kill) rests on rather than one of its own
+    /// paths, and it is the half no test of `kill` can reach: making the kernel reissue
+    /// a chosen number takes `/proc/sys/kernel/ns_last_pid` and the privilege to write
+    /// it, so a test that stopped one daemon and started another would assert only that
+    /// two spawns usually get different numbers, and would pass whatever `kill` did.
+    /// What can be pinned is the descriptor's half of the argument, which is what the
+    /// ordering in [`pin`](super::pin) turns into the guarantee.
+    ///
+    /// The reaping is the point of the `wait`, not tidiness: a descriptor onto a zombie
+    /// still has a task behind it, and the whole question is what the descriptor means
+    /// after that task is released and the number is free again. `SIGCONT` is what is
+    /// sent because the assertion is that it arrives nowhere — a signal that did reach a
+    /// stranger should be one that costs them nothing.
+    #[test]
+    fn a_pidfd_outlives_its_process_without_ever_meaning_another() {
+        if !kernel_has_pidfds("there is nothing to hold a process by") {
+            return;
+        }
+        let mut child = Command::new("sleep")
+            .arg("300")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start a process to hold");
+        let pid = Pid::from_raw(i32::try_from(child.id()).expect("a pid fits in an i32"))
+            .expect("a spawned child has a pid");
+
+        let Reach::Pidfd(pidfd) = pin(pid) else {
+            child.kill().expect("stop the process");
+            child.wait().expect("reap it");
+            panic!("`pin` gave up no descriptor on a host that has them");
+        };
+        child.kill().expect("stop the held process");
+        // Reaped, so the number is the kernel's to hand out again.
+        child.wait().expect("reap the held process");
+
+        assert_eq!(
+            pidfd_send_signal(&pidfd, Signal::CONT),
+            Err(Errno::SRCH),
+            "the signal reached something, so the descriptor is following the number \
+             rather than the process it was opened on"
+        );
+    }
+
+    /// A number that names nothing is not a host without pidfds, and is never signalled
+    /// as one.
+    ///
+    /// [`Reach::Number`](super::Reach::Number) accepts the reuse race for the sake of a
+    /// kernel that cannot do better, and an `ESRCH` is the opposite of that case: it is
+    /// this kernel answering, and the answer is that the process is gone. Falling back on
+    /// it would put the one path that signals a bare number back under precisely the
+    /// condition — a number whose process has been reaped — that makes the number
+    /// somebody else's.
+    #[test]
+    fn a_number_that_names_nothing_is_not_a_host_without_pidfds() {
+        if !kernel_has_pidfds("nothing here can be told from a missing call") {
+            return;
+        }
+        // Past any `pid_max` a kernel hands out, which is the number § 6.6's own stale
+        // pidfiles are planted with.
+        let gone = Pid::from_raw(999_999_999).expect("a positive number is a pid");
+
+        assert!(
+            matches!(pin(gone), Reach::Nothing),
+            "a pid naming no process was taken for a host with no pidfds, so `kill` \
+             would go back to signalling the number"
+        );
     }
 
     /// Regression: a label is not an id, however much it looks like one in argv. The

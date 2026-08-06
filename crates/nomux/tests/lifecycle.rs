@@ -8,9 +8,10 @@
 
 #![allow(
     clippy::expect_used,
-    reason = "the allow-expect-in-tests setting in clippy.toml reaches `#[test]` \
-              bodies and `#[cfg(test)]` modules, not the helpers an integration \
-              test crate keeps beside them"
+    clippy::panic,
+    reason = "the allow-*-in-tests settings in clippy.toml reach `#[test]` bodies \
+              and `#[cfg(test)]` modules, not the helpers an integration test crate \
+              keeps beside them"
 )]
 
 mod harness;
@@ -26,7 +27,7 @@ use nomux_proto::{Frame, FrameType, RESUME_FROM_START};
 
 use harness::{
     Client, Cue, FRAME_PATIENCE, MAX_SESSIONS, Reaper, Rng, SETTLE, SPIN_WINDOW, Session, Spawned,
-    StatField, control, cpu_ticks, leads_a_process_group, nomux_with_shell, poll_until,
+    StatField, control, cpu_ticks, entries, leads_a_process_group, nomux_with_shell, poll_until,
     process_alive, process_state, run_root, stat_field, still_serving, succeeded, wait_for,
 };
 
@@ -612,7 +613,7 @@ fn a_daemon_that_leads_a_process_group_detaches_by_forking() {
         alive,
         "no live daemon behind the pidfile: it names {recorded:?}"
     );
-    assert_detached(&detachment, recorded, "the forked child");
+    assert_detached(&detachment, recorded);
 }
 
 /// Turns two different ids away at the ceiling through `mode`, and asserts that neither
@@ -709,40 +710,34 @@ fn a_relay_refused_at_the_session_ceiling_leaves_no_lock_behind() {
 
 /// Every file in `dir` belonging to session `id`, by name.
 fn session_files(dir: &Path, id: &str) -> Vec<String> {
-    let mut found: Vec<String> = fs::read_dir(dir)
-        .expect("read the run directory")
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            name.split_once('.')
-                .is_some_and(|(found, _)| found == id)
-                .then_some(name)
-        })
-        .collect();
-    found.sort();
-    found
+    entries(dir)
+        .into_iter()
+        .filter(|name| name.split_once('.').is_some_and(|(found, _)| found == id))
+        .collect()
 }
 
 /// The distinct session ids `dir` holds, by the rule `rundir::session_id_of` counts
 /// them with: whatever precedes the first `.`.
+///
+/// [`entries`] comes back sorted, so the run of names belonging to one id is
+/// contiguous and `dedup` is all a distinct count needs.
 fn session_ids(dir: &Path) -> Vec<String> {
-    let mut ids: Vec<String> = fs::read_dir(dir)
-        .expect("read the run directory")
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            name.split_once('.').map(|(id, _)| id.to_owned())
-        })
+    let mut ids: Vec<String> = entries(dir)
+        .iter()
+        .filter_map(|name| name.split_once('.').map(|(id, _)| id.to_owned()))
         .collect();
-    ids.sort();
     ids.dedup();
     ids
 }
 
 /// Whether `pid` has finished detaching itself (§ 6.2): a session of its own, and
 /// nothing left of the stdio it was handed.
+///
+/// The same two halves [`assert_detached`] reports, through the same
+/// [`detachment_of`], so the wait and the assertion behind it cannot disagree.
 fn has_detached(pid: u32) -> bool {
-    stat_field(pid, StatField::Session) == Some(pid) && stdio_is_silenced(&stdio_targets(pid))
+    let (leads_session, stdio) = detachment_of(pid);
+    leads_session == Some(pid) && stdio_is_silenced(&stdio)
 }
 
 /// What `/proc` says about `pid`'s detachment, as the session it leads and the three
@@ -753,34 +748,28 @@ fn has_detached(pid: u32) -> bool {
 /// say about a process that is gone, and a failing assertion must not be the thing
 /// that leaves a session behind.
 fn detachment_of(pid: u32) -> (Option<u32>, Vec<PathBuf>) {
-    (stat_field(pid, StatField::Session), stdio_targets(pid))
+    let stdio = (0..3)
+        .map(|fd| fs::read_link(format!("/proc/{pid}/fd/{fd}")).unwrap_or_default())
+        .collect();
+    (stat_field(pid, StatField::Session), stdio)
 }
 
-/// The two halves of § 6.2, as [`detachment_of`] found them for `whose`.
-fn assert_detached(found: &(Option<u32>, Vec<PathBuf>), pid: Option<u32>, whose: &str) {
+/// The two halves of § 6.2, as [`detachment_of`] found them for the forked child.
+fn assert_detached(found: &(Option<u32>, Vec<PathBuf>), pid: Option<u32>) {
     let (leads_session, stdio) = found;
     assert_eq!(
         *leads_session, pid,
-        "{whose} stayed in the session it was started in, so a hangup reaches it"
+        "the forked child stayed in the session it was started in, so a hangup \
+         reaches it"
     );
     assert!(
         stdio_is_silenced(stdio),
-        "{whose} still holds the descriptors it was handed: {stdio:?}"
+        "the forked child still holds the descriptors it was handed: {stdio:?}"
     );
 }
 
-/// What the three standard descriptors of `pid` point at.
-fn stdio_targets(pid: u32) -> Vec<PathBuf> {
-    (0..3)
-        .map(|fd| fs::read_link(format!("/proc/{pid}/fd/{fd}")).unwrap_or_default())
-        .collect()
-}
-
-/// Whether all three point at `/dev/null`, which is where detaching puts them.
-///
-/// Takes what was read rather than a pid, so an assertion can report the targets it
-/// judged: they have to be collected before the daemon is, and `/proc` has nothing
-/// to say about it afterwards.
+/// Whether all three point at `/dev/null`, which is where detaching puts them. Takes
+/// what [`detachment_of`] read rather than a pid, for the reason given there.
 fn stdio_is_silenced(targets: &[PathBuf]) -> bool {
     targets.iter().all(|path| path == Path::new("/dev/null"))
 }
@@ -981,11 +970,6 @@ struct Replay {
 /// then finds its marker missing rather than finding a passing test that read the
 /// frames in whatever order they came. Written once because the two callers differ
 /// only in how long the session had been sitting there when they arrived.
-#[expect(
-    clippy::panic,
-    reason = "clippy.toml's allow-panic-in-tests reaches `#[test]` bodies, not the \
-              helpers an integration test crate keeps beside them"
-)]
 fn replay_to_the_exit(client: &mut Client) -> Replay {
     let mut seen = Vec::new();
     let deadline = Instant::now() + FRAME_PATIENCE;
@@ -1084,16 +1068,11 @@ fn a_signalled_daemon_collects_a_process_that_ignores_sighup() {
 /// what `Pty::terminate` signals and what a script's background processes do anyway.
 ///
 /// The marker trails the pid so that seeing it proves the digits already arrived, and
-/// the arithmetic keeps it out of the line discipline's echo of the command itself —
-/// which would otherwise match first, carrying `$!` unexpanded.
+/// the arithmetic is `harness::READY_MARKER`'s — without it the echo of the command
+/// would match first, carrying `$!` unexpanded.
 ///
 /// The [`Reaper`] comes back with it because the process is deliberately in nobody's
 /// reach: if an assertion fires, `sleep 300` outlives the whole suite.
-#[expect(
-    clippy::panic,
-    reason = "clippy.toml's allow-panic-in-tests reaches `#[test]` bodies, not the \
-              helpers an integration test crate keeps beside them"
-)]
 fn background_ignoring_sighup(client: &mut Client, from: u64) -> (u32, Reaper) {
     client.input(
         0,

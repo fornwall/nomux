@@ -107,8 +107,7 @@ mod tests {
     fn a_wrapped_queue_is_delivered_in_order() {
         let (read_end, write_end) = rustix::pipe::pipe().expect("pipe");
 
-        // Wrap it: fill the ring, then take from the front and push to the back
-        // so that the head is no longer at index zero.
+        // Fill, drain from the front, refill: the head ends up past index zero.
         let mut queue: VecDeque<u8> = VecDeque::with_capacity(8);
         queue.extend(b"abcdefgh");
         drop(queue.drain(..5));

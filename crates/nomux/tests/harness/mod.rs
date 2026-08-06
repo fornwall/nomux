@@ -48,11 +48,9 @@ pub(crate) const WIN: WinSize = WinSize {
 /// How long a test waits for what a daemon owes it, whether that is one frame or a
 /// sequence of them.
 ///
-/// Spent on the whole wait rather than renewed per frame: patience taken per frame
-/// renews itself on every one that arrives, so a daemon dribbling output is never
-/// late by that measure and the loop runs until the runner's kill, which cannot say
-/// which wait never ended. One value rather than one per site, since every wait here
-/// is on a daemon that is either about to answer or never going to.
+/// Spent on the whole wait rather than renewed per frame, for [`poll_by`]'s reason.
+/// One value rather than one per site, since every wait here is on a daemon that is
+/// either about to answer or never going to.
 pub(crate) const FRAME_PATIENCE: Duration = Duration::from_secs(15);
 
 /// How long a test waits for something outside the protocol — a file appearing, a
@@ -93,9 +91,16 @@ pub(crate) fn poll_until(within: Duration, condition: impl FnMut() -> bool) -> b
 
 /// [`poll_until`] against a deadline the caller shares between several waits.
 ///
-/// A test that waits for two things one after another with a bound each is bounded by
-/// their *sum*, which can outlast the runner's kill and then have nothing to point at
-/// (`.config/nextest.toml`). [`join_before`] is the same argument for threads.
+/// One deadline per test rather than one bound per wait, and the canonical statement
+/// of why. A test that waits for two things one after another with a bound each is
+/// bounded by their *sum*, which can outlast the runner's kill and then have nothing
+/// to point at (`.config/nextest.toml`); a bound renewed per frame or per round is
+/// worse still, being satisfied by every arrival — a peer dribbling one frame just
+/// inside it is never late, and the loop around it has no bound at all. Everything in
+/// this suite that takes an `Instant` where a `Duration` would have done —
+/// [`join_before`], [`Client::frame_before`], [`Client::hello_before`], and the
+/// `PATIENCE` constants the test binaries define — is here for this reason and says
+/// no more about it.
 pub(crate) fn poll_by(deadline: Instant, mut condition: impl FnMut() -> bool) -> bool {
     loop {
         if condition() {
@@ -112,8 +117,7 @@ pub(crate) fn poll_by(deadline: Instant, mut condition: impl FnMut() -> bool) ->
 /// failing rather than parking if it will not come back.
 ///
 /// `JoinHandle::join` has no deadline, so a relay that stalls in either direction
-/// hangs the whole run and the guard in `.config/nextest.toml` can only kill the
-/// process without saying which wait never ended. The deadline is the caller's rather
+/// hangs the whole run rather than failing it. The deadline is the caller's rather
 /// than a bound per join for [`poll_by`]'s reason.
 pub(crate) fn join_before<T>(handle: thread::JoinHandle<T>, deadline: Instant, what: &str) -> T {
     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -495,9 +499,9 @@ fn intern(name: &str) -> String {
 /// duplicate of everything every other test had open at that instant, and keeps it
 /// until it reaches `exec`. Until then a pipe or socket the other test has closed on
 /// purpose is not closed at all: it still has a reader, and a peer writing to it gets
-/// its bytes taken rather than the `EPIPE` the test set up. `PLAN.md` § P2 records the
-/// same hazard against `flock`; this is the general form of it, and it is invisible
-/// under `cargo nextest`, which gives each test a process of its own.
+/// its bytes taken rather than the `EPIPE` the test set up. A duplicate of an `flock`ed
+/// descriptor is the same hazard in its mild form, holding the lock alive. All of it is
+/// invisible under `cargo nextest`, which gives each test a process of its own.
 static FORKS: RwLock<()> = RwLock::new(());
 
 /// Starts `command`, holding [`FORKS`] across the `fork` it performs.
@@ -822,15 +826,22 @@ pub(crate) struct Ready {
     pub(crate) offset: u64,
 }
 
-/// What the shell is asked to say once the terminal is configured, and what that
-/// becomes once it has. The arithmetic is the point of both: see
-/// [`Client::make_ready`].
+/// What the shell is asked to say once the terminal is configured.
 ///
 /// `printf` rather than `echo`, and with no newline behind the marker, so that the
 /// marker is the *last* thing the setup line puts on the stream — which is what makes
 /// [`Ready::offset`] one past the marker rather than one past whatever the daemon
 /// read with it. See [`Client::make_ready`] for what a terminator behind it costs.
 const READY_ECHO: &str = "printf \"NOMUX-$((6*7))-READY\"";
+
+/// What [`READY_ECHO`] becomes once a shell has run it, and the canonical statement of
+/// why every marker in this suite is arithmetic.
+///
+/// The line discipline echoes the command line itself before any shell reads it, and
+/// that echo carries `$((6*7))` unexpanded — so `42` can only have come from a shell
+/// that ran the line. A marker written out whole would be found in the echo of the
+/// request for it, and the wait would be over before anything happened. Every other
+/// `$((6*7))` in these tests is here for this reason and says no more about it.
 const READY_MARKER: &str = "NOMUX-42-READY";
 
 impl Client {
@@ -869,10 +880,8 @@ impl Client {
     }
 
     /// [`Client::hello`] against a deadline the caller shares between several
-    /// greetings, for [`Client::frame_before`]'s reason: a test that reconnects two
-    /// dozen times takes a fresh [`FRAME_PATIENCE`] on each, so a daemon that stalls
-    /// on `HelloOk` is bounded only by the runner's kill — which loses whatever the
-    /// failure was going to say, the seed § 9 promises included.
+    /// greetings, per [`poll_by`]. What is lost without it is the failure the test was
+    /// going to report, the chaos seed § 9 promises included.
     pub(crate) fn hello_before(
         &mut self,
         deadline: Instant,
@@ -913,9 +922,7 @@ impl Client {
     /// The marker comes *after* the `stty` because that is what makes arriving at it
     /// proof the mode is in effect rather than merely reached: input sent while the
     /// line discipline was still canonical is discarded by it rather than delivered.
-    /// It is built out of `$((6*7))` because the line discipline echoes the command
-    /// line itself before any of it runs — that echo carries the arithmetic
-    /// unexpanded, so it cannot be what satisfies the wait.
+    /// It is built out of `$((6*7))` for [`READY_MARKER`]'s reason.
     ///
     /// Nothing may follow the marker on that line, which is why [`READY_ECHO`] is a
     /// `printf` with no newline in it. [`Ready::offset`] is one past the frame the
@@ -952,20 +959,16 @@ impl Client {
 
     /// The next frame, or `None` once `deadline` has passed without one.
     ///
-    /// The deadline belongs to the caller rather than to this function, so that a
-    /// wait made of many frames — [`Client::read_until`] taking output until a needle
-    /// appears — is bounded as a whole rather than per frame. Returning rather than
-    /// panicking on the deadline leaves the failure to whoever knows what the wait
-    /// was for, which is the only place that can also say what it saw instead.
-    /// Everything that is *not* a timeout is fatal here and says `awaiting`, because
-    /// none of it leaves the caller anything to add.
+    /// The deadline belongs to the caller rather than to this function, per
+    /// [`poll_by`], so that a wait made of many frames — [`Client::read_until`] taking
+    /// output until a needle appears — is bounded as a whole rather than per frame.
+    /// Returning rather than panicking on the deadline leaves the failure to whoever
+    /// knows what the wait was for, which is the only place that can also say what it
+    /// saw instead. Everything that is *not* a timeout is fatal here and says
+    /// `awaiting`, because none of it leaves the caller anything to add.
     ///
-    /// Reachable from the test binaries for that same first reason. A loop over
-    /// [`Client::next_frame`] takes a fresh [`FRAME_PATIENCE`] on every frame, so a daemon
-    /// dribbling one frame just inside it is never late and the loop as a whole has
-    /// no bound at all — it runs until nextest's own kill, which cannot say which
-    /// wait never ended. A test reading many frames wants one deadline, and this is
-    /// where it gets it.
+    /// Reachable from the test binaries for that same first reason: a test reading
+    /// many frames wants one deadline, and this is where it gets it.
     pub(crate) fn frame_before(
         &mut self,
         deadline: Instant,
@@ -1106,15 +1109,6 @@ impl Client {
         );
     }
 
-    /// The channel id carried by the next frame of type `want`.
-    pub(crate) fn next_chan(&mut self, want: FrameType) -> u32 {
-        let payload = self.next_of(want);
-        match Frame::decode(want, &payload).expect("decode channel frame") {
-            Frame::AgentOpen { chan } | Frame::AgentClose { chan } => chan,
-            other => panic!("expected a channel frame, got {other:?}"),
-        }
-    }
-
     /// Reads until the daemon has acknowledged input through `through`, tolerating
     /// whatever else arrives on the way.
     ///
@@ -1201,11 +1195,7 @@ impl Client {
 }
 
 /// Asks the session for a marker no shell that failed to run the line could produce,
-/// and waits for it.
-///
-/// The arithmetic is the assertion: the line discipline echoes the command line
-/// before any shell reads it, so a marker written out whole is satisfied by that echo
-/// alone. See [`Client::make_ready`], where the same trick is load-bearing.
+/// and waits for it. The arithmetic is the assertion — see [`READY_MARKER`].
 pub(crate) fn still_serving(client: &mut Client, tag: &str) {
     client.input(
         client.in_offset,

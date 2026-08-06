@@ -1,16 +1,10 @@
-# Cross-linking for the two shipping targets (IMPLEMENTATION.md § 8).
+# Cross-linking for the two shipping targets. Why `rust-lld` needs no gcc, no zig and
+# no sysroot is IMPLEMENTATION.md § 8; rustc resolves the bare name out of its own
+# sysroot, so it does not have to be on $PATH.
 #
-# `rust-lld` is the whole cross toolchain. The tree is pure Rust — rustix runs on
-# its linux_raw backend, so nothing here compiles or links a C object — and every
-# rust-std component ships the musl CRT objects and libc.a beside it in
-# `lib/self-contained/`. So the cross build needs no gcc, no zig, no sysroot:
-# `rustup target add` is the entire setup. rustc resolves the bare name `rust-lld`
-# out of its own sysroot, so it does not have to be on $PATH.
-#
-# x86_64 is listed too, though the host `cc` would link it. Reproducibility is the
-# reason: `cc` drags in whatever gcc and binutils the host happens to have, and
-# their version then shows up in the bytes we ask the client to pin a SHA-256 of.
-# rust-lld is pinned by rust-toolchain.toml like everything else.
+# x86_64 is listed too, though the host `cc` would link it: `cc` drags in whatever gcc
+# and binutils the host happens to have, and their version then lands in the bytes we
+# ask the client to pin a SHA-256 of.
 #
 # Only `linker` belongs in this file. A `rustflags` key here would be silently
 # discarded the moment anything sets $CARGO_ENCODED_RUSTFLAGS or $RUSTFLAGS — either

@@ -5,9 +5,3 @@
 # working copy differently from `cargo fmt --all --check` on the runner, which is a
 # disagreement the gate reports and cannot explain. Existing is this file's whole
 # job; the first one found wins, and one holding only comments still wins.
-#
-# `style_edition = "2024"` used to be here and did nothing: rustfmt takes the style
-# edition from the edition cargo passes it, every crate in the workspace inherits
-# edition 2024, and formatting is byte-identical with the key and without it. A line
-# that reads as configuration and configures nothing is worse than no line, since the
-# next person to touch it has to rediscover that.

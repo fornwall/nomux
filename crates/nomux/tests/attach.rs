@@ -325,9 +325,9 @@ fn spawn_starts_a_daemon_for_a_session_that_does_not_exist_yet() {
         let mut chunk = [0u8; 8192];
         loop {
             match stdout.read(&mut chunk) {
-                // The rule PLAN § P2 records, one layer out: a signal ending this
-                // read would close the channel and fail the test for something that
-                // happened to the process rather than to the relay.
+                // The rule `harness::read_uninterrupted` states, one layer out: a
+                // signal ending this read would close the channel and fail the test
+                // for something that happened to the process rather than to the relay.
                 Err(err) if err.kind() == ErrorKind::Interrupted => {}
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
@@ -404,9 +404,8 @@ fn spawn_starts_a_daemon_for_a_session_that_does_not_exist_yet() {
 fn the_relay_moves_bulk_traffic_both_ways_without_losing_a_byte() {
     // Eight pipes and two and a half socket buffers per direction, which is what
     // "fill and refill" above asks for. It was two megabytes, on no argument beyond
-    // being a round number, against the sibling below whose own note already gives
-    // the reason for this one: what a mis-slice or a swallowed short read does at one
-    // boundary it does at every one of them, so the extra megabytes buy only seconds.
+    // being a round number; the figure is the sibling below's, and so is the reason
+    // for it.
     const BULK: usize = 512 * 1024;
 
     let (mut child, peer, _listener) = relay_onto_a_socket("relay_bulk", Stdio::piped());
@@ -495,8 +494,7 @@ fn the_relay_moves_the_same_traffic_by_copying_when_the_kernel_will_not_splice_i
 /// Far above the second or so the transfers really take, and far below the
 /// termination in `.config/nextest.toml`, so a stalled relay fails here — naming the
 /// direction that stopped — rather than being killed there with nothing to point at.
-/// Spent once per *test*, since a site that waits three times with this bound each is
-/// bounded by their sum, which is past the runner's own kill.
+/// Spent once per *test*, for `harness::poll_by`'s reason.
 ///
 /// The read timeout in [`relay_onto_a_socket_over`] is the one place it is a per-call
 /// figure, and it is not a deadline: it is what stops a `read_to_end` on a socket
@@ -650,7 +648,7 @@ fn the_relay_exits_when_its_stdout_dies_with_the_destination_latched_full() {
 ///
 /// The pipe is half-closed inside [`while_nothing_forks`], because a pipe is broken
 /// only when the *last* descriptor onto its read end goes and another test's `fork` in
-/// flight holds a copy of everything open here (`PLAN.md` § P2).
+/// flight holds a copy of everything open here.
 #[test]
 fn the_relay_exits_when_its_stdout_dies_with_nothing_owed_to_it() {
     // Before a single byte has crossed, so the direction is idle rather than
@@ -715,7 +713,7 @@ fn the_relay_exits_when_a_stdout_it_can_only_copy_to_stops_reading() {
     // Shut down rather than closed, and left open afterwards to make that the point:
     // `SHUT_RD` is a property of the socket rather than of any descriptor onto it, so
     // the copy another test's `fork` in flight is holding cannot undo it where a close
-    // could (`PLAN.md` § P2).
+    // could.
     //
     // Before a byte has crossed, so nothing is owed to it and nothing is latched: the
     // relay is not watching this descriptor and cannot be told about it.
@@ -788,10 +786,8 @@ fn a_session_that_ends_with_the_relays_input_unread_still_exits_clean() {
         Stdio::piped(),
     );
 
-    // One deadline across both waits below rather than one each, for the reason
-    // [`RELAY_PATIENCE`] gives: two of them in sequence is fifty seconds against a
-    // runner that kills at forty, and a stall in the second would have been killed
-    // rather than reported.
+    // One deadline across both waits below rather than one each ([`RELAY_PATIENCE`]):
+    // two of them in sequence is fifty seconds against a runner that kills at forty.
     let deadline = Instant::now() + RELAY_PATIENCE;
 
     // Never read from this end, which is the whole provocation: the reset is the

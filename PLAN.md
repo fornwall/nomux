@@ -1,6 +1,6 @@
 # nomux — Plan
 
-Backlog, `P1`–`P4` in priority order. Rationale: [DESIGN.md](DESIGN.md).
+Backlog, in priority order. Rationale: [DESIGN.md](DESIGN.md).
 Mechanics: [IMPLEMENTATION.md](IMPLEMENTATION.md).
 
 ## Status
@@ -20,7 +20,7 @@ clone gives you `list`, `kill` and a daemon nothing can talk to.
 
 ## P1 — known gaps
 
-Five open; the last three came out of a security review.
+Four open; the last two came out of a security review.
 
 - **An id this run directory cannot hold is invisible *and* uncollectable.** `list` can
   cheaply report the `sun_path`-refused id it now skips; `kill` cannot collect it, since
@@ -29,10 +29,6 @@ Five open; the last three came out of a security review.
 - **Nothing bounds sessions per host.** The daemon's backstop of 64 landed
   ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)); the cap of eight is
   client-side ([DESIGN.md § 5.1](DESIGN.md#51-identity)) and the client is unwritten.
-- **`kill` re-checks identity by command line, not by start time** — screen's
-  CVE-2023-24626 in shape, never in privilege; reuse `pty::stat_start_time` in
-  `control::resolve`
-  ([IMPLEMENTATION.md § 6.6](IMPLEMENTATION.md#66-frozen-control-surface)).
 - **`write_private` unlinks and then writes by name.** `O_NOFOLLOW | O_EXCL` would retire
   the directory-mode argument and cover the attacker-writable parent
   [IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket) concedes; `read_prefix` already
@@ -45,6 +41,10 @@ Five open; the last three came out of a security review.
 
 - A hand-started `nomux daemon <id>` has a bind-to-publish window; a `kill` inside it
   refuses and waits it out — an honest non-zero exit, never a destroyed session.
+- Where there is no `pidfd_open` to call — a kernel below 5.3, a sandbox refusing it —
+  `kill` signals the bare pid and the reuse race it otherwise closes is back; nothing
+  else can pin the process, the pidfile being frozen as a number carrying no baseline
+  ([IMPLEMENTATION.md § 6.6](IMPLEMENTATION.md#66-frozen-control-surface)).
 - An abort says nothing from inside the process (`-Cpanic=immediate-abort`,
   `strip = "symbols"`); what is left is the `SIGQUIT` core against the
   `nomux-<target>.debug` companion ([IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)).

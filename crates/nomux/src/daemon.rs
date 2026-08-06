@@ -1,8 +1,9 @@
 //! The session daemon: owns the PTY, the ring buffer and the listening socket.
 //!
-//! Single-threaded around `poll`, with at most one client (`IMPLEMENTATION.md` § 6.4),
-//! so the poll set is small: the fixed sources in `SINGLE_SOURCES` plus one entry per
-//! live agent channel. What this process does to *itself* on the way in is `startup`.
+//! Single-threaded around `poll`, with at most one client (`IMPLEMENTATION.md` § 6.4)
+//! and one served agent connection (§ 6.7), so the poll set is fixed: the sources in
+//! `SINGLE_SOURCES` and nothing else. What this process does to *itself* on the way in
+//! is `startup`.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -18,7 +19,7 @@ use nomux_proto::{
 };
 use rustix::event::{PollFd, PollFlags, Timespec};
 
-use crate::agent::{self, Agent, MAX_AGENT_CHANNELS};
+use crate::agent::{self, Agent};
 use crate::conn::Conn;
 use crate::control::{Liveness, liveness};
 use crate::linger;
@@ -50,8 +51,7 @@ fn ring_capacity(requested: Option<&str>) -> usize {
 }
 
 /// Most sessions a run directory may already hold before this daemon refuses to add
-/// another: eight times the limit `DESIGN.md` § 5.1 leaves to the client, and a
-/// backstop against a runaway rather than a policy (`IMPLEMENTATION.md` § 6.3).
+/// another: eight times the limit `DESIGN.md` § 5.1 leaves to the client (§ 6.3).
 const MAX_SESSIONS: usize = 64;
 
 /// How long a detached session survives before reaping itself. One rule whether or not
@@ -62,8 +62,7 @@ const MAX_SESSIONS: usize = 64;
 )]
 const IDLE_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
-/// How long to keep retrying `waitpid` after the PTY reports end of file before
-/// reporting a status the daemon had to invent.
+/// How long to keep retrying `waitpid` before reporting a status the daemon invented (§ 6.5).
 const STATUS_GRACE: Duration = Duration::from_secs(2);
 
 /// How often to retry while waiting for the child to become reapable. The wait is
@@ -77,8 +76,7 @@ const STATUS_RETRY: Duration = Duration::from_millis(5);
 )]
 const IDLE_TICK: Duration = Duration::from_secs(60 * 60);
 
-/// How long to wait for the very first client before giving up. Without this a
-/// daemon spawned by a connection that died mid-handshake would live forever.
+/// How long to wait for the very first client before giving up (§ 6.5).
 const FIRST_ATTACH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long the stale-socket probe waits before giving the id up as unanswerable.
@@ -92,8 +90,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 /// set is the only way to stand back from that.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
-/// Backlog for the session socket: as deep as this host allows
-/// (`IMPLEMENTATION.md` § 6.3, which [`publish`] restates when it calls `listen` again).
+/// Backlog for the session socket: as deep as this host allows (§ 6.3).
 const SOCKET_BACKLOG: libc::c_int = -1;
 
 /// Fault injection: restores the pre-fix event ordering of § 6.4.1, where the takeover
@@ -115,8 +112,7 @@ const FAULT_SETTLE: Duration = Duration::from_millis(20);
 /// the life of the session. Generous against a relayed `Hello`'s round trip (§ 7).
 const PENDING_HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Stop accepting client input once this much is already queued for a PTY that is not
-/// taking it (`IMPLEMENTATION.md` § 4.1).
+/// Stop accepting client input once this much is queued for a PTY not taking it (§ 4.1).
 const MAX_PENDING_INPUT: usize = 1 << 20;
 
 /// The attached client, and the state that means nothing without one.
@@ -159,8 +155,7 @@ struct Daemon {
     /// Read end of the self-pipe [`crate::startup::arm_stop_signals`] armed, or
     /// `None` on a host where it could not be armed at all.
     stop_pipe: Option<OwnedFd>,
-    /// Set once a stop signal has been seen. The loop leaves on its next pass, so
-    /// the exit goes out through `shutdown` like every other one.
+    /// Set once a stop signal has been seen; the loop leaves on its next pass (§ 6.5).
     stopping: bool,
     ring: crate::ring::Ring,
     pty: Option<Pty>,
@@ -168,7 +163,7 @@ struct Daemon {
     /// A connection accepted but not yet greeting, and so not yet the client, with the
     /// deadline by which it must. Usually a liveness probe from `list`.
     pending: Option<(Conn, Instant)>,
-    /// Agent socket and its channels, once a session created with
+    /// Agent socket and the connection it is serving, once a session created with
     /// [`nomux_proto::HELLO_AGENT_FORWARD`] has bound one.
     agent: Option<Agent>,
     /// Where the child starts, captured before the daemon moved to `/`.
@@ -410,26 +405,25 @@ enum Source {
     Pending,
     /// The agent socket, where the child's `ssh-agent` connections arrive.
     AgentListener,
-    /// One proxied agent connection, by channel id rather than by index: the table
-    /// can lose an entry while this iteration is still dispatching.
-    AgentChannel(u32),
+    /// The proxied agent connection, of which there is at most one (§ 6.7).
+    AgentChannel,
 }
 
 /// Every source that appears in the poll set at most once, in the order
 /// [`Daemon::watches`] registers them. This list is what registers them, so a source
 /// added here is one [`POLL_SLOTS`] has already accounted for.
-const SINGLE_SOURCES: [Source; 6] = [
+const SINGLE_SOURCES: [Source; 7] = [
     Source::Listener,
     Source::Signal,
     Source::Pty,
     Source::Client,
     Source::Pending,
     Source::AgentListener,
+    Source::AgentChannel,
 ];
 
-/// Slots the poll set can ever need at once: [`SINGLE_SOURCES`] plus one per agent
-/// channel, which `Agent::accept` caps at [`MAX_AGENT_CHANNELS`].
-const POLL_SLOTS: usize = SINGLE_SOURCES.len() + MAX_AGENT_CHANNELS as usize;
+/// Slots the poll set can ever need at once, every source being a single one.
+const POLL_SLOTS: usize = SINGLE_SOURCES.len();
 
 impl Daemon {
     fn event_loop(&mut self) -> io::Result<()> {
@@ -532,15 +526,39 @@ impl Daemon {
                 Some((client.conn.stream().as_fd(), flags))
             }
             Source::Pending => Some((self.pending.as_ref()?.0.stream().as_fd(), PollFlags::IN)),
-            // Out of the set on the same terms as the session listener above.
+            // Out of the set on both of the session listener's terms above: an `accept`
+            // failure being waited out, and the one slot already taken (§ 6.7). The
+            // second matters twice over here — a backlog left readable with nothing
+            // willing to accept from it returns from every `poll` at once.
             Source::AgentListener => {
                 let agent = self
                     .agent
                     .as_ref()
-                    .filter(|_| self.agent_accept_retry.is_none())?;
+                    .filter(|agent| self.agent_accept_retry.is_none() && !agent.is_serving())?;
                 Some((agent.listener(), PollFlags::IN))
             }
-            Source::AgentChannel(_) => None,
+            Source::AgentChannel => {
+                let (fd, wants_write, wants_read) = self.agent.as_ref()?.watch()?;
+                // Stop draining the agent socket until the queue it feeds has room; the
+                // bytes then wait in the kernel's buffer, where the peer blocks on them.
+                let saturated = self
+                    .client
+                    .as_ref()
+                    .is_some_and(|client| client.conn.is_write_saturated());
+                let mut flags = if saturated || !wants_read {
+                    PollFlags::empty()
+                } else {
+                    PollFlags::IN
+                };
+                if wants_write {
+                    flags |= PollFlags::OUT;
+                }
+                // Dropped on an empty mask rather than registered for `HUP` alone, as
+                // the client above is: a peer that died while the client could not take
+                // what it said is nothing anyone can act on yet, and the end of file is
+                // still there on the pass that gives the queue its room back.
+                (!flags.is_empty()).then_some((fd, flags))
+            }
         }
     }
 
@@ -560,28 +578,6 @@ impl Daemon {
         for source in SINGLE_SOURCES {
             if let Some((fd, flags)) = self.watch_for(source) {
                 watch(source, fd, flags);
-            }
-        }
-
-        if let Some(agent) = self.agent.as_ref() {
-            let saturated = self
-                .client
-                .as_ref()
-                .is_some_and(|client| client.conn.is_write_saturated());
-            for (id, fd, wants_write, wants_read) in agent.watches() {
-                // Stop draining agent sockets until the queue they feed has room; the
-                // bytes then wait in the kernel's buffer, where the peer blocks on them.
-                let mut flags = if saturated || !wants_read {
-                    PollFlags::empty()
-                } else {
-                    PollFlags::IN
-                };
-                if wants_write {
-                    flags |= PollFlags::OUT;
-                }
-                if !flags.is_empty() {
-                    watch(Source::AgentChannel(id), fd, flags);
-                }
             }
         }
     }
@@ -639,6 +635,16 @@ impl Daemon {
         if self.pending.as_ref().is_some_and(|(_, at)| now >= *at) {
             self.pending = None;
         }
+        // Against the same reading of the clock, and for the same reason the pending
+        // slot has a deadline: the one agent slot is held by whoever has it until
+        // something takes it away (§ 6.7).
+        if self
+            .agent
+            .as_mut()
+            .is_some_and(|agent| agent.close_if_idle(now))
+        {
+            self.tell_client(&Frame::AgentClose);
+        }
         self.wait(ready)?;
         let revents = |want: Source| {
             ready
@@ -650,7 +656,6 @@ impl Daemon {
 
         // Nothing is read from the pipe: the byte says only that a signal arrived, and
         // the loop leaves on its next pass, too soon to spin on a readable descriptor.
-        // The rest of this iteration runs, so what the client is owed is queued first.
         if revents(Source::Signal).intersects(readable) {
             self.stopping = true;
         }
@@ -698,10 +703,9 @@ impl Daemon {
             self.read_client(scratch)?;
         }
 
-        for (source, flags) in ready.iter() {
-            if let Source::AgentChannel(id) = *source {
-                self.service_agent_channel(id, *flags, read_buf);
-            }
+        let agent_events = revents(Source::AgentChannel);
+        if !agent_events.is_empty() {
+            self.service_agent_channel(agent_events, read_buf);
         }
         // On the same terms as the session listener above, and for the same reason.
         if revents(Source::AgentListener).intersects(readable) {
@@ -713,8 +717,6 @@ impl Daemon {
         // master out of the poll set nothing would wake the pass that sends the `Exit`.
         self.collect_status();
         self.pump_output();
-        // Unconditional: `flush_some` on an empty queue makes no syscall, so asking
-        // every pass costs nothing and there is no readiness test to get wrong.
         self.write_client();
         Ok(())
     }
@@ -726,17 +728,18 @@ impl Daemon {
         let mut remaining = self.detach_deadline().map_or(IDLE_TICK, |at| {
             at.saturating_duration_since(Instant::now()).min(IDLE_TICK)
         });
-        // The child has let go of the terminal but `waitpid` has not produced its
-        // status yet; come back promptly rather than reporting one this invented.
+        // Come back before [`STATUS_GRACE`] expires on a status merely not readable yet.
         if self.child_gone.is_some() && self.exited.is_none() {
             remaining = remaining.min(STATUS_RETRY);
         }
-        // A listener out of the poll set, and a pending connection that says nothing,
-        // have no other wakeup that would give the slot back.
+        // A listener out of the poll set, a pending connection that says nothing, and an
+        // agent connection that has gone quiet have no other wakeup that would give the
+        // slot back.
         if let Some(at) = [
             self.accept_retry,
             self.agent_accept_retry,
             self.pending.as_ref().map(|(_, at)| *at),
+            self.agent.as_ref().and_then(Agent::deadline),
         ]
         .into_iter()
         .flatten()
@@ -750,12 +753,9 @@ impl Daemon {
         }
     }
 
-    /// Takes a new connection, which waits as `pending` until it says `Hello`.
-    ///
-    /// Connecting is *not* attaching (`IMPLEMENTATION.md` § 6.4): `nomux list` and the
-    /// § 6.3 spawn race both probe every socket with a bare `connect`, and counting that
-    /// as a takeover would evict the user from every session merely for listing them.
-    /// Never fails, per § 6.4.1; [`ACCEPT_BACKOFF`] is what covers a transient one.
+    /// Takes a new connection, which waits as `pending` until it says `Hello`: connecting
+    /// is *not* attaching (§ 6.4). Never fails, per § 6.4.1; [`ACCEPT_BACKOFF`] is what
+    /// covers a transient one.
     fn accept(&mut self) {
         loop {
             match self.listener.accept() {
@@ -818,10 +818,8 @@ impl Daemon {
             self.reject_pending(ErrorCode::Protocol, "unparseable Hello");
             return Ok(());
         };
-        // Before the eviction below, not after: checked only inside `on_hello`, which runs
-        // once the takeover has happened, a newcomer's *failed* handshake would throw the
-        // working client off and drop the newcomer too, leaving nobody attached (§ 6.4).
-        // `on_hello` keeps its own copy for the caller where the client greets again.
+        // Before the eviction below, not after (§ 6.4). `on_hello` keeps its own copy of
+        // the check, for the client that greets again on an established connection.
         if hello.protocol != PROTOCOL_VERSION {
             self.reject_pending(ErrorCode::Version, "protocol version mismatch");
             return Ok(());
@@ -833,8 +831,8 @@ impl Daemon {
             drop(self.read_client(scratch));
         }
         // Hands the session over (`IMPLEMENTATION.md` § 6.4), by the same door as any
-        // other refusal — which also drops the agent channels the arriving client knows
-        // nothing of. With nobody attached this does nothing at all.
+        // other refusal — which also drops the agent connection the arriving client
+        // knows nothing of. With nobody attached this does nothing at all.
         self.reject(ErrorCode::Takeover, "another client attached");
         self.client = self.pending.take().map(|(conn, _)| Attached::new(conn));
         self.on_hello(&hello)?;
@@ -859,8 +857,7 @@ impl Daemon {
         // [`nbio::read_or_eof`] answers a stray errno with `Eof` rather than propagating
         // it, for the reason [`Daemon::write_pty`] gives about the other half.
         match nbio::read_or_eof(pty.master(), buf) {
-            // Always drain, attached or not: a full ring drops its oldest bytes,
-            // but a PTY that is not read blocks the child on write.
+            // Always drain, attached or not: an unread PTY blocks the child on write (§ 4).
             nbio::Read::Data(n) => self.ring.push(buf.get(..n).unwrap_or(&[])),
             nbio::Read::Eof => self.on_child_exit(),
             nbio::Read::WouldBlock => {}
@@ -888,9 +885,8 @@ impl Daemon {
 
     /// Records that the child has let go of the terminal; the stamp starts no clock (§ 6.5).
     ///
-    /// No status is collected here: the master reports end of file while `waitpid` still
-    /// answers "not yet", for about a third of exits on this kernel, so committing one
-    /// would report `exit 3` as `exit 0`. [`Daemon::collect_status`] runs later this pass.
+    /// No status is collected here: end of file precedes reapability for about a third of
+    /// exits on this kernel (§ 6.5). [`Daemon::collect_status`] runs later this pass.
     fn on_child_exit(&mut self) {
         if self.child_gone.is_none() {
             self.child_gone = Some(Instant::now());
@@ -987,21 +983,18 @@ impl Daemon {
                     drop(pty.resize(win));
                 }
             }
-            // Empty on purpose: `OutputAck` is advisory (§ 3) and what it does is
-            // *arrive*, waking the loop so a replay stopped on a full socket resumes.
-            Frame::OutputAck => {}
             Frame::Ping => self.tell_client(&Frame::Pong),
             Frame::Detach => self.drop_client(),
-            Frame::AgentData { chan, data } => {
+            Frame::AgentData { data } => {
                 if let Some(agent) = self.agent.as_mut()
-                    && !agent.deliver(chan, data)
+                    && !agent.deliver(data)
                 {
-                    self.close_agent_channel(chan);
+                    self.close_agent_channel();
                 }
             }
-            Frame::AgentClose { chan } => {
+            Frame::AgentClose => {
                 if let Some(agent) = self.agent.as_mut() {
-                    agent.close_from_client(chan);
+                    agent.close_from_client();
                 }
             }
             _ => self.reject(ErrorCode::Protocol, "frame is not valid from a client"),
@@ -1059,13 +1052,11 @@ impl Daemon {
         let resume_from = if hello.out_offset == RESUME_FROM_START {
             base
         } else {
-            // Clamped at both ends: above `end` is a client claiming output that was never
-            // produced. `min` then `max` rather than `clamp`, which panics on unordered
-            // bounds — a bare trap with no message in a shipping build.
+            // Clamped at both ends (§ 4.2). `min` then `max` rather than `clamp`, which
+            // panics on unordered bounds — a bare trap with no message in a shipping build.
             hello.out_offset.min(self.ring.end()).max(base)
         };
-        // Not a field on the wire: `resume_from` above already decides it, and the
-        // client derives the same answer from the two numbers it has (`HelloOk::gap`).
+        // Not a field on the wire: both ends compute it — `HelloOk::gap` (§ 4.2).
         let gap = resume_from > hello.out_offset;
         if let Some(client) = self.client.as_mut() {
             client.sent_through = resume_from;
@@ -1097,17 +1088,14 @@ impl Daemon {
             .as_ref()
             .is_some_and(|client| client.repaint_ctrl_l)
         {
-            // Through the same queue as client input, so it cannot overtake keystrokes
-            // already accepted or block on a full PTY buffer. `in_applied` does not move.
+            // Queued rather than written, and not client input: `in_applied` stays (§ 4.3).
             self.pending_input.push_back(0x0c);
         } else if let Some(pty) = self.pty.as_ref() {
             drop(pty.nudge_repaint(self.win));
         }
     }
 
-    /// Applies client input exactly once: `in_applied` is authoritative, a client that
-    /// lost an `InputAck` replays from an older offset, and the overlap is trimmed rather
-    /// than rejected — re-applying it is how a truncated `rm -rf` gets run.
+    /// Applies client input exactly once, trimming an overlapping replay (§ 3).
     fn on_input(&mut self, offset: u64, data: &[u8]) {
         let end = offset.saturating_add(data.len() as u64);
         if offset > self.in_applied {
@@ -1165,9 +1153,8 @@ impl Daemon {
             }
         }
 
-        // Last, and only once everything the child wrote is queued: this one guard is the
-        // whole of § 6.5's ordering promise, and what makes a client arriving a week after
-        // the exit indistinguishable from one that watched it happen.
+        // Last, and only once everything the child wrote is queued: § 6.5's ordering
+        // promise, enforced in this one place.
         if !client.exit_sent
             && client.sent_through >= end
             && let Some((gone, (status, kind))) = exit
@@ -1180,8 +1167,7 @@ impl Daemon {
             client.exit_sent = true;
         }
         // Coalesced onto the moment this client holds the whole ring rather than issued
-        // per gap: while the child outruns it, every redraw a repaint asks for is output
-        // the next overflow discards, and asking again is what produced it (§ 4.3).
+        // per gap (§ 4.3).
         let repainting = client.repaint_due && client.sent_through >= end;
         if repainting {
             client.repaint_due = false;
@@ -1201,7 +1187,7 @@ impl Daemon {
             return;
         };
         match agent.accept(serving) {
-            agent::Accept::Opened(chan) => self.tell_client(&Frame::AgentOpen { chan }),
+            agent::Accept::Opened => self.tell_client(&Frame::AgentOpen),
             agent::Accept::Failed => {
                 self.agent_accept_retry = Some(Instant::now() + ACCEPT_BACKOFF);
             }
@@ -1209,21 +1195,21 @@ impl Daemon {
         }
     }
 
-    /// Moves bytes for one agent channel in whichever direction is ready.
-    fn service_agent_channel(&mut self, chan: u32, events: PollFlags, buf: &mut [u8]) {
+    /// Moves bytes for the served agent connection in whichever direction is ready.
+    fn service_agent_channel(&mut self, events: PollFlags, buf: &mut [u8]) {
         let Some(agent) = self.agent.as_mut() else {
             return;
         };
         if events.contains(PollFlags::OUT) {
-            match agent.flush(chan) {
+            match agent.flush() {
                 agent::Flush::Open => {}
                 // The client closed this one and has already forgotten it.
                 agent::Flush::Finished => {
-                    let _ = agent.forget(chan);
+                    let _ = agent.forget();
                     return;
                 }
                 agent::Flush::Failed => {
-                    self.close_agent_channel(chan);
+                    self.close_agent_channel();
                     return;
                 }
             }
@@ -1234,24 +1220,24 @@ impl Daemon {
         let Some(agent) = self.agent.as_mut() else {
             return;
         };
-        match agent.read(chan, buf) {
+        match agent.read(buf) {
             nbio::Read::Data(n) => {
                 let data = buf.get(..n).unwrap_or(&[]);
                 if let Some(client) = self.client.as_mut() {
-                    client.conn.send_agent_data(chan, data);
+                    client.conn.send_agent_data(data);
                 }
             }
-            nbio::Read::Eof => self.close_agent_channel(chan),
+            nbio::Read::Eof => self.close_agent_channel(),
             nbio::Read::WouldBlock => {}
         }
     }
 
-    /// Drops one channel and tells the client, which is holding the other end. Silent if
-    /// the channel was already gone: the client can close one in the same poll iteration
+    /// Drops the served connection and tells the client, which is holding the other end.
+    /// Silent if it was already gone: the client can close it in the same poll iteration
     /// that its socket reports readable.
-    fn close_agent_channel(&mut self, chan: u32) {
-        if self.agent.as_mut().is_some_and(|agent| agent.forget(chan)) {
-            self.tell_client(&Frame::AgentClose { chan });
+    fn close_agent_channel(&mut self) {
+        if self.agent.as_mut().is_some_and(Agent::forget) {
+            self.tell_client(&Frame::AgentClose);
         }
     }
 
@@ -1293,7 +1279,7 @@ impl Daemon {
         // Nothing can answer a signature request with the client gone, so the
         // waiting process should fail now rather than at reattach (§ 6.7).
         if let Some(agent) = self.agent.as_mut() {
-            agent.forget_all();
+            let _ = agent.forget();
         }
     }
 
@@ -1310,6 +1296,7 @@ impl Daemon {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::os::unix::net::UnixStream;
     use std::path::Path;
 
     use super::*;
@@ -1428,6 +1415,52 @@ mod tests {
             timeout.tv_nsec > 0
                 && timeout.tv_nsec <= i64::try_from(ACCEPT_BACKOFF.as_nanos()).unwrap(),
             "a listener nothing else wakes up for needs a wakeup of its own"
+        );
+    }
+
+    /// A served agent connection takes the listener out of the poll set and puts its own
+    /// deadline into the timeout — the two halves of § 6.7's one-at-a-time rule that live
+    /// out here rather than inside `Agent`.
+    ///
+    /// `Agent::accept` declines a second connection whatever the poll set says, so a
+    /// listener left in it costs no correctness and a whole core: the waiting connection
+    /// keeps that descriptor readable, which is [`ACCEPT_BACKOFF`]'s shape arrived at by
+    /// a taken slot rather than by an error. And nothing but the clock ends a connection
+    /// that says nothing, so a loop that slept past the deadline would never reach it.
+    #[test]
+    fn a_served_agent_connection_holds_the_listener_out_and_sets_the_next_wakeup() {
+        let root = Scratch::new("agent-serving");
+        let mut daemon = with_agent(&root);
+        // Attached, so the deadline under test is not shadowed by the session's own:
+        // a clientless daemon already wakes for `FIRST_ATTACH_TIMEOUT`, well before it.
+        let (_peer, ours) = UnixStream::pair().expect("a socketpair");
+        daemon.client = Some(Attached::new(Conn::new(ours).expect("a connection")));
+
+        let agent = daemon.agent.as_mut().expect("an agent socket");
+        let _served = UnixStream::connect(agent.path()).expect("connect to the agent socket");
+        assert_eq!(
+            agent.accept(true),
+            agent::Accept::Opened,
+            "the slot was free, so this one is served"
+        );
+
+        assert!(
+            daemon.watch_for(Source::AgentListener).is_none(),
+            "a backlog nothing is willing to accept from is a poll that returns at once"
+        );
+        assert!(
+            daemon.watch_for(Source::AgentChannel).is_some(),
+            "and the connection being served is what the loop watches in its place"
+        );
+
+        // Inside the minute `AGENT_IDLE_TIMEOUT` gives it, and nowhere near `IDLE_TICK`,
+        // which is what an attached daemon with nothing else pending would sleep for.
+        let timeout = daemon.poll_timeout();
+        assert!(
+            (55..60).contains(&timeout.tv_sec),
+            "the loop slept {}s, past the deadline that is the only thing able to give \
+             the slot back",
+            timeout.tv_sec
         );
     }
 

@@ -12,7 +12,6 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::str;
 
-/// Where the password database lives.
 const PASSWD: &str = "/etc/passwd";
 
 /// The fields of one `/etc/passwd` line that anything here cares about.
@@ -28,8 +27,6 @@ pub(crate) struct Entry {
 }
 
 /// Looks up the entry for the user this process runs as.
-///
-/// Returns `None` if the file is unreadable or holds no line for this uid.
 pub(crate) fn current() -> Option<Entry> {
     let uid = rustix::process::getuid().as_raw();
     let contents = fs::read(PASSWD).ok()?;

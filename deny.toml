@@ -1,12 +1,6 @@
 # cargo-deny, run by .github/workflows/ci.yml's check job as
-# `cargo deny check advisories bans licenses sources`.
-#
-# .github/dependabot.yml schedules version bumps monthly, which is a cadence rather
-# than a gate: an advisory published the day after a run waits four weeks for a bump
-# nobody has told dependabot to make. This fails the build instead. Licences too: the
-# shipped binary statically links other people's Apache-2.0/MIT object code, whose
-# attribution terms `clippy::cargo` never asks about — it reads this crate's manifest
-# metadata, not what the tree pulls in.
+# `cargo deny check advisories bans licenses sources`, which is where the reason for
+# each of those four is written down.
 #
 # No `[graph] targets`, deliberately: every target is checked rather than the two that
 # ship, so the windows crates errno pulls in are in scope — an advisory that surfaces

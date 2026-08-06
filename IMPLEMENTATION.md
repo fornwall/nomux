@@ -28,8 +28,9 @@ crates/nomux/         the binary: daemon, attach relay, control surface.
 `nomux-proto` is split out because the client project reimplements or links the same
 codec; keeping it I/O-free makes it portable and property-testable in isolation, and it
 is the half that can carry `#![forbid(unsafe_code)]`. What belongs there is what is on the
-wire — session id validation (§ 6.3) and the agent channel cap (§ 6.7) are daemon policy.
-Neither crate is published, for the reason [DESIGN.md § 2](DESIGN.md#2-scope) gives.
+wire — session id validation (§ 6.3) and the agent socket's one-at-a-time rule (§ 6.7)
+are daemon policy. Neither crate is published, for the reason
+[DESIGN.md § 2](DESIGN.md#2-scope) gives.
 
 - Edition 2024, MSRV 1.97.1 (`rust-toolchain.toml`).
 - Lints: `[workspace.lints]` in `Cargo.toml` is the list. The deny is `-D warnings` on the
@@ -90,19 +91,18 @@ endian. The header is fixed at 4 bytes so the reader is a two-stage `read_exact`
 | `0x03` | C→D | `Input` | `u64` offset, bytes |
 | `0x04` | D→C | `InputAck` | `u64` applied_through |
 | `0x05` | D→C | `Output` | `u64` offset, bytes |
-| `0x06` | C→D | `OutputAck` | — |
-| `0x07` | C→D | `Resize` | `u16` cols, `u16` rows, `u16` xpixel, `u16` ypixel |
-| `0x08` | D→C | `Gap` | `u64` new_base_offset |
-| `0x09` | D→C | `Exit` | `i32` status, `u8` kind (0 = exited, 1 = signalled), `u32` since_exit_secs |
-| `0x0a` | C→D | `Detach` | — |
-| `0x0b` | C→D | `Ping` | — |
-| `0x0c` | D→C | `Pong` | — |
-| `0x0d` | D→C | `Error` | `u16` code (1 protocol, 2 takeover, 3 version, 4 input_gap, 5 internal), UTF-8 message |
-| `0x0e` | D→C | `AgentOpen` | `u32` chan |
-| `0x0f` | ↔ | `AgentData` | `u32` chan, opaque `ssh-agent` bytes |
-| `0x10` | ↔ | `AgentClose` | `u32` chan |
+| `0x06` | C→D | `Resize` | `u16` cols, `u16` rows, `u16` xpixel, `u16` ypixel |
+| `0x07` | D→C | `Gap` | `u64` new_base_offset |
+| `0x08` | D→C | `Exit` | `i32` status, `u8` kind (0 = exited, 1 = signalled), `u32` since_exit_secs |
+| `0x09` | C→D | `Detach` | — |
+| `0x0a` | C→D | `Ping` | — |
+| `0x0b` | D→C | `Pong` | — |
+| `0x0c` | D→C | `Error` | `u16` code (1 protocol, 2 takeover, 3 version, 4 input_gap, 5 internal), UTF-8 message |
+| `0x0d` | D→C | `AgentOpen` | — |
+| `0x0e` | ↔ | `AgentData` | opaque `ssh-agent` bytes |
+| `0x0f` | ↔ | `AgentClose` | — |
 
-`Hello` carries the current revision, **6** — `PROTOCOL_VERSION` in `nomux-proto`, bumped
+`Hello` carries the current revision, **7** — `PROTOCOL_VERSION` in `nomux-proto`, bumped
 on any wire change, compatible ones included, since a change that left the number alone is
 one `Hello.protocol` cannot catch. What each revision moved is `git log` on
 `crates/nomux-proto/`.
@@ -161,7 +161,6 @@ in `HelloOk` and fast-forwards past what it thought was unsent.
 
 - Daemon drops any `Input` fully below `in_applied`; trims a straddling one.
 - `Input` above `in_applied` is a gap in the input stream → `Error` + close. The client must not skip.
-- `OutputAck` is advisory and payload-free. It never trims the ring (§4) and the daemon tracks what it has sent by itself, so what the frame does is **arrive**: it wakes the loop, letting a replay that stopped on a full socket resume.
 
 Ownership, not durability: the master is non-blocking (§6.1), so a child that has stopped
 reading leaves input queued indefinitely, and waiting for the write would stall the ack
@@ -183,7 +182,7 @@ it cannot serve by aborting the process.
 - The daemon always drains the PTY, attached or not. If the ring is full it advances the base, discarding the oldest bytes; a write larger than the whole ring discards everything retained as well as its own head, so the base accounts for both.
 - A client is served `[max(from, base()) .. end()]`.
 - Overflow is not a stored flag. Whether a *reader* lost anything depends on where that reader had reached, so it is derived per client by comparing its position against the base — which stays correct across any number of overflows, including ones that happened while it was away.
-- Never trimmed on ack. A full rolling window is the scrollback a fresh client gets.
+- Never trimmed to what a client has consumed. A full rolling window is the scrollback a fresh client gets.
 
 ### 4.1 Backpressure
 
@@ -195,7 +194,7 @@ Four bounds, each enforced on its own queue:
 | --- | --- | --- |
 | `MAX_PENDING_WRITE` | 1 MiB | Past this queued to the client, output stops being queued. The ring absorbs the PTY regardless, so a slow client costs a gap and never a blocked child |
 | `ABANDON_PENDING_WRITE` | 8 MiB | Past this the client is not slow but gone, and is dropped; reattaching replays from the ring. The gap between the two figures is clear of the first plus one output chunk, so only the frames that answer a client — an `InputAck` per `Input`, a `Pong` per `Ping`, queued whatever the first bound says — can reach it |
-| `MAX_PENDING_INPUT` | 1 MiB | Past this queued for a child that is not reading, the daemon stops **accepting** input: it stops decoding `Input` frames and stops asking the socket for more. Dropping is not available, `in_applied` being exactly-once (§3), and `Error{INPUT_GAP}` would accuse a client that had done nothing wrong. The bytes wait in the kernel's buffer, where the peer blocks on them — §6.7's argument for a saturated agent channel |
+| `MAX_PENDING_INPUT` | 1 MiB | Past this queued for a child that is not reading, the daemon stops **accepting** input: it stops decoding `Input` frames and stops asking the socket for more. Dropping is not available, `in_applied` being exactly-once (§3), and `Error{INPUT_GAP}` would accuse a client that had done nothing wrong. The bytes wait in the kernel's buffer, where the peer blocks on them — §6.7's argument for a saturated agent connection |
 | `MAX_PENDING_READ` | 1 MiB | One connection's undecoded receive buffer, bounded by the daemon's own number rather than by whatever the peer set `SO_SNDBUF` to. On a stock host it never binds; [PLAN.md § P4](PLAN.md#p4--test-depth) has why no test pins it |
 
 **The input cap is enforced where the queue grows**, between frames in the decode loop,
@@ -336,10 +335,10 @@ the user runs holds a writable descriptor onto its own PTY master. The child kee
 stdio regardless, `dup2` onto 0/1/2 clearing the flag on the copies.
 
 The event loop is `poll` over {master, listener, attached client, pending connection, the
-stop-signal self-pipe (§6.5), agent socket, one fd per agent channel}. The *pending*
-entry is a connection accepted but not yet greeted, and it is what makes "connecting is
-not attaching" (§6.4) work. The set is variable-length and each entry is tagged with what
-it belongs to rather than read back by position.
+stop-signal self-pipe (§6.5), agent socket, the one served agent connection}. The
+*pending* entry is a connection accepted but not yet greeted, and it is what makes
+"connecting is not attaching" (§6.4) work. The set is variable-length and each entry is
+tagged with what it belongs to rather than read back by position.
 
 The master **must** be non-blocking: a child that stops reading fills the PTY's input
 buffer, and in raw mode the line discipline throttles rather than discarding, so a
@@ -661,6 +660,18 @@ the case where `/proc` is unreadable **and** the number has been reissued. Trunc
 asymmetric for the same reason: a match inside a truncated read is authoritative, and
 only a *failure* to match leaves truncation deciding.
 
+**What is signalled is a process, not a number.** A descriptor onto the pid is
+opened **before** question 2 is put, and both `SIGTERM` and `SIGKILL` go through that
+descriptor: each reaches the process whose command line was read, or fails `ESRCH` —
+never a stranger the kernel handed the number to in between. A pid reissued *before* the
+open is caught by question 2, which the impostor fails, and nothing is signalled at all.
+Only a host with no `pidfd_open` to call — `ENOSYS` below Linux 5.3, `EINVAL` or `EPERM`
+from a sandbox — signals the number itself, and there the reuse is unclosed and
+unclosable: the pidfile is frozen as a number, so the daemon published no baseline to
+compare against ([PLAN.md § P1](PLAN.md#p1--known-gaps)). An `ESRCH` from the open is
+never read as that host, being the one condition — a process already reaped — that makes
+its number somebody else's.
+
 | `<id>.pid` | `/proc` | Result |
 | --- | --- | --- |
 | a live pid | *is*, or *could not tell* | signalled; `list` prints it |
@@ -721,18 +732,17 @@ listening, collected; acceptable because this directory is nomux's own. Corollar
 
 ### 6.7 Agent forwarding
 
-The daemon **listens** on `$RUNDIR/<id>.agent`, opens an `AgentOpen` sub-channel per
-connection and pipes `AgentData` both ways until either end closes it; the client answers
-from its own key store. Why it owns the socket rather than borrowing sshd's, and why that
-is worth a sub-channel in a protocol that otherwise refuses to multiplex:
+The daemon **listens** on `$RUNDIR/<id>.agent`, announces each connection with `AgentOpen`
+and pipes `AgentData` both ways until either end closes it; the client answers from its own
+key store. Why it owns the socket rather than borrowing sshd's:
 [DESIGN.md § 5.4](DESIGN.md#54-agent-forwarding). Mechanics:
 
-- Channel ids are `u32`, allocated by the daemon — the only opener — from a cursor that advances and, at `u32::MAX`, wraps onto an id no live channel holds. So a close/open pair crossing in flight cannot alias, and with eight live at most, one of any nine candidates is always free.
-- `AgentOpen` is optimistic: no ack. A client that cannot serve replies `AgentClose`.
-- At most `MAX_AGENT_CHANNELS` (8) concurrent; at the cap the oldest channel the client has already closed gives up its slot, and past that the daemon closes the connection immediately rather than queueing.
+- **One connection at a time**, so there is nothing to address and no frame here carries an id — the pipe is as unmultiplexed as the PTY stream beside it ([DESIGN.md § 2](DESIGN.md#2-scope)). A second peer is left in the listen backlog rather than accepted or refused: the daemon drops the listener out of its poll set while one is served, exactly as §6.3's does while the pending slot is taken, and greets what waited when the slot frees. An `ssh-agent` client sends a request and waits for the reply, so what serialising costs is a bounded wait.
+- `AgentOpen` carries nothing yet is not redundant: it is the boundary between one peer's exchange and the next, which is what the client opens its own upstream connection on, and without it a peer that connects and closes without writing crosses the wire as nothing at all. It is optimistic — no ack. A client that cannot serve replies `AgentClose`.
+- **Idle connections are given up after 60 s** with no byte moving in *either* direction, and the client is told. The daemon parses no agent protocol, so it cannot tell a peer stalled mid-request from one legitimately waiting on a slow reply — and the client may be putting a signature in front of a human to approve, which is why the window is a generous minute rather than the sub-second an exchange takes. It is measured from the last byte, not from the accept: `ssh(1)` holds one connection across a whole authentication and issues several requests down it. Without it, one peer that connects and never closes holds every later agent user off for the life of the session.
 - Payloads are opaque — the daemon never parses the agent protocol, which is what puts `session-bind@openssh.com` on the client ([DESIGN.md § 5.4](DESIGN.md#54-agent-forwarding)): a byte pipe cannot know which SSH hop the session is on.
-- **While detached, connections are accepted and closed immediately**, so a `git push` with no client attached fails fast with the same error as a missing agent rather than hanging until reattach. The same the moment a client leaves or is taken over: every open channel is dropped, nothing being able to answer a signature request.
-- No flow control of its own, but two hard bounds. While the client's write queue is saturated the daemon stops reading agent sockets, leaving the bytes in the kernel's buffer where the peer blocks on them; and a channel whose local peer has stopped reading is closed as soon as a frame *would* take its queue past 256 KiB. The bound is tested before the bytes are taken, so 256 KiB is the peak a channel reaches and the eight-channel product is 2 MiB. An agent exchange is a few hundred bytes.
+- **While detached, connections are accepted and closed immediately**, so a `git push` with no client attached fails fast with the same error as a missing agent rather than hanging until reattach. The same the moment a client leaves or is taken over: the served connection is dropped, nothing being able to answer a signature request.
+- No flow control of its own, but two hard bounds. While the client's write queue is saturated the daemon stops reading the agent socket, leaving the bytes in the kernel's buffer where the peer blocks on them; and a connection whose local peer has stopped reading is closed as soon as a frame *would* take its queue past 256 KiB. The bound is tested before the bytes are taken, so 256 KiB is the peak — a quarter of the default ring, held for one connection rather than for the session. An agent exchange is a few hundred bytes.
 - A transient `accept` failure — `EMFILE`, `ECONNABORTED` — costs that one connection and nothing else; only a bind failure is permanent, and dropping the listener on a passing error would leave `SSH_AUTH_SOCK` pointing at a socket nobody serves. It does cost the listener its place in the poll set for `ACCEPT_BACKOFF`, exactly as § 6.3's does and for that section's reason. The two are held out separately: an agent's descriptor shortage must not take the session's listener with it.
 - The socket is bound when the session is created, and only then — turning forwarding on later would mean changing `SSH_AUTH_SOCK` in a running process. A socket that cannot be bound is not fatal: the session starts without forwarding and `HelloOk` says so.
 - Security, the two consequences this side of the boundary: the socket is `0600` inside the `0700` run directory, the same permissions as sshd's forwarded socket but a longer window, since sshd's dies with the connection and this one lives as long as the session — which is why forwarding is opt-in per host. And where sshd forwarding is also active, `SSH_AUTH_SOCK` is set by sshd and then overwritten by the daemon (§6.1.1): ours wins.

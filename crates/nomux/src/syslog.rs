@@ -8,8 +8,6 @@
 
 use std::os::unix::net::UnixDatagram;
 
-/// The socket every syslog implementation on Linux offers, and the one
-/// `systemd-journald` keeps for compatibility.
 const SOCKET: &str = "/dev/log";
 
 /// Sends one line, and never reports whether it arrived.

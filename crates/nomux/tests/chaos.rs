@@ -10,6 +10,12 @@
 //! Disconnect points come from a fixed seed so a failure is reproducible; override it
 //! with `NOMUX_CHAOS_SEED` to explore other interleavings.
 
+#![allow(
+    clippy::panic,
+    reason = "clippy.toml's allow-panic-in-tests reaches `#[test]` bodies, not the \
+              helpers an integration test crate keeps beside them"
+)]
+
 mod harness;
 
 use std::time::{Duration, Instant};
@@ -24,24 +30,17 @@ const EMIT_ROUNDS: u32 = 20_000;
 
 /// How long a chaos test waits for its workload before calling it stalled.
 ///
-/// Under the forty-second kill in `.config/nextest.toml`: a deadline at or above that
-/// can never fire, and the stall is then killed from outside with nothing said — losing
-/// § 9's promise that every chaos failure carries its seed. Reached only through
-/// [`frame_by`], so it bounds a whole multi-frame read rather than each frame in it.
-/// Both tests finish in under two seconds.
+/// Under the forty-second kill in `.config/nextest.toml`, since a deadline at or above
+/// that can never fire — and a stall killed from outside says nothing, losing § 9's
+/// promise that every chaos failure carries its seed. Spent once per test, per
+/// `harness::poll_by`. Both tests finish in under two seconds.
 const PATIENCE: Duration = Duration::from_secs(20);
 
 /// Seed used when `NOMUX_CHAOS_SEED` is unset.
 const DEFAULT_SEED: u64 = 0x6e6f_6d75_785f_3031;
 
-/// The next frame, bounded by the whole test's `deadline` rather than by one frame's.
-///
-/// [`harness::Client::next_frame`] renews its patience on every frame, so a daemon
-/// dribbling one frame just inside it is never late and the loop has no bound at all.
-#[expect(
-    clippy::panic,
-    reason = "clippy.toml's allow-panic-in-tests does not reach a helper outside a #[test] fn"
-)]
+/// The next frame, bounded by the whole test's `deadline` rather than by one frame's
+/// (`harness::poll_by`), and saying which seed the stall was under.
 fn frame_by(
     client: &mut harness::Client,
     deadline: Instant,
@@ -336,8 +335,7 @@ fn replayed_input_across_random_disconnects_is_applied_once() {
     let line = b"printf M\n";
     let rounds = 12usize;
     let mut applied = intended.len() as u64;
-    // One deadline for all twelve rounds, as the two tests above have: a per-round wait
-    // renews itself and so cannot be bounded by anything but the runner's kill.
+    // One deadline for all twelve rounds, as the two tests above have.
     let deadline = Instant::now() + PATIENCE;
 
     for round in 0..rounds {

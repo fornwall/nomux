@@ -50,11 +50,8 @@ const PUBLISH_POLL_INTERVAL: Duration = Duration::from_millis(1);
 /// a smaller one buys nothing but extra syscalls.
 const SPLICE_CHUNK: usize = 64 * 1024;
 
-/// Whether this invocation may bring the session into being.
-///
-/// The two modes are one relay and two answers to an id nothing is serving, which is
-/// the whole of the distinction (`DESIGN.md` § 5.1): `spawn` creates it, `attach`
-/// refuses.
+/// Whether this invocation may bring the session into being — the whole of the
+/// distinction between the two modes (`DESIGN.md` § 5.1).
 #[derive(Clone, Copy)]
 pub(crate) enum Intent<'a> {
     /// `nomux spawn <id>`: creates the session and attaches to it in one exec, and
@@ -118,9 +115,8 @@ fn no_such_session(paths: &SessionPaths) -> io::Error {
 
 /// The refusal to create an id something is already serving.
 ///
-/// `spawn` is the one mode that says what a session *is*, so meeting a live one is
-/// the client's own state disagreeing with the host's rather than a race to retry —
-/// and the repair is `attach`, which is the command this names.
+/// `spawn` is the one mode that says what a session *is*, so meeting a live one is the
+/// client's own state disagreeing with the host's rather than a race to retry.
 fn already_running(paths: &SessionPaths) -> io::Error {
     io::Error::new(
         io::ErrorKind::AlreadyExists,
@@ -247,10 +243,7 @@ fn spawn_daemon(session_id: &str, label: Option<&str>) -> io::Result<Option<Chil
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         // A pipe rather than `/dev/null`, which is the only reason a failure to start
-        // has a reason attached to it: the daemon writes its diagnostics to stderr
-        // until `release_startup_state` points the descriptor at `/dev/null` (§ 6.2),
-        // and the pipe reaching end of file is itself the daemon reporting it got
-        // past that point.
+        // has a reason attached to it (§ 6.2).
         .stderr(Stdio::piped());
     if let Some(label) = label {
         // As two arguments, never `--label=<text>`: the label is free-form text
@@ -327,8 +320,6 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
     let mut stdout_open = true;
 
     while stdout_open && (socket_open || to_stdout.has_data()) {
-        // One mask per descriptor, empty where it is not worth watching this pass, and
-        // read back below in the same order.
         let mut stdin_flags = PollFlags::empty();
         stdin_flags.set(PollFlags::IN, stdin_open && to_socket.wants_source());
         let mut socket_flags = PollFlags::empty();
@@ -336,10 +327,7 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
         socket_flags.set(PollFlags::OUT, to_socket.wants_dest());
         let mut stdout_flags = PollFlags::empty();
         stdout_flags.set(PollFlags::OUT, to_stdout.wants_dest());
-        // A fixed frame rather than a `Vec`, which would be a heap allocation per
-        // wakeup for a set of at most three. Seeded as `daemon::wait` seeds its slots:
-        // `PollFd` has no vacant spelling, so the tail past `watched` carries a
-        // descriptor of our own under an empty mask and is never shown to `poll`.
+        // A fixed frame, seeded as `daemon::wait` seeds its slots and for its reasons.
         let mut fds: [PollFd<'_>; 3] =
             std::array::from_fn(|_| PollFd::from_borrowed_fd(sock_fd, PollFlags::empty()));
         let mut watched = 0;
@@ -393,8 +381,7 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
             && !to_socket.transfer(stdin_fd, sock_fd, &mut chunk)?
         {
             stdin_open = false;
-            // Propagate the half-close so the daemon sees our EOF while we keep
-            // draining its output.
+            // Half-close propagation (§ 7).
             drop(stream.shutdown(Shutdown::Write));
         }
         if socket_events.intersects(readable)
@@ -410,22 +397,18 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
         if socket_events.contains(PollFlags::OUT) || to_socket.has_data() {
             let _ = to_socket.drain_to(sock_fd)?;
         }
-        // One of the two ways a dead stdout arrives: `POLLOUT` is the only thing that
-        // clears `Pump::dest_full`, and a destination whose reader has gone never
-        // reports it — a full pipe with no reader is not writable, it is broken.
+        // `POLLOUT` is the only thing that clears `Pump::dest_full`, and a destination
+        // whose reader has gone never reports it — a full pipe with no reader is not
+        // writable, it is broken.
         if stdout_events.intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL) {
             stdout_open = false;
         } else if stdout_events.contains(PollFlags::OUT) {
-            // On `POLLOUT` alone, and never speculatively the way the socket above is
-            // drained. Stdout is left in the blocking mode it was inherited in and
-            // cannot safely be taken out of it — it may be a terminal whose open file
-            // description the user's shell shares — so a write it is not ready for
-            // parks the whole relay with the other direction unserved. Nothing is lost
-            // by waiting, a non-empty buffer being what put stdout in the set.
-            //
-            // The `EPIPE` that write can return is the other of the two ways, and for
-            // a socket-backed stdout it is the only one: that shape reports itself
-            // writable and then refuses.
+            // Never speculatively, the way the socket above is drained: stdout is left
+            // in the blocking mode it was inherited in and cannot safely be taken out
+            // of it — it may be a terminal whose open file description the user's shell
+            // shares — so a write it is not ready for parks the whole relay with the
+            // other direction unserved. A socket-backed stdout reports itself writable
+            // and then refuses, so its `EPIPE` here is the only way its death arrives.
             stdout_open = to_stdout.drain_to(stdout_fd)?;
         }
     }
@@ -454,8 +437,7 @@ fn copy_in(fd: BorrowedFd<'_>, buf: &mut VecDeque<u8>, chunk: &mut [u8]) -> io::
             buf.extend(chunk.get(..n).unwrap_or(&[]));
             Ok(true)
         }
-        // Nothing pending is not EOF; the peer is still there, it just had
-        // nothing to say.
+        // Nothing pending is not EOF: the peer is still there with nothing to say.
         Err(rustix::io::Errno::AGAIN) => Ok(true),
         Err(err) => Err(err.into()),
     }
@@ -479,8 +461,7 @@ enum Spliced {
 /// entering this process.
 ///
 /// Whether `splice` works for a pair is a property of the host rather than of this
-/// code (`IMPLEMENTATION.md` § 7), so it is discovered by trying — and only by the
-/// two errors that are that same property.
+/// code, so it is discovered by trying (`IMPLEMENTATION.md` § 7).
 fn splice_once(src: BorrowedFd<'_>, dst: BorrowedFd<'_>) -> Spliced {
     let flags = SpliceFlags::MOVE | SpliceFlags::NONBLOCK;
     loop {
@@ -499,18 +480,15 @@ fn splice_once(src: BorrowedFd<'_>, dst: BorrowedFd<'_>) -> Spliced {
     }
 }
 
-/// One direction of the relay.
-///
-/// The two paths through it cannot interleave, which is `IMPLEMENTATION.md` § 7's:
-/// `splice` is attempted only while the buffer is empty and never fills it.
+/// One direction of the relay, whose two paths cannot interleave
+/// (`IMPLEMENTATION.md` § 7).
 #[derive(Debug, Default)]
 struct Pump {
-    /// Bytes the destination would not take yet. Only ever filled by the copying
-    /// path.
+    /// Bytes the destination would not take yet; only ever filled by the copying path.
     buf: VecDeque<u8>,
-    /// Set for good the first time `splice` refuses the *pair* rather than the
-    /// moment. Neither reason it can refuse for can change while the relay runs, and
-    /// retrying would buy a wasted syscall per wakeup forever.
+    /// Set for good the first time `splice` refuses the *pair* rather than the moment:
+    /// neither reason it can refuse for can change while the relay runs, so retrying
+    /// would buy a wasted syscall per wakeup for ever.
     splice_refused: bool,
     /// `splice` reported the destination full. Distinct from a non-empty buffer in
     /// that nothing is held here: it records only that the source must be left alone

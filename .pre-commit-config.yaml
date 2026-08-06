@@ -68,7 +68,7 @@ repos:
         pass_filenames: false
 
       # `-- -D warnings` rather than a deny in [workspace.lints], for the reason
-      # Cargo.toml gives: a toolchain bump should redden this gate, not break the build.
+      # Cargo.toml gives.
       - id: cargo-clippy
         name: cargo clippy
         entry: cargo clippy --locked --workspace --all-targets -- -D warnings
