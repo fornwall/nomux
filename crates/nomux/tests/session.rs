@@ -797,6 +797,73 @@ fn a_session_whose_shell_cannot_be_started_is_refused_as_an_internal_failure() {
     client.expect_eof("an Error{INTERNAL}");
 }
 
+/// § 6.3's peer-credential rule from the side the suite can reach: a connection from
+/// this uid is admitted and served, and the credentials the daemon admits it on are
+/// the ones this host reports.
+///
+/// The refusal is the other side and needs a second uid, which the suite has no way to
+/// become; `daemon.rs`'s `only_this_uid_may_have_the_session` holds that half against
+/// the predicate. What a unit test cannot reach is the `getsockopt` itself, and a wrong
+/// level, option or struct there answers `Err` for every peer — a session socket that
+/// admits nobody. Every test in this file would fail with it and none would say why.
+///
+/// The probe is a bare connection because a `Client` keeps its socket to itself, and
+/// because § 6.4 has connecting cost the attached client nothing.
+#[test]
+fn a_connection_from_this_uid_is_admitted_and_reports_its_credentials() {
+    let (session, mut client, _ok) = Session::attached("peercred");
+
+    let probe = UnixStream::connect(&session.socket).expect("connect to the session socket");
+    assert_eq!(
+        peer_uid(&probe),
+        rustix::process::getuid().as_raw(),
+        "the daemon serving this socket is the uid its clients are admitted for"
+    );
+    drop(probe);
+
+    still_serving(&mut client, "NOMUX-ADMITTED");
+}
+
+/// The uid the kernel reports for the process at the other end of `stream` — for a
+/// connected client, the one that called `listen`.
+///
+/// Through `libc` for `harness::shrink_send_buffer`'s reason: rustix's socket options
+/// sit behind its `net` feature, which this tree does not enable.
+fn peer_uid(stream: &UnixStream) -> u32 {
+    use std::os::fd::AsRawFd;
+
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: u32::MAX,
+        gid: 0,
+    };
+    let mut len = u32::try_from(size_of::<libc::ucred>()).expect("the size of a ucred");
+    // SAFETY: `getsockopt` is given a `ucred` to fill and a `socklen_t` holding that
+    // type's own size, both owned by this frame and unaliased across the call, on a
+    // descriptor the borrow keeps open for it.
+    let asked = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            std::ptr::from_mut(&mut cred).cast::<libc::c_void>(),
+            std::ptr::from_mut(&mut len),
+        )
+    };
+    assert_eq!(
+        asked,
+        0,
+        "SO_PEERCRED on a connected socket: {}",
+        std::io::Error::last_os_error()
+    );
+    assert_eq!(
+        usize::try_from(len).expect("what the kernel wrote"),
+        size_of::<libc::ucred>(),
+        "a partial ucred leaves the uid below whatever it was seeded with"
+    );
+    cred.uid
+}
+
 /// A connection that speaks out of turn is refused on its own terms, without
 /// costing the session its client.
 #[test]

@@ -92,7 +92,9 @@ fn present(checked: io::Result<()>) -> io::Result<bool> {
 /// Prints one line per live session: id, pid and label.
 ///
 /// A reader that closes stdout early ends the listing (§ 10) but not the sweep, since
-/// returning early would make `head` the reason a stale session survived.
+/// returning early would make `head` the reason a stale session survived. An id this
+/// directory cannot address goes to stderr instead, being the one session that can be
+/// neither printed nor collected (§ 6.3).
 ///
 /// # Errors
 ///
@@ -108,8 +110,17 @@ pub(crate) fn list() -> io::Result<()> {
     let mut out = stdout.lock();
     let mut listening = true;
     for id in session_ids(&dir) {
-        let Ok(paths) = SessionPaths::new(&id) else {
-            continue;
+        let paths = match SessionPaths::new(&id) {
+            Ok(paths) => paths,
+            // § 6.3's `sun_path` refusal, a property of this directory rather than of the
+            // id: files are here that no mode can address, so this is the one session
+            // `list` can neither print nor collect. Named on stderr rather than in § 6.6's
+            // three frozen columns, every id in which is one a client may hand straight
+            // back to `attach`.
+            Err(err) => {
+                eprintln!("nomux: {err}; its files are left where they are");
+                continue;
+            }
         };
         // Only death collects (§ 6.3); a probe that failed for any other reason leaves a
         // session to list.

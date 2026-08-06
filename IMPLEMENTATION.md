@@ -473,8 +473,12 @@ what a client must not cache as a property of the id. Taking the bound there lea
 failure it is not told about as a live session rather than an address it could not build.
 The refusal lands there rather than at the `bind`, because `list` and `kill` read an
 unbindable address as a *live* session whose files they must not unlink; the cost is that
-files already sitting at such an id are beyond both modes
-([PLAN.md § P1](PLAN.md#p1--known-gaps)).
+files already sitting at such an id are beyond both modes. `list` names the id on stderr
+(§6.6), which is what a user needs to remove them by hand, and `kill` refuses it: the
+probe that licenses an unlink is the one thing no address can be built for, and §6.6's
+`/proc` identification is no substitute, an absent pidfile being §6.2's publish window as
+much as it is a dead session
+([PLAN.md § Known and accepted](PLAN.md#known-and-accepted)).
 
 Directory `0700`, socket `0600`, and the pidfile, lock and label `0600` too — exact
 rather than upper bounds, the umask suppressed around each creating call, since a
@@ -505,7 +509,25 @@ before it binds — because with a socket already planted at the path, the relay
 user's keystrokes to whoever bound it. Only `spawn` and the daemon *create* it. The run
 files are then opened by name, there being no `bindat(2)`; what stays open is a *parent*
 somebody else can write to, where the whole directory can be swapped between the check
-and the next `bind`.
+and the next `bind`. The two names `rundir::write_private` puts there — the pidfile and
+the label — are therefore *created* rather than opened: it unlinks first, and `O_EXCL`
+on the create refuses a symlink planted in the window between those two syscalls rather
+than following it into whatever it names, the `EEXIST` that refusal arrives as never
+being retried. Reads are `O_NOFOLLOW` against the same hazard. The `bind` keeps the
+exposure this paragraph opens with, a socket taking no such flag.
+
+A connection accepted on either of the session's two listeners — this one and §6.7's
+agent socket — is then weighed by `SO_PEERCRED` before a byte is read from it, and one
+whose uid is not this process's is closed unanswered and reported to syslog (§11).
+Defence in depth rather than the lock itself — the `0700` directory and `0600` sockets
+already exclude every other uid on a host whose modes hold, and this is what covers one
+where they do not. **Root gets no exemption**: it reaches the session through
+`/proc` or a `setuid` whatever this answers, so refusing it costs it nothing it wanted
+and keeps the rule to a sentence — a session belongs to the user who started it. A peer
+the kernel will not describe is refused with it, a `getsockopt` that failed being
+evidence of nothing. Nothing goes back on the wire: an `Error` frame would spend §6.5's
+blocking flush on a peer with every reason not to read it, and would confirm to whoever
+it is what is listening here.
 
 Spawn race (two clients, one id): `flock(LOCK_EX)` on `<id>.lock`; the loser blocks, then
 finds the socket the winner bound and is told the id is taken (§10). A stale socket is one
@@ -692,9 +714,9 @@ open is caught by question 2, which the impostor fails, and nothing is signalled
 Only a host with no `pidfd_open` to call — `ENOSYS` below Linux 5.3, `EINVAL` or `EPERM`
 from a sandbox — signals the number itself, and there the reuse is unclosed and
 unclosable: the pidfile is frozen as a number, so the daemon published no baseline to
-compare against ([PLAN.md § P1](PLAN.md#p1--known-gaps)). An `ESRCH` from the open is
-never read as that host, being the one condition — a process already reaped — that makes
-its number somebody else's.
+compare against ([PLAN.md § Known and accepted](PLAN.md#known-and-accepted)). An `ESRCH`
+from the open is never read as that host, being the one condition — a process already
+reaped — that makes its number somebody else's.
 
 | `<id>.pid` | `/proc` | Result |
 | --- | --- | --- |
@@ -722,6 +744,7 @@ Three tab-separated columns per session, one line each, no header:
 - **`<pid>` is a literal `?`** wherever the identification above yields no pid.
 - **`<label>` is empty** where there is no label or it could not be read. Bytes that are not valid UTF-8 arrive as U+FFFD rather than emptying the field, a read cut at the bound being able to split a character the daemon wrote whole. The trailing tab is still written, so a line always has three fields and a consumer can split on the count.
 - **Dead sessions are collected, not printed.** An entry whose socket refuses is unlinked during the sweep and never reaches stdout, so what `list` prints is the live set.
+- **An id this run directory cannot address is named on stderr**, never in the columns, and the exit stays 0. Its files are here and §6.3 can form no socket address for them, so it is neither probed nor collected — and every id printed above is one a client may hand straight back to `attach`.
 - **Exit 0 is not "sessions exist."** No run directory, an empty one, or one `read_dir` could not open prints nothing and exits 0 (§10 has the rest of the table).
 - `EPIPE` on stdout — `nomux list | head` — stops the printing but **not** the sweep, so a stale session is never left behind because the reader went away.
 
@@ -769,7 +792,7 @@ key store. Why it owns the socket rather than borrowing sshd's:
 - No flow control of its own, but two hard bounds. While the client's write queue is saturated the daemon stops reading the agent socket, leaving the bytes in the kernel's buffer where the peer blocks on them; and a connection whose local peer has stopped reading is closed as soon as a frame *would* take its queue past 256 KiB. The bound is tested before the bytes are taken, so 256 KiB is the peak — a quarter of the default ring, held for one connection rather than for the session. An agent exchange is a few hundred bytes.
 - A transient `accept` failure — `EMFILE`, `ECONNABORTED` — costs that one connection and nothing else; only a bind failure is permanent, and dropping the listener on a passing error would leave `SSH_AUTH_SOCK` pointing at a socket nobody serves. It does cost the listener its place in the poll set for `ACCEPT_BACKOFF`, exactly as § 6.3's does and for that section's reason. The two are held out separately: an agent's descriptor shortage must not take the session's listener with it.
 - The socket is bound when the session is created, and only then — turning forwarding on later would mean changing `SSH_AUTH_SOCK` in a running process. A socket that cannot be bound is not fatal: the session starts without forwarding and `HelloOk` says so.
-- Security, the two consequences this side of the boundary: the socket is `0600` inside the `0700` run directory, the same permissions as sshd's forwarded socket but a longer window, since sshd's dies with the connection and this one lives as long as the session — which is why forwarding is opt-in per host. And where sshd forwarding is also active, `SSH_AUTH_SOCK` is set by sshd and then overwritten by the daemon (§6.1.1): ours wins.
+- Security, the two consequences this side of the boundary: the socket is `0600` inside the `0700` run directory, the same permissions as sshd's forwarded socket but a longer window, since sshd's dies with the connection and this one lives as long as the session — which is why forwarding is opt-in per host. A connection is weighed by `SO_PEERCRED` and closed unread unless its uid is the daemon's (§6.3), as `ssh-agent` itself does: what a peer reaches here is the client's key store, so it is the socket that check is worth most on. And where sshd forwarding is also active, `SSH_AUTH_SOCK` is set by sshd and then overwritten by the daemon (§6.1.1): ours wins.
 
 ## 7. Attach relay
 

@@ -190,7 +190,7 @@ impl Agent {
     /// with `SSH_AUTH_SOCK` in the child still pointing at it. They are still told apart
     /// from an empty backlog, because only one of the two leaves a connection queued
     /// behind it, and a queued connection keeps this descriptor readable.
-    pub(crate) fn accept(&mut self, serving: bool) -> Accept {
+    pub(crate) fn accept(&mut self, serving: bool, id: &str) -> Accept {
         if self.is_serving() {
             return Accept::Idle;
         }
@@ -209,7 +209,13 @@ impl Agent {
             }
             Err(_) => return Accept::Failed,
         };
-        if !serving || stream.set_nonblocking(true).is_err() {
+        // Before the slot is taken and before a byte is read, and on the same terms as
+        // the session listener's (§ 6.3): what a connection here reaches is the client's
+        // key store, so this is the socket that check is worth most on.
+        if !crate::rundir::peer_is_ours(stream.as_fd(), id)
+            || !serving
+            || stream.set_nonblocking(true).is_err()
+        {
             return Accept::Idle;
         }
         self.channel = Some(Channel {
@@ -323,6 +329,11 @@ mod tests {
 
     use crate::scratch::Scratch;
 
+    /// The id a refusal would be reported against. Nothing here provokes one — a peer
+    /// this process connects to itself with is this uid's — and `Agent` derives no path
+    /// from it, the socket having been bound before it is passed.
+    const ID: &str = "agent";
+
     /// An agent socket of this test's own, bound in `root`.
     fn bind_in(root: &Scratch, name: &str) -> Agent {
         Agent::bind(&root.join(name)).expect("bind an agent socket")
@@ -334,7 +345,7 @@ mod tests {
     fn open(agent: &mut Agent) -> UnixStream {
         let peer = UnixStream::connect(agent.path()).expect("connect to the agent socket");
         assert_eq!(
-            agent.accept(true),
+            agent.accept(true, ID),
             Accept::Opened,
             "a connection with a client attached and the slot free must be served"
         );
@@ -391,14 +402,14 @@ mod tests {
             .write_all(b"\0\0\0\x01\x0b")
             .expect("write a request");
         assert_eq!(
-            agent.accept(true),
+            agent.accept(true, ID),
             Accept::Idle,
             "a connection arriving while one is served must be left where it is"
         );
 
         assert!(agent.forget(), "the first connection frees the slot");
         assert_eq!(
-            agent.accept(true),
+            agent.accept(true, ID),
             Accept::Opened,
             "and the one that waited is taken next"
         );
@@ -521,6 +532,6 @@ mod tests {
     fn an_empty_backlog_is_not_a_failure_to_back_off_from() {
         let root = Scratch::new("agent-idle");
         let mut agent = bind_in(&root, "i.agent");
-        assert_eq!(agent.accept(true), Accept::Idle);
+        assert_eq!(agent.accept(true, ID), Accept::Idle);
     }
 }

@@ -18,27 +18,18 @@ clone gives you `list`, `kill` and a daemon nothing can talk to.
 - **Partly done** — P3's publishing half: a `v*` tag builds, checks and publishes.
 - **Not started** — the client, whose server-side contract is the last section here.
 
-## P1 — known gaps
+## Known and accepted
 
-Four open; the last two came out of a security review.
+Refusals rather than gaps, so each says what it would take to be otherwise.
 
-- **An id this run directory cannot hold is invisible *and* uncollectable.** `list` can
-  cheaply report the `sun_path`-refused id it now skips; `kill` cannot collect it, since
-  "no socket address can be formed" is not "no live session"
+- **An id this run directory cannot hold is uncollectable.** `list` names it on stderr
+  ([IMPLEMENTATION.md § 6.6](IMPLEMENTATION.md#66-frozen-control-surface)), which is all a
+  user needs to remove the files by hand; `kill` refuses it, "no socket address can be
+  formed" being no evidence of "no live session". Identifying the daemon through `/proc`
+  instead, as § 6.6 now does for the *signal*, would not close it: an absent or empty
+  pidfile is § 6.2's publish window as much as it is a dead session, so an unlink licensed
+  by that absence is the one outcome the control surface refuses
   ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)).
-- **Nothing bounds sessions per host.** The daemon's backstop of 64 landed
-  ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)); the cap of eight is
-  client-side ([DESIGN.md § 5.1](DESIGN.md#51-identity)) and the client is unwritten.
-- **`write_private` unlinks and then writes by name.** `O_NOFOLLOW | O_EXCL` would retire
-  the directory-mode argument and cover the attacker-writable parent
-  [IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket) concedes; `read_prefix` already
-  opens that way.
-- **Nothing asserts the uid of an accepted connection.** `Daemon::accept` reads no
-  credentials, so file modes are the whole of the authentication; a `getsockopt` for
-  `SO_PEERCRED` is a few lines of defence in depth.
-
-**Known and accepted:**
-
 - A hand-started `nomux daemon <id>` has a bind-to-publish window; a `kill` inside it
   refuses and waits it out — an honest non-zero exit, never a destroyed session.
 - Where there is no `pidfd_open` to call — a kernel below 5.3, a sandbox refusing it —
@@ -126,7 +117,10 @@ The server is useless without these, and each has a server-side contract fixed h
   leaves another artifact in every user's home on every host they have touched
   ([DESIGN.md § 8](DESIGN.md#8-security-model)). It knows each session's version, so it
   can remove any `nomux-*` neither current nor holding a live session.
-- Emulator reset on `gap`, and the 8-sessions-per-host cap.
+- Emulator reset on `gap`, and the 8-sessions-per-host cap
+  ([DESIGN.md § 5.1](DESIGN.md#51-identity)). The daemon's backstop of 64 sits under it
+  ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)); only the side that knows a tab
+  was opened can enforce the real one.
 - The child's exit status, in the `Exit` frame the relay cannot read without parsing
   frames ([IMPLEMENTATION.md § 10](IMPLEMENTATION.md#10-exit-codes)); `since_exit_secs`
   rides beside it, so a status collected as it happened and one collected days later are

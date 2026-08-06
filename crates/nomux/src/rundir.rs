@@ -5,8 +5,8 @@
 //! build can manage a daemon of any version. Filenames and permissions here may
 //! never change.
 
-use std::io;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::io::{self, Write as _};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -62,16 +62,130 @@ fn with_umask<T>(mode: u32, f: impl FnOnce() -> T) -> T {
 /// which is a session `kill` will not touch. Leftovers are ordinary, since rebinding an id
 /// clears only the socket.
 ///
+/// *Created* rather than opened, `O_EXCL` refusing a symlink at the name outright: what
+/// the removal above opens is a window in which a *parent* this process does not own —
+/// § 6.3's, there being no `bindat(2)` — can put one there, and a create that followed it
+/// would write the pidfile into whatever it named. It retires nothing else: `open(2)`
+/// subtracts the umask from its mode argument like every creating call, so [`with_umask`]
+/// is still what makes [`FILE_MODE`] exact.
+///
+/// The `EEXIST` that flag introduces is refused rather than retried, and for `<id>.pid`
+/// that refuses the session (`daemon::publish`). The one process that legitimately writes
+/// these names is the daemon holding the id, so a name that came back in the microseconds
+/// since the unlink is somebody else's, and looping would race whoever is planting it
+/// rather than win.
+///
 /// One `write` rather than a `File` and a `writeln!`, which would publish the pidfile
 /// three syscalls wide instead of the two `control::resolve` waits out.
 fn write_private(path: &Path, body: &[u8]) -> io::Result<()> {
     drop(fs::remove_file(path));
-    with_umask(FILE_MODE, || fs::write(path, body))
+    // The unlink above and the create below are two syscalls on one name, so the test for
+    // losing that race has to be forced inside the window.
+    #[cfg(test)]
+    tests::plant_in_the_window(path);
+    let file = with_umask(FILE_MODE, || {
+        rustix::fs::open(
+            path,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+            Mode::from_bits_truncate(FILE_MODE),
+        )
+    })?;
+    fs::File::from(file).write_all(body)
 }
 
 /// Binds a unix socket at exactly [`SOCKET_MODE`], never briefly wider ([`with_umask`]).
 pub(crate) fn bind_socket_private(path: &Path) -> io::Result<UnixListener> {
     with_umask(SOCKET_MODE, || UnixListener::bind(path))
+}
+
+/// Whether a connection just off one of the session's two listeners is this user's, and
+/// so may be heard at all (§ 6.3); a refusal is reported against `id`.
+///
+/// Defence in depth rather than the lock itself: the `0700` run directory and `0600`
+/// sockets already exclude every other uid on a host whose modes hold. What this covers
+/// is a host where they do not — a run directory somebody widened, a filesystem that
+/// carries no modes — and it costs one `getsockopt` per connection. Both listeners, since
+/// the agent socket (§ 6.7) hands out signatures and `ssh-agent` itself refuses a peer
+/// whose uid is not its own.
+///
+/// A refusal is silent on the wire and loud in the journal. Nothing is sent back: an
+/// `Error` frame would spend `Conn::send_last`'s blocking flush (§ 6.5) on a peer with
+/// every reason not to read it, and would confirm to whoever it is what is listening here
+/// — a connection that simply closes tells a legitimate client everything and a stranger
+/// nothing. Syslog hears it instead, being the only place this process can still write
+/// (§ 11), and a peer that got past the modes above is worth a line whatever it turns out
+/// to have been.
+pub(crate) fn peer_is_ours(peer: BorrowedFd<'_>, id: &str) -> bool {
+    let uid = peer_uid(peer);
+    // The `getuid` § 6.3's run-directory check is written against, so that "this uid"
+    // means one thing across the tree; nothing here is ever setuid, so the real uid it
+    // answers with is also the one that owns the socket.
+    if uid_is_ours(&uid, rustix::process::getuid().as_raw()) {
+        return true;
+    }
+    crate::syslog::error(
+        id,
+        &match uid {
+            Ok(uid) => format!("refused a connection from uid {uid}"),
+            Err(err) => format!("refused a connection whose uid could not be read: {err}"),
+        },
+    );
+    false
+}
+
+/// The uid `SO_PEERCRED` reports for the process at the other end of `fd`.
+///
+/// Through `libc` because rustix's socket options sit behind its `net` feature, which
+/// this crate does not enable: § 8's 400 KiB budget is why the feature list is as short as
+/// it is, and it is the same reason `daemon::publish`'s second `listen` is spelled this
+/// way.
+fn peer_uid(fd: BorrowedFd<'_>) -> io::Result<u32> {
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    // Three 32-bit fields, so the conversion cannot fail; a zero would ask the kernel for
+    // nothing, which is a short answer and refused as one below.
+    let mut len = libc::socklen_t::try_from(size_of::<libc::ucred>()).unwrap_or(0);
+    // SAFETY: `getsockopt` is given a `ucred` to fill and a `socklen_t` holding that
+    // type's own size, both owned by this frame and unaliased across the call, on a
+    // descriptor the borrow keeps open for it.
+    let asked = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            std::ptr::from_mut(&mut cred).cast::<libc::c_void>(),
+            std::ptr::from_mut(&mut len),
+        )
+    };
+    if asked != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // What comes back in `len` is how much of the struct was written, and it is what makes
+    // the read below mean anything: short of the whole of it, the uid is still the zero
+    // seeded above, which is root's.
+    if usize::try_from(len).unwrap_or(0) != size_of::<libc::ucred>() {
+        return Err(io::Error::other(
+            "SO_PEERCRED answered with a partial ucred",
+        ));
+    }
+    Ok(cred.uid)
+}
+
+/// Whether a peer whose credentials came back as `peer` may have a session belonging to
+/// `ours` — which only that uid's own connections may (§ 6.3).
+///
+/// Both halves of the refusal are the same rule, deliberately. A uid that is not `ours` is
+/// turned away whatever it is, uid 0 included: root reaches the session through `/proc`, a
+/// `setuid` or a `ptrace` whatever this answers, so refusing costs it nothing it wanted
+/// and keeps the rule to a sentence — a session belongs to the user who started it. And a
+/// peer the kernel would not describe is refused with them: a `getsockopt` failing for a
+/// reason nobody predicted is not evidence of anything, least of all of a caller who
+/// belongs here.
+const fn uid_is_ours(peer: &io::Result<u32>, ours: u32) -> bool {
+    matches!(peer, Ok(uid) if *uid == ours)
 }
 
 /// Longest label written to `<id>.label`, in bytes, per the frozen layout.
@@ -947,10 +1061,28 @@ pub(crate) fn parse_pid(body: &[u8]) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
     use crate::scratch::{Scratch, mode_of};
+
+    thread_local! {
+        /// Where a symlink is to be planted at the name [`write_private`] has just
+        /// unlinked, and nowhere if there is none. Per thread, because `cargo test` runs
+        /// this crate's unit tests as threads of one process and nothing else may see
+        /// the fault.
+        static PLANT_ONCE: Cell<Option<PathBuf>> = const { Cell::new(None) };
+    }
+
+    /// What a parent this process does not own can do inside the window between the
+    /// unlink and the create, forced into it because it cannot be scheduled there.
+    /// Called from [`write_private`], which says why it has to be.
+    pub(super) fn plant_in_the_window(path: &Path) {
+        if let Some(target) = PLANT_ONCE.take() {
+            std::os::unix::fs::symlink(target, path).unwrap();
+        }
+    }
 
     #[test]
     fn a_run_directory_is_created_owner_only_and_then_accepted_as_it_stands() {
@@ -1422,6 +1554,99 @@ mod tests {
             assert_eq!(path.file_stem().unwrap(), "tab_7");
             assert_eq!(path.extension().unwrap(), extension);
         }
+    }
+
+    /// § 6.3's concession about a *parent* this process does not own: a name planted
+    /// between [`write_private`]'s unlink and its create is refused, never written
+    /// through. Following it put this session's pid wherever the symlink pointed —
+    /// under this uid, so a mode elsewhere was no defence.
+    ///
+    /// The ordinary path is asserted behind it, because the flag that closes the window
+    /// is also the one that would refuse every honest write: what is left at the name
+    /// after the refusal is the plant, and rewriting over that is the leftover the
+    /// unlink exists for.
+    #[test]
+    fn a_name_planted_in_the_write_window_is_refused_rather_than_written_through() {
+        let root = Scratch::new("rundir-plant");
+        let dir = root.path();
+        let paths = paths_in(dir, "tab_7");
+        let theirs = dir.join("elsewhere");
+        fs::write(&theirs, b"theirs").unwrap();
+
+        PLANT_ONCE.set(Some(theirs.clone()));
+        let err = paths.write_pid().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err}");
+        assert_eq!(
+            fs::read(&theirs).unwrap(),
+            b"theirs",
+            "the file the plant pointed at was never this session's to write"
+        );
+
+        paths.write_pid().unwrap();
+        assert_eq!(
+            fs::read(paths.pid()).unwrap(),
+            format!("{}\n", std::process::id()).into_bytes(),
+            "and the pidfile is this process's own, over the plant"
+        );
+        assert_eq!(mode_of(&paths.pid()), FILE_MODE, "at the frozen mode");
+    }
+
+    /// § 6.3's peer-credential rule at the three edges a suite running as one uid
+    /// cannot put in front of a live daemon: another user, root, and an answer the
+    /// kernel never gave. Against [`uid_is_ours`], which both listeners reach through
+    /// [`peer_is_ours`].
+    ///
+    /// The refusal is here rather than end to end because a real mismatched peer needs
+    /// a second uid, which the suite has no way to become. What a daemon *can* be shown
+    /// is the other direction, in `tests/session.rs`:
+    /// `a_connection_from_this_uid_is_admitted_and_reports_its_credentials`, and every
+    /// other test in the suite, since a check that refused everybody would take no
+    /// clients at all.
+    #[test]
+    fn only_this_uid_may_have_the_session() {
+        let ours = rustix::process::getuid().as_raw();
+        assert!(
+            uid_is_ours(&Ok(ours), ours),
+            "the uid that started the session is the one it is for"
+        );
+        assert!(
+            !uid_is_ours(&Ok(ours.wrapping_add(1)), ours),
+            "another user's connection is refused however it reached the socket"
+        );
+        // Stated as a consequence rather than a case, so the assertion says the same
+        // thing under a suite run as root: uid 0 is refused by the general rule and
+        // admitted only where it is itself the uid that owns the session.
+        assert_eq!(
+            uid_is_ours(&Ok(0), ours),
+            ours == 0,
+            "root gets no exemption; it has `/proc` and `setuid` and needs none"
+        );
+        for unanswered in [
+            io::Error::from_raw_os_error(libc::ENOPROTOOPT),
+            io::Error::other("SO_PEERCRED answered with a partial ucred"),
+        ] {
+            assert!(
+                !uid_is_ours(&Err(unanswered), ours),
+                "a uid the kernel would not report is not a uid that matches"
+            );
+        }
+    }
+
+    /// [`peer_uid`] against the only peer this process can produce on its own, where
+    /// the answer is known: itself.
+    ///
+    /// It pins the call rather than the policy, and that is the half worth pinning. A
+    /// wrong level, option or struct answers `Err` for every connection, which
+    /// [`uid_is_ours`] then refuses — a session socket that admits nobody, which is
+    /// the realistic way this goes wrong.
+    #[test]
+    fn the_kernel_reports_the_uid_of_a_peer_this_process_owns() {
+        let (ours, _theirs) = UnixStream::pair().expect("a socketpair");
+        assert_eq!(
+            peer_uid(ours.as_fd()).expect("SO_PEERCRED on a socketpair"),
+            rustix::process::getuid().as_raw(),
+            "both ends of a socketpair belong to the process that made it"
+        );
     }
 
     #[test]

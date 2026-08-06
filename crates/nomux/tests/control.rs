@@ -1204,6 +1204,47 @@ fn list_and_kill_operate_without_the_protocol() {
     );
 }
 
+/// The one session neither mode can act on: an id whose run files this directory cannot
+/// form a socket address for (§ 6.3). `list` used to skip it in silence, leaving files
+/// nothing would ever name again.
+///
+/// The directory is deepened here rather than taken as it comes, because what refuses an
+/// id is the length of the directory plus the id against `sun_path`'s 107 — so a checkout
+/// near the root would otherwise pass this test without ever reaching the case.
+#[test]
+fn list_reports_an_id_this_run_directory_cannot_address() {
+    // The longest id § 6.3 accepts, so what refuses it below is the directory rather
+    // than anything about the id itself.
+    let id = "a".repeat(64);
+    let mut deep = run_root("unaddressable");
+    while deep.as_os_str().len() + "/nomux/".len() + id.len() + ".label".len() <= 107 {
+        deep.push("pad");
+    }
+    let dir = deep.join("nomux");
+    fs::create_dir_all(&dir).expect("create a deep run directory");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("owner-only");
+    let planted = dir.join(format!("{id}.pid"));
+    fs::write(&planted, b"1\n").expect("plant a run file at an unaddressable id");
+
+    let listing = control(&deep, &["list"]);
+    succeeded(&listing, "one id it cannot address is not a failed list");
+    assert!(
+        stdout(&listing).is_empty(),
+        "an id nothing can attach to must stay out of § 6.6's three columns, got {:?}",
+        stdout(&listing)
+    );
+    let said = stderr(&listing);
+    assert!(
+        said.contains(&id),
+        "the id has to be named, being the only thing a user can act on: {said:?}"
+    );
+    assert!(
+        planted.exists(),
+        "and its files are left where they are: a path that cannot be probed is not \
+         evidence that nothing is listening"
+    );
+}
+
 /// Connecting is not attaching.
 ///
 /// The frozen control surface decides whether a daemon is alive by connecting to

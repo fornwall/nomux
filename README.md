@@ -32,7 +32,7 @@ protocol is private and carries no stability guarantee ([DESIGN.md § 2](DESIGN.
 
 - [DESIGN.md](DESIGN.md) — problem, properties, architecture, security model, prior art.
 - [IMPLEMENTATION.md](IMPLEMENTATION.md) — wire protocol, ring buffer, PTY handling, bootstrap, build.
-- [PLAN.md](PLAN.md) — backlog: known gaps, unbuilt features, deferred decisions.
+- [PLAN.md](PLAN.md) — backlog: accepted limitations, unbuilt features, deferred decisions.
 
 ## Build
 

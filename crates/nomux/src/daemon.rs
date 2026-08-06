@@ -784,6 +784,17 @@ impl Daemon {
                 // One at a time: the listener is only in the poll set while the slot is free
                 // ([`Daemon::watch_for`]), so nobody is accepted only to be dropped unheard.
                 Ok((stream, _)) => {
+                    // Before the slot is taken and before a byte is read, so a peer that
+                    // is not this uid's never becomes the session's business. Returning
+                    // as the served case does, rather than going round for the next
+                    // connection: the descriptor stays readable either way, so a backlog
+                    // is drained one per pass with the PTY served in between, where a
+                    // loop refusing as fast as somebody could connect would not be. And
+                    // no [`ACCEPT_BACKOFF`] — what was refused is the connection, the
+                    // listener being in perfect health.
+                    if !crate::rundir::peer_is_ours(stream.as_fd(), self.paths.id()) {
+                        return;
+                    }
                     self.pending = Conn::new(stream)
                         .ok()
                         .map(|conn| (conn, Instant::now() + PENDING_HELLO_TIMEOUT));
@@ -1205,10 +1216,11 @@ impl Daemon {
     /// [`ACCEPT_BACKOFF`]'s, for its reason and with its effect.
     fn accept_agent(&mut self) {
         let serving = self.client.is_some();
+        let id = self.paths.id();
         let Some(agent) = self.agent.as_mut() else {
             return;
         };
-        match agent.accept(serving) {
+        match agent.accept(serving, id) {
             agent::Accept::Opened => self.tell_client(&Frame::AgentOpen),
             agent::Accept::Failed => {
                 self.agent_accept_retry = Some(Instant::now() + ACCEPT_BACKOFF);
@@ -1484,7 +1496,7 @@ mod tests {
         let agent = daemon.agent.as_mut().expect("an agent socket");
         let _served = UnixStream::connect(agent.path()).expect("connect to the agent socket");
         assert_eq!(
-            agent.accept(true),
+            agent.accept(true, "agent-serving"),
             agent::Accept::Opened,
             "the slot was free, so this one is served"
         );
