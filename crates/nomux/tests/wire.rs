@@ -1,7 +1,7 @@
 //! Byte-exact conformance to the frame table in `IMPLEMENTATION.md` § 2.2.
 //!
-//! Everything else in this crate's suite tests the codec against *itself*: encode then
-//! decode, and assert you got back what you put in. That proves the two halves agree,
+//! The codec's other tests exercise it against *itself*: encode then decode,
+//! and assert you got back what you put in. That proves the two halves agree,
 //! not that either is right. Swap `HelloOk`'s `resume_from` and `in_applied` in both
 //! directions and every round-trip test still passes — same width, so the frames stay
 //! symmetric while the bytes on the wire are wrong. `codec.rs` inherits that blind
@@ -22,7 +22,7 @@
 //! [`the_hex_fixture_carries_the_same_table`] renders these vectors and holds that file
 //! to the rendering, so neither can move alone.
 
-use nomux_proto::{
+use nomux::{
     ErrorCode, ExitKind, Frame, FrameType, HEADER_LEN, Hello, HelloOk, Linger, MAX_PAYLOAD,
     PROTOCOL_VERSION, RESUME_FROM_START, WinSize,
 };
@@ -76,7 +76,7 @@ fn hello_vectors() -> Vec<Vector> {
         // them is even representable — §2.3's "no reserved space", made in bytes.
         Vector {
             frame: Frame::Hello(Hello {
-                protocol: 7,
+                protocol: 8,
                 agent_forward: true,
                 repaint_ctrl_l: true,
                 out_offset: 0x0102_0304_0506_0708,
@@ -85,7 +85,7 @@ fn hello_vectors() -> Vec<Vector> {
             }),
             bytes: &[
                 0x01, 0x00, 0x00, 0x23, // header: type, u24 len = 35
-                0x00, 0x07, // protocol
+                0x00, 0x08, // protocol
                 0x03, // flags: bit 0 agent forward, bit 1 repaint ctrl-l
                 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // out_offset
                 0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
@@ -98,7 +98,7 @@ fn hello_vectors() -> Vec<Vector> {
         // Carries `RESUME_FROM_START` as well, which no other vector shows.
         Vector {
             frame: Frame::Hello(Hello {
-                protocol: 7,
+                protocol: 8,
                 agent_forward: true,
                 repaint_ctrl_l: false,
                 out_offset: RESUME_FROM_START,
@@ -107,7 +107,7 @@ fn hello_vectors() -> Vec<Vector> {
             }),
             bytes: &[
                 0x01, 0x00, 0x00, 0x1a, // header: type, u24 len = 26
-                0x00, 0x07, // protocol
+                0x00, 0x08, // protocol
                 0x01, // flags: bit 0 agent forward, bit 1 clear
                 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // RESUME_FROM_START
                 0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
@@ -119,7 +119,7 @@ fn hello_vectors() -> Vec<Vector> {
         // vectors above, so this is the only one that pins it clear.
         Vector {
             frame: Frame::Hello(Hello {
-                protocol: 7,
+                protocol: 8,
                 agent_forward: false,
                 repaint_ctrl_l: false,
                 out_offset: 0x8182_8384_8586_8788,
@@ -128,7 +128,7 @@ fn hello_vectors() -> Vec<Vector> {
             }),
             bytes: &[
                 0x01, 0x00, 0x00, 0x19, // header: type, u24 len = 25
-                0x00, 0x07, // protocol
+                0x00, 0x08, // protocol
                 0x00, // flags: both bits clear
                 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, // out_offset
                 0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
@@ -334,28 +334,44 @@ fn control_vectors() -> Vec<Vector> {
 /// The single serialized agent pipe of § 6.7.
 fn agent_vectors() -> Vec<Vector> {
     vec![
-        // 0x0d AgentOpen: header only. One connection is served at a time, so there is
-        // nothing to name, and the frame is the boundary rather than an address.
+        // 0x0d AgentOpen: u32 generation, which the daemon mints and the other two
+        // frames echo. One connection is served at a time, so it addresses nothing —
+        // it separates the peers that hold the one slot in turn.
         Vector {
-            frame: Frame::AgentOpen,
-            bytes: &[0x0d, 0x00, 0x00, 0x00],
+            frame: Frame::AgentOpen {
+                generation: 0x1112_1314,
+            },
+            bytes: &[
+                0x0d, 0x00, 0x00, 0x04, //
+                0x11, 0x12, 0x13, 0x14, // generation
+            ],
         },
-        // 0x0e AgentData: opaque bytes, the whole payload. What is written here is a
-        // real `ssh-agent` request — length 1, type 11 (REQUEST_IDENTITIES) — to make
-        // the point that the daemon never parses it.
+        // 0x0e AgentData: u32 generation, then opaque bytes to the end of the payload.
+        // What is written here is a real `ssh-agent` request — length 1, type 11
+        // (REQUEST_IDENTITIES) — to make the point that the daemon never parses it.
+        // The generation has its top bit set, which no other vector shows: it is
+        // unsigned, and a session that mints four billion of them wraps rather than
+        // going negative.
         Vector {
             frame: Frame::AgentData {
+                generation: 0x9192_9394,
                 data: b"\x00\x00\x00\x01\x0b",
             },
             bytes: &[
-                0x0e, 0x00, 0x00, 0x05, // header: len = 5
+                0x0e, 0x00, 0x00, 0x09, // header: len = 4 + 5
+                0x91, 0x92, 0x93, 0x94, // generation
                 0x00, 0x00, 0x00, 0x01, 0x0b,
             ],
         },
-        // 0x0f AgentClose: header only, like the open it answers.
+        // 0x0f AgentClose: u32 generation, like the open it answers. Written at the
+        // first generation a session mints, which is a channel like any other and not
+        // a sentinel — nothing on this wire spells "no channel".
         Vector {
-            frame: Frame::AgentClose,
-            bytes: &[0x0f, 0x00, 0x00, 0x00],
+            frame: Frame::AgentClose { generation: 0 },
+            bytes: &[
+                0x0f, 0x00, 0x00, 0x04, //
+                0x00, 0x00, 0x00, 0x00, // generation
+            ],
         },
     ]
 }
@@ -385,7 +401,7 @@ fn documented_bytes_decode_to_their_frames() {
     for Vector { frame, bytes } in vectors() {
         let (header, payload) = bytes.split_at(HEADER_LEN);
         let header: [u8; HEADER_LEN] = header.try_into().unwrap();
-        let header = nomux_proto::decode_header(&header).unwrap();
+        let header = nomux::decode_header(&header).unwrap();
 
         assert_eq!(header.ty, frame.frame_type(), "type byte");
         assert_eq!(
@@ -488,8 +504,14 @@ fn record(vector: &Vector) -> String {
             lines.push(format!("code {code:?}"));
             lines.push(format!("message {}", hex(message.as_bytes())));
         }
-        Frame::AgentData { data } => lines.push(format!("data {}", hex(data))),
-        Frame::Detach | Frame::Ping | Frame::Pong | Frame::AgentOpen | Frame::AgentClose => {}
+        Frame::AgentOpen { generation } | Frame::AgentClose { generation } => {
+            lines.push(format!("generation {generation:#010x}"));
+        }
+        Frame::AgentData { generation, data } => {
+            lines.push(format!("generation {generation:#010x}"));
+            lines.push(format!("data {}", hex(data)));
+        }
+        Frame::Detach | Frame::Ping | Frame::Pong => {}
     }
     lines.push(format!("bytes {}", hex(bytes)));
     lines.join("\n")
@@ -709,8 +731,8 @@ fn the_frozen_numbers_are_the_ones_the_document_gives() {
         (
             "PROTOCOL_VERSION",
             u64::from(PROTOCOL_VERSION),
-            7,
-            "§ 2.2 puts the current revision at 7",
+            8,
+            "§ 2.2 puts the current revision at 8",
         ),
         (
             "MAX_PAYLOAD",

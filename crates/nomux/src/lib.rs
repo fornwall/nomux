@@ -5,6 +5,11 @@
 //!
 //! A private protocol with no stability guarantee: [`PROTOCOL_VERSION`] exists to
 //! fail fast on a mismatched peer rather than to negotiate (`IMPLEMENTATION.md` § 2).
+//!
+//! A library target beside the binary rather than a module inside it, because an
+//! integration test cannot import from a binary and most of the suite speaks this
+//! codec. That also keeps `forbid(unsafe_code)` over a whole target: the seccomp
+//! filter, `pre_exec` and the signal handlers are the binary's.
 
 #![forbid(unsafe_code)]
 
@@ -19,7 +24,7 @@ pub use frame::{
 ///
 /// `IMPLEMENTATION.md` § 2.2 owns the history, and `tests/wire.rs` holds the constant,
 /// the vectors and the document to each other: a bump has to move all three.
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 
 /// Fixed frame header size, so reads are a two-stage `read_exact`.
 pub const HEADER_LEN: usize = 4;
@@ -148,14 +153,13 @@ impl core::fmt::Display for ProtoError {
     }
 }
 
-impl core::error::Error for ProtoError {}
-
-/// Encodes a frame header.
+/// Encodes a frame header. Reached only through [`Frame::encode`], which patches one in
+/// behind the payload it has already written.
 ///
 /// # Errors
 ///
 /// [`ProtoError::PayloadTooLarge`] if `len` exceeds [`MAX_PAYLOAD`].
-pub const fn encode_header(ty: FrameType, len: u32) -> Result<[u8; HEADER_LEN], ProtoError> {
+pub(crate) const fn encode_header(ty: FrameType, len: u32) -> Result<[u8; HEADER_LEN], ProtoError> {
     if len > MAX_PAYLOAD {
         return Err(ProtoError::PayloadTooLarge(len));
     }
@@ -173,16 +177,17 @@ pub const fn encode_header(ty: FrameType, len: u32) -> Result<[u8; HEADER_LEN], 
 ///
 /// # Examples
 ///
-/// ```
-/// use nomux_proto::{FrameType, Header, decode_header, encode_header};
+/// § 2.1's header, in bytes: the discriminant, then the length big endian in the
+/// three that follow.
 ///
-/// let bytes = encode_header(FrameType::Output, 4096)?;
-/// assert_eq!(bytes, [0x05, 0x00, 0x10, 0x00]);
+/// ```
+/// use nomux::{FrameType, Header, decode_header};
+///
 /// assert_eq!(
-///     decode_header(&bytes)?,
+///     decode_header(&[0x05, 0x00, 0x10, 0x00])?,
 ///     Header { ty: FrameType::Output, len: 4096 }
 /// );
-/// # Ok::<(), nomux_proto::ProtoError>(())
+/// # Ok::<(), nomux::ProtoError>(())
 /// ```
 pub fn decode_header(bytes: &[u8; HEADER_LEN]) -> Result<Header, ProtoError> {
     let [ty, a, b, c] = *bytes;

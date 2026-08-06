@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use nomux_proto::PROTOCOL_VERSION;
+use nomux::PROTOCOL_VERSION;
 
 use harness::{
     Reaper, Session, Spawned, collect, control, daemon_reaper, entries, leads_a_process_group,
@@ -255,6 +255,12 @@ fn a_daemon_holds_the_spawn_lock_while_it_claims_the_id() {
 /// have — rather than the 127 that would tell `DESIGN.md` § 7's client its own id named
 /// nothing here. Collecting on a probe that never reached the socket would be the escape
 /// hatch unlinking a session whose daemon is merely busy.
+///
+/// The two refusals say the same thing about the wedge because the same thing is known:
+/// an undrained backlog is evidence of neither death nor life, which is § 6.6's
+/// `unprobeable` and not a session established to be running. `list` is the asymmetry
+/// and not the exception — an entry it cannot collect is one it must still print, since
+/// only death collects and a client may address the id either way.
 #[test]
 fn nothing_parks_on_a_socket_whose_backlog_is_full() {
     let deadline = Instant::now() + PATIENCE;
@@ -284,8 +290,16 @@ fn nothing_parks_on_a_socket_whose_backlog_is_full() {
         "kill claimed to have removed a session it never established the state of"
     );
     assert!(
-        stderr(&killed).contains("is running"),
-        "the refusal must say the session is still there: {:?}",
+        stderr(&killed).contains("could not be probed") && stderr(&killed).contains("backlog"),
+        "the refusal must name the state it gave up on, which is the whole of what was \
+         established and the only thing anyone can repair: {:?}",
+        stderr(&killed)
+    );
+    assert!(
+        !stderr(&killed).contains("is running"),
+        "and it must not report a session it never reached as one: nothing was listening \
+         for, and no pid was ever published in, a run directory this test planted a \
+         wedged socket into and nothing else: {:?}",
         stderr(&killed)
     );
     assert_eq!(
@@ -899,6 +913,102 @@ fn kill_reports_a_socket_it_could_not_probe_rather_than_a_session_that_outlived_
         "the SIGTERM was never the broken part: the daemon must still have gone"
     );
     drop(session.run.run(&["kill", "lk25"]));
+}
+
+/// The same unprobeable socket, over a pidfile that names no daemon: what could not be
+/// probed is still reported as that, rather than as a session established to be running.
+///
+/// Every refusal `control::resolve` reaches is worded "session `<id>` is running, but
+/// `<id>.pid`: …", and the only thing that ever establishes the opening clause is a
+/// connection a daemon accepted. Under an unprobeable socket nothing did — § 6.3 makes
+/// that errno evidence of neither death nor life — so what came back named a state nobody
+/// had seen, and pointed the user at the one file that was not the problem.
+///
+/// The two rows are what `<id>.pid` can be doing while the probe fails: absent, which is
+/// § 6.2's publish window and is waited out, and naming a live process that is positively
+/// not this daemon, which is settled on the first pass. They enter `resolve`'s two
+/// refusals from opposite ends and must come back with the same account, that account
+/// being about the socket rather than about either file.
+///
+/// Nothing is signalled on either row, which is the difference from
+/// [`kill_reports_a_socket_it_could_not_probe_rather_than_a_session_that_outlived_sigkill`]
+/// beside it: there `<id>.pid` identifies the daemon, and identifying it through `/proc`
+/// owes the probe nothing, so the `SIGTERM` still goes out. Here there is nothing to
+/// identify, so both the daemon and the stranger have to still be running afterwards.
+///
+/// Stands down as root for that test's reason: a mode keeps nobody out of their own
+/// socket, so there is no unprobeable socket to report.
+#[test]
+fn kill_reports_an_unprobeable_socket_over_a_pidfile_that_names_no_daemon() {
+    if skip_as_root("a socket at mode 0400 still answers its own user, so nothing is unprobeable") {
+        return;
+    }
+    // One live process for the row whose pidfile has to appear to name something, held
+    // across both so the last assertion can ask whether anything was signalled at all.
+    let mut bystander = sleeper();
+    let stranger = bystander.id();
+    let strangers = format!("{stranger}\n");
+    for (id, planted) in [("lk27", None), ("lk33", Some(strangers.as_str()))] {
+        let session = LiveSession::create(id);
+        match planted {
+            None => fs::remove_file(session.pid_path()).expect("take the pidfile away"),
+            Some(body) => fs::write(session.pid_path(), body).expect("plant a stranger's pid"),
+        }
+        let before = entries(&session.run.dir);
+        // Readable still, so this is the `connect` and nothing else: 0400 takes away the
+        // write permission that a `connect` to a unix socket needs, and leaves every
+        // other file of the session exactly as the daemon left it.
+        fs::set_permissions(session.run.socket(), fs::Permissions::from_mode(0o400))
+            .expect("shut the socket to connect");
+
+        let killed = session.run.run(&["kill", id]);
+        let left = entries(&session.run.dir);
+        // Asked outright rather than waited for: no signal was sent, so there is nothing
+        // for the daemon to be on its way out of, and a wait here could only turn the
+        // assertion into one that passes for having been quick.
+        let serving = process_alive(session.pid);
+        drop(fs::set_permissions(
+            session.run.socket(),
+            fs::Permissions::from_mode(0o600),
+        ));
+
+        let said = stderr(&killed);
+        assert_eq!(
+            killed.status.code(),
+            Some(1),
+            "{id}: kill claimed a postcondition no probe ever saw: {:?}",
+            stdout(&killed)
+        );
+        assert!(
+            said.contains("could not be probed") && said.contains("Permission denied"),
+            "{id}: the refusal must name the errno that stopped it, that being the whole \
+             of what is known and the only thing anyone can repair: {said:?}"
+        );
+        assert!(
+            !said.contains("is running"),
+            "{id}: nothing established that the session is running, so nothing may say \
+             it is: {said:?}"
+        );
+        assert!(
+            !said.contains(&format!("{id}.pid")),
+            "{id}: the pidfile is not what stopped this call, and naming it sends a user \
+             to repair a file that would have changed nothing: {said:?}"
+        );
+        assert!(
+            serving,
+            "{id}: nothing here identified a process, so nothing was this call's to \
+             signal: {said:?}"
+        );
+        assert_eq!(
+            left, before,
+            "{id}: a session that may be live keeps every one of its files"
+        );
+        drop(session.run.run(&["kill", id]));
+    }
+    assert!(
+        bystander.is_running(),
+        "the one number in a pidfile got signalled over a socket that was never probed"
+    );
 }
 
 /// Regression: a daemon is still recognised when its command line is long *behind*
@@ -1570,7 +1680,7 @@ fn invalid_session_ids_are_refused() {
 /// The two answers a client gets out of this binary before it has a session: the
 /// protocol revision, and 64 for a command line that makes no sense.
 ///
-/// `--version` carries the revision taken from `nomux_proto` rather than written out
+/// `--version` carries the revision taken from `nomux` rather than written out
 /// here: pinning the number would make bumping the protocol a two-file change and say
 /// nothing about whether the binary reports the one it speaks.
 ///

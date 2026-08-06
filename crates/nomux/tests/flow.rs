@@ -4,9 +4,14 @@
 //! A client can write faster than the child reads, and a peer can stop reading what
 //! it asked for. Neither may grow the daemon without bound, and neither may cost the
 //! session its shell: the daemon stops reading the socket in the one direction and
-//! lets go of the connection in the other. The `EMFILE` test is here because it is
-//! the same question about a third resource — what the event loop does when it
-//! cannot make progress on something it is being woken for.
+//! lets go of the connection in the other. Between the two is the peer that has
+//! closed its write half — § 7's relay on stdin EOF, which has stopped sending and is
+//! still owed everything the child has yet to say — and what it is owed and when it
+//! stops being owed anything is here for that reason.
+//!
+//! The `EMFILE` test is here because it is the same question about a third resource —
+//! what the event loop does when it cannot make progress on something it is being
+//! woken for.
 
 #![allow(
     clippy::expect_used,
@@ -22,7 +27,7 @@ use std::io::{ErrorKind, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-use nomux_proto::{Frame, FrameType, HEADER_LEN, RESUME_FROM_START, decode_header};
+use nomux::{Frame, FrameType, HEADER_LEN, RESUME_FROM_START, decode_header};
 
 use harness::{
     ABANDON_PENDING_WRITE, Cue, FRAME_PATIENCE, MAX_PENDING_INPUT, SPIN_WINDOW, Session, cpu_ticks,
@@ -312,6 +317,144 @@ fn input_delivered_before_a_half_close_is_applied_rather_than_dropped() {
     );
 }
 
+/// A half-closed client is served until there is nothing left owed to it, and let go
+/// then rather than on its end of file (`IMPLEMENTATION.md` § 7).
+///
+/// End of file with nothing undecoded behind it used to be a departure. That is the
+/// answer a client that has *gone* wants and the wrong one for the relay, which shuts
+/// its write half down on stdin EOF and goes on draining output — so `nomux attach ID
+/// < script` was served whatever the child had produced by the time the file ran out
+/// and lost everything after it. Against the real binary that was a script of `sleep
+/// 2; echo LATE; exit 7` returning in a tenth of a second with the shell's greeting
+/// and nothing else, while a later attach found `LATE` and the status sitting in the
+/// ring, produced for a client the daemon had already let go of.
+///
+/// The cue is what makes that a loss rather than a race: the child touches its
+/// terminal for the first time *after* the half-close below, so every byte asserted on
+/// here was produced for a peer the old daemon had already dropped.
+///
+/// The ending is the other half, and neither half stands alone: the `Exit` is the last
+/// thing owed to a peer that can ask for nothing more — the master leaves the poll set
+/// at the child's exit, so the ring is finished — and without the close behind it the
+/// same relay drains a socket that will never close, which is `nomux attach ID <
+/// script` hanging instead of truncating.
+///
+/// The spin measurement is about the state the cue holds this in: a client registered
+/// for `HUP` alone, on a socket readable for ever, that being what end of file is.
+/// Asking `poll` for `IN` there is a wakeup on every pass for the life of the session —
+/// 49 ticks in half a second, measured — which is what would make a connection worth
+/// keeping too expensive to keep.
+///
+/// A raw socket rather than a [`Client`], `shutdown(SHUT_WR)` being the whole of what
+/// this is about and something the harness client has no spelling for.
+#[test]
+fn a_half_closed_client_is_served_to_the_end_and_let_go_there() {
+    use std::net::Shutdown;
+
+    /// What the child says once the cue lets it through. Arithmetic for
+    /// `READY_MARKER`'s reason, though `-echo` already keeps the request for it off
+    /// the stream.
+    const LATE: &str = "LATE-42";
+    /// The status the child leaves with, and so the last thing this client is owed.
+    const STATUS: i32 = 7;
+    /// [`a_daemon_that_cannot_accept_stands_back_rather_than_spinning`]'s figure, for
+    /// its reason and against the same window.
+    const TOLERATED: u64 = 5;
+
+    let session = Session::start("halfclose_serve");
+    let daemon = session.child.id();
+    let cue = Cue::new(&session.root);
+
+    let mut setup = session.connect();
+    let ok = setup.hello(RESUME_FROM_START);
+    // `raw -echo` so that nothing but the child puts `LATE` on the stream, and the cue
+    // so that it does so at a moment this test chooses.
+    setup.make_ready(
+        "raw -echo",
+        Some(r#"read cue < cue; printf "LATE-$((6*7))"; exit 7"#),
+        ok.resume_from,
+    );
+    // Dropped whole, which is a peer that has gone: the connection under test is the
+    // one below, and it must arrive at a session with nobody attached.
+    drop(setup);
+
+    let mut peer = UnixStream::connect(&session.socket).expect("connect");
+    write_frame(&mut peer, &hello_frame(0, RESUME_FROM_START));
+    // The half-close § 7 has the relay make on stdin EOF, with the read half left open
+    // — a peer that is still there and still owed.
+    peer.shutdown(Shutdown::Write)
+        .expect("half-close the way the relay does");
+
+    // While the cue still holds the child, so what is measured is a daemon with
+    // nothing to do and a peer it is keeping anyway.
+    let burned = cpu_ticks(daemon);
+    assert!(
+        burned <= TOLERATED,
+        "the daemon burned {burned} clock ticks in {SPIN_WINDOW:?} over a client that \
+         had closed its write half, which it now keeps for the life of the session"
+    );
+
+    cue.release();
+
+    // Read to the end of the connection rather than to the frame this wants: the
+    // daemon closing it is half of what is under test, and one that never does is
+    // caught by the deadline rather than by parking the run.
+    peer.set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("bound each read");
+    let deadline = Instant::now() + FRAME_PATIENCE;
+    let mut answered = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let closed = loop {
+        match read_uninterrupted(&mut peer, &mut chunk) {
+            Ok(0) => break true,
+            Ok(n) => answered.extend_from_slice(&chunk[..n]),
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+            Err(err) => panic!("reading what the daemon sent a half-closed client: {err}"),
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+    };
+
+    let seen = frames(&answered);
+    let transcript: Vec<u8> = seen
+        .iter()
+        .filter_map(|frame| match *frame {
+            Frame::Output { data, .. } => Some(data),
+            _ => None,
+        })
+        .flatten()
+        .copied()
+        .collect();
+    assert!(
+        String::from_utf8_lossy(&transcript).contains(LATE),
+        "the child's {LATE} never reached a client that had only closed its write \
+         half: {} bytes over {} frames, which is what the daemon was still willing to \
+         send it",
+        transcript.len(),
+        seen.len()
+    );
+    assert!(
+        matches!(seen.last(), Some(&Frame::Exit { status, .. }) if status == STATUS),
+        "the last thing a half-closed client is owed is the status its child left \
+         with, and this connection ended on {:?}",
+        seen.last()
+    );
+    assert!(
+        closed,
+        "the daemon went on holding a connection it owed nothing: past the Exit the \
+         ring is finished, and § 7's relay drains this socket until it closes"
+    );
+
+    // The session outlives the client that read it to the end, per § 6.5 — and is
+    // clientless again, which is what puts it back on the idle deadline.
+    let mut probe = session.connect();
+    assert!(
+        probe.hello(RESUME_FROM_START).in_applied > 0,
+        "the session did not survive the connection it finished serving"
+    );
+}
+
 /// Regression: a session whose child exits while its input queue is full still
 /// answers.
 ///
@@ -496,16 +639,18 @@ fn a_client_that_never_reads_its_answers_is_dropped_rather_than_queued_for() {
         "the daemon took {sent} bytes from a peer that read none of its answers"
     );
 
-    let seen = frame_types(&answered);
+    let seen = frames(&answered);
     assert!(
-        seen.contains(&FrameType::Pong),
+        seen.iter().any(|frame| matches!(*frame, Frame::Pong)),
         "the daemon answered none of the pings, so what filled its queue was not the \
          traffic § 4.1 says cannot be held back: {} bytes over {} frames",
         answered.len(),
         seen.len()
     );
     assert!(
-        !seen.contains(&FrameType::Error),
+        !seen
+            .iter()
+            .any(|frame| matches!(*frame, Frame::Error { .. })),
         "the daemon refused this peer rather than letting go of it, which reaches the \
          same closed connection for an entirely different reason"
     );
@@ -537,7 +682,7 @@ fn a_client_that_never_reads_its_answers_is_dropped_rather_than_queued_for() {
 /// One detach costs at most half a second, and no bound this suite could carry would tell
 /// half a second of that from half a second of a loaded machine — so the rounds below buy
 /// a floor instead. Each leaves the daemon holding more than the socket will take and then
-/// half-closes, and under the defect each of those is a whole `FINAL_FLUSH_TIMEOUT` that
+/// detaches, and under the defect each of those is a whole `FINAL_FLUSH_TIMEOUT` that
 /// the budget below cannot be reached through. What is measured is still the child:
 /// chunks of terminal output it has got rid of, counted from the far side of the PTY,
 /// where a daemon that is not running is the only thing that can hold them up.
@@ -584,7 +729,7 @@ fn detaching_a_stalled_client_does_not_stop_the_child() {
     let done = || fs::metadata(&ticks).map_or(0, |meta| meta.len());
 
     // Twice what a peer that never reads can be handed, so the leftover at the moment of
-    // the half-close is more than the socket will take however the reads and writes
+    // the detach is more than the socket will take however the reads and writes
     // interleaved — the state a blocking final flush waits out. Measured rather than
     // assumed, per [`socket_capacity`].
     let held = socket_capacity();
@@ -619,13 +764,15 @@ fn detaching_a_stalled_client_does_not_stop_the_child() {
 }
 
 /// One round of [`detaching_a_stalled_client_does_not_stop_the_child`]: a client that
-/// greets, is handed more than it will ever take, and half-closes without reading a byte
-/// — § 7's relay detaching with its own output stalled behind it.
+/// greets, is handed more than it will ever take, and detaches without reading a byte
+/// — § 4.1's departing client with its own output stalled behind it.
+///
+/// The `Detach` is what makes this a departure, and the two alternatives are not: a
+/// half-close is not one at all (§ 7), and a socket closed outright takes the flush
+/// away rather than testing it, an `EPIPE` being the daemon waiting for nothing.
 ///
 /// The socket is handed back rather than dropped, for the reason the caller keeps it.
 fn stalled_detach(session: &Session, pings: &[u8]) -> UnixStream {
-    use std::net::Shutdown;
-
     let mut socket = UnixStream::connect(&session.socket).expect("connect");
     write_frame(&mut socket, &hello_frame(0, RESUME_FROM_START));
     // Blocking, and so paced by the daemon: a round can only hand its pings over as fast
@@ -636,12 +783,9 @@ fn stalled_detach(session: &Session, pings: &[u8]) -> UnixStream {
     socket
         .write_all(pings)
         .expect("hand the daemon more answers than this peer will take");
-    // The half-close § 7 has the relay make on stdin EOF, which is how the daemon hears
-    // this client leave. The read half stays open, so the peer is still there and still
-    // not reading: the state a final flush has to wait out in full.
-    socket
-        .shutdown(Shutdown::Write)
-        .expect("half-close the way the relay does");
+    // Behind the answers it will never read, so the departure is heard with the whole
+    // of that queue still owed: the state a final flush has to wait out in full.
+    write_frame(&mut socket, &Frame::Detach);
     socket
 }
 
@@ -667,29 +811,29 @@ fn input_frames(at_least: usize, from: u64) -> (Vec<u8>, u64) {
     (frames, offset)
 }
 
-/// The types of the frames in `bytes`, stopping at the first one that is not all
-/// there.
+/// The frames in `bytes`, stopping at the first one that is not all there.
 ///
-/// For the one test that reads a connection the daemon abandoned rather than closed
-/// in order: its last write is however much of the queue the socket took, so the tail
-/// is routinely half a frame, and a walk that decoded it would be reporting on the
-/// truncation rather than on what the daemon sent. Only the header is read, because
-/// the question is which frames arrived rather than what they carried.
-fn frame_types(bytes: &[u8]) -> Vec<FrameType> {
-    let mut types = Vec::new();
+/// The truncation is the point rather than an edge: one caller reads a connection the
+/// daemon abandoned rather than closed in order, whose last write is however much of
+/// the queue the socket took — so the tail is routinely half a frame, and a walk that
+/// insisted on it would be reporting on the truncation rather than on what the daemon
+/// sent. What is decoded is whatever was delivered whole.
+fn frames(bytes: &[u8]) -> Vec<Frame<'_>> {
+    let mut frames = Vec::new();
     let mut at = 0;
     while let Some(head) = bytes
         .get(at..at + HEADER_LEN)
         .and_then(|head| <[u8; HEADER_LEN]>::try_from(head).ok())
     {
         let header = decode_header(&head).expect("decode a header the daemon wrote");
-        at += HEADER_LEN + header.len as usize;
-        if at > bytes.len() {
+        let Some(payload) = bytes.get(at + HEADER_LEN..at + HEADER_LEN + header.len as usize)
+        else {
             break;
-        }
-        types.push(header.ty);
+        };
+        frames.push(Frame::decode(header.ty, payload).expect("decode a frame the daemon wrote"));
+        at += HEADER_LEN + header.len as usize;
     }
-    types
+    frames
 }
 
 /// A greeted socket that refuses rather than blocks once the daemon stops taking what

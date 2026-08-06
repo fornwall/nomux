@@ -12,7 +12,7 @@
 //! it cannot see is the wire itself — it generates frames and compares frames, so the
 //! byte layout is `wire.rs`'s job.
 
-use nomux_proto::{
+use nomux::{
     ErrorCode, ExitKind, Frame, FrameType, HEADER_LEN, Hello, HelloOk, Linger, MAX_PAYLOAD,
     ProtoError, WinSize, decode_header,
 };
@@ -87,7 +87,10 @@ impl OwnedFrame {
                 offset,
                 data: &self.bytes,
             },
-            Frame::AgentData { .. } => Frame::AgentData { data: &self.bytes },
+            Frame::AgentData { generation, .. } => Frame::AgentData {
+                generation,
+                data: &self.bytes,
+            },
             borrows_nothing => borrows_nothing,
         }
     }
@@ -144,8 +147,9 @@ fn any_frame() -> impl Strategy<Value = OwnedFrame> {
     let exit_kind = prop::sample::select(ExitKind::ALL.to_vec());
 
     // The variants that borrow nothing, in one group, `prop_oneof!` costing an arm
-    // apiece. The five payload-less ones share the last arm, having no field to sample
-    // between them; [`every_frame_type_is_generated`] checks that none went missing.
+    // apiece. The three payload-less ones share the last arm, having no field to sample
+    // between them, and the two agent boundaries share the one before it, differing only
+    // in type; [`every_frame_type_is_generated`] checks that none went missing.
     let copied = prop_oneof![
         (any::<u64>(), any::<u64>(), linger, any::<bool>()).prop_map(
             |(resume_from, in_applied, linger, agent)| {
@@ -167,13 +171,12 @@ fn any_frame() -> impl Strategy<Value = OwnedFrame> {
                 since_exit_secs,
             }
         }),
-        prop::sample::select(vec![
-            Frame::Detach,
-            Frame::Ping,
-            Frame::Pong,
-            Frame::AgentOpen,
-            Frame::AgentClose,
-        ]),
+        (any::<u32>(), any::<bool>()).prop_map(|(generation, opening)| if opening {
+            Frame::AgentOpen { generation }
+        } else {
+            Frame::AgentClose { generation }
+        }),
+        prop::sample::select(vec![Frame::Detach, Frame::Ping, Frame::Pong]),
     ];
 
     prop_oneof![
@@ -213,7 +216,13 @@ fn any_frame() -> impl Strategy<Value = OwnedFrame> {
             Frame::Error { code, message: "" },
             message
         )),
-        any_bytes().prop_map(|data| OwnedFrame::with_bytes(Frame::AgentData { data: b"" }, data)),
+        (any::<u32>(), any_bytes()).prop_map(|(generation, data)| OwnedFrame::with_bytes(
+            Frame::AgentData {
+                generation,
+                data: b"",
+            },
+            data
+        )),
     ]
 }
 

@@ -711,7 +711,7 @@ impl SessionPaths {
     }
 
     /// `ssh-agent` socket, served for a session created with
-    /// [`nomux_proto::HELLO_AGENT_FORWARD`].
+    /// [`nomux::HELLO_AGENT_FORWARD`].
     #[must_use]
     pub(crate) fn agent(&self) -> PathBuf {
         self.with_extension("agent")

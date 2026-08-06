@@ -109,11 +109,10 @@ wire_enum! {
     ///
     /// Reported rather than worked around, and a byte of [`HelloOk`] in its own right
     /// rather than bits inside its flags (`IMPLEMENTATION.md` § 6.2, § 2.3).
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     Linger: u8, as_byte / from_byte,
     /// Not determined: no `systemd`, or its state is unreadable. Do not warn —
     /// on a host without `logind` there is nothing to warn about.
-    #[default]
     Unknown = 0,
     /// `logind` is running and lingering is off for this user. The session dies at
     /// logout if the host also sets `KillUserProcesses=yes`.
@@ -226,17 +225,27 @@ pub enum Frame<'a> {
     },
     /// A process connected to the session's agent socket, and the client is to open one
     /// of its own to the real agent.
-    ///
-    /// Carries nothing, one connection being served at a time, and kept even so where
-    /// [`Frame::AgentData`] alone would nearly serve (`IMPLEMENTATION.md` § 6.7).
-    AgentOpen,
+    AgentOpen {
+        /// Names this incarnation of the one slot. Local peers are accepted out of band
+        /// from the client's stream, so the connections that hold it in turn are
+        /// otherwise indistinguishable — one at a time in *space* only
+        /// (`IMPLEMENTATION.md` § 6.7).
+        generation: u32,
+    },
     /// Opaque `ssh-agent` bytes for the connection being served.
     AgentData {
+        /// The channel these are for. The daemon drops what names one it no longer
+        /// holds, rather than writing a dead peer's bytes into its successor.
+        generation: u32,
         /// Bytes, never parsed by the daemon.
         data: &'a [u8],
     },
     /// The served connection is finished.
-    AgentClose,
+    AgentClose {
+        /// The channel being closed, on the same terms as [`Frame::AgentData`]: a
+        /// client's close for a peer that has already gone must not take the next one.
+        generation: u32,
+    },
 }
 
 impl<'a> Frame<'a> {
@@ -256,9 +265,9 @@ impl<'a> Frame<'a> {
             Self::Ping => FrameType::Ping,
             Self::Pong => FrameType::Pong,
             Self::Error { .. } => FrameType::Error,
-            Self::AgentOpen => FrameType::AgentOpen,
+            Self::AgentOpen { .. } => FrameType::AgentOpen,
             Self::AgentData { .. } => FrameType::AgentData,
-            Self::AgentClose => FrameType::AgentClose,
+            Self::AgentClose { .. } => FrameType::AgentClose,
         }
     }
 
@@ -335,12 +344,18 @@ impl<'a> Frame<'a> {
                 out.push(kind.as_byte());
                 out.extend_from_slice(&since_exit_secs.to_be_bytes());
             }
-            Self::Detach | Self::Ping | Self::Pong | Self::AgentOpen | Self::AgentClose => {}
+            Self::Detach | Self::Ping | Self::Pong => {}
             Self::Error { code, message } => {
                 out.extend_from_slice(&code.as_u16().to_be_bytes());
                 out.extend_from_slice(message.as_bytes());
             }
-            Self::AgentData { data } => out.extend_from_slice(data),
+            Self::AgentOpen { generation } | Self::AgentClose { generation } => {
+                out.extend_from_slice(&generation.to_be_bytes());
+            }
+            Self::AgentData { generation, data } => {
+                out.extend_from_slice(&generation.to_be_bytes());
+                out.extend_from_slice(data);
+            }
         }
         Ok(())
     }
@@ -355,10 +370,9 @@ impl<'a> Frame<'a> {
     /// and [`ProtoError::Malformed`] for invalid enum discriminants or non-UTF-8
     /// text.
     pub fn decode(ty: FrameType, payload: &'a [u8]) -> Result<Self, ProtoError> {
-        // The in-tree caller reaches this only through `decode_header`, which has
-        // already applied the bound. Restated because `decode` is public and usable
-        // on its own: without it a frame could decode that this crate would then
-        // refuse to encode.
+        // The daemon reaches this only through `decode_header`, which has already
+        // applied the bound. Restated because `decode` is public and the suite calls
+        // it on its own: without it a frame could decode that `encode` would refuse.
         let len = u32::try_from(payload.len()).unwrap_or(u32::MAX);
         if len > crate::MAX_PAYLOAD {
             return Err(ProtoError::PayloadTooLarge(len));
@@ -433,9 +447,16 @@ impl<'a> Frame<'a> {
                 message: core::str::from_utf8(r.rest())
                     .map_err(|_| ProtoError::Malformed("error message is not UTF-8"))?,
             },
-            FrameType::AgentOpen => Self::AgentOpen,
-            FrameType::AgentClose => Self::AgentClose,
-            FrameType::AgentData => Self::AgentData { data: r.rest() },
+            FrameType::AgentOpen => Self::AgentOpen {
+                generation: r.u32()?,
+            },
+            FrameType::AgentClose => Self::AgentClose {
+                generation: r.u32()?,
+            },
+            FrameType::AgentData => Self::AgentData {
+                generation: r.u32()?,
+                data: r.rest(),
+            },
         };
 
         // Every fixed-size frame must have consumed its payload exactly; the

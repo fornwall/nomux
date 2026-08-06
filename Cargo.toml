@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/nomux", "crates/nomux-proto"]
+members = ["crates/nomux"]
 
 [workspace.package]
 version = "0.2.0"
@@ -9,9 +9,6 @@ rust-version = "1.97.1"
 license = "Apache-2.0"
 repository = "https://github.com/fornwall/nomux"
 authors = ["Fredrik Fornwall <fredrik@fornwall.net>"]
-
-[workspace.dependencies]
-nomux-proto = { path = "crates/nomux-proto" }
 
 # See IMPLEMENTATION.md § 8 — the cold upload happens over cellular, so size is a
 # correctness-adjacent concern. Target <= 400 KiB per architecture.

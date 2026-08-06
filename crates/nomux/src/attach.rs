@@ -304,9 +304,16 @@ fn await_publication(paths: &SessionPaths, deadline: Instant) {
 /// `IMPLEMENTATION.md` § 6.2, and both are still done here because it cannot reach
 /// either soon enough; that section has the two windows this closes.
 fn spawn_daemon(session_id: &str, label: Option<&str>) -> io::Result<Option<ChildStderr>> {
-    let exe = env::current_exe()?;
-    let mut command = Command::new(exe);
+    // The inode this process was loaded from, not the path it was loaded under: a name is
+    // resolved again at exec, and what it resolves to by then belongs to any uid that can
+    // write the install directory (`SECURITY.md`). Only that second exec is closed — the
+    // first ran out of that directory, whose trust `DESIGN.md` § 8 leaves to the client.
+    let mut command = Command::new("/proc/self/exe");
     command
+        // Keeps the real path in `ps`, off the very link named above, so a host with no
+        // `/proc` still fails here rather than newly at the exec.
+        // `control::names_daemon_for` skips `argv[0]` and reads neither spelling.
+        .arg0(env::current_exe()?)
         .arg("daemon")
         .arg(session_id)
         .stdin(Stdio::null())

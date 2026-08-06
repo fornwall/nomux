@@ -18,7 +18,7 @@ This repo is **the server binary only**, and nothing in it aims to be a general
 terminal tool. The SSH client and terminal emulator are a separate project by the same
 author, and the two ship as a unit, so:
 
-- The wire protocol is **private**: no negotiation, no extension points, no stability guarantee. Enums are exhaustive, so an unknown value is a bug rather than a forward-compatibility case; nothing is on the wire that nothing reads; and `nomux-proto` is unpublished, a crates.io version being a stability promise this bullet refuses to make.
+- The wire protocol is **private**: no negotiation, no extension points, no stability guarantee. Enums are exhaustive, so an unknown value is a bug rather than a forward-compatibility case; nothing is on the wire that nothing reads; and nothing here is published, a crates.io version being a stability promise this bullet refuses to make.
 - Behaviour goes to whichever side it is cheapest on: emulator reset on gap recovery is the client's because the client already holds the emulator, and either end can tell there was a gap by comparing offsets ([IMPLEMENTATION.md § 4.2](IMPLEMENTATION.md#42-attach-with-from--base)).
 - Version skew has exactly one real case (§6.4), bounded rather than designed around.
 

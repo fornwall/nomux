@@ -12,7 +12,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-use nomux_proto::WinSize;
+use nomux::WinSize;
 use rustix::fs::{Mode, OFlags};
 use rustix::pty::{OpenptFlags, openpt, ptsname, unlockpt};
 use rustix::termios::{Winsize, tcsetwinsize};
@@ -406,18 +406,13 @@ fn pick_dir(home: Option<&Path>, fallback: Option<&Path>) -> PathBuf {
         .map_or_else(|| PathBuf::from("/"), Path::to_path_buf)
 }
 
-/// Splits an `ExitStatus` into the wire representation of [`nomux_proto::Frame::Exit`].
+/// Splits an `ExitStatus` into the wire representation of [`nomux::Frame::Exit`].
 #[must_use]
-pub(crate) fn exit_parts(status: std::process::ExitStatus) -> (i32, nomux_proto::ExitKind) {
+pub(crate) fn exit_parts(status: std::process::ExitStatus) -> (i32, nomux::ExitKind) {
     use std::os::unix::process::ExitStatusExt;
     status.code().map_or_else(
-        || {
-            (
-                status.signal().unwrap_or(0),
-                nomux_proto::ExitKind::Signalled,
-            )
-        },
-        |code| (code, nomux_proto::ExitKind::Exited),
+        || (status.signal().unwrap_or(0), nomux::ExitKind::Signalled),
+        |code| (code, nomux::ExitKind::Exited),
     )
 }
 

@@ -20,7 +20,7 @@ mod harness;
 
 use std::time::{Duration, Instant};
 
-use nomux_proto::{Frame, RESUME_FROM_START};
+use nomux::{Frame, RESUME_FROM_START};
 
 use harness::{Rng, Session, socket_capacity};
 
@@ -46,7 +46,7 @@ fn frame_by(
     deadline: Instant,
     seed: u64,
     stalled: &str,
-) -> (nomux_proto::FrameType, Vec<u8>) {
+) -> (nomux::FrameType, Vec<u8>) {
     client
         .frame_before(deadline, stalled)
         .unwrap_or_else(|| panic!("{stalled} (seed {seed})"))

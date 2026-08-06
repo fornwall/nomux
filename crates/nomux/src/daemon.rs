@@ -13,7 +13,7 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use nomux_proto::{
+use nomux::{
     ErrorCode, ExitKind, Frame, FrameType, Hello, HelloOk, Linger, PROTOCOL_VERSION,
     RESUME_FROM_START, WinSize,
 };
@@ -164,7 +164,7 @@ struct Daemon {
     /// deadline by which it must. Usually a liveness probe from `list`.
     pending: Option<(Conn, Instant)>,
     /// Agent socket and the connection it is serving, once a session created with
-    /// [`nomux_proto::HELLO_AGENT_FORWARD`] has bound one.
+    /// [`nomux::HELLO_AGENT_FORWARD`] has bound one.
     agent: Option<Agent>,
     /// Where the child starts, captured before the daemon moved to `/`.
     child_dir: PathBuf,
@@ -447,6 +447,16 @@ const SINGLE_SOURCES: [Source; 7] = [
 /// Slots the poll set can ever need at once, every source being a single one.
 const POLL_SLOTS: usize = SINGLE_SOURCES.len();
 
+/// What "this source has something to service" is, and the same for every source.
+///
+/// `contains(IN)` would leave one reporting `ERR` or `NVAL` alone in the set with nothing
+/// servicing it and no backoff armed, so `poll` returns at once on every pass for ever —
+/// the spin [`ACCEPT_BACKOFF`] exists to rule out, reached without an `accept` failure.
+const READABLE: PollFlags = PollFlags::IN
+    .union(PollFlags::HUP)
+    .union(PollFlags::ERR)
+    .union(PollFlags::NVAL);
+
 impl Daemon {
     fn event_loop(&mut self) -> io::Result<()> {
         let mut scratch = Vec::new();
@@ -533,7 +543,11 @@ impl Daemon {
                 let client = self.client.as_ref()?;
                 // § 4.1's back pressure, and only the throttling half of it: what
                 // *bounds* the queue is `read_client` declining to decode past the cap.
-                let mut flags = if self.input_is_saturated() {
+                // A peer that has closed its write half leaves the read set for good
+                // rather than for a while: end of file is reported as readable for
+                // ever, so asking for `IN` again is a `poll` that returns at once on
+                // every pass for the rest of the session.
+                let mut flags = if self.input_is_saturated() || client.conn.is_eof() {
                     PollFlags::empty()
                 } else {
                     PollFlags::IN
@@ -544,7 +558,8 @@ impl Daemon {
                     flags |= PollFlags::OUT;
                 }
                 // Registered even when the mask is empty: `HUP` and `ERR` are reported
-                // whatever it says, the only way to hear a held-back peer die (§ 4.1).
+                // whatever it says, and past a half-close that is the *only* thing
+                // left that can report this peer dead (§ 4.1).
                 Some((client.conn.stream().as_fd(), flags))
             }
             Source::Pending => Some((self.pending.as_ref()?.0.stream().as_fd(), PollFlags::IN)),
@@ -660,12 +675,12 @@ impl Daemon {
         // Against the same reading of the clock, and for the same reason the pending
         // slot has a deadline: the one agent slot is held by whoever has it until
         // something takes it away (§ 6.7).
-        if self
+        if let Some(generation) = self
             .agent
             .as_mut()
-            .is_some_and(|agent| agent.close_if_idle(now))
+            .and_then(|agent| agent.close_if_idle(now))
         {
-            self.tell_client(&Frame::AgentClose);
+            self.tell_client(&Frame::AgentClose { generation });
         }
         self.wait(ready)?;
         let revents = |want: Source| {
@@ -674,11 +689,10 @@ impl Daemon {
                 .find(|(source, _)| *source == want)
                 .map_or(PollFlags::empty(), |(_, flags)| *flags)
         };
-        let readable = PollFlags::IN | PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL;
 
         // Nothing is read from the pipe: the byte says only that a signal arrived, and
         // the loop leaves on its next pass, too soon to spin on a readable descriptor.
-        if revents(Source::Signal).intersects(readable) {
+        if revents(Source::Signal).intersects(READABLE) {
             self.stopping = true;
         }
 
@@ -687,12 +701,12 @@ impl Daemon {
         if pty_events.intersects(PollFlags::OUT) {
             self.write_pty();
         }
-        if pty_events.intersects(readable) {
+        if pty_events.intersects(READABLE) {
             self.read_pty(read_buf);
         }
         // Frames the input cap left undecoded are not announced a second time, so
         // draining the queue just above is itself the event that lets them through.
-        let client_ready = client_events.intersects(readable)
+        let client_ready = client_events.intersects(READABLE)
             || (!self.input_is_saturated()
                 && self
                     .client
@@ -711,13 +725,10 @@ impl Daemon {
         // Nothing arriving now can be served: a takeover here would spend a second 500 ms
         // flush evicting a client about to be dropped, past § 6.5's shutdown budget.
         if !self.stopping {
-            if revents(Source::Pending).intersects(readable) {
+            if revents(Source::Pending).intersects(READABLE) {
                 self.read_pending(scratch)?;
             }
-            // The same `IN | HUP | ERR` every other source is tested with: `contains(IN)`
-            // would leave a listener reporting `ERR` alone in the set with nothing
-            // servicing it and no backoff armed, the shape [`ACCEPT_BACKOFF`] rules out.
-            if revents(Source::Listener).intersects(readable) {
+            if revents(Source::Listener).intersects(READABLE) {
                 self.accept();
             }
         }
@@ -730,7 +741,7 @@ impl Daemon {
             self.service_agent_channel(agent_events, read_buf);
         }
         // On the same terms as the session listener above, and for the same reason.
-        if revents(Source::AgentListener).intersects(readable) {
+        if revents(Source::AgentListener).intersects(READABLE) {
             self.accept_agent();
         }
 
@@ -967,7 +978,12 @@ impl Daemon {
         let Some(client) = self.client.as_mut() else {
             return Ok(());
         };
-        if client.conn.fill().is_err() {
+        // Nothing is asked of a socket whose peer has closed its write half: there is
+        // nothing behind that zero, and what it delivered before it is already in the
+        // buffer the loop below reads. Such a peer is not gone — `attach` half-closes
+        // on stdin EOF and goes on draining output (§ 7) — so what ends this connection
+        // is the *write* side, in [`Daemon::write_client`], and never the read side.
+        if !client.conn.is_eof() && client.conn.fill().is_err() {
             // A connection failing is the normal case, not a daemon failure (§ 6.4.1). What
             // `fill` had buffered goes undecoded: the client resends from `in_applied` (§ 3).
             self.drop_client();
@@ -1001,14 +1017,6 @@ impl Daemon {
             };
             self.handle_frame(&frame)?;
         }
-
-        if self
-            .client
-            .as_ref()
-            .is_some_and(|client| client.conn.is_eof())
-        {
-            self.drop_client();
-        }
         Ok(())
     }
 
@@ -1024,16 +1032,16 @@ impl Daemon {
             }
             Frame::Ping => self.tell_client(&Frame::Pong),
             Frame::Detach => self.drop_client(),
-            Frame::AgentData { data } => {
+            Frame::AgentData { generation, data } => {
                 if let Some(agent) = self.agent.as_mut()
-                    && !agent.deliver(data)
+                    && !agent.deliver(generation, data)
                 {
                     self.close_agent_channel();
                 }
             }
-            Frame::AgentClose => {
+            Frame::AgentClose { generation } => {
                 if let Some(agent) = self.agent.as_mut() {
-                    agent.close_from_client();
+                    agent.close_from_client(generation);
                 }
             }
             _ => self.reject(ErrorCode::Protocol, "frame is not valid from a client"),
@@ -1227,7 +1235,9 @@ impl Daemon {
             return;
         };
         match agent.accept(serving, id) {
-            agent::Accept::Opened => self.tell_client(&Frame::AgentOpen),
+            agent::Accept::Opened(generation) => {
+                self.tell_client(&Frame::AgentOpen { generation });
+            }
             agent::Accept::Failed => {
                 self.agent_accept_retry = Some(Instant::now() + ACCEPT_BACKOFF);
             }
@@ -1254,17 +1264,18 @@ impl Daemon {
                 }
             }
         }
-        if !events.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR) {
+        if !events.intersects(READABLE) {
             return;
         }
         let Some(agent) = self.agent.as_mut() else {
             return;
         };
+        let generation = agent.generation();
         match agent.read(buf) {
             nbio::Read::Data(n) => {
                 let data = buf.get(..n).unwrap_or(&[]);
-                if let Some(client) = self.client.as_mut() {
-                    client.conn.send_agent_data(data);
+                if let Some((generation, client)) = generation.zip(self.client.as_mut()) {
+                    client.conn.send_agent_data(generation, data);
                 }
             }
             nbio::Read::Eof => self.close_agent_channel(),
@@ -1276,14 +1287,23 @@ impl Daemon {
     /// Silent if it was already gone: the client can close it in the same poll iteration
     /// that its socket reports readable.
     fn close_agent_channel(&mut self) {
-        if self.agent.as_mut().is_some_and(Agent::forget) {
-            self.tell_client(&Frame::AgentClose);
+        if let Some(generation) = self.agent.as_mut().and_then(Agent::forget) {
+            self.tell_client(&Frame::AgentClose { generation });
         }
     }
 
-    /// Pushes out what is queued, letting the connection go if it cannot be served: the
-    /// socket has failed outright, or the peer is past `ABANDON_PENDING_WRITE` and so is
-    /// not reading at all (§ 4.1).
+    /// Pushes out what is queued, and is where a connection ends: a socket that has
+    /// failed, a peer past `ABANDON_PENDING_WRITE` and so not reading at all (§ 4.1), or
+    /// one owed nothing further.
+    ///
+    /// The last is the only ending that is not a failure, and is what a half-closed
+    /// peer's end of file is answered with rather than a departure: it can ask for
+    /// nothing more, and past the `Exit` there is nothing more to send it — `child_gone`
+    /// takes the master out of the poll set, so a ring read to its end stays read to its
+    /// end (§ 6.5). Read as a departure, that end of file cost `nomux attach ID < script`
+    /// every byte its child produced after the file ran out, § 7 having the relay go on
+    /// draining; without the close behind it, that same relay drains a socket nothing
+    /// will ever close.
     ///
     /// Out through [`Daemon::drop_client`] like every other departure — the flush inside
     /// it costs one refused write on a socket that has just refused one, against two
@@ -1292,7 +1312,12 @@ impl Daemon {
         let Some(client) = self.client.as_mut() else {
             return;
         };
-        if client.conn.flush_some().is_err() || client.conn.is_write_hopeless() {
+        // Read after the flush, an unfinished queue being exactly what the `Exit` has
+        // not been delivered through yet.
+        let finished = client.conn.flush_some().is_err()
+            || client.conn.is_write_hopeless()
+            || (client.exit_sent && client.conn.is_eof() && !client.conn.wants_write());
+        if finished {
             self.drop_client();
         }
     }
@@ -1503,7 +1528,7 @@ mod tests {
         let _served = UnixStream::connect(agent.path()).expect("connect to the agent socket");
         assert_eq!(
             agent.accept(true, "agent-serving"),
-            agent::Accept::Opened,
+            agent::Accept::Opened(0),
             "the slot was free, so this one is served"
         );
 

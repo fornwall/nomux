@@ -23,7 +23,7 @@ use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nomux_proto::{Frame, FrameType, RESUME_FROM_START};
+use nomux::{Frame, FrameType, RESUME_FROM_START};
 
 use harness::{
     Client, Cue, FRAME_PATIENCE, MAX_SESSIONS, Reaper, Rng, SETTLE, SPIN_WINDOW, Session, Spawned,
@@ -75,7 +75,7 @@ fn the_exit_status_arrives_after_the_final_output() {
 
     assert_eq!(
         (replay.status, replay.kind),
-        (3, nomux_proto::ExitKind::Exited),
+        (3, nomux::ExitKind::Exited),
         "the child's own status must survive into the replay"
     );
     assert!(
@@ -132,7 +132,7 @@ fn a_child_killed_by_a_signal_is_reported_as_signalled_rather_than_as_a_status()
 
     assert_eq!(
         (status, kind),
-        (9, nomux_proto::ExitKind::Signalled),
+        (9, nomux::ExitKind::Signalled),
         "a child killed by SIGKILL must arrive as the signal that killed it, not as \
          a status a process chose"
     );
@@ -219,7 +219,7 @@ fn a_synthesised_exit_status_is_sent_on_the_pass_that_collects_it() {
         status, 0,
         "a child that closed the terminal without exiting has no status of its own"
     );
-    assert_eq!(kind, nomux_proto::ExitKind::Exited);
+    assert_eq!(kind, nomux::ExitKind::Exited);
     assert!(
         elapsed < BOUND,
         "the Exit frame took {elapsed:?}: the status was collected at the two-second \
@@ -565,7 +565,7 @@ fn a_child_that_exits_with_input_still_queued_delivers_its_last_output_in_full()
 
     assert_eq!(
         ended,
-        (9, nomux_proto::ExitKind::Exited),
+        (9, nomux::ExitKind::Exited),
         "the child's own status must survive the exit its queued input interrupted"
     );
     assert!(
@@ -1080,7 +1080,7 @@ fn a_session_whose_child_has_exited_keeps_its_files_and_its_status_with_nobody_a
     let replay = replay_to_the_exit(&mut client);
     assert_eq!(
         (replay.status, replay.kind),
-        (7, nomux_proto::ExitKind::Exited),
+        (7, nomux::ExitKind::Exited),
         "the child's own status must survive being held for {UNATTENDED:?} with \
          nobody to give it to"
     );
@@ -1113,7 +1113,7 @@ struct Replay {
     /// Exit status, or the signal number when `kind` is `Signalled`.
     status: i32,
     /// How the child terminated.
-    kind: nomux_proto::ExitKind,
+    kind: nomux::ExitKind,
     /// Whole seconds the daemon says have passed since the child let go of the
     /// terminal.
     since_exit_secs: u32,

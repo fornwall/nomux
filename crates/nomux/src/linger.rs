@@ -8,7 +8,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use nomux_proto::Linger;
+use nomux::Linger;
 
 use crate::passwd;
 

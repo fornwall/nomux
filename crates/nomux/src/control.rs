@@ -38,7 +38,10 @@ const TERM_GRACE: Duration = Duration::from_secs(2);
 /// never reached whatever is serving the socket.
 ///
 /// Nothing survives `SIGKILL`, so this is never observed of an ordinary daemon. What it
-/// bounds is the case where the pid signalled is *not* the process behind the socket.
+/// bounds is the case where the pid signalled is *not* the process behind the socket —
+/// and the case where there was no signal to survive, [`pin`] having given nothing to send
+/// one through, which is why the refusal at the end of it is [`still_answering`]'s to word
+/// rather than one sentence.
 const KILL_GRACE: Duration = Duration::from_millis(500);
 
 /// How often to look again while waiting any of the graces out. One interval for all of
@@ -188,18 +191,14 @@ pub(crate) fn kill(session_id: &str) -> io::Result<()> {
                 Liveness::Unknown(err) => return Err(unprobeable(&paths, &err)),
             }
             if Instant::now() >= deadline {
-                // Still answering after `SIGKILL`, which nothing survives — so the pid
-                // signalled is not the process serving this socket. Reachable only from
-                // the arm above that accepted a connection, which makes every clause of
-                // the sentence below true.
+                // Both graces out with the socket still answering. Reachable only from
+                // the arm above that accepted a connection, which is what makes the
+                // answering true of every reach — and the whole of what is true of every
+                // reach, [`Chosen::signal`] being a no-op on one of the three. What the
+                // escalation did is therefore [`still_answering`]'s to say rather than
+                // this call site's.
                 if killed {
-                    return Err(refuse(format!(
-                        "session {id} is still answering after SIGTERM and SIGKILL to \
-                         pid {pid}, so that pid is not the process serving it; leaving \
-                         it alone rather than unlinking a live session's files",
-                        id = paths.id(),
-                        pid = chosen.pid.as_raw_nonzero(),
-                    )));
+                    return Err(refuse(still_answering(paths.id(), &chosen)));
                 }
                 chosen.signal(Signal::KILL);
                 killed = true;
@@ -261,15 +260,29 @@ fn hold_spawn_lock(paths: &SessionPaths) -> io::Result<SpawnLock> {
 fn resolve(paths: &SessionPaths) -> io::Result<Option<Chosen>> {
     let deadline = Instant::now() + PUBLISH_GRACE;
     loop {
-        if matches!(liveness(&paths.socket(), PROBE_TIMEOUT), Liveness::Stale(_)) {
-            return Ok(None);
-        }
+        // The probe's errno is kept rather than matched away, because every refusal below
+        // is [`unresolved`]'s to word and that is what it words them by. The connection is
+        // not kept: the match drops it where the discarded probe always dropped it, so
+        // nothing holds one open across the grace.
+        let unprobed = match liveness(&paths.socket(), PROBE_TIMEOUT) {
+            Liveness::Stale(_) => return Ok(None),
+            Liveness::Alive(_) => None,
+            Liveness::Unknown(err) => Some(err),
+        };
         let mut buf = [0u8; MAX_PID_LEN];
         let waiting_on = match pidfile(&paths.pid(), &mut buf) {
             Ok((filed, body)) if !body.trim_ascii().is_empty() => {
-                return chosen(paths, filed)
-                    .map(Some)
-                    .ok_or_else(|| running_but(paths, &unidentified(paths.id(), filed, body)));
+                // A pid `/proc` does not rule out is taken whatever the probe did, and
+                // that is deliberate: [`chosen`] identifies a *process*, by a route the
+                // socket has no part in, so a mode or a descriptor limit that keeps this
+                // process off the socket is no reason to stop signalling a daemon this
+                // one has positively named. Nothing is unlinked on the strength of it —
+                // every exit from [`kill`] still goes through a probe that has to say the
+                // session stopped.
+                return chosen(paths, filed).map(Some).ok_or_else(|| {
+                    let problem = unidentified(paths.id(), filed, body);
+                    unresolved(paths, unprobed.as_ref(), &problem)
+                });
             }
             // Present but empty is the same window one syscall later, so it is waited
             // out too: `SessionPaths::write_pid` creates the file and fills it in two
@@ -278,10 +291,10 @@ fn resolve(paths: &SessionPaths) -> io::Result<Option<Chosen>> {
             Err(err) if err.kind() == io::ErrorKind::NotFound => "it never appeared",
             // Unreadable is not the publish window and never becomes it, so it is
             // settled now rather than waited on.
-            Err(err) => return Err(running_but(paths, &err.to_string())),
+            Err(err) => return Err(unresolved(paths, unprobed.as_ref(), &err.to_string())),
         };
         if Instant::now() >= deadline {
-            return Err(running_but(paths, waiting_on));
+            return Err(unresolved(paths, unprobed.as_ref(), waiting_on));
         }
         thread::sleep(POLL_INTERVAL);
     }
@@ -326,10 +339,13 @@ enum Reach {
     /// `pidfd_open` — see [`pin`], which is also where that is weighed.
     Number,
     /// Neither, so nothing is signalled and [`kill`] establishes what became of the
-    /// session by probing the socket alone. Reached where the process was gone before it
-    /// could be held, which is not a state anything here needs to report: a daemon that
-    /// has exited is the postcondition arriving early.
-    Nothing,
+    /// session by probing the socket alone. Carries the errno that declined the
+    /// descriptor, which is the whole of what says why no signal went out: it is
+    /// [`pin`]'s `ESRCH` — a daemon that has exited, and the postcondition arriving
+    /// early — or one of the errnos that cannot be told from it, where the session goes
+    /// on running and every clause about a signal is false. Only [`still_answering`]
+    /// reads it, that being the one path where the difference is visible.
+    Nothing(io::Error),
 }
 
 impl Chosen {
@@ -343,7 +359,7 @@ impl Chosen {
         match &self.reach {
             Reach::Pidfd(pidfd) => drop(pidfd_send_signal(pidfd, sig)),
             Reach::Number => drop(kill_process(self.pid, sig)),
-            Reach::Nothing => {}
+            Reach::Nothing(_) => {}
         }
     }
 }
@@ -380,8 +396,11 @@ fn pin(pid: Pid) -> Reach {
         // than declining, and every remaining errno is one this cannot tell from it. None
         // may fall back: signalling a bare number is exactly what the fallback above
         // accepts a race to do, and doing it here would accept that race under the one
-        // condition — a number whose process is reaped — that makes it certain.
-        Err(_) => Reach::Nothing,
+        // condition — a number whose process is reaped — that makes it certain. Kept
+        // rather than discarded for that same indistinguishability: nothing here can say
+        // which of them it was, so the one refusal that would otherwise describe signals
+        // it never sent says the errno instead.
+        Err(err) => Reach::Nothing(err.into()),
     }
 }
 
@@ -485,6 +504,24 @@ fn running_but(paths: &SessionPaths, problem: &str) -> io::Error {
     ))
 }
 
+/// Which refusal a session [`resolve`] could not name a process for has earned — decided
+/// by the probe rather than by the pidfile.
+///
+/// [`running_but`] opens by saying the session *is running*, and the only thing that ever
+/// established that is a connection a daemon accepted. Where the probe failed instead,
+/// § 6.3 makes it evidence of neither death nor life, so there is no session to describe
+/// and no publish window to have been caught in the middle of: § 6.6's account of that
+/// state is [`unprobeable`], which names the errno — the one thing about *this* call
+/// anybody can repair. What the pidfile was doing is left unsaid there rather than added
+/// to it, since a session that turns out to have stopped owes no explanation for a file
+/// it was never going to be asked for.
+fn unresolved(paths: &SessionPaths, unprobed: Option<&io::Error>, problem: &str) -> io::Error {
+    unprobed.map_or_else(
+        || running_but(paths, problem),
+        |err| unprobeable(paths, err),
+    )
+}
+
 /// Why [`chosen`] came back with nothing over a session that is answering, in the words
 /// [`running_but`] finishes.
 ///
@@ -505,6 +542,38 @@ fn unidentified(id: &str, filed: Option<Pid>, body: &[u8]) -> String {
         None => parse_pid(body).map_or_else(
             || format!("it holds {quoted:?}"),
             |pid| format!("pid {pid} names no process this user can signal"),
+        ),
+    }
+}
+
+/// The refusal to collect a session that was answering still when both graces ran out, in
+/// the words the [`Reach`] it was escalated *through* earns.
+///
+/// The answering is established either way — the caller reaches this only from a
+/// connection a daemon accepted. The rest turns on whether a signal went out. Through a
+/// descriptor or a number one did, so a session that outlived `SIGKILL`, which nothing
+/// survives, says the pid signalled is not the process serving the socket. Through
+/// [`Reach::Nothing`] none did: `pidfd_open` declined the process before either grace
+/// began, and the same two-and-a-half seconds of answering then say nothing whatever about
+/// the pid. What is reportable there is the errno that declined it, which is also the only
+/// part of the state anybody can repair.
+///
+/// The graces are waited out under that reach all the same, and not as a formality: the
+/// socket is what decides, and [`pin`]'s `ESRCH` is a daemon already on its way out, whose
+/// socket falling silent inside them reaches the unlink instead of this sentence.
+fn still_answering(id: &str, chosen: &Chosen) -> String {
+    let pid = chosen.pid.as_raw_nonzero();
+    match &chosen.reach {
+        Reach::Pidfd(_) | Reach::Number => format!(
+            "session {id} is still answering after SIGTERM and SIGKILL to pid {pid}, so \
+             that pid is not the process serving it; leaving it alone rather than \
+             unlinking a live session's files"
+        ),
+        Reach::Nothing(err) => format!(
+            "session {id} is still answering, and pid {pid} could not be held to be \
+             signalled ({err}), so neither SIGTERM nor SIGKILL was sent and nothing here \
+             established what is serving it; leaving it alone rather than unlinking a \
+             live session's files"
         ),
     }
 }
@@ -577,7 +646,7 @@ mod tests {
     use rustix::io::Errno;
     use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
 
-    use super::{Reach, names_daemon_for, pin};
+    use super::{Chosen, Reach, names_daemon_for, pin, still_answering};
 
     /// Joins argv the way `/proc/<pid>/cmdline` presents it, minus the trailing NUL
     /// that [`is_daemon_for`](super::is_daemon_for) has already trimmed.
@@ -672,10 +741,80 @@ mod tests {
         let gone = Pid::from_raw(999_999_999).expect("a positive number is a pid");
 
         assert!(
-            matches!(pin(gone), Reach::Nothing),
+            matches!(pin(gone), Reach::Nothing(_)),
             "a pid naming no process was taken for a host with no pidfds, so `kill` \
              would go back to signalling the number"
         );
+    }
+
+    /// The refusal after both graces says what the escalation did, and a [`Reach`] that
+    /// sent nothing is never described as having sent two signals.
+    ///
+    /// Put to the sentence where it is built rather than to a `kill`, because the state
+    /// behind it cannot be arranged from a test: [`Reach::Nothing`] over a session that
+    /// goes on answering needs `pidfd_open` to fail with something other than the three
+    /// errnos [`pin`](super::pin) reads as a host without the call — a descriptor limit,
+    /// or memory — and nothing a test may do produces one at *that* call. `RLIMIT_NOFILE`
+    /// is the lever that looks like it would: it cannot, because the probe and the
+    /// pidfile read each take a descriptor and give it back strictly before the open, so
+    /// any limit tight enough to refuse it refuses the `connect` first and `kill` answers
+    /// with the unprobeable socket instead. A test that arranged the limit anyway would
+    /// assert only that, and pass whatever this sentence said.
+    #[test]
+    fn a_refusal_names_no_signal_that_was_never_sent() {
+        let pid = Pid::from_raw(999_999_999).expect("a positive number is a pid");
+        let unheld = still_answering(
+            "one",
+            &Chosen {
+                pid,
+                reach: Reach::Nothing(Errno::MFILE.into()),
+            },
+        );
+        assert!(
+            !unheld.contains("SIGTERM and SIGKILL to"),
+            "no signal went out, so none may be named as having gone out — that sentence \
+             also says the pid is the wrong one, which nothing here established: \
+             {unheld:?}"
+        );
+        assert!(
+            unheld.contains("neither SIGTERM nor SIGKILL was sent")
+                && unheld.contains("Too many open files"),
+            "what happened is that the process could not be held, and the errno that \
+             declined it is the whole of what says why: {unheld:?}"
+        );
+
+        // The other direction, and the one every test of `kill` reaches: a signal that
+        // did go out is still reported as having gone out, over a session that outlived
+        // it.
+        let signalled = still_answering(
+            "one",
+            &Chosen {
+                pid,
+                reach: Reach::Number,
+            },
+        );
+        assert!(
+            signalled.contains("still answering after SIGTERM and SIGKILL to pid 999999999"),
+            "a session that outlasted a signal that was sent says so, and names the \
+             number it was sent to: {signalled:?}"
+        );
+        // The two reaches that signal have one sentence between them, the pid having been
+        // reached either way.
+        if kernel_has_pidfds("the descriptor's half of that sentence goes unchecked") {
+            let pidfd = pidfd_open(Pid::INIT, PidfdFlags::empty()).expect("hold pid 1");
+            assert_eq!(
+                still_answering(
+                    "one",
+                    &Chosen {
+                        pid,
+                        reach: Reach::Pidfd(pidfd),
+                    }
+                ),
+                signalled,
+                "a signal through a descriptor and one through a bare number both reached \
+                 the pid, so they have the same thing to say about it"
+            );
+        }
     }
 
     /// Regression: a label is not an id, however much it looks like one in argv. The

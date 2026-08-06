@@ -25,7 +25,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
-use nomux_proto::{
+use nomux::{
     ErrorCode, Frame, FrameType, HEADER_LEN, HELLO_REPAINT_CTRL_L, Hello, Linger, PROTOCOL_VERSION,
     RESUME_FROM_START, WinSize, decode_header,
 };
@@ -696,7 +696,7 @@ fn frames_a_client_may_not_send_are_refused_and_the_connection_closed() {
         Refused {
             what: "a HelloOk, which is the daemon's own answer coming back at it",
             write: |client| {
-                client.send(&Frame::HelloOk(nomux_proto::HelloOk {
+                client.send(&Frame::HelloOk(nomux::HelloOk {
                     resume_from: 0,
                     in_applied: 0,
                     linger: Linger::Unknown,

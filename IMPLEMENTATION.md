@@ -21,15 +21,20 @@ pidfile's format, what `list` prints. Everything else describes a version, not a
 ## 1. Layout and conventions
 
 ```
-crates/nomux-proto/   wire protocol: framing, codec, offsets. No I/O, no unsafe.
-crates/nomux/         the binary: daemon, attach relay, control surface.
+crates/nomux/         one package, two targets:
+  src/lib.rs          wire protocol: framing, codec, offsets. No I/O, no unsafe.
+  src/main.rs         the binary: daemon, attach relay, control surface.
 ```
 
-`nomux-proto` is split out because the client project reimplements or links the same
-codec; keeping it I/O-free makes it portable and property-testable in isolation, and it
-is the half that can carry `#![forbid(unsafe_code)]`. What belongs there is what is on the
-wire — session id validation (§ 6.3) and the agent socket's one-at-a-time rule (§ 6.7)
-are daemon policy. Neither crate is published, for the reason
+The protocol is a library target rather than a module of the binary because an
+integration test cannot import from a binary and most of the suite speaks the codec; it
+also keeps `#![forbid(unsafe_code)]` over a whole target, the seccomp filter, `pre_exec`
+and the signal handlers being the binary's. What belongs in it is what is on the wire —
+session id validation (§ 6.3) and the agent socket's one-at-a-time rule (§ 6.7) are
+daemon policy. A package of its own earned nothing beyond that: the clients are written
+in other languages and reimplement the codec rather than linking it, so what a second
+implementation is built against is § 2.2 and `crates/nomux/tests/wire-vectors.txt`, that
+table rendered in bytes for a reader who parses no Rust. Not published, for the reason
 [DESIGN.md § 2](DESIGN.md#2-scope) gives.
 
 - Edition 2024, MSRV 1.97.1 (`rust-toolchain.toml`).
@@ -99,14 +104,15 @@ endian. The header is fixed at 4 bytes so the reader is a two-stage `read_exact`
 | `0x0a` | C→D | `Ping` | — |
 | `0x0b` | D→C | `Pong` | — |
 | `0x0c` | D→C | `Error` | `u16` code (1 protocol, 2 takeover, 3 version, 4 input_gap, 5 internal), UTF-8 message |
-| `0x0d` | D→C | `AgentOpen` | — |
-| `0x0e` | ↔ | `AgentData` | opaque `ssh-agent` bytes |
-| `0x0f` | ↔ | `AgentClose` | — |
+| `0x0d` | D→C | `AgentOpen` | `u32` generation |
+| `0x0e` | ↔ | `AgentData` | `u32` generation, opaque `ssh-agent` bytes |
+| `0x0f` | ↔ | `AgentClose` | `u32` generation |
 
-`Hello` carries the current revision, **7** — `PROTOCOL_VERSION` in `nomux-proto`, bumped
-on any wire change, compatible ones included, since a change that left the number alone is
-one `Hello.protocol` cannot catch. What each revision moved is `git log` on
-`crates/nomux-proto/`.
+`Hello` carries the current revision, **8** — `PROTOCOL_VERSION` in
+`crates/nomux/src/lib.rs`, bumped on any wire change, compatible ones included, since a
+change that left the number alone is one `Hello.protocol` cannot catch. What each
+revision moved is `git log --follow` on that file and `src/frame.rs`; `--follow` because
+the codec was a crate of its own until it was inlined.
 
 The session id is **not** in `Hello`, being already fixed by the socket path (warm) or by
 the id `spawn` and `attach` were handed (cold). Nor does anything in `Hello` say where the
@@ -118,6 +124,17 @@ me whatever you have"*, used on a fresh app launch to recover scrollback.
 than truncated. `Hello.term` may not contain a NUL, refused encoding as well as decoding:
 U+0000 is valid UTF-8, so nothing else catches it, and let through it reaches the child's
 environment (§6.1.1) where `execve` refuses it — the host blamed for what the client sent.
+
+The agent generation names one *incarnation* of the single sub-channel §6.7 serves. The
+daemon mints it per accepted connection and puts it on `AgentOpen`; the client echoes it
+on everything it sends for that channel; the daemon discards any `AgentData` or
+`AgentClose` naming a channel it no longer holds. It is `u32` because the reachable
+distance between a stale frame and the live channel is a round trip: a client that has
+stopped reading is dropped at `ABANDON_PENDING_WRITE`, 8 MiB (§4.1), which is half a
+million unread boundary frames and so half a million turnovers it could still be behind —
+past a `u16`, and four orders under this. It also costs `AgentData` four of its
+`MAX_PAYLOAD` bytes, which the daemon's chunking subtracts rather than discovering as a
+refused encode.
 
 `Exit.since_exit_secs` counts whole seconds since the child let go of the terminal,
 elapsed against a monotonic clock rather than stamped against a wall clock, and saturating
@@ -418,6 +435,17 @@ exception, `Stdio::piped()`: everything that fails before
 pipe reaching end of file says the daemon got past that point, after which it has syslog
 (§11). `chdir "/"` and the `/dev/null` redirection are that same call, past the pidfile
 and the spawn lock, and after the run-directory paths are resolved and the socket bound.
+
+What it execs is `/proc/self/exe`, the inode this process was loaded from, rather than the
+path `env::current_exe` names — which would be resolved a second time against an install
+directory §5.2 creates and never checks, and that second resolution is nobody's to
+promise. The reachable cost is availability rather than execution: §5.2 installs by `mv -f`
+over the binary, which unlinks the running inode, so the old name then resolves to nothing
+and a spawn parked in that window loses its daemon to a concurrent upgrade of its own
+version. `argv[0]` stays that path, so `ps` still names the build holding the session and
+§6.6's identification is untouched — it skips `argv[0]` regardless — and `env::current_exe`
+reads the same link, so a host with no `/proc` refuses the spawn exactly where it already
+did.
 That redirection survives a hand-started `nomux daemon <id> 0<&- 1>&- 2>&-` only because
 those three numbers were never free: the Rust runtime opens `/dev/null` onto any of them
 `main` would have inherited closed, so the lowest number a `bind` here can be given is 3
@@ -588,6 +616,20 @@ replaced usually being one that has *stopped reading*; its queued output is drop
 first, and the arriving client replays it from the ring anyway. No read-only mirrors and
 no session sharing — one client per session by construction.
 
+**A client's end of file is not a departure.** The relay half-closes on stdin EOF and goes
+on draining output (§7), so a peer that has stopped *sending* is still owed everything the
+child has yet to say. `read_client` asks nothing more of that socket — end of file is
+readable for ever, so it leaves the read mask rather than waking the loop on every pass —
+and the connection ends on the write side instead: a write that fails, §4.1's
+`ABANDON_PENDING_WRITE`, or the `Exit` going out with nothing left owed. That last is what
+ends `nomux attach <id> < script`: past the child's exit the master is out of the poll set,
+so a ring read to its end stays read to its end, and a peer that can ask for nothing more
+is owed nothing more. Read as a departure instead, it cost that script every byte its child
+produced after the file ran out; without the close behind it the same relay drains a socket
+nothing will ever close. A half-closed client holds the session exactly as an attached
+silent one does — §6.5's idle deadline is armed by there being no client at all — and is
+bounded in memory by that same 8 MiB.
+
 #### 6.4.1 Event ordering
 
 Within one `poll` iteration the client is serviced **before** the listener. A single
@@ -691,7 +733,7 @@ mid-number being a smaller, plausible, live pid rather than the number on disk.
 - Unlinking happens under `<id>.lock`, with the probe repeated once it is held, that being the only point at which the answer cannot change between being read and acted on. An entry whose lock somebody else holds is skipped, being a session started rather than garbage; one whose lock is not *obtainable at all* is collected anyway, per §6.3 — a collector that stops collecting because of the mutex protecting it leaks under exactly the conditions it exists for.
 - `kill` takes `<id>.lock` first and holds it to the end, so nothing can spawn into the id it is removing; then probes the socket, identifies the daemon as **Identification** below has it, sends `SIGTERM`, waits up to 2 s, then `SIGKILL`, and unlinks every `<id>.*` once the session has stopped answering, the lock last. It waits up to 2 s for that lock, which is what makes it *win* the race against a `spawn` — a budget that has to cover a `fork`, an `exec`, a `bind` and the stale-socket probe in front of it (§6.3).
 - **A live session's files are never unlinked.** Where the socket answers and the pidfile will not say which process serves it, `kill` exits non-zero and leaves all five alone: removing them takes the socket away from a daemon still holding the user's shell, and frees the id for a second daemon to bind over.
-- `kill` exits non-zero rather than reporting a "no such session" it did not establish. Five states do that: identification coming back with nothing, where the refusal prints the number, where it came from and what `/proc` said, and recommends nothing, the repair that suggests itself being the catastrophic one half the time; a socket that could not be *probed*, which §6.3 makes evidence of neither death nor life; a session still answering half a second after `SIGKILL`, so the pid signalled is not the process serving it; a socket answering again on the probe under the lock, a daemon having bound the id since this call established it was gone; and a lock still held at the 2 s deadline. **That last arm also swallows a real failure:** `EROFS` is not one of §6.3's three "nobody can hold this" errnos, so on a read-only run directory the lock reads as *held* and `kill` blames another process for what is the filesystem. The refusal to unlink is still correct; only the account of why is wrong.
+- `kill` exits non-zero rather than reporting a "no such session" it did not establish. Five states do that: identification coming back with nothing, where the refusal prints the number, where it came from and what `/proc` said, and recommends nothing, the repair that suggests itself being the catastrophic one half the time; a socket that could not be *probed*, which §6.3 makes evidence of neither death nor life — and which is the account any refusal takes wherever the probe failed and nothing named a process to act on, "the session is running" being established by an accepted connection and by nothing else; a session still answering half a second after `SIGKILL`, so the pid signalled is not the process serving it, or, where `pidfd_open` declined the process and there was nothing to send a signal through, a session still answering with neither signal sent, which is what that refusal says rather than naming two that never went out; a socket answering again on the probe under the lock, a daemon having bound the id since this call established it was gone; and a lock still held at the 2 s deadline. **That last arm also swallows a real failure:** `EROFS` is not one of §6.3's three "nobody can hold this" errnos, so on a read-only run directory the lock reads as *held* and `kill` blames another process for what is the filesystem. The refusal to unlink is still correct; only the account of why is wrong.
 - One further non-zero exit is the one case where the session really did stop: the unlink itself failing. Absence is success, but an `EIO`, an immutable `<id>.lock`, or a filesystem remounted read-only since the lock was taken is reported rather than swallowed — a surviving `<id>.lock` is a session `list` rediscovers and tries to collect on every run from then on. Every path is still attempted, so one stubborn file does not strand the other four.
 
 #### Identification
@@ -721,7 +763,10 @@ from a sandbox — signals the number itself, and there the reuse is unclosed an
 unclosable: the pidfile is frozen as a number, so the daemon published no baseline to
 compare against ([PLAN.md § Known and accepted](PLAN.md#known-and-accepted)). An `ESRCH`
 from the open is never read as that host, being the one condition — a process already
-reaped — that makes its number somebody else's.
+reaped — that makes its number somebody else's. Nor is any other errno that open can fail
+with, a descriptor limit or memory among them, none being tellable from `ESRCH`: nothing
+is signalled at all, and a session still answering when both graces run out earns a
+refusal that names the errno and says neither signal went out.
 
 | `<id>.pid` | `/proc` | Result |
 | --- | --- | --- |
@@ -789,8 +834,9 @@ and pipes `AgentData` both ways until either end closes it; the client answers f
 key store. Why it owns the socket rather than borrowing sshd's:
 [DESIGN.md § 5.4](DESIGN.md#54-agent-forwarding). Mechanics:
 
-- **One connection at a time**, so there is nothing to address and no frame here carries an id — the pipe is as unmultiplexed as the PTY stream beside it ([DESIGN.md § 2](DESIGN.md#2-scope)). A second peer is left in the listen backlog rather than accepted or refused: the daemon drops the listener out of its poll set while one is served, exactly as §6.3's does while the pending slot is taken, and greets what waited when the slot frees. An `ssh-agent` client sends a request and waits for the reply, so what serialising costs is a bounded wait.
-- `AgentOpen` carries nothing yet is not redundant: it is the boundary between one peer's exchange and the next, which is what the client opens its own upstream connection on, and without it a peer that connects and closes without writing crosses the wire as nothing at all. It is optimistic — no ack. A client that cannot serve replies `AgentClose`.
+- **One connection at a time.** A second peer is left in the listen backlog rather than accepted or refused: the daemon drops the listener out of its poll set while one is served, exactly as §6.3's does while the pending slot is taken, and greets what waited when the slot frees. An `ssh-agent` client sends a request and waits for the reply, so what serialising costs is a bounded wait.
+- **Each connection is named**, by the `u32` generation all three frames carry (§2.2). Serialising leaves nothing to address in *space*, which is where the argument here used to stop — and that is not the whole of it, because the daemon accepts local peers out of band from the client's stream, so the connections holding the one slot in turn are ambiguous in *time*. A peer that ended while the client still had frames in flight for it was answered by whoever took the slot next; and the client's own `AgentClose` for the first closed the second, silently, a close the client made being the one thing the daemon does not report back. Nothing on this wire could fence that instead: `Ping` is C→D and `Pong` D→C, so the daemon has nothing it can send to force a round trip. So the daemon mints a generation per accept and discards any `AgentData` or `AgentClose` naming a channel it no longer holds. Only the client→daemon direction strictly needs it, and a frame type has one layout in both ([DESIGN.md § 2](DESIGN.md#2-scope)).
+- `AgentOpen` carries only that generation and is not redundant even so: it is the boundary between one peer's exchange and the next, which is what the client opens its own upstream connection on and what tells it what to stamp; without it a peer that connects and closes without writing crosses the wire as nothing at all. It is optimistic — no ack. A client that cannot serve replies `AgentClose`.
 - **Idle connections are given up after 60 s** with no byte moving in *either* direction, and the client is told. The daemon parses no agent protocol, so it cannot tell a peer stalled mid-request from one legitimately waiting on a slow reply — and the client may be putting a signature in front of a human to approve, which is why the window is a generous minute rather than the sub-second an exchange takes. It is measured from the last byte, not from the accept: `ssh(1)` holds one connection across a whole authentication and issues several requests down it. Without it, one peer that connects and never closes holds every later agent user off for the life of the session.
 - Payloads are opaque — the daemon never parses the agent protocol, which is what puts `session-bind@openssh.com` on the client ([DESIGN.md § 5.4](DESIGN.md#54-agent-forwarding)): a byte pipe cannot know which SSH hop the session is on.
 - **While detached, connections are accepted and closed immediately**, so a `git push` with no client attached fails fast with the same error as a missing agent rather than hanging until reattach. The same the moment a client leaves or is taken over: the served connection is dropped, nothing being able to answer a signature request.
@@ -808,7 +854,7 @@ one relay and two answers to an id nothing is serving
 - `poll` on stdin/stdout and the socket, moving bytes with `splice(2)` and falling back to a userspace copy.
 - No frame parsing. A small userspace buffer per direction, used where `splice` is unavailable and again on any transient failure of it; nothing protocol-shaped is ever held.
 - Connects to the session's socket. Where nothing answers, `spawn` starts the daemon (§6.3) and waits for it, and `attach` refuses (§10).
-- Half-close propagation: EOF on stdin → `shutdown(SHUT_WR)` on the socket, keep draining the other direction.
+- Half-close propagation: EOF on stdin → `shutdown(SHUT_WR)` on the socket, keep draining the other direction. The daemon answers that by serving the connection until it owes it nothing and closing there (§6.4), which is what ends a relay whose stdin was a file.
 
 Protocol logic exists only in the daemon. The relay must never need a version bump.
 

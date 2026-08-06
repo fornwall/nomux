@@ -3,8 +3,9 @@
 //! The daemon serves the child an `ssh-agent` socket and carries what crosses it to
 //! the attached client, one connection at a time. What can go wrong with that: the flag
 //! a client has to ask for, a socket the daemon cannot bind, a client that is not there
-//! to answer, a second peer arriving mid-exchange, the queue cap, and a connection the
-//! client closed with a queue behind it.
+//! to answer, a second peer arriving mid-exchange, the slot changing hands under frames
+//! already sent for the peer that had it, the queue cap, and a connection the client
+//! closed with a queue behind it.
 
 mod harness;
 
@@ -12,40 +13,38 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 
-use nomux_proto::{Frame, FrameType, HELLO_AGENT_FORWARD, RESUME_FROM_START};
+use nomux::{Frame, FrameType, HELLO_AGENT_FORWARD, RESUME_FROM_START};
 
 use harness::{
     Client, SPIN_WINDOW, Session, cpu_ticks, read_uninterrupted, socket_capacity, still_serving,
 };
 
 /// Waits for the next `AgentOpen` or `AgentClose`, ignoring the session's own chatter,
-/// and asserts that it is `want` — `why` saying what that would mean.
+/// asserts that it is `want` — `why` saying what that would mean — and hands back the
+/// generation it names, which everything the client sends for that channel has to carry.
 ///
 /// Which of the two arrives is the question these tests keep asking, the daemon serving
 /// one connection at a time being visible as nothing but the *order* of the boundaries.
-/// Neither carries a payload any more, which is checked here rather than at each of the
-/// call sites that would otherwise all repeat it.
-fn expect_agent(client: &mut Client, want: FrameType, why: &str) {
-    assert_eq!(next_agent_boundary(client), want, "{why}");
+fn expect_agent(client: &mut Client, want: FrameType, why: &str) -> u32 {
+    let (ty, generation) = next_agent_boundary(client);
+    assert_eq!(ty, want, "{why}");
+    generation
 }
 
-/// The next `AgentOpen` or `AgentClose`, whichever comes first.
-fn next_agent_boundary(client: &mut Client) -> FrameType {
+/// The next `AgentOpen` or `AgentClose`, whichever comes first, and the channel it names.
+fn next_agent_boundary(client: &mut Client) -> (FrameType, u32) {
     loop {
         let (ty, payload) = client.next_frame();
-        if matches!(ty, FrameType::AgentOpen | FrameType::AgentClose) {
-            assert!(
-                payload.is_empty(),
-                "{ty:?} carries nothing: one connection is served at a time"
-            );
-            return ty;
+        let decoded = Frame::decode(ty, &payload);
+        if let Ok(Frame::AgentOpen { generation } | Frame::AgentClose { generation }) = decoded {
+            return (ty, generation);
         }
         assert!(
             matches!(
                 ty,
                 FrameType::Output | FrameType::InputAck | FrameType::Pong
             ),
-            "unexpected {ty:?} while waiting for an agent frame"
+            "unexpected {ty:?} while waiting for an agent frame: {decoded:?}"
         );
     }
 }
@@ -76,7 +75,7 @@ fn agent_forwarding_proxies_a_connection_in_both_directions() {
     assert!(seen.contains(&expected), "child environment: {seen:?}");
 
     let mut agent = session.connect_agent();
-    expect_agent(
+    let generation = expect_agent(
         &mut client,
         FrameType::AgentOpen,
         "a connection to the session's agent socket is announced to the client",
@@ -88,25 +87,31 @@ fn agent_forwarding_proxies_a_connection_in_both_directions() {
     assert_eq!(
         Frame::decode(FrameType::AgentData, &payload).expect("decode"),
         Frame::AgentData {
+            generation,
             data: b"\0\0\0\x01\x0b",
         },
-        "agent bytes must arrive verbatim"
+        "agent bytes must arrive verbatim, under the channel they came from"
     );
 
     // Client to child.
     client.send(&Frame::AgentData {
+        generation,
         data: b"\0\0\0\x05\x0c-reply",
     });
     let mut reply = [0u8; 11];
     agent.read_exact(&mut reply).expect("read response");
     assert_eq!(&reply, b"\0\0\0\x05\x0c-reply");
 
-    // And the close travels too.
+    // And the close travels too, for the channel that ended and not for some other.
     drop(agent);
-    expect_agent(
-        &mut client,
-        FrameType::AgentClose,
-        "the peer hanging up ends the connection on the wire too",
+    assert_eq!(
+        expect_agent(
+            &mut client,
+            FrameType::AgentClose,
+            "the peer hanging up ends the connection on the wire too",
+        ),
+        generation,
+        "and the close names the channel that ended"
     );
 }
 
@@ -231,7 +236,7 @@ fn a_second_agent_connection_waits_for_the_one_being_served() {
         FrameType::AgentClose,
         "the slot has to come free before anything else can have it",
     );
-    expect_agent(
+    let generation = expect_agent(
         &mut client,
         FrameType::AgentOpen,
         "and the peer that waited is greeted only then",
@@ -241,11 +246,109 @@ fn a_second_agent_connection_waits_for_the_one_being_served() {
     assert_eq!(
         Frame::decode(FrameType::AgentData, &payload).expect("decode"),
         Frame::AgentData {
+            generation,
             data: b"\0\0\0\x01\x0b",
         },
         "what the waiting peer wrote before its turn must still be there"
     );
 
+    still_serving(&mut client, "NOMUX-STILL-SERVING");
+}
+
+/// Regression: frames the client sent for a peer that has ended are never answered by
+/// the peer that took the slot next.
+///
+/// The daemon accepts local peers out of band from the client's stream, so before the
+/// generation there was nothing to tell one incarnation of the one slot from the next:
+/// an `AgentData` written before the client read `AgentClose` was delivered to whoever
+/// held the slot when it arrived, and the client's own `AgentClose` for the peer that
+/// had gone closed its successor — silently, that being the one close the daemon does
+/// not report back.
+///
+/// The race is driven the other way round rather than waited for. The frames go out
+/// *after* the turnover has been read off the wire, which is the same thing to a daemon
+/// that cannot see when the client read: what reaches it is bytes naming a channel it no
+/// longer holds, which is exactly what a frame overtaken by the turnover is.
+#[test]
+fn frames_for_a_peer_that_ended_are_not_answered_by_its_successor() {
+    let (session, mut client, ok) = Session::attached_with("agent_turnover", HELLO_AGENT_FORWARD);
+    client.make_ready("-echo", None, ok.resume_from);
+
+    let ending = session.connect_agent();
+    let stale = expect_agent(
+        &mut client,
+        FrameType::AgentOpen,
+        "the peer that is about to end holds the slot",
+    );
+    let mut successor = session.connect_agent();
+
+    drop(ending);
+    assert_eq!(
+        expect_agent(
+            &mut client,
+            FrameType::AgentClose,
+            "the peer that ended frees the slot",
+        ),
+        stale,
+        "the close names the channel that ended"
+    );
+    let live = expect_agent(
+        &mut client,
+        FrameType::AgentOpen,
+        "and the one that waited takes it",
+    );
+    assert_ne!(
+        live, stale,
+        "a successor named what its predecessor was named is the whole bug: the daemon \
+         would have no way left to tell their frames apart"
+    );
+
+    // What the client had in flight for the peer that ended, in the order it wrote them.
+    client.send(&Frame::AgentData {
+        generation: stale,
+        data: b"STALE",
+    });
+    client.send(&Frame::AgentClose { generation: stale });
+    // Both are decoded before this is answered, frames being handled in order, so what
+    // follows cannot outrun them.
+    client.send(&Frame::Ping);
+    drop(client.next_of(FrameType::Pong));
+
+    client.send(&Frame::AgentData {
+        generation: live,
+        data: b"FRESH",
+    });
+    let mut seen = [0u8; 5];
+    let mut filled = 0;
+    while filled < seen.len() {
+        match read_uninterrupted(&mut successor, &mut seen[filled..]) {
+            Ok(0) => panic!(
+                "the successor was closed by an `AgentClose` the client sent for the \
+                 peer that ended, and was never told"
+            ),
+            Ok(read) => filled += read,
+            Err(err) => panic!("reading what the successor was served: {err}"),
+        }
+    }
+    assert_eq!(
+        &seen, b"FRESH",
+        "the successor was handed bytes its predecessor was owed"
+    );
+
+    // And it is still the channel the daemon is serving, in the other direction too.
+    successor.write_all(b"\0\0\0\x01\x0b").expect("write");
+    let payload = client.next_of(FrameType::AgentData);
+    assert_eq!(
+        Frame::decode(FrameType::AgentData, &payload).expect("decode"),
+        Frame::AgentData {
+            generation: live,
+            data: b"\0\0\0\x01\x0b",
+        },
+        "the successor is still served, under the channel it was opened as"
+    );
+
+    // Nothing was said about the stale close, and nothing else was disturbed:
+    // `still_serving` fails on any frame that is not the session's own chatter.
     still_serving(&mut client, "NOMUX-STILL-SERVING");
 }
 
@@ -276,7 +379,7 @@ fn an_agent_connection_whose_queue_outgrows_the_cap_is_closed_alone() {
     let capacity = socket_capacity();
 
     let mut drowned_peer = session.connect_agent();
-    expect_agent(
+    let drowned = expect_agent(
         &mut client,
         FrameType::AgentOpen,
         "the peer that will stop reading is served first",
@@ -288,7 +391,10 @@ fn an_agent_connection_whose_queue_outgrows_the_cap_is_closed_alone() {
     let filler = vec![b'q'; CHUNK];
     let mut sent = 0usize;
     while sent < capacity + CAP + OVERSHOOT {
-        client.send(&Frame::AgentData { data: &filler });
+        client.send(&Frame::AgentData {
+            generation: drowned,
+            data: &filler,
+        });
         sent += filler.len();
     }
 
@@ -322,7 +428,7 @@ fn an_agent_connection_whose_queue_outgrows_the_cap_is_closed_alone() {
     // the next connection can have, and bytes cross it in the direction the daemon has
     // to be awake for.
     let mut next = session.connect_agent();
-    expect_agent(
+    let generation = expect_agent(
         &mut client,
         FrameType::AgentOpen,
         "the slot the overflow freed is one the next connection can have",
@@ -332,6 +438,7 @@ fn an_agent_connection_whose_queue_outgrows_the_cap_is_closed_alone() {
     assert_eq!(
         Frame::decode(FrameType::AgentData, &payload).expect("decode"),
         Frame::AgentData {
+            generation,
             data: b"\0\0\0\x01\x0b",
         },
         "the daemon took its agent socket down with the connection that overflowed"
@@ -379,7 +486,7 @@ fn overqueued_then_closed(name: &str) -> Overqueued {
 
     let capacity = socket_capacity();
     let peer = session.connect_agent();
-    expect_agent(
+    let generation = expect_agent(
         &mut client,
         FrameType::AgentOpen,
         "the connection this state is built on is served",
@@ -388,13 +495,16 @@ fn overqueued_then_closed(name: &str) -> Overqueued {
     let filler = vec![b'k'; CHUNK];
     let mut sent = 0usize;
     while sent < capacity + OVERSHOOT {
-        client.send(&Frame::AgentData { data: &filler });
+        client.send(&Frame::AgentData {
+            generation,
+            data: &filler,
+        });
         sent += filler.len();
         client.send(&Frame::Ping);
         drop(client.next_of(FrameType::Pong));
     }
 
-    client.send(&Frame::AgentClose);
+    client.send(&Frame::AgentClose { generation });
     still_serving(&mut client, "NOMUX-CLOSE-ACTED-ON");
     Overqueued {
         session,

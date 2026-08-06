@@ -62,10 +62,11 @@ trap cleanup EXIT
 # path below; 130 rather than 1, so it is not read as the guard reporting a failure.
 trap 'cleanup; exit 130' INT TERM HUP
 
-# `-p nomux --bin nomux` rather than `--workspace`: the guard is a unit test in
+# `--bin nomux` rather than every target: the guard is a unit test in
 # crates/nomux/src/pty.rs, which compiles into the binary's own test target, and the
 # faulted run shares no artifacts with anything — so a wider selection would build the
-# integration suites and proptest twice over and run neither.
+# integration suites and the lib's own tests twice over and run neither. `-p nomux`
+# narrows nothing today, there being one package.
 run_plain() {
     cargo nextest run --locked -p nomux --bin nomux -E "test($test_name)" >"$log" 2>&1
 }

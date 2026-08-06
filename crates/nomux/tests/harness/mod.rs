@@ -33,7 +33,7 @@ use std::sync::{PoisonError, RwLock};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
-use nomux_proto::{
+use nomux::{
     ErrorCode, Frame, FrameType, HEADER_LEN, HELLO_AGENT_FORWARD, HELLO_REPAINT_CTRL_L, Hello,
     PROTOCOL_VERSION, RESUME_FROM_START, WinSize, decode_header,
 };
@@ -309,12 +309,12 @@ impl Session {
     /// kills it on drop, so the caller has to bind it for as long as the client is
     /// used — `let (_session, ..)`, never `let (_, ..)`, which would end the session
     /// on the spot.
-    pub(crate) fn attached(name: &str) -> (Self, Client, nomux_proto::HelloOk) {
+    pub(crate) fn attached(name: &str) -> (Self, Client, nomux::HelloOk) {
         Self::attached_with(name, 0)
     }
 
     /// [`Session::attached`], with `flags` in the greeting.
-    pub(crate) fn attached_with(name: &str, flags: u8) -> (Self, Client, nomux_proto::HelloOk) {
+    pub(crate) fn attached_with(name: &str, flags: u8) -> (Self, Client, nomux::HelloOk) {
         let session = Self::start(name);
         let mut client = session.connect();
         let ok = client.hello_with(flags, RESUME_FROM_START);
@@ -406,7 +406,7 @@ pub(crate) fn reconnect_until_gap(
     session: &Session,
     flags: u8,
     out_offset: u64,
-) -> (Client, nomux_proto::HelloOk) {
+) -> (Client, nomux::HelloOk) {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let mut client = session.connect();
@@ -885,11 +885,11 @@ impl Client {
         self.send(&Frame::Input { offset, data });
     }
 
-    pub(crate) fn hello(&mut self, out_offset: u64) -> nomux_proto::HelloOk {
+    pub(crate) fn hello(&mut self, out_offset: u64) -> nomux::HelloOk {
         self.hello_with(0, out_offset)
     }
 
-    pub(crate) fn hello_with(&mut self, flags: u8, out_offset: u64) -> nomux_proto::HelloOk {
+    pub(crate) fn hello_with(&mut self, flags: u8, out_offset: u64) -> nomux::HelloOk {
         self.send(&hello_frame(flags, out_offset));
         let greeting = self.frame_owed("a HelloOk from the daemon");
         self.take_hello_ok(greeting)
@@ -898,11 +898,7 @@ impl Client {
     /// [`Client::hello`] against a deadline the caller shares between several
     /// greetings, per [`poll_by`]. What is lost without it is the failure the test was
     /// going to report, the chaos seed § 9 promises included.
-    pub(crate) fn hello_before(
-        &mut self,
-        deadline: Instant,
-        out_offset: u64,
-    ) -> nomux_proto::HelloOk {
+    pub(crate) fn hello_before(&mut self, deadline: Instant, out_offset: u64) -> nomux::HelloOk {
         self.send(&hello_frame(0, out_offset));
         let awaiting = "a HelloOk from the daemon";
         let greeting = self
@@ -912,7 +908,7 @@ impl Client {
     }
 
     /// Decodes the greeting and moves this client's two offsets onto it.
-    fn take_hello_ok(&mut self, (ty, payload): (FrameType, Vec<u8>)) -> nomux_proto::HelloOk {
+    fn take_hello_ok(&mut self, (ty, payload): (FrameType, Vec<u8>)) -> nomux::HelloOk {
         assert_eq!(ty, FrameType::HelloOk, "expected HelloOk, got {ty:?}");
         match Frame::decode(ty, &payload).expect("decode HelloOk") {
             Frame::HelloOk(ok) => {

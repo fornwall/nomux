@@ -28,14 +28,14 @@ mod harness;
 
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
-use nomux_proto::{Frame, RESUME_FROM_START};
+use nomux::{Frame, RESUME_FROM_START};
 
 use harness::{
-    Rng, Session, Spawned, accept_within, collect, control, daemon_reaper, entries,
+    Rng, SETTLE, Session, Spawned, accept_within, collect, control, daemon_reaper, entries,
     has_unread_bytes, hello_frame, join_before, nomux, nomux_with_shell, poll_by, poll_until,
     process_state, push_until_refused, read_uninterrupted, run_root, shrink_send_buffer, stderr,
     stdout, still_serving, succeeded, wedge_socket, while_nothing_forks, write_frame,
@@ -453,6 +453,126 @@ fn spawn_starts_a_daemon_for_a_session_that_does_not_exist_yet() {
         found,
         "spawn did not start a daemon and relay its output; saw {:?}",
         String::from_utf8_lossy(&seen)
+    );
+}
+
+/// `spawn` starts the binary it is running, not whatever is at the path it was
+/// started under.
+///
+/// A path is resolved again by the `exec`, so between this process's own load and
+/// its daemon's there is a window in which the install directory decides what the
+/// daemon *is* — and that directory is created rather than checked
+/// (`IMPLEMENTATION.md` § 5.2), which is why `DESIGN.md` § 8 keeps another uid
+/// replacing the binary in scope instead of dismissing it with the rest of "already
+/// the user". Only this second exec is closed here; the first ran out of that
+/// directory before anything in this process could have an opinion.
+///
+/// The replacement is § 5.2's own `mv -f`, so this is equally the case with nobody
+/// hostile in it: a spawn parked in that window while another connection installs the
+/// same version.
+///
+/// Nothing is raced. `create` blocks on `<id>.lock` before it forks (§ 6.3), so the
+/// swap goes in while the spawn is parked there, and it goes in after `Spawned::spawn`
+/// has returned — which is to say after the relay's own `exec`, so the binary being
+/// replaced is no longer the one the relay would run.
+///
+/// Two ways to fail and the marker is what separates them, which is why it is asserted
+/// on rather than merely waited for. A `rename` leaves the replaced inode reachable
+/// through no name, so this kernel answers the relay's own `/proc/self/exe` with
+/// `… (deleted)` and a path re-read there resolves to nothing at all: what that costs
+/// is a daemon that never starts, and only a path that still resolved would cost the
+/// plant *running*. Which of the two a host gives is the kernel's to decide and not
+/// this code's to promise, so neither is left unnamed.
+///
+/// The `kill` at the end is the other half. `argv[0]` is what the exec'd program is no
+/// longer spelled as, and § 6.6 identifies a daemon from `/proc/<pid>/cmdline`, so a
+/// session that could not be collected here would be one this fix had made
+/// unreachable.
+#[test]
+fn spawn_starts_the_binary_it_is_running_not_the_one_now_at_its_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = run_root("spawn_swapped_exe");
+    let dir = root.join("nomux");
+    fs::create_dir_all(&dir).expect("create the run directory");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+        .expect("tighten the run directory");
+
+    // The file `create` takes before it goes anywhere near the fork, held until the
+    // swap below is in place.
+    let lock = fs::File::create(dir.join("swapped.lock")).expect("create the spawn lock");
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)
+        .expect("hold the spawn lock");
+
+    // A copy under a path this test owns: the swap is `mv` over the installed binary,
+    // which is § 5.2's own install step and not something to do to `target/`.
+    //
+    // Under the gate, because the very next thing done to this path is an `exec` of it:
+    // a `fork` elsewhere in the process while the copy holds it open for writing carries
+    // a duplicate of that descriptor until it `exec`s, and a file with a writer is one
+    // `execve` answers `ETXTBSY`. Measured as one failure in eleven `cargo test` runs,
+    // where a test binary is threads rather than processes and there is something else
+    // to fork.
+    let installed = root.join("nomux-installed");
+    while_nothing_forks(|| {
+        fs::copy(env!("CARGO_BIN_EXE_nomux"), &installed).expect("install a binary of our own")
+    });
+
+    let relay = Spawned::spawn(
+        Command::new(&installed)
+            .args(["spawn", "swapped"])
+            .env("XDG_RUNTIME_DIR", &root)
+            .env("SHELL", "/bin/sh")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+    );
+    // Waited for rather than read once. `Command::spawn` resumes this thread from
+    // inside the child's `execve`, and the kernel completes that wakeup before it
+    // installs the new `exe_file` — so a single read here loses a race about once in a
+    // dozen `cargo test` runs and reports a relay that was still being loaded as one
+    // that had loaded the wrong thing.
+    let loaded = fs::canonicalize(&installed).ok();
+    let exe = || fs::read_link(format!("/proc/{}/exe", relay.id())).ok();
+    assert!(
+        poll_until(SETTLE, || exe() == loaded),
+        "the swap is only about the daemon's exec once the relay has done its own, so \
+         a relay still to be loaded fails here rather than as the planting below: \
+         /proc says {:?}",
+        exe()
+    );
+
+    let marker = root.join("planted-ran");
+    let plant = root.join("planted");
+    fs::write(&plant, format!("#!/bin/sh\n: > '{}'\n", marker.display())).expect("write the plant");
+    fs::set_permissions(&plant, fs::Permissions::from_mode(0o755)).expect("make the plant run");
+    fs::rename(&plant, &installed).expect("swap the binary at the install path");
+    // Released under the gate, so no `fork` this suite has in flight is carrying a
+    // duplicate of the descriptor the lock is attached to.
+    while_nothing_forks(|| drop(lock));
+
+    let pid_file = dir.join("swapped.pid");
+    let settled = poll_until(SETTLE, || pid_file.exists() || marker.exists());
+    // Bound before the assertions rather than after them: the passing path leaves a
+    // daemon to collect, and the failing one leaves nothing that could leak.
+    let _reaper = pid_file.exists().then(|| daemon_reaper(&root, "swapped"));
+
+    assert!(
+        !marker.exists(),
+        "the file now at the install path ran, so the exec resolved that name a second \
+         time instead of the inode this process was already loaded from"
+    );
+    assert!(
+        settled,
+        "the daemon never came up, and nothing was planted either — so the name was \
+         resolved again and this time answered with nothing, which is the same re-read \
+         costing a session instead of giving one away"
+    );
+    drop(relay);
+    succeeded(
+        &control(&root, &["kill", "swapped"]),
+        "the daemon was not identified as one, so what it is exec'd as has reached \
+         `argv[0]` after all",
     );
 }
 

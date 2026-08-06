@@ -4,9 +4,9 @@
 # come back. Nothing here was produced by the encoder under test — these are the
 # document's bytes, not this codec's, which is what makes them a check on it.
 #
-# Not the original. `crates/nomux-proto/tests/wire.rs` holds the same table as Rust
-# literals read out of § 2.2 by hand, renders this file from them and fails if the two
-# disagree, so a wire change reaches both or neither.
+# Not the original. `crates/nomux/tests/wire.rs` holds the same table as Rust literals
+# read out of § 2.2 by hand, renders this file from them and fails if the two disagree,
+# so a wire change reaches both or neither.
 #
 # Grammar, so a reader needs no library: a line is blank, a comment — `#` its first
 # non-blank character — or a key and a value separated by whitespace. `frame` opens a
@@ -19,7 +19,7 @@
 # two's-complement pattern being a reinterpretation this file should not ask for.
 
 frame Hello
-protocol 0x0007
+protocol 0x0008
 agent_forward true
 repaint_ctrl_l true
 out_offset 0x0102030405060708
@@ -28,10 +28,10 @@ rows 0x0028
 xpixel 0x03c0
 ypixel 0x0280
 term 0x787465726d2d323536636f6c6f72
-bytes 0x0100002300070301020304050607080078002803c00280000e787465726d2d323536636f6c6f72
+bytes 0x0100002300080301020304050607080078002803c00280000e787465726d2d323536636f6c6f72
 
 frame Hello
-protocol 0x0007
+protocol 0x0008
 agent_forward true
 repaint_ctrl_l false
 out_offset 0xffffffffffffffff
@@ -40,10 +40,10 @@ rows 0x0028
 xpixel 0x03c0
 ypixel 0x0280
 term 0x7674313030
-bytes 0x0100001a000701ffffffffffffffff0078002803c0028000057674313030
+bytes 0x0100001a000801ffffffffffffffff0078002803c0028000057674313030
 
 frame Hello
-protocol 0x0007
+protocol 0x0008
 agent_forward false
 repaint_ctrl_l false
 out_offset 0x8182838485868788
@@ -52,7 +52,7 @@ rows 0x0028
 xpixel 0x03c0
 ypixel 0x0280
 term 0x64756d62
-bytes 0x0100001900070081828384858687880078002803c00280000464756d62
+bytes 0x0100001900080081828384858687880078002803c00280000464756d62
 
 frame HelloOk
 resume_from 0x2122232425262728
@@ -127,11 +127,14 @@ message 0x74616b656e206f766572
 bytes 0x0c00000c000274616b656e206f766572
 
 frame AgentOpen
-bytes 0x0d000000
+generation 0x11121314
+bytes 0x0d00000411121314
 
 frame AgentData
+generation 0x91929394
 data 0x000000010b
-bytes 0x0e000005000000010b
+bytes 0x0e00000991929394000000010b
 
 frame AgentClose
-bytes 0x0f000000
+generation 0x00000000
+bytes 0x0f00000400000000

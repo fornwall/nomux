@@ -59,15 +59,8 @@ name = "nomux"
 version = "0.2.0"
 dependencies = [
  "libc",
- "nomux-proto",
- "rustix",
-]
-
-[[package]]
-name = "nomux-proto"
-version = "0.2.0"
-dependencies = [
  "proptest",
+ "rustix",
 ]
 
 [[package]]

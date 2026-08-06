@@ -1,7 +1,11 @@
 [package]
 name = "nomux"
 description = "Persistent PTY sessions that survive SSH disconnects, with zero server-side install"
-# Unpublishable while it depends on an unpublished, versionless `nomux-proto`.
+# Not published. A crates.io version is a semver promise about an API, and the lib
+# target's API *is* the wire format — which DESIGN.md § 2 says is private, unstable and
+# spoken by exactly one client, shipped in lockstep. `PROTOCOL_VERSION` is the real
+# compatibility axis, and it answers a peer rather than a resolver. The binary reaches a
+# host by upload against a SHA-256 the client pins, which is not a registry either.
 publish = false
 version.workspace = true
 edition.workspace = true
@@ -11,7 +15,6 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-nomux-proto.workspace = true
 rustix = { version = "1.1.4", features = ["pty", "termios", "process", "event", "fs", "pipe", "stdio"] }
 # The declarations and syscalls rustix does not wrap, or puts in its `runtime` module
 # and documents as unusable in a process that has a libc — which this one does, via
@@ -19,6 +22,15 @@ rustix = { version = "1.1.4", features = ["pty", "termios", "process", "event", 
 # `fork`/`_exit`/`waitpid`, and the raw AF_UNIX socket calls; `grep -r 'libc::'` for
 # the current set rather than trusting this list to have kept up.
 libc = "0.2.189"
+
+# The default `fork` and `timeout` features run every case in a subprocess so a
+# hang or an abort can be attributed. This codec allocates nothing it does not
+# bound and loops over nothing, so a case that neither returns nor panics is not a
+# failure mode worth paying `rusty-fork`, `tempfile` and `wait-timeout` for. Same
+# for `bit-set`, which only accelerates shrinking of bitset strategies this suite
+# does not use.
+[dev-dependencies]
+proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 
 [lints]
 workspace = true

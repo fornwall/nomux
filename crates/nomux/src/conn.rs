@@ -9,7 +9,7 @@
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 
-use nomux_proto::{Frame, FrameType, HEADER_LEN, Header, MAX_PAYLOAD, decode_header};
+use nomux::{Frame, FrameType, HEADER_LEN, Header, MAX_PAYLOAD, decode_header};
 
 /// Stop queueing output once this much is already waiting for a slow client
 /// (`IMPLEMENTATION.md` § 4.1).
@@ -160,12 +160,17 @@ impl Conn {
         offset
     }
 
-    /// Queues agent bytes as one or more `AgentData` frames, splitting at
-    /// [`MAX_PAYLOAD`].
-    pub(crate) fn send_agent_data(&mut self, data: &[u8]) {
-        // The whole payload is the bytes, so the chunk is the cap itself.
-        for part in data.chunks(MAX_PAYLOAD as usize) {
-            self.send(&Frame::AgentData { data: part });
+    /// Queues agent bytes as one or more `AgentData` frames for `generation`, splitting
+    /// at [`MAX_PAYLOAD`].
+    pub(crate) fn send_agent_data(&mut self, generation: u32, data: &[u8]) {
+        // Leave room for the 4-byte generation that shares the payload. Chunking at the
+        // cap itself would put a full part four bytes over it, and `send` drops what it
+        // cannot encode — a silent hole in a stream nothing here can resend.
+        for part in data.chunks(MAX_PAYLOAD as usize - 4) {
+            self.send(&Frame::AgentData {
+                generation,
+                data: part,
+            });
         }
     }
 
@@ -295,11 +300,11 @@ impl Conn {
     ///
     /// # Errors
     ///
-    /// [`nomux_proto::ProtoError`] for an unparseable header.
+    /// [`nomux::ProtoError`] for an unparseable header.
     pub(crate) fn take_frame(
         &mut self,
         scratch: &mut Vec<u8>,
-    ) -> Result<Option<FrameType>, nomux_proto::ProtoError> {
+    ) -> Result<Option<FrameType>, nomux::ProtoError> {
         let available = self.rx.get(self.rx_pos..).unwrap_or(&[]);
         let Some(head) = available.first_chunk::<HEADER_LEN>() else {
             return Ok(None);
@@ -324,7 +329,7 @@ mod tests {
     use std::io::ErrorKind;
     use std::time::Instant;
 
-    use nomux_proto::{
+    use nomux::{
         ErrorCode, Hello, HelloOk, Linger, PROTOCOL_VERSION, ProtoError, RESUME_FROM_START, WinSize,
     };
 
@@ -378,6 +383,7 @@ mod tests {
                 data: payload,
             },
             Frame::AgentData {
+                generation: 3,
                 data: &payload[..7],
             },
         ]

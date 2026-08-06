@@ -118,12 +118,16 @@ jobs:
       # rustdoc has its own lint namespace, so `rustdoc::broken_intra_doc_links` is
       # reached by neither the clippy hook above nor RUSTFLAGS — and this tree links
       # between items constantly, where a renamed function turns a link into nothing
-      # rather than into an error. `--document-private-items` because the binary crate
-      # is almost entirely private and would otherwise be documented empty. Seconds
-      # against the warm cache: only the workspace crates are rebuilt, their
-      # dependencies having been built by the step above. Not a hook, because a
-      # pre-commit run should not be waiting on rustdoc.
-      - run: RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps --document-private-items
+      # rather than into an error. `--document-private-items` because the binary target
+      # is almost entirely private and would otherwise be documented empty. `--lib
+      # --bins` because the two targets share the package's name, and a bare `cargo doc`
+      # then documents the lib alone and silently stops checking every link in the
+      # daemon; naming both runs rustdoc over each. The collision warning cargo prints
+      # is about which HTML survives, and nothing reads the HTML. Seconds against the
+      # warm cache: only this package's targets are rebuilt, their dependencies having
+      # been built by the step above. Not a hook, because a pre-commit run should not be
+      # waiting on rustdoc.
+      - run: RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps --document-private-items --lib --bins
 
       # The cargo-nextest hook's command plus the two flags that only make sense here.
       # `--run-ignored all`: the one ignored test sits out a real reaping timeout,

@@ -66,11 +66,12 @@ trap 'cleanup; exit 130' INT TERM HUP
 # The directory names are kept short on purpose: the integration tests bind unix
 # sockets underneath them, and `sockaddr_un` truncates at 108 bytes.
 #
-# `-p nomux --test session` rather than `--workspace`: the guard is one test in
+# `--test session` rather than every target: the guard is one test in
 # crates/nomux/tests/session.rs, and this runs twice under RUSTFLAGS that share no
-# artifacts, so everything outside that target is compiled twice and run never.
-# `--workspace` also built the chaos, control, codec and wire test binaries and
-# proptest with its dependency tree behind them. Narrowing does not lose the daemon:
+# artifacts, so everything outside that target is compiled twice and run never — the
+# chaos, control, codec and wire binaries among them. `-p nomux` narrows nothing today,
+# there being one package, and proptest is compiled either way as a dev-dependency of
+# it. Narrowing does not lose the daemon:
 # the harness resolves it through `env!("CARGO_BIN_EXE_nomux")`, which cargo defines
 # by building the package's binary for its own integration tests.
 run_with() {
