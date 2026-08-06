@@ -16,11 +16,20 @@
 //! A failure here is either a deliberate wire change, which is a
 //! `PROTOCOL_VERSION` bump and an edit to § 2.2, or a bug. It is never a test that
 //! needs relaxing.
+//!
+//! The same table is written out beside this file as `wire-vectors.txt`, in a form an
+//! implementation in another language reads without parsing Rust;
+//! [`the_hex_fixture_carries_the_same_table`] renders these vectors and holds that file
+//! to the rendering, so neither can move alone.
 
 use nomux_proto::{
     ErrorCode, ExitKind, Frame, FrameType, HEADER_LEN, Hello, HelloOk, Linger, MAX_PAYLOAD,
     PROTOCOL_VERSION, RESUME_FROM_START, WinSize,
 };
+
+/// The language-neutral copy of the table below, compiled in rather than read: a test
+/// holding a file it cannot open is a test that cannot quietly rewrite it.
+const FIXTURE: &str = include_str!("wire-vectors.txt");
 
 /// Distinct in all four fields on purpose: `cols`, `rows`, `xpixel` and `ypixel`
 /// share a layout and a width, so equal values would hide a transposition.
@@ -385,6 +394,169 @@ fn documented_bytes_decode_to_their_frames() {
             "declared length disagrees with the payload that follows it"
         );
         assert_eq!(Frame::decode(header.ty, payload).unwrap(), frame);
+    }
+}
+
+/// A byte string as the fixture writes one.
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::from("0x");
+    // `'?'` is unreachable, a nibble being a base-16 digit by construction; it stands in
+    // for an `unwrap` the lint wall refuses outside a `#[test]`.
+    out.extend(
+        bytes
+            .iter()
+            .flat_map(|byte| [byte >> 4, byte & 0x0f])
+            .map(|nibble| char::from_digit(u32::from(nibble), 16).unwrap_or('?')),
+    );
+    out
+}
+
+/// The four fields of a winsize, destructured so that a fifth would not be dropped
+/// silently from the fixture.
+fn win_lines(win: WinSize) -> [String; 4] {
+    let WinSize {
+        cols,
+        rows,
+        xpixel,
+        ypixel,
+    } = win;
+    [
+        format!("cols {cols:#06x}"),
+        format!("rows {rows:#06x}"),
+        format!("xpixel {xpixel:#06x}"),
+        format!("ypixel {ypixel:#06x}"),
+    ]
+}
+
+/// One vector as `wire-vectors.txt` writes it.
+///
+/// The values are the frame's, not the wire's: booleans where § 2.3 has flag bits, a
+/// name where the wire has a discriminant, no `term_len` an encoder can count for
+/// itself. Rendering the wire form instead would make each record a restatement of its
+/// own `bytes`, which is the one thing a reader must not be handed.
+fn record(vector: &Vector) -> String {
+    let &Vector { frame, bytes } = vector;
+    let mut lines = vec![format!("frame {:?}", frame.frame_type())];
+    match frame {
+        Frame::Hello(Hello {
+            protocol,
+            agent_forward,
+            repaint_ctrl_l,
+            out_offset,
+            win,
+            term,
+        }) => {
+            lines.push(format!("protocol {protocol:#06x}"));
+            lines.push(format!("agent_forward {agent_forward}"));
+            lines.push(format!("repaint_ctrl_l {repaint_ctrl_l}"));
+            lines.push(format!("out_offset {out_offset:#018x}"));
+            lines.extend(win_lines(win));
+            lines.push(format!("term {}", hex(term.as_bytes())));
+        }
+        Frame::HelloOk(HelloOk {
+            resume_from,
+            in_applied,
+            linger,
+            agent,
+        }) => {
+            lines.push(format!("resume_from {resume_from:#018x}"));
+            lines.push(format!("in_applied {in_applied:#018x}"));
+            lines.push(format!("linger {linger:?}"));
+            lines.push(format!("agent {agent}"));
+        }
+        Frame::Input { offset, data } | Frame::Output { offset, data } => {
+            lines.push(format!("offset {offset:#018x}"));
+            lines.push(format!("data {}", hex(data)));
+        }
+        Frame::InputAck { applied_through } => {
+            lines.push(format!("applied_through {applied_through:#018x}"));
+        }
+        Frame::Resize(win) => lines.extend(win_lines(win)),
+        Frame::Gap { new_base_offset } => {
+            lines.push(format!("new_base_offset {new_base_offset:#018x}"));
+        }
+        Frame::Exit {
+            status,
+            kind,
+            since_exit_secs,
+        } => {
+            lines.push(format!("status {status}"));
+            lines.push(format!("kind {kind:?}"));
+            lines.push(format!("since_exit_secs {since_exit_secs:#010x}"));
+        }
+        Frame::Error { code, message } => {
+            lines.push(format!("code {code:?}"));
+            lines.push(format!("message {}", hex(message.as_bytes())));
+        }
+        Frame::AgentData { data } => lines.push(format!("data {}", hex(data))),
+        Frame::Detach | Frame::Ping | Frame::Pong | Frame::AgentOpen | Frame::AgentClose => {}
+    }
+    lines.push(format!("bytes {}", hex(bytes)));
+    lines.join("\n")
+}
+
+/// The whole table as the fixture writes it.
+fn rendered_fixture() -> String {
+    let records: Vec<String> = vectors().iter().map(record).collect();
+    format!("{}\n", records.join("\n\n"))
+}
+
+/// The lines of a fixture that say something, numbered from one — the reader its own
+/// grammar promises, which is the one thing here that has to be naive.
+fn content(text: &str) -> Vec<(usize, String)> {
+    text.lines()
+        .enumerate()
+        .map(|(index, line)| {
+            (
+                index + 1,
+                line.split_whitespace().collect::<Vec<_>>().join(" "),
+            )
+        })
+        .filter(|(_, line)| !line.is_empty() && !line.starts_with('#'))
+        .collect()
+}
+
+/// `wire-vectors.txt` says what this table says, so a second implementation can be
+/// built against these bytes without reading Rust.
+///
+/// The table is the original and the fixture is rendered from it rather than the other
+/// way round: what the two tests above are worth rests on the vectors being literals
+/// read out of § 2.2 by hand and reviewed as a diff, and the fixture's `bytes` come from
+/// those literals rather than from `encode`, so what it offers another implementation is
+/// the document and not this codec's opinion of it. Both sides are read through the
+/// ignorable-line rule the fixture states, so a re-commented or hand-aligned file still
+/// passes and only the data is pinned.
+///
+/// A stale fixture fails here and is never rewritten: [`FIXTURE`] is `include_str!`, so
+/// this test has no handle to write through, and the rendering rides on the failure
+/// instead — which is what a maintainer pastes, a vector added or dropped having moved
+/// every line after it.
+#[test]
+fn the_hex_fixture_carries_the_same_table() {
+    let rendered = rendered_fixture();
+    let table = content(&rendered);
+    let carried = content(FIXTURE);
+
+    let complaint = table
+        .iter()
+        .enumerate()
+        .find_map(|(index, (_, want))| match carried.get(index) {
+            Some((_, found)) if found == want => None,
+            Some((number, found)) => Some(format!(
+                "wire-vectors.txt:{number} carries `{found}`, and this table renders `{want}`"
+            )),
+            None => Some(format!(
+                "wire-vectors.txt ends before this table does, at `{want}`"
+            )),
+        })
+        .or_else(|| {
+            carried.get(table.len()).map(|(number, extra)| {
+                format!("wire-vectors.txt:{number} carries `{extra}`, which no vector renders")
+            })
+        });
+
+    if let Some(complaint) = complaint {
+        panic!("{complaint}\n\nthe table renders:\n\n{rendered}");
     }
 }
 

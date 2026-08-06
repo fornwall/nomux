@@ -1,0 +1,137 @@
+# The frame table of IMPLEMENTATION.md § 2.2 in bytes, for an implementation in another
+# language to check itself against: build each record's message from the field values,
+# encode it, and the result must be `bytes` exactly; decode `bytes` and the fields must
+# come back. Nothing here was produced by the encoder under test — these are the
+# document's bytes, not this codec's, which is what makes them a check on it.
+#
+# Not the original. `crates/nomux-proto/tests/wire.rs` holds the same table as Rust
+# literals read out of § 2.2 by hand, renders this file from them and fails if the two
+# disagree, so a wire change reaches both or neither.
+#
+# Grammar, so a reader needs no library: a line is blank, a comment — `#` its first
+# non-blank character — or a key and a value separated by whitespace. `frame` opens a
+# record and names the message; the keys under it are that message's fields in § 2.2's
+# order; `bytes` closes it with the whole frame, four-byte header included. A value is
+# `true` or `false`, an enumerator whose number § 2.2 gives, or lowercase hex behind an
+# `0x` prefix — a number, zero-padded to the width of its field, except in `term`,
+# `message`, `data` and `bytes`, where it is the field's bytes and may be `0x` alone.
+# `status` is the one signed field on this wire and is written in decimal, a
+# two's-complement pattern being a reinterpretation this file should not ask for.
+
+frame Hello
+protocol 0x0007
+agent_forward true
+repaint_ctrl_l true
+out_offset 0x0102030405060708
+cols 0x0078
+rows 0x0028
+xpixel 0x03c0
+ypixel 0x0280
+term 0x787465726d2d323536636f6c6f72
+bytes 0x0100002300070301020304050607080078002803c00280000e787465726d2d323536636f6c6f72
+
+frame Hello
+protocol 0x0007
+agent_forward true
+repaint_ctrl_l false
+out_offset 0xffffffffffffffff
+cols 0x0078
+rows 0x0028
+xpixel 0x03c0
+ypixel 0x0280
+term 0x7674313030
+bytes 0x0100001a000701ffffffffffffffff0078002803c0028000057674313030
+
+frame Hello
+protocol 0x0007
+agent_forward false
+repaint_ctrl_l false
+out_offset 0x8182838485868788
+cols 0x0078
+rows 0x0028
+xpixel 0x03c0
+ypixel 0x0280
+term 0x64756d62
+bytes 0x0100001900070081828384858687880078002803c00280000464756d62
+
+frame HelloOk
+resume_from 0x2122232425262728
+in_applied 0x3132333435363738
+linger Enabled
+agent true
+bytes 0x02000012212223242526272831323334353637380201
+
+frame HelloOk
+resume_from 0x4142434445464748
+in_applied 0x5152535455565758
+linger Unknown
+agent true
+bytes 0x02000012414243444546474851525354555657580001
+
+frame HelloOk
+resume_from 0x6162636465666768
+in_applied 0x7172737475767778
+linger Disabled
+agent false
+bytes 0x02000012616263646566676871727374757677780100
+
+frame Input
+offset 0x0000000000000009
+data 0x6c73202d6c0d
+bytes 0x0300000e00000000000000096c73202d6c0d
+
+frame InputAck
+applied_through 0x000000000000000f
+bytes 0x04000008000000000000000f
+
+frame Output
+offset 0x4142434445464748
+data 0x1b5b324a
+bytes 0x0500000c41424344454647481b5b324a
+
+frame Resize
+cols 0x0078
+rows 0x0028
+xpixel 0x03c0
+ypixel 0x0280
+bytes 0x060000080078002803c00280
+
+frame Gap
+new_base_offset 0x0000000000002000
+bytes 0x070000080000000000002000
+
+frame Exit
+status 130
+kind Signalled
+since_exit_secs 0x0a0b0c0d
+bytes 0x0800000900000082010a0b0c0d
+
+frame Exit
+status -1
+kind Exited
+since_exit_secs 0x00000000
+bytes 0x08000009ffffffff0000000000
+
+frame Detach
+bytes 0x09000000
+
+frame Ping
+bytes 0x0a000000
+
+frame Pong
+bytes 0x0b000000
+
+frame Error
+code Takeover
+message 0x74616b656e206f766572
+bytes 0x0c00000c000274616b656e206f766572
+
+frame AgentOpen
+bytes 0x0d000000
+
+frame AgentData
+data 0x000000010b
+bytes 0x0e000005000000010b
+
+frame AgentClose
+bytes 0x0f000000

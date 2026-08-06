@@ -54,9 +54,10 @@ beside it. `NOMUX_DEBUG` and `NOMUX_UPDATE_BASELINE` are tested for exactly `1`.
 | `NOMUX_DEBUG` | `scripts/build-release.sh` | Also build the unstripped companions (§8) |
 | `NOMUX_UPDATE_BASELINE` | `scripts/build-release.sh` | Rewrite `scripts/size-baseline` from this build and skip the growth gate (§8) |
 
-The first three are subject to §6.3's absolute-path rule. Going the other way, the
-daemon sets `TERM` from `Hello`, `NOMUX_SESSION=<id>` and — where forwarding is on —
-`SSH_AUTH_SOCK` in the child, and takes `NOMUX_BOOTSTRAP` back out (§6.1.1).
+The first three are subject to §6.3's absolute-path rule where they name the run
+directory. Going the other way, the daemon sets `TERM` from `Hello`, `NOMUX_SESSION=<id>`
+and — where forwarding is on — `SSH_AUTH_SOCK` in the child, and takes `NOMUX_BOOTSTRAP`
+back out (§6.1.1).
 
 ## 2. Wire protocol
 
@@ -219,8 +220,10 @@ pushes out what the socket takes and lets the rest go: it is all per-connection 
 reattach recomputes — `sent_through` rewinds to what the arriving client consumed (§4.2),
 `exit_sent` clears (§6.5) — so what the client comes back to is the ring, not the queue.
 Waiting would be the whole event loop blocked for `FINAL_FLUSH_TIMEOUT`, PTY drain
-included, at exactly the moment the peer has stopped reading. Only the two departures with
-nothing behind them keep the blocking flush: §6.4's eviction and §6.5's shutdown.
+included, at exactly the moment the peer has stopped reading. Only departures with nothing
+behind them keep the blocking flush: §6.5's shutdown, and every close that carries a final
+`Error` — §6.4's eviction among them — each of which throws its own queue away first and so
+blocks on one frame.
 
 ### 4.2 Attach with `from < base()`
 
@@ -247,7 +250,7 @@ On a gap the byte stream is discontinuous and the client's emulator may be
 mid-escape-sequence. Recovery, mirroring `dtach -r`:
 
 1. Client resets its emulator locally — `ESC c` is correct but heavy-handed (drops scroll region and charset); `ESC [ ! p` + `ESC [ 2J` + `ESC [ H` is the softer default.
-2. Daemon triggers a repaint from the child via a `TIOCSWINSZ` dance: set `cols-1`, then the real `cols`. The resulting two `SIGWINCH`es make most full-screen programs redraw. A terminal one column wide gets the second alone, there being no narrower size to go to, which leaves the repaint weaker there and is accepted.
+2. Daemon triggers a repaint from the child via a `TIOCSWINSZ` dance: set `cols-1`, then the real `cols`. The resulting two `SIGWINCH`es make most full-screen programs redraw. A terminal one column wide gets neither: there is no narrower size to go to, and the lone resize left is to the size already in effect, which `tty_do_resize` short-circuits on rather than signalling. Accepted — the alternative is a second dance, widening, for a width nothing renders on.
 3. Repaint policy is the client's, restated in each `Hello` (§2.3): `winch` (default) or `ctrl_l` (write `0x0c` to the PTY — better for a bare shell prompt, destructive inside an editor).
 
 `ctrl_l` goes through the same queue as client input rather than straight to the master,
@@ -406,7 +409,7 @@ reported with an exit status somebody sees, and before the pidfile is written, s
 `listen` again on the descriptor it inherited, `listen` installing a backlog rather than
 keeping the one in force (§6.3); a failure there is discarded rather than propagated.
 
-`spawn` arranges the first two lines for the daemon it starts — `setsid` in its own
+`spawn` arranges two of those lines for the daemon it starts — `setsid` in its own
 `pre_exec`, stdin and stdout to `/dev/null` through `Stdio::null()` — because until its
 own `setsid` a hangup would take the session with it, and until it redirects its stdio it
 holds the *relay's* descriptors, where anything it writes lands mid-frame. Stderr is the
@@ -539,7 +542,7 @@ obey, in the order the rules bind:
 - **Anything that unlinks takes the lock first and holds it to the end** — `list`'s sweep, `kill` (§6.6), and the daemon's own exit (§6.5).
 - **The daemon takes it before it probes for a stale socket**, and never blocks for it: otherwise a sweep descheduled after the same probe unlinks what this daemon has bound since.
 - **`spawn` holds it past the `connect` that succeeds, until `<id>.pid` exists.** The daemon binds before it writes that file (§6.2), so a `kill` landing in that window would find a live daemon and no pid to signal. The wait is bounded by the spawn timeout and is never fatal.
-- **The daemon drops it the instant the pidfile exists.** One still holding it at `kill`'s 2 s deadline (§6.6) would be one nothing could stop.
+- **The daemon drops it once `<id>.pid` and the label are written.** One still holding it at `kill`'s 2 s deadline (§6.6) would be one nothing could stop.
 - **Every acquirer confirms that what it locked is still the file at that path** — `fstat` against `stat`, device and inode — and goes back for the real one if it is not; `flock` attaches to an inode and `<id>.lock` is itself collected.
 - **`<id>.lock` is unlinked last** of the five: from the moment its name is gone the caller's lock guards nothing, so a later unlink would land on a session somebody else has legitimately brought up.
 - **A lock no process could obtain is proceeded past without one**, and the list is exactly `Errno::ACCESS`, `Errno::PERM` and `Errno::OPNOTSUPP` — each a property of the *file*, so a lock this caller cannot get is one no caller can be holding. Every other errno is a property of the moment and makes a caller wait, skip or refuse.
@@ -572,11 +575,13 @@ reports the session throughout — until the incumbent greets, reaches end of fi
 misses its 5 s deadline.
 
 **A `Hello` this daemon cannot answer is refused before the eviction, not after.** The
-`Hello.protocol` check therefore runs on the pending connection rather than inside the
-handshake, which only runs once the takeover has happened: deferred there, a newer
-client's *failed* greeting threw the working client off with `Error{TAKEOVER}` and then
-dropped the newcomer too, leaving nobody attached and no client permitted to reconnect.
-The one place [DESIGN.md § 6.4](DESIGN.md#64-version-skew)'s skew story touches the daemon.
+`Hello.protocol` check therefore runs on the pending connection, ahead of the handshake —
+which keeps a copy of its own for the client that greets again on the connection it
+already holds, and otherwise runs only once the takeover has happened: deferred there, a
+newer client's *failed* greeting threw the working client off with `Error{TAKEOVER}` and
+then dropped the newcomer too, leaving nobody attached and no client permitted to
+reconnect. The one place [DESIGN.md § 6.4](DESIGN.md#64-version-skew)'s skew story touches
+the daemon.
 
 The eviction's final write is bounded by a deadline (§6.5's 500 ms), the connection being
 replaced usually being one that has *stopped reading*; its queued output is dropped
@@ -686,7 +691,7 @@ mid-number being a smaller, plausible, live pid rather than the number on disk.
 - Unlinking happens under `<id>.lock`, with the probe repeated once it is held, that being the only point at which the answer cannot change between being read and acted on. An entry whose lock somebody else holds is skipped, being a session started rather than garbage; one whose lock is not *obtainable at all* is collected anyway, per §6.3 — a collector that stops collecting because of the mutex protecting it leaks under exactly the conditions it exists for.
 - `kill` takes `<id>.lock` first and holds it to the end, so nothing can spawn into the id it is removing; then probes the socket, identifies the daemon as **Identification** below has it, sends `SIGTERM`, waits up to 2 s, then `SIGKILL`, and unlinks every `<id>.*` once the session has stopped answering, the lock last. It waits up to 2 s for that lock, which is what makes it *win* the race against a `spawn` — a budget that has to cover a `fork`, an `exec`, a `bind` and the stale-socket probe in front of it (§6.3).
 - **A live session's files are never unlinked.** Where the socket answers and the pidfile will not say which process serves it, `kill` exits non-zero and leaves all five alone: removing them takes the socket away from a daemon still holding the user's shell, and frees the id for a second daemon to bind over.
-- `kill` exits non-zero rather than reporting a "no such session" it did not establish. Four states do that: identification coming back with nothing, where the refusal prints the number, where it came from and what `/proc` said, and recommends nothing, the repair that suggests itself being the catastrophic one half the time; a socket that could not be *probed*, which §6.3 makes evidence of neither death nor life; a session still answering half a second after `SIGKILL`, so the pid signalled is not the process serving it; and a lock still held at the 2 s deadline. **That last arm also swallows a real failure:** `EROFS` is not one of §6.3's three "nobody can hold this" errnos, so on a read-only run directory the lock reads as *held* and `kill` blames another process for what is the filesystem. The refusal to unlink is still correct; only the account of why is wrong.
+- `kill` exits non-zero rather than reporting a "no such session" it did not establish. Five states do that: identification coming back with nothing, where the refusal prints the number, where it came from and what `/proc` said, and recommends nothing, the repair that suggests itself being the catastrophic one half the time; a socket that could not be *probed*, which §6.3 makes evidence of neither death nor life; a session still answering half a second after `SIGKILL`, so the pid signalled is not the process serving it; a socket answering again on the probe under the lock, a daemon having bound the id since this call established it was gone; and a lock still held at the 2 s deadline. **That last arm also swallows a real failure:** `EROFS` is not one of §6.3's three "nobody can hold this" errnos, so on a read-only run directory the lock reads as *held* and `kill` blames another process for what is the filesystem. The refusal to unlink is still correct; only the account of why is wrong.
 - One further non-zero exit is the one case where the session really did stop: the unlink itself failing. Absence is success, but an `EIO`, an immutable `<id>.lock`, or a filesystem remounted read-only since the lock was taken is reported rather than swallowed — a surviving `<id>.lock` is a session `list` rediscovers and tries to collect on every run from then on. Every path is still attempted, so one stubborn file does not strand the other four.
 
 #### Identification
@@ -724,7 +729,7 @@ reaped — that makes its number somebody else's.
 | a live pid | positively *is not* | `kill` refuses; `list` prints `?` |
 | a number naming no live process | not asked | `kill` refuses; `list` prints `?` |
 | missing, or created but not yet filled | not asked | §6.2's publish window: re-read for up to 2 s, then refused if it still says nothing |
-| unreadable, not a number, or past 32 bytes | not asked | refused at once — waiting cannot change any of the three |
+| unreadable, not a number, or reaching 32 bytes | not asked | refused at once — waiting cannot change any of the three |
 
 What is deliberately **not** asked is which process holds the socket's descriptor:
 matching a `sockfs` inode means parsing `/proc/net/unix` on the one surface that has to
@@ -789,7 +794,7 @@ key store. Why it owns the socket rather than borrowing sshd's:
 - **Idle connections are given up after 60 s** with no byte moving in *either* direction, and the client is told. The daemon parses no agent protocol, so it cannot tell a peer stalled mid-request from one legitimately waiting on a slow reply — and the client may be putting a signature in front of a human to approve, which is why the window is a generous minute rather than the sub-second an exchange takes. It is measured from the last byte, not from the accept: `ssh(1)` holds one connection across a whole authentication and issues several requests down it. Without it, one peer that connects and never closes holds every later agent user off for the life of the session.
 - Payloads are opaque — the daemon never parses the agent protocol, which is what puts `session-bind@openssh.com` on the client ([DESIGN.md § 5.4](DESIGN.md#54-agent-forwarding)): a byte pipe cannot know which SSH hop the session is on.
 - **While detached, connections are accepted and closed immediately**, so a `git push` with no client attached fails fast with the same error as a missing agent rather than hanging until reattach. The same the moment a client leaves or is taken over: the served connection is dropped, nothing being able to answer a signature request.
-- No flow control of its own, but two hard bounds. While the client's write queue is saturated the daemon stops reading the agent socket, leaving the bytes in the kernel's buffer where the peer blocks on them; and a connection whose local peer has stopped reading is closed as soon as a frame *would* take its queue past 256 KiB. The bound is tested before the bytes are taken, so 256 KiB is the peak — a quarter of the default ring, held for one connection rather than for the session. An agent exchange is a few hundred bytes.
+- No flow control of its own, but two hard bounds. While the client's write queue is saturated the daemon stops reading the agent socket, leaving the bytes in the kernel's buffer where the peer blocks on them; and a connection whose local peer has stopped reading is closed as soon as a frame *would* take its queue past 256 KiB. The bound is tested before the bytes are taken, so 256 KiB is the peak — a sixteenth of the default ring, held for one connection rather than for the session. An agent exchange is a few hundred bytes.
 - A transient `accept` failure — `EMFILE`, `ECONNABORTED` — costs that one connection and nothing else; only a bind failure is permanent, and dropping the listener on a passing error would leave `SSH_AUTH_SOCK` pointing at a socket nobody serves. It does cost the listener its place in the poll set for `ACCEPT_BACKOFF`, exactly as § 6.3's does and for that section's reason. The two are held out separately: an agent's descriptor shortage must not take the session's listener with it.
 - The socket is bound when the session is created, and only then — turning forwarding on later would mean changing `SSH_AUTH_SOCK` in a running process. A socket that cannot be bound is not fatal: the session starts without forwarding and `HelloOk` says so.
 - Security, the two consequences this side of the boundary: the socket is `0600` inside the `0700` run directory, the same permissions as sshd's forwarded socket but a longer window, since sshd's dies with the connection and this one lives as long as the session — which is why forwarding is opt-in per host. A connection is weighed by `SO_PEERCRED` and closed unread unless its uid is the daemon's (§6.3), as `ssh-agent` itself does: what a peer reaches here is the client's key store, so it is the socket that check is worth most on. And where sshd forwarding is also active, `SSH_AUTH_SOCK` is set by sshd and then overwritten by the daemon (§6.1.1): ours wins.
@@ -860,8 +865,9 @@ producing half of a check whose consuming half does not exist: **the client is m
 pin a SHA-256 per architecture and verify it after upload, and nothing does that today**
 ([PLAN.md § P3](PLAN.md#p3--release-process)). A `v*` tag publishes `SHA256SUMS` in the
 format `sha256sum -c` reads. Release builds pin a **dated** nightly, a floating one moving
-the bytes that hash is taken over: `scripts/nightly-version` is the only place a compiler
-is named, and a tree whose `scripts/size-baseline` was measured by another is refused.
+the bytes that hash is taken over: `scripts/nightly-version` is the only place the release
+compiler is named, and a tree whose `scripts/size-baseline` was measured by another is
+refused.
 
 **Debug companions.** A stripped binary gives § 6.5's `SIGQUIT` core no function names,
 so `NOMUX_DEBUG=1` asks the build for `nomux-<target>.debug` per target — a *second*
@@ -883,7 +889,8 @@ every test a process, `cargo test` gives all the unit tests one, so any process-
 singleton — the umask `rundir::with_umask` sets around a create, the standard descriptor
 numbers — is shared by threads that know nothing about each other, and each such case has
 to be serialised or forked into a child. A `fork` duplicating another test's descriptors
-is the same rule, which is why every process goes through `harness::launch`.
+is the same rule, which is why every process the integration suite starts goes through
+`harness::launch`.
 
 The chaos suite covers what a shell transcript does not: a byte lost inside a CSI or
 sixel sequence changes the meaning of everything after it, so the escape-heavy case
@@ -900,6 +907,15 @@ shipped binary is unaffected — and `scripts/verify-takeover-guard.sh` asserts 
 guard *fails* under it. The bug only bites when the input and the `Hello` that evicts its
 sender land in one wakeup, so `--cfg nomux_fault_settle` forces that interleaving alone
 and the script runs the guard under both.
+
+The same shape guards §6.5's grace. `Pty::terminate` reaps on every pass of its
+`HANGUP_GRACE` loop, an unreaped zombie still answering for its own process group and the
+walk that filters zombies never being reached without it; dropping the reap costs nothing
+outside the process but half a second and one `SIGKILL` at a group holding that zombie
+alone. `--cfg nomux_fault_unreaped` drops it and `scripts/verify-hangup-grace-guard.sh`
+asserts the guard *fails* under it. What the guard watches is that kill rather than the
+half second — a wall clock measures the machine as much as the shutdown — and the run
+that must pass carries no cfg at all, being the build the suite already runs.
 
 ## 10. Exit codes
 

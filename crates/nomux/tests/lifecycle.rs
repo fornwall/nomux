@@ -3,8 +3,8 @@
 //! Starting: a daemon that detaches from whoever launched it (`IMPLEMENTATION.md`
 //! § 6.2) and a child that inherits nothing but its stdio. Ending: the exit status
 //! the client is owed and when it arrives (§ 6.5, § 10), the reaping of everything
-//! the session leaves behind it, and the shutdown a signal or an idle deadline sets
-//! off.
+//! the session leaves behind it — including the child a synthesised status has
+//! already spoken for — and the shutdown a signal or an idle deadline sets off.
 
 #![allow(
     clippy::expect_used,
@@ -283,6 +283,64 @@ fn a_shell_that_exits_behind_a_background_job_is_still_reaped() {
         poll_until(SETTLE, || !process_alive(raw)),
         "the signalled daemon never exited, so the job it was collecting is still \
          running"
+    );
+}
+
+/// Regression: the child is still reaped after the daemon has answered for it.
+///
+/// The other half of [`a_shell_that_exits_behind_a_background_job_is_still_reaped`],
+/// where `child_gone` never arrives: here it arrives too early. A child that closes the
+/// terminal without exiting — § 6.5's "anything that daemonises itself" — brings the
+/// master to end of file with `waitpid` empty, so at `STATUS_GRACE` the daemon
+/// *fabricates* an `exit 0` over a process that is still running. `collect_status` then
+/// opened with `if self.exited.is_some() { return; }` and was the only caller of
+/// `Pty::try_wait` before `terminate`, which made that guess the last word: the child,
+/// when it really exited, stayed a zombie the daemon held for the life of the session —
+/// up to the seven-day idle timeout.
+///
+/// The `Exit` frame is what orders the two halves. Releasing the cue only once it has
+/// arrived is what puts the synthesis *before* the exit; the other way round `waitpid`
+/// is ready at end of file, the ordinary arm collects, and the test is green against the
+/// defect it was written for.
+///
+/// `exec` for the reason
+/// [`a_synthesised_exit_status_is_sent_on_the_pass_that_collects_it`] gives, over a
+/// non-interactive shell that blocks on the cue rather than a `sleep`, so when the child
+/// goes is the test's to say rather than a wall clock's.
+///
+/// The `Ping` supplies the pass the reap happens on, as in the sibling — and here
+/// nothing else could: `poll_timeout` stops clamping to `STATUS_RETRY` the moment
+/// `exited` is set, so a session left holding a zombie sleeps on to `IDLE_TICK`.
+#[test]
+fn a_child_that_exits_after_its_status_was_synthesised_is_still_reaped() {
+    let (session, mut client, ok) = Session::attached("zombie_synth");
+    let child = shell_of(&session);
+    let cue = Cue::new(&session.root);
+
+    client.make_ready(
+        "-echo",
+        Some("exec sh -c 'read go < cue' 0</dev/null 1>/dev/null 2>/dev/null"),
+        ok.resume_from,
+    );
+    // Two seconds of `STATUS_GRACE` later, and the daemon has now told this client how a
+    // child that is still sitting on the cue below turned out.
+    drop(client.next_of(FrameType::Exit));
+
+    cue.release();
+    assert!(
+        poll_until(SETTLE, || !process_alive(child)),
+        "the child never took the cue and exited, so nothing below is about a status \
+         that outlived its process"
+    );
+
+    client.send(&Frame::Ping);
+    drop(client.next_of(FrameType::Pong));
+
+    assert_ne!(
+        process_state(child),
+        Some('Z'),
+        "the daemon answered for pid {child} at the grace and then stopped reaping, so \
+         the child it spoke for is a zombie it holds until the session ends"
     );
 }
 

@@ -13,7 +13,7 @@ There is no SLA — this is a personal project — but reports are read.
 
 ## Scope
 
-nomux has no released version and none receives security updates; fixes land on
+No released version of nomux receives security updates; fixes land on
 `main`. The threat model is [DESIGN.md § 8](DESIGN.md#8-security-model); known gaps
 are [PLAN.md](PLAN.md)'s, notably [§ P3](PLAN.md#p3--release-process): a `v*` tag
 publishes the per-architecture checksums, and nothing verifies an upload against

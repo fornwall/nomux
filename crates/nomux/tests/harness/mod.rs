@@ -48,9 +48,10 @@ pub(crate) const WIN: WinSize = WinSize {
 /// How long a test waits for what a daemon owes it, whether that is one frame or a
 /// sequence of them.
 ///
-/// Spent on the whole wait rather than renewed per frame, for [`poll_by`]'s reason.
-/// One value rather than one per site, since every wait here is on a daemon that is
-/// either about to answer or never going to.
+/// Spent once per [`Client`] rather than renewed per wait, for [`poll_by`]'s reason; a
+/// test whose waits legitimately outlast it says so with [`Client::waits_by`]. One
+/// value rather than one per site, since every wait here is on a daemon that is either
+/// about to answer or never going to.
 pub(crate) const FRAME_PATIENCE: Duration = Duration::from_secs(15);
 
 /// How long a test waits for something outside the protocol — a file appearing, a
@@ -98,9 +99,9 @@ pub(crate) fn poll_until(within: Duration, condition: impl FnMut() -> bool) -> b
 /// worse still, being satisfied by every arrival — a peer dribbling one frame just
 /// inside it is never late, and the loop around it has no bound at all. Everything in
 /// this suite that takes an `Instant` where a `Duration` would have done —
-/// [`join_before`], [`Client::frame_before`], [`Client::hello_before`], and the
-/// `PATIENCE` constants the test binaries define — is here for this reason and says
-/// no more about it.
+/// [`join_before`], [`Client::frame_before`], [`Client::hello_before`],
+/// [`Client::waits_by`], and the `PATIENCE` constants the test binaries define — is
+/// here for this reason and says no more about it.
 pub(crate) fn poll_by(deadline: Instant, mut condition: impl FnMut() -> bool) -> bool {
     loop {
         if condition() {
@@ -297,6 +298,7 @@ impl Session {
             pending: Vec::new(),
             in_offset: 0,
             out_offset: 0,
+            deadline: Instant::now() + FRAME_PATIENCE,
         }
     }
 
@@ -814,6 +816,11 @@ pub(crate) struct Client {
     /// session a question without being handed the two offsets to ask it at.
     in_offset: u64,
     out_offset: u64,
+    /// When everything this client is still owed must have arrived by.
+    ///
+    /// [`FRAME_PATIENCE`] from the moment it connected, spent across every wait it
+    /// makes rather than minted per wait, for [`poll_by`]'s reason.
+    deadline: Instant,
 }
 
 /// Where the two streams stand once the child is ready. See [`Client::make_ready`].
@@ -845,6 +852,15 @@ const READY_ECHO: &str = "printf \"NOMUX-$((6*7))-READY\"";
 const READY_MARKER: &str = "NOMUX-42-READY";
 
 impl Client {
+    /// Hands this client `deadline` in place of the [`FRAME_PATIENCE`] it connected
+    /// with.
+    ///
+    /// For the test whose waits legitimately outlast that, and for the loop that
+    /// reconnects — where a client per round renews a budget meant to be spent once.
+    pub(crate) const fn waits_by(&mut self, deadline: Instant) {
+        self.deadline = deadline;
+    }
+
     pub(crate) fn send(&mut self, frame: &Frame<'_>) {
         write_frame(&mut self.stream, frame);
     }
@@ -875,7 +891,7 @@ impl Client {
 
     pub(crate) fn hello_with(&mut self, flags: u8, out_offset: u64) -> nomux_proto::HelloOk {
         self.send(&hello_frame(flags, out_offset));
-        let greeting = self.next_frame();
+        let greeting = self.frame_owed("a HelloOk from the daemon");
         self.take_hello_ok(greeting)
     }
 
@@ -952,9 +968,13 @@ impl Client {
     }
 
     pub(crate) fn next_frame(&mut self) -> (FrameType, Vec<u8>) {
-        let awaiting = "a frame from the daemon";
-        self.frame_before(Instant::now() + FRAME_PATIENCE, awaiting)
-            .unwrap_or_else(|| panic!("timed out waiting for {awaiting}"))
+        self.frame_owed("a frame from the daemon")
+    }
+
+    /// The next frame by this client's deadline, or the failure naming what was owed.
+    fn frame_owed(&mut self, awaiting: &str) -> (FrameType, Vec<u8>) {
+        self.frame_before(self.deadline, awaiting)
+            .unwrap_or_else(|| out_of_time(awaiting))
     }
 
     /// The next frame, or `None` once `deadline` has passed without one.
@@ -1019,11 +1039,8 @@ impl Client {
     /// for a Error frame" names neither the row nor the behaviour — and every row
     /// fails identically. The sentence belongs to whoever built the table.
     fn next_of_awaiting(&mut self, want: FrameType, awaiting: &str) -> Vec<u8> {
-        let deadline = Instant::now() + FRAME_PATIENCE;
         loop {
-            let (ty, payload) = self
-                .frame_before(deadline, awaiting)
-                .unwrap_or_else(|| panic!("timed out waiting for {awaiting}"));
+            let (ty, payload) = self.frame_owed(awaiting);
             if ty == want {
                 return payload;
             }
@@ -1045,7 +1062,7 @@ impl Client {
     /// be refused before it takes the session over, and a client handed the right
     /// code after its replacement has already evicted it was given the wrong answer.
     pub(crate) fn expect_error(&mut self, code: ErrorCode, what: &str) {
-        let (ty, payload) = self.next_frame();
+        let (ty, payload) = self.frame_owed(&format!("a refusal ({what})"));
         assert_refusal(ty, &payload, code, what);
     }
 
@@ -1066,7 +1083,6 @@ impl Client {
     /// both end with a closed connection, and only one of them is the behaviour a
     /// caller is asking about.
     pub(crate) fn expect_eof(&mut self, after: &str) {
-        let deadline = Instant::now() + FRAME_PATIENCE;
         let mut chunk = [0u8; 8192];
         loop {
             while let Some((ty, _)) = self.take_pending_frame() {
@@ -1082,10 +1098,9 @@ impl Client {
                 Err(err) if err.kind() == ErrorKind::WouldBlock => {}
                 Err(err) => panic!("reading after {after}: {err}"),
             }
-            assert!(
-                Instant::now() < deadline,
-                "the daemon never closed the connection after {after}"
-            );
+            if Instant::now() >= self.deadline {
+                out_of_time(&format!("the daemon to close the connection after {after}"));
+            }
         }
     }
 
@@ -1101,7 +1116,7 @@ impl Client {
     pub(crate) fn wait_for_unread_bytes(&mut self) {
         self.send(&Frame::Ping);
         let stream = &self.stream;
-        let queued = poll_until(FRAME_PATIENCE, || has_unread_bytes(stream));
+        let queued = poll_by(self.deadline, || has_unread_bytes(stream));
         assert!(
             queued,
             "the daemon wrote nothing, so closing here would be an orderly FIN \
@@ -1120,11 +1135,8 @@ impl Client {
     /// this" true.
     pub(crate) fn wait_for_input_ack(&mut self, through: u64) {
         let awaiting = format!("an InputAck through offset {through}");
-        let deadline = Instant::now() + FRAME_PATIENCE;
         loop {
-            let (ty, payload) = self
-                .frame_before(deadline, &awaiting)
-                .unwrap_or_else(|| panic!("timed out waiting for {awaiting}"));
+            let (ty, payload) = self.frame_owed(&awaiting);
             if ty == FrameType::InputAck
                 && let Frame::InputAck { applied_through } =
                     Frame::decode(ty, &payload).expect("decode ack")
@@ -1170,8 +1182,7 @@ impl Client {
         let mut seen = Vec::new();
         let mut offset = from;
         let awaiting = format!("{needle:?} in the session's output");
-        let deadline = Instant::now() + FRAME_PATIENCE;
-        while let Some((ty, payload)) = self.frame_before(deadline, &awaiting) {
+        while let Some((ty, payload)) = self.frame_before(self.deadline, &awaiting) {
             match Frame::decode(ty, &payload).expect("decode frame") {
                 Frame::Output { offset: at, data } => {
                     assert_eq!(at, offset, "output offsets must be contiguous");
@@ -1187,11 +1198,25 @@ impl Client {
                 other => panic!("unexpected frame while awaiting {needle:?}: {other:?}"),
             }
         }
-        panic!(
-            "timed out waiting for {needle:?}; saw: {:?}",
+        out_of_time(&format!(
+            "{awaiting}, having seen {:?}",
             String::from_utf8_lossy(&seen)
-        );
+        ));
     }
+}
+
+/// The failure every wait against a [`Client::deadline`] ends in.
+///
+/// One sentence for all of them, and the whole of what one deadline per client buys:
+/// the wait still owed when it ran out names itself, where the runner's kill
+/// (`.config/nextest.toml`) could only say the test was slow. *Shared*, because an
+/// earlier wait may have spent most of it: what is named is the wait that did not
+/// finish rather than necessarily the slow one.
+fn out_of_time(awaiting: &str) -> ! {
+    panic!(
+        "timed out waiting for {awaiting}; the deadline this client shares between its \
+         waits is spent"
+    );
 }
 
 /// Asks the session for a marker no shell that failed to run the line could produce,

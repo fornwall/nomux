@@ -44,6 +44,12 @@ const HANGUP_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 /// Interval between liveness checks while waiting out [`HANGUP_GRACE`].
 const HANGUP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
+/// Fault injection: drops the reap out of [`Pty::terminate`]'s grace loop, restoring the
+/// zombie short-circuit that loop's comment describes, so the regression test guarding it
+/// can be *shown* to fail (`scripts/verify-hangup-grace-guard.sh`). A `const` rather than
+/// a `#[cfg]` block, so both paths stay type-checked and the branch folds away.
+const REAP_DURING_GRACE: bool = !cfg!(nomux_fault_unreaped);
+
 /// A running session: the PTY master plus the child holding its slave.
 #[derive(Debug)]
 pub(crate) struct Pty {
@@ -171,7 +177,9 @@ impl Pty {
     /// back, delivering two `SIGWINCH`es.
     ///
     /// The gap-recovery repaint of `IMPLEMENTATION.md` § 4.3, which has what it does
-    /// and does not reach, and why a one-column terminal gets the second resize alone.
+    /// and does not reach, and why a one-column terminal is left without one: the master
+    /// already holds `win` by the time a repaint is owed, so the lone resize left there
+    /// is one the kernel short-circuits rather than signals.
     ///
     /// # Errors
     ///
@@ -228,7 +236,9 @@ impl Pty {
                     // `test_kill_process_group` answers `Ok` for it and the `&&`
                     // below short-circuits before `session_members` — which *does*
                     // filter zombies — is ever consulted.
-                    let _ = self.child.try_wait();
+                    if REAP_DURING_GRACE {
+                        let _ = self.child.try_wait();
+                    }
                     group_alive = rustix::process::test_kill_process_group(pid).is_ok();
                     if !group_alive && session_members(raw).is_empty() {
                         settled = true;
@@ -600,17 +610,21 @@ mod tests {
     fn terminate_signals_a_pid_only_while_it_is_still_the_childs() {
         use std::sync::atomic::Ordering::Relaxed;
 
+        let _trap = TRAP_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         // A live shell, whose session is emphatically not empty.
         let mut pty = shell("terminate_live");
         let raw = i32::try_from(pty.child.id()).unwrap_or(0);
-        if !trap_hangups_of(raw) {
+        if !trap_kills_of(raw, libc::SIGHUP) {
             // A host that will not take the filter cannot answer any of this, the
             // way `the_walk_never_returns_this_process` cannot without a session id.
             return;
         }
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pty.terminate()));
         assert!(
-            SIGNALLED_A_FREED_PID.swap(false, Relaxed),
+            TRAPPED_A_KILL.swap(false, Relaxed),
             "the ordinary case sent no SIGHUP, so the two assertions below are \
              about an instrument that measures nothing"
         );
@@ -637,13 +651,16 @@ mod tests {
                 && session_members(raw).is_empty(),
             "nothing of the session may be left, or this is the other case"
         );
-        assert!(trap_hangups_of(raw), "the filter was taken once already");
+        assert!(
+            trap_kills_of(raw, libc::SIGHUP),
+            "the filter was taken once already"
+        );
         // Caught here too, and for the opposite reason: a build that signals takes
         // rustix's assertion with it, and the failure worth reading is the flag below
         // rather than that one.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pty.terminate()));
         assert!(
-            !SIGNALLED_A_FREED_PID.swap(false, Relaxed),
+            !TRAPPED_A_KILL.swap(false, Relaxed),
             "terminate signalled a pid the kernel had already taken back"
         );
         assert!(
@@ -660,10 +677,13 @@ mod tests {
             .started
             .expect("a start time for a child that is running");
         pty.started = Some(started.wrapping_add(1));
-        assert!(trap_hangups_of(raw), "the filter was taken twice already");
+        assert!(
+            trap_kills_of(raw, libc::SIGHUP),
+            "the filter was taken twice already"
+        );
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pty.terminate()));
         assert!(
-            !SIGNALLED_A_FREED_PID.load(Relaxed),
+            !TRAPPED_A_KILL.load(Relaxed),
             "terminate signalled a pid that had been handed to somebody else"
         );
         assert!(
@@ -673,6 +693,78 @@ mod tests {
         // The child outlives a `terminate` that left early, either way.
         drop(pty.child.kill());
         drop(pty.child.wait());
+    }
+
+    /// Regression: a shutdown over a child that has already gone ends with the session,
+    /// rather than sitting out [`HANGUP_GRACE`] behind the child's own zombie.
+    ///
+    /// The child is left exited and *unreaped* — what the daemon holds between the poll
+    /// that missed the exit and the one that would collect it. A zombie is still a member
+    /// of its process group, so the liveness probe answers `Ok` for it and the `&&` never
+    /// reaches the walk that filters zombies: drop the grace loop's reap and the session
+    /// never reads as settled, so `SIGKILL` goes out over one that emptied itself half a
+    /// second earlier. `--cfg nomux_fault_unreaped` is that build.
+    ///
+    /// The `SIGKILL` is the observation, not the half second: nothing is left alive to
+    /// receive it, so the syscall is the whole of the difference — the reason the test
+    /// above watches a reach rather than its effect — and a wall clock would be measuring
+    /// the machine as much as the shutdown.
+    #[test]
+    fn terminate_ends_a_settled_session_without_reaching_for_sigkill() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let _trap = TRAP_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let mut pty = shell("terminate_quiet");
+        let raw = i32::try_from(pty.child.id()).unwrap_or(0);
+        let pid = rustix::process::Pid::from_raw(raw).expect("the child's pid");
+        rustix::io::write(pty.master(), b"exit\n").expect("ask the shell to leave");
+
+        // Watched through `/proc`, not through `try_wait`, which would perform the very
+        // reap this is about and leave nothing to observe.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline && !collected(raw) {
+            std::thread::sleep(HANGUP_POLL_INTERVAL);
+        }
+        assert!(collected(raw), "the shell never exited");
+        assert!(
+            rustix::process::test_kill_process_group(pid).is_ok(),
+            "the zombie must still answer for its group, or the short-circuit this is \
+             about cannot happen"
+        );
+        assert!(
+            session_members(raw).is_empty(),
+            "the zombie must be all that is left, or the grace is owed either way"
+        );
+
+        if !trap_kills_of(raw, libc::SIGKILL) {
+            // A host that will not take the filter cannot answer this, as above.
+            return;
+        }
+        // The instrument, proved before it is read from: the same kill the assertion
+        // below is about, made deliberately. A trapped syscall does not run, so it
+        // reaches nothing.
+        let control = std::panic::catch_unwind(|| {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        });
+        drop(control);
+        assert!(
+            TRAPPED_A_KILL.swap(false, Relaxed),
+            "the filter did not fire on a kill made deliberately, so the assertion \
+             below is about an instrument that measures nothing"
+        );
+
+        // Caught for the reason the test above catches: the rolled-back syscall trips
+        // rustix's assertion on a return value, and the flag is set before that.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pty.terminate()));
+        assert!(
+            !TRAPPED_A_KILL.load(Relaxed),
+            "terminate reached for SIGKILL over a session whose last member was the \
+             zombie it had been handed to reap"
+        );
+        assert!(outcome.is_ok(), "terminate panicked with no kill behind it");
     }
 
     /// A shell on a PTY of its own, which is what the four tests around this
@@ -742,25 +834,37 @@ mod tests {
         false
     }
 
-    /// Set by [`note_sigsys`] when [`trap_hangups_of`] catches a reach going out.
-    static SIGNALLED_A_FREED_PID: std::sync::atomic::AtomicBool =
+    /// Serialises the tests that trap a reach. The flag below and the `SIGSYS`
+    /// disposition are both process-wide, and `cargo test` gives every unit test the
+    /// same process (§ 9), so two of them trapping at once would each be reading the
+    /// other's signals.
+    static TRAP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Set by [`note_sigsys`] when [`trap_kills_of`] catches a signal going out.
+    static TRAPPED_A_KILL: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 
     extern "C" fn note_sigsys(_signum: libc::c_int) {
-        SIGNALLED_A_FREED_PID.store(true, std::sync::atomic::Ordering::Relaxed);
+        TRAPPED_A_KILL.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Traps every `SIGHUP` at `pid` or at its process group, so that issuing one
-    /// sets [`SIGNALLED_A_FREED_PID`] instead of reaching the kernel. `false` where
-    /// the filter was refused.
+    /// Traps every `signal` at `pid` or at its process group, so that issuing one sets
+    /// [`TRAPPED_A_KILL`] instead of reaching the kernel. `false` where the filter was
+    /// refused.
     ///
-    /// `SIGHUP` because both reaches begin with one and nothing else does: the liveness
-    /// probe sends signal 0, and the `SIGKILL` on the way out is not a reach.
+    /// The two signals ever asked for are the ends of a reach: `SIGHUP` opens one and
+    /// nothing else sends it — the liveness probe sends signal 0 — and `SIGKILL` closes
+    /// one after the grace. The positive form sweeps in `Child::kill`'s `SIGKILL`, which
+    /// is not a reach, and harmlessly: a `terminate` that settled reaped on the way, and
+    /// `Child::kill` over a reaped child makes no syscall at all.
+    ///
+    /// The flag is cleared here rather than by the caller, so it always means "since this
+    /// filter went in".
     ///
     /// This thread's alone — no `TSYNC` flag — which keeps it off the rest of a `cargo
     /// test` run. It cannot be removed once installed, and is not. Installing a second
     /// is how one test watches three pids.
-    fn trap_hangups_of(pid: i32) -> bool {
+    fn trap_kills_of(pid: i32, signal: libc::c_int) -> bool {
         // `struct seccomp_data`: the syscall number at 0, then the arguments from
         // 16, eight bytes each. Only the low half of an argument is loaded, which is
         // the whole of a pid and is where it sits on every little-endian target.
@@ -788,7 +892,7 @@ mod tests {
                 equals,
                 0,
                 3,
-                u32::try_from(libc::SIGHUP).expect("a signal number"),
+                u32::try_from(signal).expect("a signal number"),
             ),
             jump(load, 0, 0, TARGET),
             jump(equals, 2, 0, pid.cast_unsigned()),
@@ -797,6 +901,7 @@ mod tests {
             jump(answer, 0, 0, libc::SECCOMP_RET_TRAP),
         ];
 
+        TRAPPED_A_KILL.store(false, std::sync::atomic::Ordering::Relaxed);
         // Before the filter, or the first trap is a core dump.
         //
         // SAFETY: `signal` with a handler that does nothing but store to an atomic,

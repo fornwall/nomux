@@ -3,9 +3,9 @@
 //! `list` and `kill` reach a session only through the five files on disk
 //! (`IMPLEMENTATION.md` § 6.6), so everything they can get wrong is here: the spawn
 //! lock they must take before removing anything (§ 6.3), the order they remove it
-//! in, what they do with a session that is alive, and the directory those files
-//! live in. These tests drive the real binary, because most of that is only wrong
-//! across process boundaries.
+//! in, what they do with a session that is alive — including one that has not said
+//! what to signal yet — and the directory those files live in. These tests drive
+//! the real binary, because most of that is only wrong across process boundaries.
 //!
 //! Session ids are kept short on purpose: they carry unix sockets, and
 //! `sockaddr_un` truncates the path at 108 bytes. The directory they sit in is
@@ -512,6 +512,70 @@ fn kill_waits_out_a_pidfile_that_has_been_created_but_not_yet_written() {
     // false on every exit `succeeded` above lets through — [`LiveSession::is_alive`]
     // cannot fail here, and an assertion that cannot fail is not one. The pid `kill`
     // was told to signal is what had to go, and `/proc` is where that is visible.
+    assert!(
+        poll_by(deadline, || !process_alive(session.pid)),
+        "kill reported success with the daemon it was asked to stop still running \
+         as pid {}",
+        session.pid
+    );
+}
+
+/// Regression: `kill` waits out an `<id>.pid` that is not there at all.
+///
+/// § 6.2's bind-to-publish window one syscall before the empty file
+/// [`kill_waits_out_a_pidfile_that_has_been_created_but_not_yet_written`] pins. `spawn`
+/// holds the spawn lock across it (`attach::await_publication`), as does a daemon that
+/// took one, so what reaches this arm is what neither covers: a publish that outlived the
+/// spawn's deadline, and § 6.3's daemon that could not take the lock at all. Absence is
+/// also how a collected session reads, and both wrong answers — no such session, or a
+/// pidfile past repair — refuse a daemon in perfect health and leave the id unkillable
+/// through the one surface meant to reach any version of it.
+///
+/// The arrangement is that test's, and absence changes none of it: `<id>.lock` is a
+/// different file, so the fence still puts `kill` past the lock it takes strictly before
+/// it looks for a pid, and the wait in front of the fence is still what keeps "still
+/// running" from being a race this passes by winning.
+#[test]
+fn kill_waits_out_a_pidfile_that_has_never_appeared() {
+    let deadline = Instant::now() + PATIENCE;
+    let session = LiveSession::create("lk32");
+    let body = fs::read_to_string(session.pid_path()).expect("read the pidfile");
+    fs::remove_file(session.pid_path()).expect("take the pidfile away");
+    let lock = fs::metadata(session.run.lock_path()).expect("stat the spawn lock");
+
+    let mut killing = Spawned::spawn(
+        nomux(&session.run.root, &["kill", "lk32"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
+    assert!(
+        !poll_until(Duration::from_millis(500), || !killing.is_running()),
+        "`kill` returned while nothing named a pid, so it is answering the publish \
+         window rather than waiting it out"
+    );
+    wait_until_flock(
+        Flock::Granted,
+        lock.dev(),
+        lock.ino(),
+        "`kill` took the spawn lock",
+        deadline,
+    );
+    fs::write(session.pid_path(), body.as_bytes()).expect("publish the pid");
+
+    assert!(
+        poll_by(deadline, || !killing.is_running()),
+        "`nomux kill` never returned from the publish grace it was waiting out"
+    );
+    let killed = killing
+        .into_exited()
+        .wait_with_output()
+        .expect("collect what kill said");
+
+    succeeded(
+        &killed,
+        "kill refused a session whose daemon had yet to publish its pid",
+    );
     assert!(
         poll_by(deadline, || !process_alive(session.pid)),
         "kill reported success with the daemon it was asked to stop still running \

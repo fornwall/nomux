@@ -39,10 +39,56 @@ Refusals rather than gaps, so each says what it would take to be otherwise.
 - An abort says nothing from inside the process (`-Cpanic=immediate-abort`,
   `strip = "symbols"`); what is left is the `SIGQUIT` core against the
   `nomux-<target>.debug` companion ([IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)).
-- A takeover and the daemon's own shutdown each spend up to 500 ms in `Conn::flush_final`,
-  and takeovers are unbounded; the socket's `0600` makes that process this uid's. An
-  ordinary detach no longer pays it: `Daemon::drop_client` delivers what the socket takes
-  and drops the rest, which a reattach replays from the ring.
+- A shutdown, a takeover and every close carrying a final `Error` each spend up to 500 ms
+  in `Conn::flush_final`, and nothing bounds how often the last two happen; the socket's
+  `0600` makes that process this uid's. An ordinary detach no longer pays it:
+  `Daemon::drop_client` delivers what the socket takes and drops the rest, which a
+  reattach replays from the ring.
+
+## P1 — known gaps
+
+Three, none of them found by a test; each is held today by something other than a check.
+
+- **An agent sub-channel can be handed to the wrong connection.** `AgentOpen`,
+  `AgentData` and `AgentClose` carry no connection identity
+  ([IMPLEMENTATION.md § 6.7](IMPLEMENTATION.md#67-agent-forwarding)), so the daemon keys
+  each on whatever holds the one slot when it arrives. A peer that ends while the client
+  still has frames in flight for it is answered by the peer that took the slot next:
+  `Agent::deliver` writes those bytes into the new connection, and a client's own
+  `AgentClose` for the old one closes the new one *silently*, a close the client made
+  being the one thing the daemon does not report back. Back-to-back exchanges — a
+  `git push` signing several times, a nested `ssh` — are the traffic that reaches it.
+  Nothing daemon-side separates a frame sent before the client read `AgentClose` from one
+  sent after it read `AgentOpen`, so what closes it is a generation on those three
+  frames: a wire change and a revision bump.
+- **`nomux attach <id> < file` is dropped once the daemon has read the file.**
+  `Daemon::read_client` lets a client go the moment its connection reports end of file
+  with nothing left undecoded, which is the answer § 6.5 wants from a departing client
+  and not the one [§ 7](IMPLEMENTATION.md#7-attach-relay) describes for the relay, whose
+  stdin EOF is a `shutdown(SHUT_WR)` with the other direction still owed. What it costs
+  is the output of anything driven from a file. Which of the two is right is a decision
+  rather than a fix: not dropping also moves when a session becomes reapable.
+- **`spawn` execs the daemon by name.** `attach::spawn_daemon` starts
+  `env::current_exe()`, a path re-opened at exec, so a uid that can write the install
+  directory can swap the binary in between — the case [SECURITY.md](SECURITY.md) names as
+  in scope. `/proc/self/exe` as the program closes the re-exec half and costs
+  `control::names_daemon_for` nothing, that walk skipping `argv[0]`; what it changes is
+  what `ps` shows, and [DESIGN.md § 8](DESIGN.md#8-security-model) puts the trust in the
+  directory itself on the client.
+
+## P2 — structure
+
+- **Two refusals describe something other than what happened.** `control::resolve` waits
+  the publish grace out on a socket it could not probe and then reports the session
+  running, liveness never having been established — § 6.6 has `unprobeable` for exactly
+  that state and this path goes round it. And the refusal after `SIGKILL` names two
+  signals that were never sent, where `pidfd_open` failed with something outside the
+  three errnos `pin` reads as death. Both refuse, leave all five files and exit non-zero,
+  so it is the sentence that is wrong and not the outcome.
+- **`Daemon::service_agent_channel` tests `IN | HUP | ERR` where every other source in the
+  pass tests `NVAL` too.** Unreachable, the daemon owning that descriptor through `Agent`
+  — but it is the one exception to a rule the loop states twice, and the spin
+  `ACCEPT_BACKOFF` exists to rule out is what an `NVAL`-only wakeup would leave.
 
 ## P3 — release process
 
@@ -55,26 +101,10 @@ Refusals rather than gaps, so each says what it would take to be otherwise.
 
 ## P4 — test depth
 
-- **A quiet `SIGTERM` shutdown paying `HANGUP_GRACE` is unpinned.** The timing test that
-  covered it was deleted: it compared two wall-clock shutdowns, and the zombie
-  short-circuit it guarded has no consequence outside the process except latency, so
-  nothing observable distinguishes the bug. Pinning it needs a `/proc`-visible marker
-  from inside `Pty::terminate`, or the § 9 fault injection.
-- **A hung wait inside a test cannot be attributed.** Harness waits mint their own
-  `FRAME_PATIENCE` rather than taking the caller's deadline, so a test whose rows each
-  make several waits is bounded only by the runner's kill
-  ([.config/nextest.toml](.config/nextest.toml)) — which reports a timeout without
-  saying which wait hung. One deadline field on `Client`, consulted by `next_frame`,
-  `expect_eof` and `read_until`, closes it; `frame_before`, `poll_by` and `hello_before`
-  already take one.
 - A `cargo-fuzz` target for `decode_header` and `Frame::decode`; `proptest` covers the
   parser on stable today, so the dependency has not earned itself.
 - Chaos against a real full-screen program; the suite stays deterministic on sixel and
   CSI from `sh`, and driving an actual `vim` would test `vim`.
-- The wire vectors are locked in `crates/nomux-proto/tests/wire.rs`; the same table as a
-  language-neutral hex fixture would let another implementation check identical bytes.
-- The *missing* `<id>.pid` arm of the publish grace is untested; only the empty arm is
-  pinned ([IMPLEMENTATION.md § 6.6](IMPLEMENTATION.md#66-frozen-control-surface)).
 - `MAX_PENDING_READ` has no test: the kernel's send buffer is tighter than the 1 MiB cap
   on a stock host, and forcing it with `SO_SNDBUF` is a test that silently cannot fail.
 

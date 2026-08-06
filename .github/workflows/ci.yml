@@ -138,7 +138,42 @@ jobs:
   takeover-guard:
     name: takeover guard
     runs-on: ubuntu-latest
-    # A compile error is paid for once rather than in two jobs at the same time.
+    # A compile error is paid for once rather than in three jobs at the same time.
+    needs: check
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install the pinned toolchain
+        run: rustup toolchain install --profile minimal --no-self-update
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          # Separate target directory, separate fingerprints, separate cache. Named for
+          # the ordering this job is about, the guard below it having a key of its own.
+          key: fault-injection
+
+      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
+        with:
+          tool: cargo-nextest
+
+      # Asserts the regression test still fails on the pre-fix ordering; a guard that
+      # passes on the bug guards nothing.
+      - run: sh scripts/verify-takeover-guard.sh
+
+  # Beside the job above rather than a step inside it, though both run a script under a
+  # fault cfg. They share no build: that one compiles the session integration suite under
+  # `nomux_fault_settle` and again under `nomux_fault_injection`, this one compiles the
+  # binary's unit tests under `nomux_fault_unreaped`, and no two of those four fingerprints
+  # agree. So one job would run the compiles in series where two run them at once, and
+  # rust-cache keys one blob per job — a shared job would save and restore every target
+  # directory on every run of either. The names are the rest of it: a failure here is
+  # about § 6.5's grace, and reading it under "takeover guard" would send the first
+  # person to look at § 6.4.1.
+  hangup-grace-guard:
+    name: hangup grace guard
+    runs-on: ubuntu-latest
+    # A compile error is paid for once rather than in three jobs at the same time.
     needs: check
     timeout-minutes: 20
     steps:
@@ -150,15 +185,16 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           # Separate target directory, separate fingerprints, separate cache.
-          key: fault-injection
+          key: fault-unreaped
 
       - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
         with:
           tool: cargo-nextest
 
-      # Asserts the regression test still fails on the pre-fix ordering; a guard that
-      # passes on the bug guards nothing.
-      - run: sh scripts/verify-takeover-guard.sh
+      # Asserts the regression test still fails without the grace loop's reap. The bug it
+      # guards costs half a second of shutdown and nothing else, so nothing but this says
+      # the test is still looking.
+      - run: sh scripts/verify-hangup-grace-guard.sh
 
   # The 400 KiB budget is correctness-adjacent — the cold upload happens over
   # cellular — and is the one thing the local hooks cannot check.
@@ -244,7 +280,7 @@ jobs:
   # What P3 asked for: the checksums somewhere a client can read them. An artifact
   # expires after ninety days and sits behind a login; a release asset does neither.
   #
-  # Its own job for two reasons. It `needs` all three above, so a tag cannot publish a
+  # Its own job for two reasons. It `needs` every job above, so a tag cannot publish a
   # release whose tests failed — parallel jobs with no dependency would have raced, and
   # the release build passing says only that the binaries fit, not that they work. And
   # it is the only job that wants a write token, so it is the only one that gets one;
@@ -252,7 +288,7 @@ jobs:
   publish:
     name: publish the release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [check, takeover-guard, release]
+    needs: [check, takeover-guard, hangup-grace-guard, release]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

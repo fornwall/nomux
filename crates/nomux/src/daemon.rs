@@ -937,15 +937,21 @@ impl Daemon {
     /// started still holds the slave — `sleep 3600 &` then `exit` — and nothing else would
     /// reap it. Whether the client is *told* is [`Daemon::pump_output`]'s decision; what
     /// this costs is the pid, which makes [`Pty::pid_reissued`] load-bearing.
+    ///
+    /// The `waitpid` runs ahead of the settled-status exit, that call being the reaping
+    /// itself: § 6.5's synthesised status names a child that may still be running, so
+    /// leaving on `self.exited` alone held its zombie for the rest of the session. What
+    /// comes back is discarded there rather than allowed to revise a status a client has
+    /// already been told, and `try_wait` caches, so a collected child costs no syscall.
     fn collect_status(&mut self) {
+        let reaped = self
+            .pty
+            .as_mut()
+            .and_then(|pty| pty.try_wait().ok().flatten());
         if self.exited.is_some() {
             return;
         }
-        if let Some(status) = self
-            .pty
-            .as_mut()
-            .and_then(|pty| pty.try_wait().ok().flatten())
-        {
+        if let Some(status) = reaped {
             self.exited = Some(pty::exit_parts(status));
         } else if self
             .child_gone

@@ -31,6 +31,7 @@ strip = "symbols"
 unexpected_cfgs = { level = "warn", check-cfg = [
     "cfg(nomux_fault_injection)",
     "cfg(nomux_fault_settle)",
+    "cfg(nomux_fault_unreaped)",
 ] }
 missing_docs = "warn"
 missing_debug_implementations = "warn"

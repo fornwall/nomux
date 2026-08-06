@@ -19,7 +19,7 @@ use crate::nbio::Read;
 ///
 /// An agent exchange is a few hundred bytes, so this is already three orders of
 /// magnitude past anything legitimate; what it bounds is the peer that has stopped
-/// reading altogether, at a quarter of the default ring rather than beside it.
+/// reading altogether, at a sixteenth of the default ring rather than beside it.
 const MAX_CHANNEL_QUEUE: usize = 256 * 1024;
 
 /// How long the served connection may move no byte in either direction before the
@@ -352,8 +352,8 @@ mod tests {
         peer
     }
 
-    /// Regression: the old peak was `MAX_CHANNEL_QUEUE + MAX_PAYLOAD`, a quarter more
-    /// than the constant's own comment sizes the session against.
+    /// Regression: the old peak was `MAX_CHANNEL_QUEUE + MAX_PAYLOAD`, twice what the
+    /// constant's own comment sizes the session against.
     #[test]
     fn a_channel_queue_is_bounded_before_the_bytes_are_taken() {
         let root = Scratch::new("agent-queue");

@@ -114,7 +114,9 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 fn an_escape_heavy_stream_is_byte_exact_across_random_disconnects() {
     let chaos_seed = chaos_seed();
     let session = Session::start_with_ring("chaos_exact", 8 << 20);
+    let deadline = Instant::now() + PATIENCE;
     let mut client = session.connect();
+    client.waits_by(deadline);
     let ok = client.hello(RESUME_FROM_START);
 
     // Echo and newline translation silenced, so what arrives is exactly what the child
@@ -131,7 +133,6 @@ fn an_escape_heavy_stream_is_byte_exact_across_random_disconnects() {
     let mut seen: Vec<u8> = Vec::new();
     let mut disconnects = 0u32;
     let mut since_disconnect = 0usize;
-    let deadline = Instant::now() + PATIENCE;
 
     while find(&seen, b"CHAOS-END").is_none() {
         let (ty, payload) = frame_by(&mut client, deadline, chaos_seed, "emitter never finished");
@@ -156,6 +157,7 @@ fn an_escape_heavy_stream_is_byte_exact_across_random_disconnects() {
         if since_disconnect >= 4 * 1024 + usize::try_from(rng.below(12 * 1024)).unwrap_or(0) {
             drop(client);
             client = session.connect();
+            client.waits_by(deadline);
             let resumed = client.hello_before(deadline, offset);
             assert!(
                 !resumed.gap(offset),
@@ -213,7 +215,9 @@ fn overflow_during_disconnects_is_always_reported() {
 
     let chaos_seed = chaos_seed();
     let session = Session::start_with_ring("chaos_firehose", 32 * 1024);
+    let deadline = Instant::now() + PATIENCE;
     let mut client = session.connect();
+    client.waits_by(deadline);
     let ok = client.hello(RESUME_FROM_START);
 
     let ready = client.make_ready("-echo -onlcr", None, ok.resume_from);
@@ -239,7 +243,6 @@ fn overflow_during_disconnects_is_always_reported() {
     let mut announced_gaps = 0u32;
     let mut resume_gaps = 0u32;
     let mut received = 0u64;
-    let deadline = Instant::now() + PATIENCE;
 
     for round in 0..24 {
         // Read past everything already queued, because § 9's announcement is behind all
@@ -285,6 +288,7 @@ fn overflow_during_disconnects_is_always_reported() {
         drop(client);
         std::thread::sleep(Duration::from_millis(rng.below(30)));
         client = session.connect();
+        client.waits_by(deadline);
         let resumed = client.hello_before(deadline, offset);
         assert!(
             resumed.resume_from >= offset,
@@ -322,7 +326,11 @@ fn overflow_during_disconnects_is_always_reported() {
 fn replayed_input_across_random_disconnects_is_applied_once() {
     let chaos_seed = chaos_seed();
     let session = Session::start_with_ring("chaos_input", 4 << 20);
+    // One deadline for all twelve rounds, as the two tests above have — handed to every
+    // client the loop makes, since a fresh one would otherwise start the budget again.
+    let deadline = Instant::now() + PATIENCE;
     let mut client = session.connect();
+    client.waits_by(deadline);
     let ok = client.hello(RESUME_FROM_START);
 
     let ready = client.make_ready("-echo -onlcr", None, ok.resume_from);
@@ -335,8 +343,6 @@ fn replayed_input_across_random_disconnects_is_applied_once() {
     let line = b"printf M\n";
     let rounds = 12usize;
     let mut applied = intended.len() as u64;
-    // One deadline for all twelve rounds, as the two tests above have.
-    let deadline = Instant::now() + PATIENCE;
 
     for round in 0..rounds {
         intended.extend_from_slice(line);
@@ -345,6 +351,7 @@ fn replayed_input_across_random_disconnects_is_applied_once() {
 
         drop(client);
         client = session.connect();
+        client.waits_by(deadline);
         let resumed = client.hello_before(deadline, offset);
         assert!(
             resumed.in_applied <= intended.len() as u64,

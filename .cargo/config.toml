@@ -10,8 +10,8 @@
 # discarded the moment anything sets $CARGO_ENCODED_RUSTFLAGS or $RUSTFLAGS — either
 # environment variable replaces these tables rather than appending to them — and both
 # scripts do: scripts/build-release.sh sets the encoded form, so that a space in a
-# remapped path cannot split a flag, and scripts/verify-takeover-guard.sh sets the
-# plain one. Link flags that must not go missing are passed from there instead.
+# remapped path cannot split a flag, and both fault-injection guards under scripts/ set
+# the plain one. Link flags that must not go missing are passed from there instead.
 
 [target.x86_64-unknown-linux-musl]
 linker = "rust-lld"
