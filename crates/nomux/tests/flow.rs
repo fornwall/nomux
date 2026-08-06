@@ -1,5 +1,6 @@
 //! Back pressure in both directions, and the one shortage the daemon must stand
-//! back from rather than spin on (`IMPLEMENTATION.md` § 4.1, § 6.4.1).
+//! back from rather than spin on (`IMPLEMENTATION.md` § 4.1, and `daemon.rs`'s
+//! `ACCEPT_BACKOFF`).
 //!
 //! A client can write faster than the child reads, and a peer can stop reading what
 //! it asked for. Neither may grow the daemon without bound, and neither may cost the
@@ -90,11 +91,12 @@ fn a_child_that_stops_reading_input_does_not_wedge_the_daemon() {
 /// buffered without limit, and reconnecting does not raise the ceiling.
 ///
 /// Holding a client out of the poll set throttles only the reads the poll set drives,
-/// and that is not where the queue grows: the takeover path of § 6.4.1 reaches the
-/// decode loop twice without passing through the poll set at all — once to drain the
-/// outgoing connection, once for the input pipelined behind the arriving `Hello` — so
-/// each reconnect injected another queue's worth. The cap therefore has to be enforced
-/// between frames in the decode loop, and every round after the first is what says so.
+/// and that is not where the queue grows: the takeover path `daemon.rs`'s
+/// `ACCEPT_BEFORE_READ` orders reaches the decode loop twice without passing through the
+/// poll set at all — once to drain the outgoing connection, once for the input pipelined
+/// behind the arriving `Hello` — so each reconnect injected another queue's worth. The
+/// cap therefore has to be enforced between frames in the decode loop, and every round
+/// after the first is what says so.
 ///
 /// `in_applied` is what is asserted on because it is exactly what the daemon has taken
 /// ownership of (§ 3): every byte queued for the PTY is below it, so a ceiling on it is
@@ -668,16 +670,14 @@ fn a_client_that_never_reads_its_answers_is_dropped_rather_than_queued_for() {
 /// `drop_client` handed the departing connection to `Conn::flush_final`, which puts the
 /// socket back in blocking mode and spends up to 500 ms pushing what is queued at a peer
 /// that has stopped reading. This event loop is single-threaded, so for the whole of that
-/// the PTY is not read — and a terminal holds about twelve kilobytes, so the child is
-/// stopped inside `write` for as long as it lasts. The trigger is precisely the case this
-/// project exists for: a client whose relay stdout has stalled on a sleeping radio,
-/// detaching.
+/// the PTY is not read, and the child is stopped inside `write` for as long as it lasts
+/// (`CHUNK` below is why one write is enough to stop it).
 ///
 /// Nothing in that queue was worth the wait. `sent_through`, `in_applied` and `exit_sent`
 /// are per connection, so a client that comes back is served the ring from where it
 /// *consumed* to and handed the exit behind it again (§ 4.2, § 6.5): what is queued is a
-/// copy of state the session still holds, which is `send_last`'s argument for throwing
-/// its own queue away.
+/// copy of state the session still holds, which is `Conn::close_with`'s argument for
+/// throwing its own queue away.
 ///
 /// One detach costs at most half a second, and no bound this suite could carry would tell
 /// half a second of that from half a second of a loaded machine — so the rounds below buy
@@ -721,8 +721,9 @@ fn detaching_a_stalled_client_does_not_stop_the_child() {
         ok.resume_from,
     );
     // Before the rounds, so each of them arrives at a session with nobody attached: a
-    // takeover leaves through `send_last`, whose own bounded flush is § 6.4's deliberate
-    // one and would put a deadline into this measurement that belongs to another test.
+    // takeover leaves through `Conn::close_with`, whose own bounded flush is § 6.4's
+    // deliberate one and would put a deadline into this measurement that belongs to
+    // another test.
     drop(client);
 
     let ticks = session.root.join("ticks");
@@ -860,8 +861,9 @@ fn blaster(session: &Session) -> UnixStream {
 /// the listener goes on reporting itself readable and `poll` returns instantly on
 /// every pass for as long as the shortage lasts. The peer closing does not clear it
 /// either: an aborted connection sits in the backlog until something accepts it.
-/// § 6.4.1 is right that such an error must not end the session, but returning to
-/// retry it on the next pass is retrying it immediately and for ever — and under a
+/// `Daemon::accept` is right that such an error must not end the session, but
+/// returning to retry it on the next pass — rather than standing the listener down
+/// for `ACCEPT_BACKOFF` — is retrying it immediately and for ever, and under a
 /// system-wide `ENFILE` every nomux daemon on the host burns a core, which is what
 /// whoever is trying to recover the machine has to compete with.
 ///

@@ -1,15 +1,11 @@
-# A bound on how long a test may take. Without it nextest's default slow-timeout
-# prints a warning and then waits for ever, so a session test whose daemon never
-# answers holds the runner with no failing test to point at.
+# A bound on how long a test may take. Without it nextest's default slow-timeout prints a
+# warning and then waits for ever, so a session test whose daemon never answers holds the
+# runner with no failing test to point at.
 #
-# Twenty seconds is well clear of the slowest ordinary test, which finishes in six.
-# Terminating at two periods puts the kill at forty, above every deadline a test gives
-# itself — and each of those is spent across the waits it covers rather than minted
-# per wait: a client's is `harness::FRAME_PATIENCE` from the moment it connected,
-# fifteen seconds, unless the test hands it one of its own; twenty-five covers the four
-# directions of a relay; thirty a `list` or `kill` that must not park. So a test that
-# runs out fails on the wait that was still owed and names it, where the kill here can
-# only say the test was slow.
+# Twenty seconds clears the slowest ordinary test, which finishes in ten. Terminating at two
+# periods puts the kill at forty, above every deadline a test gives itself — so a test that
+# runs out fails on the wait it was still owed and names it, where the kill here could only
+# say the test was slow.
 [profile.default]
 slow-timeout = { period = "20s", terminate-after = 2 }
 

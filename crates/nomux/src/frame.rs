@@ -1,7 +1,10 @@
 //! Frame payloads and their codec.
 //!
-//! Decoding borrows from the input buffer, so relaying PTY bytes costs no
-//! allocation and no copy beyond the eventual write.
+//! Decoding borrows byte and string fields from the payload it is handed, so nothing
+//! here allocates. It is not copy-free, and the PTY path is the copying one: `encode`
+//! appends the payload to the caller's buffer, every output byte copied once, which is
+//! what lets a queued `Frame::Output` outlive the ring slot it was read from. `conn.rs`
+//! has the copy the other direction makes.
 
 use crate::{FrameType, HEADER_LEN, ProtoError, encode_header, wire_enum};
 
@@ -145,7 +148,7 @@ impl HelloOk {
     /// discontinuous for a client that asked to resume at `out_offset`.
     ///
     /// Derived rather than carried on the wire, for the reason `IMPLEMENTATION.md`
-    /// § 2.3 gives.
+    /// § 4.2 gives.
     #[must_use]
     pub const fn gap(&self, out_offset: u64) -> bool {
         self.resume_from > out_offset
@@ -205,8 +208,10 @@ pub enum Frame<'a> {
         /// How it terminated.
         kind: ExitKind,
         /// Whole seconds since the child let go of the terminal, saturating
-        /// (`IMPLEMENTATION.md` § 2.2, which has why it is elapsed rather than
-        /// stamped and why it rides on this frame).
+        /// (`IMPLEMENTATION.md` § 2.2). Elapsed against a monotonic clock rather than
+        /// a wall-clock stamp the two ends would have to agree on, and carried here
+        /// rather than on [`HelloOk`], which goes out on every attach of every session
+        /// while this means anything only once the child has gone.
         since_exit_secs: u32,
     },
     /// Client is leaving without ending the session.
@@ -279,24 +284,29 @@ impl<'a> Frame<'a> {
     /// [`crate::MAX_PAYLOAD`], or [`ProtoError::Malformed`] for a field too long for
     /// its own length prefix. `out` is rewound to its original length in every case.
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), ProtoError> {
-        // The payload goes straight into the caller's buffer and the header is
-        // patched in behind it, so every error path rewinds to `start` and a caller
-        // appending frames back to back never ships half of one.
+        // The payload goes straight into the caller's buffer and the header is patched
+        // in behind it, so the rewind lives here, once, rather than on each error path
+        // inside: a caller appending frames back to back never ships half of one,
+        // whatever `encode_from` grows a new way to fail on.
         let start = out.len();
+        self.encode_from(start, out)
+            .inspect_err(|_| out.truncate(start))
+    }
+
+    /// Appends the frame, `start` being `out`'s length on entry. Free to leave a partial
+    /// frame behind on failure: [`Frame::encode`] rewinds to `start`.
+    fn encode_from(&self, start: usize, out: &mut Vec<u8>) -> Result<(), ProtoError> {
         out.extend_from_slice(&[0; HEADER_LEN]);
-        self.encode_payload(out)
-            .inspect_err(|_| out.truncate(start))?;
+        self.encode_payload(out)?;
 
         let header = u32::try_from(out.len() - start - HEADER_LEN)
             .map_err(|_| ProtoError::PayloadTooLarge(u32::MAX))
-            .and_then(|len| encode_header(self.frame_type(), len))
-            .inspect_err(|_| out.truncate(start))?;
+            .and_then(|len| encode_header(self.frame_type(), len))?;
         // Unreachable after the `extend_from_slice`; fallible for `indexing_slicing`.
         let Some(slot) = out
             .get_mut(start..)
             .and_then(<[u8]>::first_chunk_mut::<HEADER_LEN>)
         else {
-            out.truncate(start);
             return Err(ProtoError::Malformed("the header slot went missing"));
         };
         *slot = header;

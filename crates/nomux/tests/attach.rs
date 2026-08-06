@@ -28,7 +28,7 @@ mod harness;
 
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
@@ -72,18 +72,9 @@ fn a_daemon_that_cannot_publish_its_pidfile_refuses_to_start() {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped()),
     );
-    assert_eq!(
-        refused.status.code(),
-        Some(1),
-        "a daemon that cannot publish its pidfile must refuse to start (§ 10): {:?}",
-        stderr(&refused)
-    );
-    // Only that it said something: `write_pid` propagates the bare `io::Error` from
-    // `fs::write`, so the line names no path to look for.
-    assert!(
-        !stderr(&refused).is_empty(),
-        "a daemon that refuses to start must say why"
-    );
+    // No phrase to look for: `write_pid` propagates the bare `io::Error` from
+    // `fs::write`, so the line names no path.
+    refuses(&refused, 1, "", "a daemon that cannot publish its pidfile");
 
     let listed = control(&root, &["list"]);
     succeeded(
@@ -134,18 +125,12 @@ fn spawn_reports_a_session_it_could_not_start_as_no_such_session() {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped()),
     );
-    assert_eq!(
-        refused.status.code(),
-        Some(127),
-        "a session that does not exist and could not be started must be reported \
-         the way a shell reports a missing command: {:?}",
-        stderr(&refused)
-    );
-    assert!(
-        stdout(&refused).is_empty(),
-        "stdout is where § 5.1 has the client read the bootstrap line, so a failing \
-         spawn must leave it alone: {:?}",
-        stdout(&refused)
+    // No phrase: the number is the row under test, the wording being the failure's own.
+    refuses(
+        &refused,
+        127,
+        "",
+        "spawn on a session that could not be started",
     );
 }
 
@@ -177,24 +162,11 @@ fn spawn_refuses_an_id_something_is_already_serving() {
             .stderr(Stdio::piped()),
     );
 
-    assert_eq!(
-        refused.status.code(),
-        Some(126),
-        "an id something already answers for must be refused as found-but-not-ours: \
-         {:?}",
-        stderr(&refused)
-    );
-    assert!(
-        stderr(&refused).contains("already exists"),
-        "and it must say which of the two refusals this is, since one wants `nomux \
-         attach` and the other wants a different id: {:?}",
-        stderr(&refused)
-    );
-    assert!(
-        stdout(&refused).is_empty(),
-        "stdout is where § 5.1 has the client read the bootstrap line, so a refused \
-         spawn must leave it alone: {:?}",
-        stdout(&refused)
+    refuses(
+        &refused,
+        126,
+        "already exists",
+        "spawn on an id something already answers for",
     );
 
     let mut client = session.connect();
@@ -225,8 +197,10 @@ fn spawn_refuses_an_id_something_is_already_serving() {
 /// the unlink still destroys the file, and moving the unlink without renaming the
 /// refusal still sends the client away. The whole directory is compared rather than the
 /// one name, which is also what says no second daemon was started behind an id that
-/// already has one. `attach`'s row against the same wedge is `control.rs`'s, that being
-/// where the refusals the relay modes share with `list` and `kill` live.
+/// already has one, and the refusal is made to name the backlog because nothing else on
+/// this host says what it gave up on. `attach`'s row against the same wedge is
+/// `control.rs`'s, that being where the refusals the relay modes share with `list` and
+/// `kill` live.
 #[test]
 fn spawn_refuses_a_wedged_session_without_unlinking_the_lock_it_took() {
     use std::os::unix::fs::PermissionsExt;
@@ -248,19 +222,11 @@ fn spawn_refuses_a_wedged_session_without_unlinking_the_lock_it_took() {
     );
     let left = entries(&dir);
 
-    assert_eq!(
-        refused.status.code(),
-        Some(126),
-        "an id something is holding must be refused as found-but-not-ours even when \
-         what holds it will not answer, since a client that retries meets the same \
-         session: {:?}",
-        stderr(&refused)
-    );
-    assert!(
-        stderr(&refused).contains("backlog is full"),
-        "and the refusal must name the state it gave up on, since nothing else on this \
-         host will say so: {:?}",
-        stderr(&refused)
+    refuses(
+        &refused,
+        126,
+        "backlog is full",
+        "spawn on an id something is holding but will not answer",
     );
     assert_eq!(
         left,
@@ -269,24 +235,15 @@ fn spawn_refuses_a_wedged_session_without_unlinking_the_lock_it_took() {
          second daemon, so a wedged session must be left exactly as it was found, plus \
          the lock this spawn took"
     );
-    assert!(
-        stdout(&refused).is_empty(),
-        "stdout is where § 5.1 has the client read the bootstrap line, so a refused \
-         spawn must leave it alone: {:?}",
-        stdout(&refused)
-    );
 }
 
 /// `attach` refuses an id nothing answers for instead of inventing a session behind
 /// it — and starts nothing on the way to saying so.
 ///
-/// The refusal is the point and the silence is what makes it one. Attach-or-create
-/// answered an id whose session had been reaped by starting a fresh shell under the
-/// same name, so a client reconnecting after a reboot, a `kill`, or its own week away
-/// got a working terminal with none of its state and nothing to say so — a failure a
-/// user discovers by running `make` a second time and wondering where the first went.
-/// 127 is the shell's "not found", which `DESIGN.md` § 7 has the client read as "try
-/// again" rather than as a host to give up on.
+/// The refusal is the point and the silence is what makes it one: attach-or-create
+/// answered an id whose session had been reaped with a fresh shell under the same name
+/// and nothing to say so. 127 is the shell's "not found", which `DESIGN.md` § 7 has the
+/// client read as "try again" rather than as a host to give up on.
 ///
 /// Both spellings of "nothing answers", because they reach the refusal through
 /// different code and only one of them was ever a refusal: a run directory this host
@@ -329,24 +286,11 @@ fn attach_refuses_an_id_nothing_answers_for_rather_than_inventing_a_session() {
         // *was* started — `setsid`ed away, where nothing in this file reaches it.
         drop(control(&root, &["kill", "ghost"]));
 
-        assert_eq!(
-            refused.status.code(),
-            Some(127),
-            "attach on {describing} must be reported the way a shell reports a \
-             missing command: {:?}",
-            stderr(&refused)
-        );
-        assert!(
-            stderr(&refused).contains("no session"),
-            "and it must name what it could not find, since the repair is `nomux \
-             spawn` rather than a retry: {:?}",
-            stderr(&refused)
-        );
-        assert!(
-            stdout(&refused).is_empty(),
-            "stdout is where § 5.1 has the client read the bootstrap line, so a \
-             refused attach must leave it alone: {:?}",
-            stdout(&refused)
+        refuses(
+            &refused,
+            127,
+            "no session",
+            &format!("attach on {describing}"),
         );
         assert_eq!(
             made_a_directory, expect_dir,
@@ -359,6 +303,37 @@ fn attach_refuses_an_id_nothing_answers_for_rather_than_inventing_a_session() {
              start: {left:?}"
         );
     }
+}
+
+/// The refusal § 10 owes an invocation, whole: the exit code, a stderr line naming
+/// which refusal this is, and a stdout nothing has been written to.
+///
+/// One property in three clauses, each read by somebody different. The code is what
+/// `DESIGN.md` § 7 has the client branch on — 126 "stop", 127 "try again" — and the user
+/// never sees it; `must_say` is what the *user* gets, and it has to name which of the
+/// refusals sharing that number this was, since that and not the number is what says
+/// whether the repair is `nomux attach`, a different id, or a retry; and stdout is where
+/// § 5.1 has the client read its bootstrap line, so a refusal must leave it alone rather
+/// than put a byte there for a client to read as the session it was just denied.
+///
+/// `what` names the invocation, so a failure inside a loop over cases says which case it
+/// was. An empty `must_say` asks only that it said something, which is all a refusal
+/// carrying a bare `io::Error` can promise.
+fn refuses(out: &Output, code: i32, must_say: &str, what: &str) {
+    let (said, wrote) = (stderr(out), stdout(out));
+    assert_eq!(
+        out.status.code(),
+        Some(code),
+        "{what} must be refused with exit {code}: {said:?}"
+    );
+    assert!(
+        !said.is_empty() && said.contains(must_say),
+        "{what} must say so, naming {must_say:?}: {said:?}"
+    );
+    assert!(
+        wrote.is_empty(),
+        "{what} must leave stdout alone: {wrote:?}"
+    );
 }
 
 /// Exercises the path a real bootstrap takes: `nomux spawn` on an id nothing is
@@ -459,17 +434,11 @@ fn spawn_starts_a_daemon_for_a_session_that_does_not_exist_yet() {
 /// `spawn` starts the binary it is running, not whatever is at the path it was
 /// started under.
 ///
-/// A path is resolved again by the `exec`, so between this process's own load and
-/// its daemon's there is a window in which the install directory decides what the
-/// daemon *is* — and that directory is created rather than checked
-/// (`IMPLEMENTATION.md` § 5.2), which is why `DESIGN.md` § 8 keeps another uid
-/// replacing the binary in scope instead of dismissing it with the rest of "already
-/// the user". Only this second exec is closed here; the first ran out of that
-/// directory before anything in this process could have an opinion.
-///
-/// The replacement is § 5.2's own `mv -f`, so this is equally the case with nobody
-/// hostile in it: a spawn parked in that window while another connection installs the
-/// same version.
+/// The `exec` resolves the install path a second time, so between this process's load
+/// and its daemon's whatever is in that directory decides what the daemon *is* —
+/// `DESIGN.md` § 8's reason for keeping another uid in scope, and a window
+/// `IMPLEMENTATION.md` § 5.2's own `mv -f` reaches with nobody hostile in it. Only that
+/// second exec is closed here; the first ran out of the directory already.
 ///
 /// Nothing is raced. `create` blocks on `<id>.lock` before it forks (§ 6.3), so the
 /// swap goes in while the spawn is parked there, and it goes in after `Spawned::spawn`

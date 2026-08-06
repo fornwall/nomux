@@ -8,15 +8,15 @@ session alive across the loss of the SSH connection that created it.
 
 Persistence without a multiplexer: no prefix key, no panes, no status bar, no
 rewritten `TERM`. Byte-exact passthrough, so sixel, OSC 52, hyperlinks, mouse
-reporting and scrollback all work unchanged — up to the ring's capacity; a
-disconnect that outlasts it is reported as an explicit gap, not silently truncated.
+reporting and scrollback all work unchanged.
 
 `nomux <mode> [session-id] [--label <text>]`. The modes are `daemon`, `spawn` and
 `attach`; `list` and `kill` are the control surface, frozen across versions.
 `nomux --help` has the rest.
 
 Four properties drive the system — this binary plus the client that pushes and drives
-it, versioned as one unit. Two, the resume path and the zero install, are the client's:
+it, versioned as one unit. Two, the resume path and the zero install, are the client's.
+What each one costs is [DESIGN.md § 3](DESIGN.md#3-key-properties):
 
 - **Byte-stream replay, not screen-state sync** — no terminal emulator on the server.
 - **Resume over a fresh SSH connection, not a side channel** — inherits ProxyJump, certificates, 2FA, agent forwarding.
@@ -30,9 +30,8 @@ without that client there is no way to get a shell out of this — what works st
 today is `nomux list` and `nomux kill`. The two halves ship as one unit, so the wire
 protocol is private and carries no stability guarantee ([DESIGN.md § 2](DESIGN.md#2-scope)).
 
-- [DESIGN.md](DESIGN.md) — problem, properties, architecture, security model, prior art.
+- [DESIGN.md](DESIGN.md) — problem, properties, architecture, security model, prior art, rejected alternatives.
 - [IMPLEMENTATION.md](IMPLEMENTATION.md) — wire protocol, ring buffer, PTY handling, bootstrap, build.
-- [PLAN.md](PLAN.md) — backlog: accepted limitations, unbuilt features, deferred decisions.
 
 ## Build
 
@@ -42,7 +41,7 @@ Nothing has to be installed by hand: the toolchain is pinned in
 ```sh
 git clone https://github.com/fornwall/nomux && cd nomux
 cargo build     # rustup installs the pinned 1.97.1 on first use
-cargo test      # the whole suite, doctests included
+cargo test      # unit and integration tests, plus the one doctest
 prek install    # once per clone: the commit gate, `.pre-commit-config.yaml`
 ```
 
@@ -52,7 +51,13 @@ size budgets, the pinned nightly and the debug companions are in
 
 ## Status
 
-[PLAN.md § Status](PLAN.md#status) — the copy kept current.
+Complete and under test on Linux at the protocol revision
+[IMPLEMENTATION.md § 2.2](IMPLEMENTATION.md#22-messages) states.
+
+- **Platform** — Linux only; everywhere else, plain SSH ([DESIGN.md § 7](DESIGN.md#7-degradation)).
+- **Suite** — layers and invariants in [IMPLEMENTATION.md § 9](IMPLEMENTATION.md#9-testing); CI adds `--run-ignored all`.
+- **Release** — both musl targets build reproducibly inside the size and growth gates, and a `v*` tag builds, checks and publishes them ([IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)).
+- **Not started** — the client. Every piece of it has a server-side contract fixed in [IMPLEMENTATION.md](IMPLEMENTATION.md).
 
 ## License
 

@@ -6,6 +6,25 @@
 //! straight to the socket.
 //!
 //! One relay, two ways in ([`Intent`]). Everything past the connection is shared.
+//!
+//! # The four refusals
+//!
+//! Both modes decide on one probe of the socket, and § 6.3 makes a `connect` that failed
+//! for anything but a refusal evidence of nothing.
+//!
+//! | probe             | `attach`, wanting a session | `spawn`, wanting a free id |
+//! |-------------------|-----------------------------|----------------------------|
+//! | refused or absent | [`no_such_session`], 127    | start a daemon             |
+//! | accepted          | relay to it                 | [`already_running`], 126   |
+//! | neither           | [`unattachable`], 126       | [`may_be_running`], 126    |
+//!
+//! The last row is the wedged daemon: an `AF_UNIX` `connect` to a full backlog blocks
+//! rather than being refused, so [`crate::rundir::connect_within`] gives up with `TimedOut`
+//! over a socket somebody bound and stopped accepting on — evidence *of* a session, and
+//! § 10's "no such session" had `DESIGN.md` § 7's client cache a live one as an id it had
+//! got wrong. The two 126s keep separate kinds all the same: `AlreadyExists` answers a
+//! question only the creating mode asks, so `attach` reports the `ResourceBusy` that
+//! `control::hold_spawn_lock` gives the same state.
 
 use std::collections::VecDeque;
 use std::env;
@@ -22,7 +41,7 @@ use rustix::event::{PollFd, PollFlags};
 use rustix::pipe::SpliceFlags;
 
 use crate::control::{Liveness, liveness};
-use crate::rundir::SessionPaths;
+use crate::rundir::{SessionPaths, check_run_dir, ensure_run_dir};
 
 /// How long to wait for a freshly spawned daemon to bind its socket.
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -83,7 +102,7 @@ fn resume(paths: &SessionPaths) -> io::Result<UnixStream> {
     // Checked and never created, which is `list` and `kill`'s rule (§ 6.3) and is
     // this mode's now that it creates nothing either. A directory that is not there
     // holds no session, which is the refusal below rather than a failure of its own.
-    match paths.check_dir() {
+    match check_run_dir(paths.dir()) {
         Ok(()) => {}
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Err(no_such_session(paths)),
         Err(err) => return Err(err),
@@ -95,12 +114,8 @@ fn resume(paths: &SessionPaths) -> io::Result<UnixStream> {
     }
 }
 
-/// The refusal `attach` answers an id nothing is serving with.
-///
-/// Two states reach it and it deliberately does not tell them apart: an id that never
-/// named a session here, and one whose session has been reaped. Neither is
-/// recoverable from and both want the same next command, so the difference would be
-/// resolution nobody can act on.
+/// `attach` on an id nothing is serving — never created here, or reaped, which are not
+/// told apart because both want the same next command.
 fn no_such_session(paths: &SessionPaths) -> io::Error {
     io::Error::new(
         io::ErrorKind::NotFound,
@@ -113,21 +128,7 @@ fn no_such_session(paths: &SessionPaths) -> io::Error {
     )
 }
 
-/// The refusal to join an id whose socket answered neither death nor life.
-///
-/// [`no_such_session`] on the other half of the probe, and the two must stay apart: § 6.3
-/// makes a `connect` that failed for anything but a refusal evidence of nothing, and the
-/// wedged daemon settles which way that doubt falls. An `AF_UNIX` `connect` to a full
-/// backlog blocks rather than being refused, so [`crate::rundir::connect_within`] gives up
-/// with `TimedOut` over a socket somebody bound and stopped accepting on — evidence *of* a
-/// session, and answering it with § 10's "no such session" had `DESIGN.md` § 7's client
-/// read a live session as an id it had got wrong.
-///
-/// `ResourceBusy` where [`may_be_running`] says `AlreadyExists`, both being 126 through
-/// `main`'s reporter: existing is the one thing `attach` wanted, so "already exists"
-/// answers a question only the creating mode asks. What this met is what
-/// `control::hold_spawn_lock` reports with the same kind — something holds the session,
-/// and waiting did not outlast it.
+/// `attach` on an id whose socket answered neither death nor life (the module's last row).
 fn unattachable(paths: &SessionPaths, err: &io::Error) -> io::Error {
     io::Error::new(
         io::ErrorKind::ResourceBusy,
@@ -141,10 +142,8 @@ fn unattachable(paths: &SessionPaths, err: &io::Error) -> io::Error {
     )
 }
 
-/// The refusal to create an id something is already serving.
-///
-/// `spawn` is the one mode that says what a session *is*, so meeting a live one is the
-/// client's own state disagreeing with the host's rather than a race to retry.
+/// `spawn` on an id something is already serving: the client's own state disagreeing with
+/// the host's rather than a race to retry.
 fn already_running(paths: &SessionPaths) -> io::Error {
     io::Error::new(
         io::ErrorKind::AlreadyExists,
@@ -157,17 +156,8 @@ fn already_running(paths: &SessionPaths) -> io::Error {
     )
 }
 
-/// The refusal to create an id whose socket answered neither death nor life.
-///
-/// [`already_running`]'s kind on weaker evidence, which is § 6.3's rule read from the
-/// creating side: a `connect` that failed for anything but a refusal establishes
-/// nothing, and `spawn` may only bring into being an id it can say is free. The wedged
-/// daemon is the case that settles the wording — an `AF_UNIX` `connect` to a full
-/// backlog blocks rather than being refused, so [`crate::rundir::connect_within`]'s own
-/// `TimedOut` reports a socket somebody bound and stopped accepting on, which is
-/// evidence *of* a session. Answering that with § 10's "no such session" told a client
-/// to cache a live session as gone; `AlreadyExists` is 126, the code `DESIGN.md` § 7
-/// has it stop on.
+/// `spawn` on an id whose socket answered neither death nor life: [`already_running`]'s
+/// kind on weaker evidence, `spawn` being allowed to create only an id it can say is free.
 fn may_be_running(paths: &SessionPaths, err: &io::Error) -> io::Error {
     io::Error::new(
         io::ErrorKind::AlreadyExists,
@@ -194,7 +184,7 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> io::Result<UnixStream> {
     // directory (§ 6.3), and where that directory is a symlink into somewhere another
     // user can write, the name is theirs to make: checking only when nothing answers
     // checks only the case where nothing was planted.
-    paths.ensure_dir()?;
+    ensure_run_dir(paths.dir())?;
 
     // A collector may unlink `<id>.lock` while this call is blocked on it, which
     // `rundir::SpawnLock` has: the lock that comes back is the one on the file now at
@@ -260,19 +250,15 @@ fn spawn_and_join(paths: &SessionPaths, label: Option<&str>) -> io::Result<UnixS
     }
 }
 
-/// Gives back the `<id>.lock` this call created and hands `err` on.
-///
-/// A leftover name is one `session_id_of` counts as a session, so without this every
-/// spawn refused at § 6.3's ceiling would raise the count that refused it — and only
-/// this process, still holding the lock, can undo that.
+/// Gives back the `<id>.lock` this call created and hands `err` on, a leftover name being
+/// one `session_id_of` counts as a session for § 6.3's ceiling.
 ///
 /// Called from the two exits that established the id is nobody's and from nowhere else,
-/// because the stronger rule is § 6.6's — a live session's files are never unlinked —
-/// and an exit that established neither death nor life may not act against it. Which
-/// exit it is cannot be read off the error, which is the whole reason this is a call
-/// rather than a wrapper the caller applies to every failure: the deadline above and
-/// [`crate::rundir::connect_within`] both report `TimedOut`, one over a socket nothing
-/// ever bound and one over a socket somebody bound and stopped accepting on.
+/// § 6.6 forbidding an exit that established neither death nor life to unlink over a live
+/// session. Which exit it is cannot be read off the error, which is why this is a call
+/// rather than a wrapper on every failure: the deadline above and
+/// [`crate::rundir::connect_within`] both report `TimedOut`, one over a socket nothing ever
+/// bound and one over a socket somebody bound and stopped accepting on.
 fn released(paths: &SessionPaths, err: io::Error) -> io::Error {
     drop(fs::remove_file(paths.lock()));
     err
@@ -304,10 +290,14 @@ fn await_publication(paths: &SessionPaths, deadline: Instant) {
 /// `IMPLEMENTATION.md` § 6.2, and both are still done here because it cannot reach
 /// either soon enough; that section has the two windows this closes.
 fn spawn_daemon(session_id: &str, label: Option<&str>) -> io::Result<Option<ChildStderr>> {
-    // The inode this process was loaded from, not the path it was loaded under: a name is
-    // resolved again at exec, and what it resolves to by then belongs to any uid that can
-    // write the install directory (`SECURITY.md`). Only that second exec is closed — the
-    // first ran out of that directory, whose trust `DESIGN.md` § 8 leaves to the client.
+    // The inode this process was loaded from, not the path it was loaded under, for two
+    // reasons. A name is resolved again at exec, and what it resolves to by then belongs to
+    // any uid that can write the install directory (`SECURITY.md`) — only that second exec
+    // is closed, the first having run out of that directory, whose trust `DESIGN.md` § 8
+    // leaves to the client. And the name need not resolve to this build at all: § 5.2
+    // installs by `mv -f`, which unlinks the running inode without destroying it, so a
+    // spawn parked in that window would otherwise lose its daemon to a concurrent upgrade
+    // *of its own version*.
     let mut command = Command::new("/proc/self/exe");
     command
         // Keeps the real path in `ps`, off the very link named above, so a host with no
@@ -373,8 +363,9 @@ fn daemon_complaint(stderr: Option<ChildStderr>) -> Option<String> {
 
 /// Moves bytes between stdio and the socket until either side closes.
 fn relay(stream: &UnixStream) -> io::Result<()> {
-    // The socket has to be non-blocking for the `splice` path to be safe to take
-    // (§ 7), and everything below already reads `EAGAIN` as "not now".
+    // `SPLICE_F_NONBLOCK` governs the *pipe* end of a pair alone, so a splice into a socket
+    // that is full parks the whole relay inside the kernel unless the socket itself is
+    // non-blocking. Everything below already reads `EAGAIN` as "not now".
     stream.set_nonblocking(true)?;
 
     let stdin = io::stdin();
@@ -495,16 +486,12 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
 /// Reads once through `chunk` into `buf`. `false` means the source reached EOF.
 fn copy_in(fd: BorrowedFd<'_>, buf: &mut VecDeque<u8>, chunk: &mut [u8]) -> io::Result<bool> {
     match crate::nbio::read(fd, chunk) {
-        // Four shapes of one ending. A PTY-backed peer reports end of session as
-        // `EIO` rather than 0; a socket peer that closed with bytes of *ours* still
-        // unread hands over the last of its own and then answers `ECONNRESET`, and
-        // `ENOTCONN` where the connection is already gone by the time the read
-        // lands.
-        //
-        // That middle one is the ordinary way a session ends here rather than an
-        // exotic one — § 4.1, `write_client` and `shutdown` each leave input of ours
-        // unread — and taken as a failure it costs the relay the exit status § 10
-        // gives a delivered `Exit` frame.
+        // Four shapes of one ending. A PTY-backed peer reports end of session as `EIO`
+        // rather than 0; a socket peer that closed with bytes of *ours* still unread hands
+        // over the last of its own and then answers `ECONNRESET` — the ordinary way a
+        // session ends here (§ 4.1), and a failure here would cost the relay the exit
+        // status § 10 gives a delivered `Exit` frame; and `ENOTCONN` where the connection
+        // is already gone by the time the read lands.
         Ok(0)
         | Err(rustix::io::Errno::IO | rustix::io::Errno::CONNRESET | rustix::io::Errno::NOTCONN) => {
             Ok(false)
@@ -536,8 +523,9 @@ enum Spliced {
 /// Moves up to [`SPLICE_CHUNK`] bytes from `src` to `dst` without them ever
 /// entering this process.
 ///
-/// Whether `splice` works for a pair is a property of the host rather than of this
-/// code, so it is discovered by trying (`IMPLEMENTATION.md` § 7).
+/// Whether `splice` works for a pair is a property of the host rather than of this code,
+/// so it is discovered by trying: under sshd this process's stdio is a pipe on some builds
+/// and a socket on others, and only a pair with a pipe in it can be spliced.
 fn splice_once(src: BorrowedFd<'_>, dst: BorrowedFd<'_>) -> Spliced {
     let flags = SpliceFlags::MOVE | SpliceFlags::NONBLOCK;
     loop {
@@ -556,8 +544,8 @@ fn splice_once(src: BorrowedFd<'_>, dst: BorrowedFd<'_>) -> Spliced {
     }
 }
 
-/// One direction of the relay, whose two paths cannot interleave
-/// (`IMPLEMENTATION.md` § 7).
+/// One direction of the relay, whose two paths cannot interleave: `splice` is attempted
+/// only while `buf` below is empty, and never puts anything into it.
 #[derive(Debug, Default)]
 struct Pump {
     /// Bytes the destination would not take yet; only ever filled by the copying path.

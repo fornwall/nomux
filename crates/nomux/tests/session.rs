@@ -31,8 +31,9 @@ use nomux::{
 };
 
 use harness::{
-    Client, FRAME_PATIENCE, Rng, Session, Spawned, hello_frame, nomux_with_shell, poll_by,
-    poll_until, read_uninterrupted, reconnect_until_gap, run_root, still_serving,
+    Client, DEFAULT_TEST_RING, FRAME_PATIENCE, Rng, Session, Spawned, hello_frame,
+    nomux_with_shell, poll_by, poll_until, read_uninterrupted, reconnect_until_gap, run_root,
+    still_serving,
 };
 
 #[test]
@@ -622,7 +623,7 @@ fn an_overflow_that_outruns_an_attached_client_is_reported_as_a_gap_mid_stream()
 #[test]
 fn a_ring_capacity_the_daemon_cannot_use_falls_back_to_the_default() {
     for (name, value) in [("ring_zero", "0"), ("ring_garbage", "not-a-number")] {
-        let session = Session::start_with_raw_ring(name, value);
+        let session = Session::start_with(name, value, "/bin/sh");
         let mut client = session.connect();
         let ok = client.hello(RESUME_FROM_START);
 
@@ -784,7 +785,7 @@ fn frames_a_client_may_not_send_are_refused_and_the_connection_closed() {
 /// `login_shell` falls back through the password database only when it is *absent*.
 #[test]
 fn a_session_whose_shell_cannot_be_started_is_refused_as_an_internal_failure() {
-    let session = Session::start_with_shell("shell_broken", "/tmp");
+    let session = Session::start_with("shell_broken", &DEFAULT_TEST_RING.to_string(), "/tmp");
     let mut client = session.connect();
 
     // By hand: `Client::hello` panics on anything but a `HelloOk`, and the refusal is
@@ -915,6 +916,60 @@ fn a_resize_reaches_the_child_and_every_attach_restates_the_geometry() {
     client.read_until("24 80", resumed.resume_from);
 }
 
+/// An attach restates the geometry even when it has not changed since the last one.
+///
+/// The daemon is not the only thing that can move the master: `stty rows` inside the
+/// session needs no permission from it, and nothing reports the change back. So a size
+/// this daemon last sent is a record of what it sent, never a belief about what the
+/// terminal is — and the pass that may not skip the `TIOCSWINSZ` is precisely the one
+/// where the two look equal. Reattaching from an unchanged window is the only chance the
+/// user has to put a child's own resize right, which is what makes § 2.2's "the arriving
+/// `Hello`'s winsize is authoritative" a rule about every `Hello` rather than about the
+/// ones that differ.
+#[test]
+fn an_attach_restates_a_geometry_the_child_moved_underneath_it() {
+    let (session, mut client, ok) = Session::attached("resize-stale");
+
+    // The child takes the terminal somewhere the daemon never sent it.
+    client.input(0, b"stty rows 50 cols 100 && stty size\n");
+    client.read_until("50 100", ok.resume_from);
+    drop(client);
+
+    // Same window as before, so the daemon's record of the size it last sent agrees with
+    // the greeting — and the child is nonetheless owed the restatement.
+    let mut client = session.connect();
+    let resumed = client.hello(RESUME_FROM_START);
+    client.input(resumed.in_applied, b"stty size\n");
+    client.read_until("24 80", resumed.resume_from);
+}
+
+/// A burst of `Resize` frames arrives as the last of them, whole.
+///
+/// `Resize` touches no queue, so it never breaks the daemon's decode loop the way `Input`
+/// does at `MAX_PENDING_READ`: one pass can carry as many as the receive buffer holds.
+/// Applied per frame, that is tens of thousands of `TIOCSWINSZ` calls and as many
+/// `SIGWINCH`s to the child in a single wakeup, with the PTY undrained throughout — the
+/// one stall § 4.1 does not let a client cause. `Daemon::apply_win` collapses them to one.
+/// What has to survive the collapse is the only size that was ever real, the last, and
+/// `stty` is the witness that it was applied rather than merely the field's last value.
+#[test]
+fn a_burst_of_resizes_arrives_as_the_last_one() {
+    let (_session, mut client, ok) = Session::attached("resize-burst");
+
+    // Written back to back and ahead of any input, so the daemon decodes them together
+    // rather than being woken once per frame.
+    for cols in 100..200u16 {
+        client.send(&Frame::Resize(WinSize {
+            cols,
+            rows: 43,
+            xpixel: 0,
+            ypixel: 0,
+        }));
+    }
+    client.input(0, b"stty size\n");
+    client.read_until("43 199", ok.resume_from);
+}
+
 /// `Detach` gives the connection up without giving up the session
 /// (`IMPLEMENTATION.md` § 2.2).
 ///
@@ -972,11 +1027,10 @@ const WINCHED: &str = "NOMUX-42-WINCHED";
 /// `Client::make_ready`, whose marker arrives *before* the command behind it starts: a
 /// `SIGWINCH` landing before the `trap` has run is ignored and no marker ever comes.
 ///
-/// `owed` names the marker the fence cannot bound. `Ctrl-L` needs nothing, `cat` handing
-/// the keystroke back along the same path as the fence; the `SIGWINCH` marker is printed
-/// by a *second* process that `TIOCSWINSZ` has merely made runnable, and nothing orders
-/// it against `cat` echoing the fence. § 4.3 obliges the repaint to happen, not to win
-/// that race.
+/// `owed` names the marker the fence cannot bound: `Ctrl-L` needs nothing, `cat` handing
+/// the keystroke back along the same path as the fence, but the `SIGWINCH` marker comes
+/// from a *second* process `TIOCSWINSZ` has merely made runnable — and § 4.3 obliges the
+/// repaint to happen, not to win that race.
 fn repaint_transcript(name: &str, flags: u8, owed: Option<&str>) -> String {
     /// The child echoes far more than this, so the gap is by construction.
     const RING: usize = 1024;
@@ -1155,7 +1209,8 @@ fn a_sustained_overflow_repaints_when_the_client_catches_up_rather_than_per_gap(
     // collects a megabyte of two-kilobyte frames queued before it fell behind, and has
     // to read all of them at this pace before reaching the first `Gap` behind them.
     drop(client);
-    let (mut client, resumed) = reconnect_until_gap(&session, HELLO_REPAINT_CTRL_L, ready.offset);
+    let (mut client, resumed) =
+        reconnect_until_gap(&session, deadline, HELLO_REPAINT_CTRL_L, ready.offset);
 
     // Paced reads against an unpaced child: every frame taken off the socket lets the
     // daemon's queue dip below its cap, which is what lets the next pass notice the ring

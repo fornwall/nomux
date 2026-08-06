@@ -46,10 +46,12 @@ pub(crate) fn read(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<usize, Errno> {
 ///
 /// Linux fails master reads with `EIO`, rather than returning 0, once the last process
 /// holding the slave exits — so the kernel's own EOF is folded in here too. Nothing is
-/// propagated, which is why there is no `Result`: `IMPLEMENTATION.md` § 6.4.1 keeps a
-/// stray errno from destroying the session, and an errno this does not know is a
-/// descriptor nothing can be read from. Both callers answer [`Read::Eof`] by dropping
-/// the descriptor out of the poll set, so nothing spins on one either.
+/// propagated, which is why there is no `Result`: one `poll` pass reports several sources
+/// at once (`daemon.rs`, around `ACCEPT_BEFORE_READ`), and `daemon::Daemon::read_client`
+/// states the rule this is the other half of — a failure on one descriptor ends that
+/// connection and never the event loop. An errno this does not know is a descriptor nothing
+/// can be read from, and both callers answer [`Read::Eof`] by dropping it out of the poll
+/// set, so nothing spins on one either.
 pub(crate) fn read_or_eof(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Read {
     match read(fd, buf) {
         Ok(n) if n > 0 => Read::Data(n),
@@ -72,6 +74,15 @@ pub(crate) fn read_or_eof(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Read {
 /// an optimisation: a wrapped `VecDeque` served back-first delivers transposed
 /// keystrokes rather than an error anybody could see, and an empty front handed to
 /// `write` alone comes back `Ok(0)`, after which the queue never drains again.
+///
+/// `Ok(0)` on a non-empty queue is "come back on `POLLOUT`" here, and deliberately not the
+/// `WriteZero` that `Conn::flush_some` makes of the same count. The difference is what is
+/// being written to: `flush_some` only ever holds a `UnixStream`, which cannot answer a
+/// non-empty write with zero, while every fd reaching here is a tty or a pipe. A `^S` in
+/// the session arrives as the `EAGAIN` beside this arm rather than as a zero — the master
+/// is `O_NONBLOCK`, and `n_tty_write` turns the driver's zero into `EAGAIN` before
+/// userspace sees it — so what this arm is for is a count that says only "nothing moved",
+/// which is never grounds for tearing down a queue that still owes its bytes.
 pub(crate) fn drain_to(queue: &mut VecDeque<u8>, fd: BorrowedFd<'_>) -> Result<(), Errno> {
     if queue.is_empty() {
         return Ok(());

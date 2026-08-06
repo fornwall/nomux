@@ -14,13 +14,12 @@ visible surface for one property.
 
 ## 2. Scope
 
-This repo is **the server binary only**, and nothing in it aims to be a general
-terminal tool. The SSH client and terminal emulator are a separate project by the same
-author, and the two ship as a unit, so:
+Nothing here aims to be a general terminal tool, and the client that drives this binary
+versions as one unit with it, so:
 
-- The wire protocol is **private**: no negotiation, no extension points, no stability guarantee. Enums are exhaustive, so an unknown value is a bug rather than a forward-compatibility case; nothing is on the wire that nothing reads; and nothing here is published, a crates.io version being a stability promise this bullet refuses to make.
+- The wire protocol is **private**: no negotiation, no extension points, no stability guarantee. Enums are exhaustive, so an unknown value is a bug rather than a forward-compatibility case; nothing is on the wire that nothing reads; and nothing here is published, since a crates.io version would be a stability promise this bullet refuses to make.
 - Behaviour goes to whichever side it is cheapest on: emulator reset on gap recovery is the client's because the client already holds the emulator, and either end can tell there was a gap by comparing offsets ([IMPLEMENTATION.md § 4.2](IMPLEMENTATION.md#42-attach-with-from--base)).
-- Version skew has exactly one real case (§6.4), bounded rather than designed around.
+- Version skew has exactly one real case (§6.4), bounded and not designed around.
 
 | In scope | Out of scope |
 | --- | --- |
@@ -123,9 +122,8 @@ session identity *is* tab identity: no naming UI, no session picker, no id ever 
 - Opaque ids do not survive loss of client state: after a reinstall the daemons still run but the app no longer knows which tab each was. A human-readable label therefore sits beside the socket, so `nomux list` stays meaningful and orphans are recoverable. It is also why `attach` refuses an id nothing answers for instead of creating one (§4).
 - Concurrency is *intended* to cap at 8 per host, and the cap is the client's: only the side that knows a tab was opened can hold it, so nothing holds it today. The daemon holds a backstop instead, refusing to start past 64 ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)), because what reaches 64 is a runaway rather than a user who wanted one more terminal.
 
-Rejected: one implicit session per host (survives reinstall, but no second terminal for
-a build alongside an editor) and user-named sessions (solve both, at the cost of the
-session-list UI this project exists to avoid).
+§10 holds the two schemes refused in favour of this one: one implicit session per host,
+and user-named sessions.
 
 ### 5.2 Reaping
 
@@ -231,3 +229,34 @@ session, cached per host so it is not re-probed, on the conditions in
 Each layer has precedent; the combination — zero-install, no new ports, byte-exact —
 does not. `dtach`'s `-r winch|ctrl_l` repaint strategy is adopted directly for gap
 recovery.
+
+## 10. Rejected alternatives
+
+Each of these was considered and refused. They are recorded here so nobody rediscovers
+one as a gap.
+
+- **Read-only mirrors, and session sharing generally.** Out of scope (§2).
+- **Per-host or user-named identity.** One implicit session per host survives the loss
+  of client state, but leaves no second terminal for a build alongside an editor.
+  User-named sessions fix both and cost the session-list UI this project exists to
+  avoid (§5.1).
+- **Negotiating the ring capacity in `Hello`.** `NOMUX_RING_BYTES` already tunes it, and
+  the default is the whole question: raise it and every session reserves address space
+  no administrator agreed to, lower it and a twenty-minute disconnect loses a build.
+- **Compressing the output ring.** Measured at `b71db5f`, whose commit message holds the
+  tables: `lz4_flex` buys a median 4.6× more scrollback for 6–8 KiB of binary and costs
+  21× on the PTY push path, 2.8 ms a MiB on the x86_64 the throughput was taken on. It
+  trades memory for CPU, and a larger default ring buys the same scrollback for neither.
+- **A server-side screen snapshot on overflow.** This is the second, lossier emulator §3
+  rejects: deterministic but not exact, and the visible screen only. `libvterm` would
+  also be the first C object in a tree whose musl targets build from `rustup target add`
+  alone ([IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)).
+- **Cross-device handover.** Takeover is the right primitive
+  ([IMPLEMENTATION.md § 6.4](IMPLEMENTATION.md#64-multiple-clients)), but handover needs
+  an input offset in `Hello`, a client that never auto-reconnects after
+  `Error{TAKEOVER}`, and replay conditioned on geometry. That is a wire change and a
+  revision bump whenever it lands, so nothing is reserved for it now (§2).
+- **`daemon::run` *waiting* for the spawn lock.** Waiting would park a session behind the
+  `spawn` that holds the lock ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)).
+- **Addressing the run files through a validated directory descriptor.** There is no
+  `bindat(2)` ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)).

@@ -233,24 +233,15 @@ impl Session {
     }
 
     pub(crate) fn start_with_ring(name: &str, ring_bytes: usize) -> Self {
-        Self::start_with_raw_ring(name, &ring_bytes.to_string())
+        Self::start_with(name, &ring_bytes.to_string(), "/bin/sh")
     }
 
-    /// Starts a daemon with `NOMUX_RING_BYTES` set to exactly `value`, for the one
-    /// test about a value the daemon cannot parse (`IMPLEMENTATION.md` § 4).
-    pub(crate) fn start_with_raw_ring(name: &str, value: &str) -> Self {
-        Self::start_with(name, value, "/bin/sh")
-    }
-
-    /// Starts a daemon whose `SHELL` is `shell`, however unusable that path is, for
-    /// the one test about a session that cannot be created.
-    pub(crate) fn start_with_shell(name: &str, shell: &str) -> Self {
-        Self::start_with(name, &DEFAULT_TEST_RING.to_string(), shell)
-    }
-
-    /// The body all three go through, so what every daemon in this suite is told is
-    /// said once.
-    fn start_with(name: &str, ring_bytes: &str, shell: &str) -> Self {
+    /// The body every daemon in this suite goes through, so what each of them is told
+    /// is said once. `ring_bytes` reaches `NOMUX_RING_BYTES` verbatim, for the one test
+    /// about a value the daemon cannot parse (`IMPLEMENTATION.md` § 4), and `shell`
+    /// reaches `SHELL` however unusable, for the one test about a session that cannot
+    /// be created.
+    pub(crate) fn start_with(name: &str, ring_bytes: &str, shell: &str) -> Self {
         let root = run_root(name);
         let id = intern(name);
         let child = launch(
@@ -402,14 +393,19 @@ impl Cue {
 /// assertion on `gap` really asserts that the machine got round to it. Reconnecting
 /// until the daemon itself says so turns that into a wait on the thing being waited
 /// for.
+///
+/// `deadline` is the caller's, spent here rather than renewed: a fresh [`Client`] per
+/// round would otherwise mint a fresh frame budget every time round, which is the case
+/// [`poll_by`] is written against.
 pub(crate) fn reconnect_until_gap(
     session: &Session,
+    deadline: Instant,
     flags: u8,
     out_offset: u64,
 ) -> (Client, nomux::HelloOk) {
-    let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let mut client = session.connect();
+        client.waits_by(deadline);
         let resumed = client.hello_with(flags, out_offset);
         if resumed.gap(out_offset) {
             return (client, resumed);

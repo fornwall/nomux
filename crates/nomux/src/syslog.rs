@@ -20,10 +20,8 @@ const SOCKET: &str = "/dev/log";
 /// because it could not describe itself would be worse than one nobody can diagnose.
 /// This is the same trade `silence_stdio` makes with its discarded `Result`.
 ///
-/// No timestamp and no hostname, which is a choice rather than an omission: an
-/// RFC 3164 timestamp means local time, local time means a timezone database, and
-/// that is real weight against the § 8 budget to restate what the collector stamps
-/// anyway — `journald`, `rsyslog` and `busybox syslogd` all fill both in.
+/// No timestamp and no hostname: an RFC 3164 timestamp is local time, so it would mean
+/// carrying a timezone database to restate what every collector stamps anyway.
 fn send(priority: u8, session_id: &str, message: &str) {
     // Filtered by the function `list` filters a label with, over the whole assembled
     // line: the text beside a session id is usually an `io::Error` carrying a run

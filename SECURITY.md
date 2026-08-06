@@ -14,10 +14,9 @@ There is no SLA — this is a personal project — but reports are read.
 ## Scope
 
 No released version of nomux receives security updates; fixes land on
-`main`. The threat model is [DESIGN.md § 8](DESIGN.md#8-security-model); known gaps
-are [PLAN.md](PLAN.md)'s, notably [§ P3](PLAN.md#p3--release-process): a `v*` tag
-publishes the per-architecture checksums, and nothing verifies an upload against
-them yet — the client's half.
+`main`. The threat model is [DESIGN.md § 8](DESIGN.md#8-security-model). The gap worth
+naming here: a `v*` tag publishes per-architecture checksums, and nothing verifies an
+upload against them yet — that half is the client's, and it is unwritten.
 
 Two things are deliberate, both in [DESIGN.md § 8](DESIGN.md#8-security-model): an
 attacker who is already the user — though a *different* user replacing a binary the

@@ -9,7 +9,6 @@ description = "Persistent PTY sessions that survive SSH disconnects, with zero s
 publish = false
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
@@ -18,9 +17,10 @@ authors.workspace = true
 rustix = { version = "1.1.4", features = ["pty", "termios", "process", "event", "fs", "pipe", "stdio"] }
 # The declarations and syscalls rustix does not wrap, or puts in its `runtime` module
 # and documents as unusable in a process that has a libc — which this one does, via
-# std. Chiefly the seccomp BPF filter and `prctl`, the signal handlers,
-# `fork`/`_exit`/`waitpid`, and the raw AF_UNIX socket calls; `grep -r 'libc::'` for
-# the current set rather than trusting this list to have kept up.
+# std. Chiefly the signal handlers, `fork`/`_exit`/`waitpid`, the raw AF_UNIX socket
+# calls, and — in the tests alone — the seccomp BPF filter and `prctl` they trap a reach
+# with; `grep -r 'libc::'` for the current set rather than trusting this list to have
+# kept up.
 libc = "0.2.189"
 
 # The default `fork` and `timeout` features run every case in a subprocess so a

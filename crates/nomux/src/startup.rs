@@ -36,8 +36,11 @@ extern "C" fn note_stop_signal(_signum: libc::c_int) {
 }
 
 /// Routes [`STOP_SIGNALS`] into a descriptor the poll set can watch, and hands back
-/// its read end. A self-pipe rather than `signalfd` for the reason
-/// `IMPLEMENTATION.md` § 6.5 gives; rustix has no binding for it either.
+/// its read end.
+///
+/// A self-pipe rather than `signalfd`, which reports only *blocked* signals: reading one
+/// would mean a process-wide `sigprocmask` that then has to survive the `exec` into the
+/// session's child. rustix has no binding for it either.
 ///
 /// # Errors
 ///

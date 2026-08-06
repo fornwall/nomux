@@ -4,8 +4,8 @@
 #
 # This file is the gate. .github/workflows/ci.yml runs `prek run --all-files` rather
 # than restating these commands, so a hook and the CI step that enforces it cannot
-# drift apart; the two things CI adds on top — rustdoc, and the ignored test — are
-# there as steps of their own because neither belongs in a pre-commit hook.
+# drift apart; the three things CI adds on top — rustdoc, the workspace's one doctest and
+# the ignored test — are steps of their own because none belongs in a pre-commit hook.
 #
 # Hooks are ordered cheapest-first so an obvious failure reports fast.
 # They trigger on Rust sources and on manifests, since the lint configuration
@@ -17,25 +17,16 @@
 repos:
   - repo: local
     hooks:
-      # Two files, compared as text. Every build here and in CI installs its toolchain
-      # from rust-toolchain.toml, so all of them are MSRV builds — but only while the two
-      # strings agree, and `clippy::incompatible_msrv` catches std-API drift alone.
-      - id: msrv-is-the-pinned-toolchain
-        name: rust-toolchain.toml and rust-version name the same compiler
-        entry: |
-          sh -c '
-          pinned=$(awk -F\" "/^channel *=/ { print \$2; exit }" rust-toolchain.toml)
-          msrv=$(awk -F\" "/^rust-version *=/ { print \$2; exit }" Cargo.toml)
-          if [ -z "$pinned" ] || [ "$pinned" != "$msrv" ]; then
-              echo "the toolchain CI builds with is not the MSRV the crate declares:" >&2
-              echo "  rust-toolchain.toml channel: '"'"'$pinned'"'"'" >&2
-              echo "  Cargo.toml rust-version:     '"'"'$msrv'"'"'" >&2
-              echo "  move both, or the declared MSRV is tested by nothing." >&2
-              exit 1
-          fi
-          '
+      # The tree cites IMPLEMENTATION.md and DESIGN.md by section number ~700 times, most
+      # of them from source comments. Nothing about a renumbering announces itself: a
+      # comment pointing at a section that has gone reads exactly like one that has not,
+      # so the reference rots in a file nobody reopens. Cheapest hook, and the only one
+      # that can fail on a commit touching no Rust at all.
+      - id: section-references-resolve
+        name: every § names a section that exists
+        entry: sh scripts/check-references.sh
         language: system
-        files: '^(rust-toolchain\.toml|Cargo\.toml)$'
+        files: '\.(rs|md|sh|toml|yml)$'
         pass_filenames: false
 
       # ci.yml carries ~60 lines of embedded shell that the hook below never sees —
@@ -79,15 +70,6 @@ repos:
       - id: cargo-nextest
         name: cargo nextest run
         entry: cargo nextest run --locked --workspace
-        language: system
-        files: '(\.rs|\.toml)$|^Cargo\.lock$'
-        pass_filenames: false
-
-      # nextest cannot run doctests, so they need their own pass or doc
-      # examples silently go unexercised.
-      - id: cargo-doctest
-        name: cargo test --doc
-        entry: cargo test --locked --doc --workspace
         language: system
         files: '(\.rs|\.toml)$|^Cargo\.lock$'
         pass_filenames: false

@@ -45,14 +45,14 @@ nightly_file="$repo/scripts/nightly-version"
 update_baseline="${NOMUX_UPDATE_BASELINE:-0}"
 # The shipping build is `-Cpanic=immediate-abort` with `strip = "symbols"`, so an abort emits
 # no message, location or symbol; what is left is the `SIGQUIT` core of § 6.5, which names no
-# functions without a companion (PLAN.md § P1). Off unless asked for: it doubles the cross
+# functions without the companion § 8 describes. Off unless asked for: it doubles the cross
 # builds, and only the publishing path keeps what they produce.
 companions="${NOMUX_DEBUG:-0}"
 
 # Read before building: finding a typo here after the cross builds have run is finding it too
-# late. Missing, malformed, and a header whose data lines were dropped are one condition —
-# the gate has no reference — and all refused rather than reported as a first build. The last
-# is likeliest and worst: it parses, passes, marks every target `new`, and leaves the gate
+# late. Missing, malformed, and a line dropped from an otherwise fine file are one condition —
+# the gate has no reference for some target — and all refused rather than reported as a first
+# build. The last is likeliest and worst: it parses, it passes, and it leaves the gate
 # present, running, and unable to fail.
 baselines=''
 if [ -e "$baseline_file" ]; then
@@ -63,10 +63,19 @@ if [ -e "$baseline_file" ]; then
         { print $1, $2 }
     ' "$baseline_file") || baselines=''
 fi
-if [ -z "$baselines" ] && [ "$update_baseline" != 1 ]; then
-    die "no usable ${baseline_file#"$repo"/}, the growth gate's only reference. It holds" \
-        "  one \`target bytes\` pair per line, # comments ignored; rerun with" \
-        "  NOMUX_UPDATE_BASELINE=1 to record one from this build."
+if [ "$update_baseline" != 1 ]; then
+    unknown=''
+    for target in $targets; do
+        printf '%s\n' "$baselines" | awk -v t="$target" '$1 == t { hit = 1 } END { exit !hit }' ||
+            unknown="$unknown $target"
+    done
+    if [ -n "$unknown" ]; then
+        die "no usable entry in ${baseline_file#"$repo"/}, the growth gate's only reference," \
+            "  for:$unknown" \
+            "  It holds one \`target bytes\` pair per line, # comments ignored. Restore the" \
+            "  line if it was dropped or its target misspelled; if the architecture is new," \
+            "  rerun with NOMUX_UPDATE_BASELINE=1 and commit the recorded sizes."
+    fi
 fi
 
 # Through RUSTUP_TOOLCHAIN rather than a `+toolchain` argument, so every rustc and cargo
@@ -148,10 +157,26 @@ objcopy="$(rustc --print target-libdir)/../bin/llvm-objcopy"
 readobj="$(rustc --print target-libdir)/../bin/llvm-readobj"
 # Its own target directory: the companion differs by one rustc flag, so sharing one would make
 # each build invalidate the other's cache and turn every one of them cold.
-companion_dir="${CARGO_TARGET_DIR:-$repo/target}/companion"
+# Resolved rather than taken as spelled: cargo accepts a *relative* $CARGO_TARGET_DIR and
+# reads it against this script's cwd, and both uses below need an absolute path — rustc
+# matches a remap prefix component-wise, and check_leaks greps the artifact for this
+# literal. A bare `t` would remap nothing and then fail every build on a byte that occurs
+# in any 175 KiB binary. `pwd -P` also settles a symlink and a trailing slash.
+target_root=$(unset CDPATH; cd -- "${CARGO_TARGET_DIR:-$repo/target}" 2>/dev/null && pwd -P) ||
+    target_root="${CARGO_TARGET_DIR:-$repo/target}"
+case "$target_root" in
+    /*) ;;
+    *) die "CARGO_TARGET_DIR must be an absolute path or an existing directory: $target_root" ;;
+esac
+companion_dir="$target_root/companion"
 remap="--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
 remap="$remap$us--remap-path-prefix=$sysroot=/rust"
 remap="$remap$us--remap-path-prefix=$repo=/nomux"
+# Only the same path as $repo when the target directory is left where cargo puts it. A
+# $CARGO_TARGET_DIR outside the checkout — which the test suite needs, sockaddr_un being
+# 108 bytes — otherwise leaves every build-script path unremapped and undetected: the one
+# below would report the artifact clean and the checksum would differ on the next machine.
+[ "$target_root" = "$repo/target" ] || remap="$remap$us--remap-path-prefix=$target_root=/target"
 
 # crt-static stated rather than left to each target's spec to default to. Both musl targets do,
 # so this is belt and braces — but not every target this script has built did, and the failure
@@ -159,7 +184,6 @@ remap="$remap$us--remap-path-prefix=$repo=/nomux"
 # a host we know nothing about, discovered at a user's shell rather than here.
 rustflags="-Clink-self-contained=yes$us-Ctarget-feature=+crt-static$us$remap"
 rustflags="$rustflags$us-Zunstable-options$us-Cpanic=immediate-abort"
-set -- -Z build-std=std,panic_abort
 
 # build-std compiles std from source but still links the musl CRT objects and libc.a out of
 # the target's rust-std component, so the component is needed even so. Checked here because
@@ -203,7 +227,7 @@ trap 'dist_cleanup; exit 130' INT TERM HUP
 # sysroot layout — and nothing would say so until a client failed a checksum it could not
 # diagnose. `-a` is load-bearing: without it grep calls the artifact binary and finds nothing.
 check_leaks() {
-    for leak in "${CARGO_HOME:-$HOME/.cargo}" "$sysroot" "$repo"; do
+    for leak in "${CARGO_HOME:-$HOME/.cargo}" "$sysroot" "$repo" "$target_root"; do
         if LC_ALL=C grep -qaF -- "$leak" "$1"; then
             die "FAIL: ${1##*/} embeds the build path $leak" \
                 "      the artifact is reproducible only on this machine."
@@ -229,8 +253,10 @@ check_static() {
 
 for target in $targets; do
     echo "building $target ($toolchain)..." >&2
-    CARGO_ENCODED_RUSTFLAGS="$rustflags" cargo build --locked --release --target "$target" --bin nomux "$@" >&2
-    cp "${CARGO_TARGET_DIR:-$repo/target}/$target/release/nomux" "$dist/nomux-$target"
+    CARGO_ENCODED_RUSTFLAGS="$rustflags" \
+        cargo build --locked --release --target "$target" --bin nomux \
+        -Zbuild-std=std,panic_abort >&2
+    cp "$target_root/$target/release/nomux" "$dist/nomux-$target"
     check_leaks "$dist/nomux-$target"
     check_static "$dist/nomux-$target"
 
@@ -242,7 +268,8 @@ for target in $targets; do
         # differ. Deriving one from the other would change what ships, and what ships is what
         # the checksums and the baseline cover.
         CARGO_TARGET_DIR="$companion_dir" CARGO_ENCODED_RUSTFLAGS="$rustflags$us-Cstrip=none" \
-            cargo build --locked --release --target "$target" --bin nomux "$@" >&2
+            cargo build --locked --release --target "$target" --bin nomux \
+            -Zbuild-std=std,panic_abort >&2
         cp "$companion_dir/$target/release/nomux" "$dist/nomux-$target.debug"
         # Matters more here: DWARF is made of file paths, so a companion is where an
         # unremapped sysroot or checkout surfaces first.
@@ -253,12 +280,15 @@ for target in $targets; do
         # to leave code alone, and a companion whose addresses have moved is worse than none —
         # it names functions, and names the wrong ones. `.text` is what a core is read against;
         # identical contents at an identical address is what "these symbols describe it" means.
-        "$objcopy" --dump-section .text="$companion_dir/ship.text" "$dist/nomux-$target" /dev/null
-        "$objcopy" --dump-section .text="$companion_dir/comp.text" "$dist/nomux-$target.debug" /dev/null
-        if ! cmp -s "$companion_dir/ship.text" "$companion_dir/comp.text"; then
+        "$objcopy" --dump-section .text="$dist/ship.text" "$dist/nomux-$target" /dev/null
+        "$objcopy" --dump-section .text="$dist/comp.text" "$dist/nomux-$target.debug" /dev/null
+        if ! cmp -s "$dist/ship.text" "$dist/comp.text"; then
             die "FAIL: the $target companion's .text is not the shipping binary's." \
                 "      its symbols would name the wrong functions in a core."
         fi
+        # Under $dist so the trap above owns them on every failure path, and gone from it
+        # before anything here is checksummed or uploaded.
+        rm -f "$dist/ship.text" "$dist/comp.text"
     fi
 done
 
@@ -279,16 +309,14 @@ trap - EXIT INT TERM HUP
 
 # Neither gate exits early, so one run tells you everything wrong with the build: a size problem
 # is rarely confined to one architecture, and the table is meant to be read across.
-over_budget=''
-grown=''
-unknown=''
+failed=''
 measured=''
 nl='
 '
 echo
-printf '%-34s %9s %9s %8s  %s\n' TARGET BYTES KIB PCT SHA256
+printf '%-34s %9s %9s %9s  %s\n' TARGET BYTES KIB DELTA SHA256
 for target in $targets; do
-    bytes=$(stat -c %s "$dist/nomux-$target")
+    bytes=$(($(wc -c < "$dist/nomux-$target")))
     sha=$(sha256sum "$dist/nomux-$target" | cut -c1-16)
     # Same column widths as the table, so a refreshed baseline is diffable against the one
     # it replaced instead of reflowing when a binary crosses a power of ten.
@@ -296,45 +324,32 @@ for target in $targets; do
 
     verdict=''
     if [ "$bytes" -gt "$max_bytes" ]; then
-        verdict="$verdict OVER BUDGET"
-        over_budget="$over_budget $target"
+        verdict=' OVER BUDGET'
+        failed=1
+        echo "FAIL: $target is over the $((max_bytes / 1024)) KiB budget of IMPLEMENTATION.md § 8." >&2
     fi
 
-    # One missing entry is the dropped-header case above, one target at a time: it parses, it
-    # passes, and it leaves the gate running with nothing to run against. A newly added
-    # architecture reads identically — but adding one is already a commit that touches this
-    # file, so it costs that commit the escape hatch rather than costing every lost line its
-    # gate. The 400 KiB cap still applies, so the exposure is bounded, but only just: at
-    # ~175 KiB a target could more than double before the cap noticed.
+    # Bytes rather than a percentage: this is the number the gate compares, `sh` having no
+    # floating point to round one with. Empty only on a refresh run, every target having been
+    # held against the baseline before the builds started.
     base=$(printf '%s\n' "$baselines" | awk -v t="$target" '$1 == t { print $2; exit }')
-    if [ -z "$base" ]; then
-        pct='new'
-        # Silent on the run that sets the flag: it is about to record this very size.
-        if [ "$update_baseline" != 1 ]; then
-            verdict="$verdict NO BASELINE"
-            unknown="$unknown $target"
-        fi
-    else
+    delta=new
+    if [ -n "$base" ]; then
         diff=$((bytes - base))
-        # The magnitude is divided as a positive number and the sign carried separately, because
-        # the truncation of a negative quotient differs between shells. The percentage is a
-        # rendering and never the thing tested: the gate compares diff*100 against
-        # base*max_growth_pct, the same question without rounding — `sh` has no floating point
-        # to round with — so a figure displaying as exactly the threshold is decided by the
-        # bytes. Growth only; a shrink is what this project wants.
-        sign='+'
-        if [ "$diff" -lt 0 ]; then sign='-'; fi
-        tenths=$(((diff < 0 ? -diff : diff) * 1000 / base))
-        pct="$sign$((tenths / 10)).$((tenths % 10))%"
-        if [ "$update_baseline" != 1 ] && [ "$diff" -gt 0 ] &&
-            [ $((diff * 100)) -gt $((base * max_growth_pct)) ]; then
-            verdict="$verdict GROWN"
-            grown="$grown $target"
+        delta=$(printf '%+d' "$diff")
+        # A negative diff cannot exceed a positive threshold, so only growth can fail here; a
+        # shrink is what this project wants, however large.
+        if [ "$update_baseline" != 1 ] && [ $((diff * 100)) -gt $((base * max_growth_pct)) ]; then
+            verdict=' GROWN'
+            failed=1
+            echo "FAIL: $target grew $delta bytes against ${baseline_file#"$repo"/}, over" >&2
+            echo "      $max_growth_pct%. Find what did it — the cost is paid on every cold upload" >&2
+            echo "      — or accept it with NOMUX_UPDATE_BASELINE=1 and commit the new baseline." >&2
         fi
     fi
 
-    printf '%-34s %9d %7d.%d %8s  %s%s\n' "$target" "$bytes" "$((bytes / 1024))" \
-        "$(((bytes % 1024) * 10 / 1024))" "$pct" "$sha" "$verdict"
+    printf '%-34s %9d %7d.%d %9s  %s%s\n' "$target" "$bytes" "$((bytes / 1024))" \
+        "$(((bytes % 1024) * 10 / 1024))" "$delta" "$sha" "$verdict"
 done
 echo
 if [ "$companions" = 1 ]; then
@@ -344,45 +359,17 @@ else
 fi
 
 if [ "$update_baseline" = 1 ]; then
-    if [ -n "$over_budget" ]; then
-        # These figures would make the next build's delta look healthy while the binary is
-        # still too big for the one gate that is not negotiable.
+    if [ -n "$failed" ]; then
+        # The growth gate does not run on a refresh, so the cap is the only thing that can have
+        # failed — and these figures would make the next build's delta look healthy while the
+        # binary is still too big for the one gate that is not negotiable.
         echo "baseline left alone: a build that misses the cap is not one to record." >&2
     else
-        # The baseline's prose header is its own and is carried forward, not reproduced here: a
-        # copy in this script would be a second original, free to drift from the file it rewrites
-        # because nothing compares the two. awk replays the comment block up to the first data
-        # line, re-stamping only the two lines that are measurements — appending them to a header
-        # that has lost them, since they are what the consistency check above reads.
-        stamp=$(printf '# Measured on %s by:\n#   %s' "$(date -u '+%Y-%m-%d')" "$version")
-        header="$stamp"
-        if [ -e "$baseline_file" ]; then
-            header=$(awk -v stamp="$stamp" '
-                /^[^#]/ { exit }
-                /^#[[:space:]]*Measured on/ { print stamp; getline; seen = 1; next }
-                { print }
-                END { if (!seen) print stamp }
-            ' "$baseline_file")
-        fi
-        printf '%s\n%s' "$header" "$measured" > "$baseline_file"
+        printf '%s\n# Measured on %s by:\n#   %s\n%s' \
+            '# Per-target size baseline for scripts/build-release.sh, which says what it is for.' \
+            "$(date -u '+%Y-%m-%d')" "$version" "$measured" > "$baseline_file"
         echo "baseline refreshed in ${baseline_file#"$repo"/}; commit it with the change that moved the bytes."
     fi
 fi
 
-if [ -n "$over_budget" ] || [ -n "$grown" ] || [ -n "$unknown" ]; then
-    if [ -n "$over_budget" ]; then
-        echo "FAIL: over the $((max_bytes / 1024)) KiB budget of IMPLEMENTATION.md § 8:$over_budget" >&2
-    fi
-    if [ -n "$grown" ]; then
-        echo "FAIL: grown more than $max_growth_pct% against ${baseline_file#"$repo"/}:$grown" >&2
-        echo "      find what did it — the cost is paid on every cold upload — or accept it" >&2
-        echo "      deliberately with NOMUX_UPDATE_BASELINE=1 and commit the new baseline." >&2
-    fi
-    if [ -n "$unknown" ]; then
-        echo "FAIL: no entry in ${baseline_file#"$repo"/} for:$unknown" >&2
-        echo "      the growth gate has nothing to hold this build against. Restore the line" >&2
-        echo "      if it was dropped or its target misspelled; if the architecture is new," >&2
-        echo "      rerun with NOMUX_UPDATE_BASELINE=1 and commit the recorded sizes." >&2
-    fi
-    exit 1
-fi
+[ -z "$failed" ] || exit 1

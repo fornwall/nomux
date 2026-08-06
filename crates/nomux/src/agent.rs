@@ -23,18 +23,11 @@ use crate::nbio::Read;
 const MAX_CHANNEL_QUEUE: usize = 256 * 1024;
 
 /// How long the served connection may move no byte in either direction before the
-/// daemon gives it up (`IMPLEMENTATION.md` § 6.7).
+/// daemon gives it up (`IMPLEMENTATION.md` § 6.7, which has why a whole minute and why
+/// it runs from the last byte rather than from the accept).
 ///
-/// Nothing here parses the agent protocol, so a peer stalled mid-request is
-/// indistinguishable from one legitimately waiting on a slow reply — and the client may
-/// be putting a signature in front of a human to approve, which is why the window is a
-/// generous minute against the sub-second an exchange actually takes. Without it one
-/// peer that connects and never closes holds every later agent user off for the life of
-/// the session, there being only the one slot.
-///
-/// Measured from the last byte rather than from the accept: `ssh(1)` holds a single
-/// agent connection across a whole authentication and issues several requests down it,
-/// which a first-byte deadline would cut off partway.
+/// There being only the one slot, without this a peer that connects and never closes
+/// holds every later agent user off for the life of the session.
 #[expect(
     clippy::duration_suboptimal_units,
     reason = "Duration::from_mins is unstable on the pinned 1.97.1 toolchain"
@@ -102,13 +95,14 @@ pub(crate) struct Agent {
     channel: Option<Channel>,
     /// What the next accepted connection is called.
     ///
-    /// A `u32` rather than a `u64` because the reachable distance between a stale frame
-    /// and the live channel is one round trip, and rather than a `u16` because that
-    /// distance is not what bounds it: a client that has stopped reading is dropped at
-    /// `ABANDON_PENDING_WRITE`, 8 MiB, which is half a million unread boundary frames
-    /// and so half a million turnovers it could still be behind — past a `u16`, nowhere
-    /// near this. Wrapping is therefore unreachable rather than merely unlikely, and
-    /// costs 4 bytes on a frame whose payload is a few hundred.
+    /// A name rather than a fence the daemon sends to flush the ended peer's frames out
+    /// of the wire ahead of the next accept: `Ping` is client→daemon and `Pong`
+    /// daemon→client, so the daemon has nothing it can send that forces a round trip.
+    ///
+    /// A `u32` because what bounds the distance between a stale frame and the live
+    /// channel is the queue a client is dropped at — `ABANDON_PENDING_WRITE`, 8 MiB, so
+    /// half a million unread boundary frames: past a `u16`, four orders under this. So
+    /// wrapping is unreachable rather than merely unlikely.
     next_generation: u32,
 }
 

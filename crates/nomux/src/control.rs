@@ -22,7 +22,16 @@ use crate::rundir::{
 /// How long a probe of a session socket waits for an answer.
 ///
 /// Bounded at all because an `AF_UNIX` `connect` to a full backlog blocks rather than being
-/// refused (§ 6.3). Two seconds, the budget every other wait here is given.
+/// refused (§ 6.3). Two seconds, the budget every other wait here is given, and spent in
+/// full only against that backlog — a session that really has stopped answers
+/// `ECONNREFUSED` on the first attempt.
+///
+/// Deliberately *not* clamped to whatever grace remains, so the deadlines below are each
+/// checked after a probe rather than bounding one, and a stage can overrun its grace by a
+/// whole probe: § 6.6 states what that compounds to. A clamp would buy the wall clock back
+/// by turning a wedged session into [`Liveness::Unknown`], which § 6.3 makes evidence of
+/// neither death nor life — so `kill` would refuse a session it could have collected. A
+/// slow refusal is the better failure.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// What `list` gives a probe instead. Nothing, because only [`Liveness::Stale`] changes
@@ -155,6 +164,12 @@ pub(crate) fn list() -> io::Result<()> {
 
 /// Terminates a session and removes its run files.
 ///
+/// An id whose run files overrun § 6.3's `sun_path` bound is refused here rather than acted
+/// on: [`SessionPaths::new`] is what turns one into the paths this signals and unlinks, so
+/// there is nothing for it to address. [`list`] names such a session on stderr instead of in
+/// § 6.6's three columns, and between the two it is one this host holds that neither mode
+/// can collect.
+///
 /// # Errors
 ///
 /// Fails on an invalid session id, on a run directory that is not this user's alone
@@ -164,8 +179,9 @@ pub(crate) fn list() -> io::Result<()> {
 pub(crate) fn kill(session_id: &str) -> io::Result<()> {
     let paths = SessionPaths::new(session_id)?;
     // The same check `list` makes, and this is where it bites hardest: what follows reads
-    // a pid out of a file and signals it.
-    if !present(paths.check_dir())? {
+    // a pid out of a file and signals it. Checked and never created — being told to remove
+    // a session must not be what brings a run directory into existence.
+    if !present(check_run_dir(paths.dir()))? {
         return Ok(());
     }
     // Held from here to the end of the function (§ 6.6): without it, an attach that starts

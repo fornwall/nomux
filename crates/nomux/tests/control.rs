@@ -254,13 +254,8 @@ fn a_daemon_holds_the_spawn_lock_while_it_claims_the_id() {
 /// every file where it is, and `attach` gives § 10's 126 — found and not this mode's to
 /// have — rather than the 127 that would tell `DESIGN.md` § 7's client its own id named
 /// nothing here. Collecting on a probe that never reached the socket would be the escape
-/// hatch unlinking a session whose daemon is merely busy.
-///
-/// The two refusals say the same thing about the wedge because the same thing is known:
-/// an undrained backlog is evidence of neither death nor life, which is § 6.6's
-/// `unprobeable` and not a session established to be running. `list` is the asymmetry
-/// and not the exception — an entry it cannot collect is one it must still print, since
-/// only death collects and a client may address the id either way.
+/// hatch unlinking a session whose daemon is merely busy: all that is known is § 6.6's
+/// `unprobeable`, and an entry `list` cannot collect is one it must still print.
 #[test]
 fn nothing_parks_on_a_socket_whose_backlog_is_full() {
     let deadline = Instant::now() + PATIENCE;
@@ -451,151 +446,136 @@ fn the_lock_and_the_pidfile_are_created_at_0600_whatever_the_umask() {
     succeeded(&session.run(&["kill", "lk5"]), "kill failed");
 }
 
-/// Regression: `kill` waits out a pidfile that exists but is still empty.
+/// Regression: `kill` waits out an `<id>.pid` the daemon has not published yet.
 ///
-/// The daemon publishes its pid in two steps — `File::create`, which leaves a
-/// zero-length file, and then the write that fills it — so there is a moment when
-/// the path exists and holds nothing. `spawn` does not cover it: it releases the
-/// spawn lock as soon as the path *exists*, which the empty file already satisfies,
-/// so an ordinary session creation reaches this state and not only a hand-started
-/// daemon.
+/// § 6.2's bind-to-publish window, in both states it can be caught in. The daemon
+/// publishes in two steps — `File::create`, which leaves a zero-length file, and the
+/// write that fills it — so the path is first absent and then present and empty, and
+/// answering either rather than waiting it out reports a *corrupt* pidfile over a
+/// session microseconds from finishing. Neither state needs a hand-started daemon to
+/// reach: `spawn` releases the spawn lock as soon as the path *exists*, which the empty
+/// file already satisfies, and what reaches the absent one is what
+/// `attach::await_publication` does not cover — a publish that outlived the spawn's
+/// deadline, and § 6.3's daemon that could not take the lock at all. Absence is also how
+/// a collected session reads, so both wrong answers leave the id unkillable through the
+/// one surface meant to reach any version of it.
 ///
-/// An empty pidfile is the daemon's bind-to-publish window one syscall later than the
-/// absent one already waited out, but it read as a *corrupt* pidfile and was reported
-/// at once — refusing a session in perfect health, microseconds from finishing.
-///
-/// The file is emptied and refilled by hand because the real window is too narrow to
-/// lose a race into deliberately; what is under test is what `kill` does while it is
-/// open, not how it is arrived at.
+/// The pidfile is emptied or removed and put back by hand because the real window is too
+/// narrow to lose a race into deliberately; what is under test is what `kill` does while
+/// it is open, not how it is arrived at. `<id>.lock` is a different file either way, so
+/// one arrangement serves both rows.
 #[test]
-fn kill_waits_out_a_pidfile_that_has_been_created_but_not_yet_written() {
-    let deadline = Instant::now() + PATIENCE;
-    let session = LiveSession::create("lk9");
-    let body = fs::read_to_string(session.pid_path()).expect("read the pidfile");
-    fs::write(session.pid_path(), b"").expect("empty the pidfile");
-    // Stat'ed before `kill` runs, so the file the wait below watches is the one this
-    // session already has rather than whatever is at the path by then.
-    let lock = fs::metadata(session.run.lock_path()).expect("stat the spawn lock");
+fn kill_waits_out_a_pidfile_the_daemon_has_not_published_yet() {
+    /// An id, what its `<id>.pid` is doing — which is also what says which row fired —
+    /// and how to take the published pid back out, leaving the file in that state.
+    type Row = (&'static str, &'static str, fn(&Path));
 
-    let mut killing = Spawned::spawn(
-        nomux(&session.run.root, &["kill", "lk9"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
-    );
+    /// One of those states, held open with its `kill` in flight.
+    struct Unpublished {
+        says: &'static str,
+        session: LiveSession,
+        published: String,
+        lock: fs::Metadata,
+        killing: Spawned,
+    }
+
+    let deadline = Instant::now() + PATIENCE;
+    // Both rows are put in flight before either is waited on, so the negative below is
+    // one 500 ms of wall clock rather than one per row.
+    let rows: [Row; 2] = [
+        ("lk9", "the pidfile was still empty", |path| {
+            fs::write(path, b"").expect("empty the pidfile");
+        }),
+        ("lk32", "nothing named a pid", |path| {
+            fs::remove_file(path).expect("take the pidfile away");
+        }),
+    ];
+    let mut waiting: Vec<Unpublished> = rows
+        .into_iter()
+        .map(|(id, says, withhold)| {
+            let session = LiveSession::create(id);
+            let published = fs::read_to_string(session.pid_path()).expect("read the pidfile");
+            withhold(&session.pid_path());
+            // Stat'ed before `kill` runs, so the file the fence below watches is the one this
+            // session already has rather than whatever is at the path by then.
+            let lock = fs::metadata(session.run.lock_path()).expect("stat the spawn lock");
+            let killing = Spawned::spawn(
+                nomux(&session.run.root, &["kill", id])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped()),
+            );
+            Unpublished {
+                says,
+                session,
+                published,
+                lock,
+                killing,
+            }
+        })
+        .collect();
+
     // The window is closed on two conditions rather than on a guess at how long `kill`
     // takes to reach it, and the first of them is the property itself: while the
     // pidfile says nothing, `kill` must still be *running*. That is what a fixed sleep
-    // and the fence below cannot assert between them — a `kill` that answered the empty
-    // file at once would let the fence miss it and fail this test somewhere else, or
-    // win the race and pass it having tested nothing. Half a second against a grace of
-    // two, so the margin is the wait rather than the scheduler.
+    // and the fence below cannot assert between them — a `kill` that answered the
+    // unpublished file at once would let the fence miss it and fail this test somewhere
+    // else, or win the race and pass it having tested nothing. Half a second against a
+    // grace of two, so the margin is the wait rather than the scheduler.
     assert!(
-        !poll_until(Duration::from_millis(500), || !killing.is_running()),
-        "`kill` returned while the pidfile was still empty, so it is answering the \
-         publish window rather than waiting it out"
+        !poll_until(Duration::from_millis(500), || waiting
+            .iter_mut()
+            .any(|row| !row.killing.is_running())),
+        "`kill` returned while {}, so it is answering the publish window rather than \
+         waiting it out",
+        waiting
+            .iter_mut()
+            .find_map(|row| (!row.killing.is_running()).then_some(row.says))
+            .unwrap_or("the pidfile said nothing")
     );
-    // And the fence, which says *where* it is waiting. `kill` takes `<id>.lock` and
-    // holds it to the end (§ 6.6) strictly before it goes looking for a pid, so a
-    // granted `FLOCK` on that inode puts it past the whole `fork`, `exec` and
-    // run-directory check and one `connect` and one `open` from the empty file.
-    wait_until_flock(
-        Flock::Granted,
-        lock.dev(),
-        lock.ino(),
-        "`kill` took the spawn lock",
-        deadline,
-    );
-    fs::write(session.pid_path(), body.as_bytes()).expect("republish the pid");
 
-    assert!(
-        poll_by(deadline, || !killing.is_running()),
-        "`nomux kill` never returned from the publish grace it was waiting out"
-    );
-    let killed = killing
-        .into_exited()
-        .wait_with_output()
-        .expect("collect what kill said");
+    for mut row in waiting {
+        // And the fence, which says *where* it is waiting. `kill` takes `<id>.lock` and
+        // holds it to the end (§ 6.6) strictly before it goes looking for a pid, so a
+        // granted `FLOCK` on that inode puts it past the whole `fork`, `exec` and
+        // run-directory check and one `connect` and one `open` from the pidfile.
+        wait_until_flock(
+            Flock::Granted,
+            row.lock.dev(),
+            row.lock.ino(),
+            "`kill` took the spawn lock",
+            deadline,
+        );
+        fs::write(row.session.pid_path(), row.published.as_bytes()).expect("publish the pid");
 
-    succeeded(
-        &killed,
-        "kill refused a session whose pidfile was merely still being written",
-    );
-    // The daemon, not its socket. `kill` spins until the socket stops answering and
-    // only *then* unlinks it, so a `connect` to a path that is no longer there is
-    // false on every exit `succeeded` above lets through — [`LiveSession::is_alive`]
-    // cannot fail here, and an assertion that cannot fail is not one. The pid `kill`
-    // was told to signal is what had to go, and `/proc` is where that is visible.
-    assert!(
-        poll_by(deadline, || !process_alive(session.pid)),
-        "kill reported success with the daemon it was asked to stop still running \
-         as pid {}",
-        session.pid
-    );
-}
+        assert!(
+            poll_by(deadline, || !row.killing.is_running()),
+            "`nomux kill` never returned from the publish grace it was waiting out, \
+             where {}",
+            row.says
+        );
+        let killed = row
+            .killing
+            .into_exited()
+            .wait_with_output()
+            .expect("collect what kill said");
 
-/// Regression: `kill` waits out an `<id>.pid` that is not there at all.
-///
-/// § 6.2's bind-to-publish window one syscall before the empty file
-/// [`kill_waits_out_a_pidfile_that_has_been_created_but_not_yet_written`] pins. `spawn`
-/// holds the spawn lock across it (`attach::await_publication`), as does a daemon that
-/// took one, so what reaches this arm is what neither covers: a publish that outlived the
-/// spawn's deadline, and § 6.3's daemon that could not take the lock at all. Absence is
-/// also how a collected session reads, and both wrong answers — no such session, or a
-/// pidfile past repair — refuse a daemon in perfect health and leave the id unkillable
-/// through the one surface meant to reach any version of it.
-///
-/// The arrangement is that test's, and absence changes none of it: `<id>.lock` is a
-/// different file, so the fence still puts `kill` past the lock it takes strictly before
-/// it looks for a pid, and the wait in front of the fence is still what keeps "still
-/// running" from being a race this passes by winning.
-#[test]
-fn kill_waits_out_a_pidfile_that_has_never_appeared() {
-    let deadline = Instant::now() + PATIENCE;
-    let session = LiveSession::create("lk32");
-    let body = fs::read_to_string(session.pid_path()).expect("read the pidfile");
-    fs::remove_file(session.pid_path()).expect("take the pidfile away");
-    let lock = fs::metadata(session.run.lock_path()).expect("stat the spawn lock");
-
-    let mut killing = Spawned::spawn(
-        nomux(&session.run.root, &["kill", "lk32"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
-    );
-    assert!(
-        !poll_until(Duration::from_millis(500), || !killing.is_running()),
-        "`kill` returned while nothing named a pid, so it is answering the publish \
-         window rather than waiting it out"
-    );
-    wait_until_flock(
-        Flock::Granted,
-        lock.dev(),
-        lock.ino(),
-        "`kill` took the spawn lock",
-        deadline,
-    );
-    fs::write(session.pid_path(), body.as_bytes()).expect("publish the pid");
-
-    assert!(
-        poll_by(deadline, || !killing.is_running()),
-        "`nomux kill` never returned from the publish grace it was waiting out"
-    );
-    let killed = killing
-        .into_exited()
-        .wait_with_output()
-        .expect("collect what kill said");
-
-    succeeded(
-        &killed,
-        "kill refused a session whose daemon had yet to publish its pid",
-    );
-    assert!(
-        poll_by(deadline, || !process_alive(session.pid)),
-        "kill reported success with the daemon it was asked to stop still running \
-         as pid {}",
-        session.pid
-    );
+        succeeded(
+            &killed,
+            &format!("kill refused a session where {}", row.says),
+        );
+        // The daemon, not its socket. `kill` spins until the socket stops answering and
+        // only *then* unlinks it, so a `connect` to a path that is no longer there is
+        // false on every exit `succeeded` above lets through — [`LiveSession::is_alive`]
+        // cannot fail here, and an assertion that cannot fail is not one. The pid `kill`
+        // was told to signal is what had to go, and `/proc` is where that is visible.
+        assert!(
+            poll_by(deadline, || !process_alive(row.session.pid)),
+            "kill reported success with the daemon it was asked to stop still running \
+             as pid {}",
+            row.session.pid
+        );
+    }
 }
 
 /// Whether this run is root, where a test that shuts a run file with a mode would assert
@@ -920,9 +900,8 @@ fn kill_reports_a_socket_it_could_not_probe_rather_than_a_session_that_outlived_
 ///
 /// Every refusal `control::resolve` reaches is worded "session `<id>` is running, but
 /// `<id>.pid`: …", and the only thing that ever establishes the opening clause is a
-/// connection a daemon accepted. Under an unprobeable socket nothing did — § 6.3 makes
-/// that errno evidence of neither death nor life — so what came back named a state nobody
-/// had seen, and pointed the user at the one file that was not the problem.
+/// connection a daemon accepted. Under an unprobeable socket nothing did (§ 6.3), so the
+/// refusal named a state nobody had seen and blamed the file that was not the problem.
 ///
 /// The two rows are what `<id>.pid` can be doing while the probe fails: absent, which is
 /// § 6.2's publish window and is waited out, and naming a live process that is positively
@@ -1640,6 +1619,12 @@ fn the_control_surface_neither_creates_nor_complains_about_a_missing_run_directo
 /// An id that could never have named a session is a malformed command line rather
 /// than a session that would not have us.
 ///
+/// Both of § 10's sources of 64, which are not the same claim: an id no run directory
+/// could ever hold, and one *this* run directory has no room for — a property of the
+/// directory rather than of the id, a 64-byte id being § 6.3's longest legal one. A
+/// client caches "unattachable" per host on 126 and retries on 127, so either of them
+/// arriving as one of those numbers would be wrong and uncaught.
+///
 /// Through `spawn`, which is the mode with something to lose by getting the order
 /// wrong: it is the one that goes on to `ensure_dir`, so a refusal that came after
 /// the directory was created would be a bad id bringing a run directory into
@@ -1653,28 +1638,43 @@ fn invalid_session_ids_are_refused() {
     // the refusal is what is under test, and a regression that got as far as the
     // filesystem would otherwise leave its mess where every other test lives.
     let root = run_root("bad_ids");
-    for id in ["../escape", "with/slash", "with space"] {
-        let output = control(&root, &["spawn", id]);
+    // Deepened rather than taken as it comes, per
+    // [`list_reports_an_id_this_run_directory_cannot_address`]: what refuses the last
+    // row is the length of the directory plus the id against `sun_path`'s 107, so a
+    // checkout near the root would otherwise pass without reaching the case. Nothing is
+    // created along the way — the refusal precedes every syscall that would.
+    let long = "a".repeat(64);
+    let mut deep = root.clone();
+    while deep.as_os_str().len() + "/nomux/".len() + long.len() + ".label".len() <= 107 {
+        deep.push("pad");
+    }
+
+    for (root, id, says) in [
+        (&root, "../escape", "invalid session id"),
+        (&root, "with/slash", "invalid session id"),
+        (&root, "with space", "invalid session id"),
+        (&deep, long.as_str(), "is too long for"),
+    ] {
+        let output = control(root, &["spawn", id]);
         // The exit status, not merely a non-zero one: § 10 gives a malformed
-        // invocation `EX_USAGE`, and the distinction is the whole behaviour. A client
-        // caches "unattachable" per host on 126, so an id that could never have named
-        // a session must not come back wearing that number.
+        // invocation `EX_USAGE`, and the distinction is the whole behaviour.
         assert_eq!(
             output.status.code(),
             Some(64),
-            "id {id:?} should be refused as EX_USAGE, got {:?}",
-            output.status
+            "id {id:?} should be refused as EX_USAGE, got {:?}: {:?}",
+            output.status,
+            stderr(&output)
         );
         assert!(
-            stderr(&output).contains("invalid session id"),
-            "id {id:?} should be rejected by name"
+            stderr(&output).contains(says),
+            "id {id:?} should be rejected by name, saying {says:?}: {:?}",
+            stderr(&output)
+        );
+        assert!(
+            !root.join("nomux").exists(),
+            "id {id:?} brought the run directory it would have lived in into existence"
         );
     }
-    assert!(
-        !root.join("nomux").exists(),
-        "an id that could never have named a session brought the run directory it \
-         would have lived in into existence"
-    );
 }
 
 /// The two answers a client gets out of this binary before it has a session: the

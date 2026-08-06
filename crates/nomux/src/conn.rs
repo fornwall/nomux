@@ -192,13 +192,16 @@ impl Conn {
     /// Reads whatever the socket has available into the receive buffer, up to
     /// [`MAX_PENDING_READ`] still undecoded.
     ///
+    /// `chunk` is the caller's, and is only ever written to: a buffer of its own would be
+    /// zeroed on every call, and the daemon already carries one big enough that a burst
+    /// costs a quarter of the reads.
+    ///
     /// # Errors
     ///
     /// Propagates read failures other than `EWOULDBLOCK` and `EINTR`.
-    pub(crate) fn fill(&mut self) -> io::Result<()> {
-        let mut chunk = [0u8; 16 * 1024];
+    pub(crate) fn fill(&mut self, chunk: &mut [u8]) -> io::Result<()> {
         while !self.is_read_saturated() {
-            match self.stream.read(&mut chunk) {
+            match self.stream.read(chunk) {
                 Ok(0) => {
                     self.eof = true;
                     return Ok(());
@@ -235,9 +238,9 @@ impl Conn {
     /// Pushes out whatever is queued, giving up [`FINAL_FLUSH_TIMEOUT`] after it
     /// started.
     ///
-    /// Private, and reached only by the two consuming callers below: it goes *blocking*,
-    /// so for as long as it runs the caller's event loop is not running — no PTY drained,
-    /// no reaping — and its timeout path hands back a socket still in that mode.
+    /// Private, and reached only by [`Conn::close_with`]: it goes *blocking*, so for as
+    /// long as it runs the caller's event loop is not running — no PTY drained, no
+    /// reaping — and its timeout path hands back a socket still in that mode.
     ///
     /// # Errors
     ///
@@ -268,30 +271,24 @@ impl Conn {
         self.stream.flush()
     }
 
-    /// Delivers what is queued and closes, waiting up to [`FINAL_FLUSH_TIMEOUT`] for a
+    /// Closes, delivering `frame` as the last thing this connection will ever carry — or,
+    /// with `None`, whatever is already queued. Waits up to [`FINAL_FLUSH_TIMEOUT`] for a
     /// peer that is not taking it.
     ///
-    /// For the one departure with nothing behind it: the session's own shutdown (§ 6.5),
-    /// where the ring this queue could have been replayed from goes with the daemon. An
-    /// ordinary detach leaves through `Daemon::drop_client`, which may not stop the
-    /// world for half a second on the way.
+    /// A `frame` replaces the queue rather than joining it: a reattaching client replays
+    /// all of that from the ring (§ 6.4), and a small final write is what completes against
+    /// a peer that is barely reading. `None` is for the one departure with nothing behind
+    /// it — the session's own shutdown (§ 6.5), where the ring goes with the daemon.
     ///
-    /// Consumed rather than borrowed for [`Conn::send_last`]'s reason.
-    pub(crate) fn flush_last(mut self) {
-        drop(self.flush_final());
-    }
-
-    /// Sends `frame` as the last thing this connection will ever carry, discarding
-    /// anything still queued — a reattaching client replays it from the ring anyway
-    /// (§ 6.4) — then flushes.
-    ///
-    /// Consumed rather than borrowed because [`Conn::flush_final`] returns on its
-    /// timeout path with the queue untouched and the socket back in blocking mode,
-    /// which no event loop may be handed.
-    pub(crate) fn send_last(mut self, frame: &Frame<'_>) {
-        self.tx.clear();
-        self.tx_pos = 0;
-        self.send(frame);
+    /// Consumed rather than borrowed because [`Conn::flush_final`] returns on its timeout
+    /// path with the queue untouched and the socket back in blocking mode, which no event
+    /// loop may be handed.
+    pub(crate) fn close_with(mut self, frame: Option<&Frame<'_>>) {
+        if let Some(frame) = frame {
+            self.tx.clear();
+            self.tx_pos = 0;
+            self.send(frame);
+        }
         drop(self.flush_final());
     }
 
@@ -400,6 +397,13 @@ mod tests {
         conn.rx.len() - conn.rx_pos
     }
 
+    /// Fills through a buffer of the caller's, as the daemon's event loop does with the
+    /// one it carries for the whole pass.
+    fn fill(conn: &mut Conn) -> io::Result<()> {
+        let mut chunk = vec![0u8; 64 * 1024];
+        conn.fill(&mut chunk)
+    }
+
     /// Hands every byte of `bytes` to `conn`, filling whenever the kernel's buffer
     /// fills — a frame at [`MAX_PAYLOAD`] does not fit in one, so the alternative is
     /// a blocking write with nobody left to unblock it.
@@ -411,7 +415,7 @@ mod tests {
                 Ok(n) => sent += n,
                 Err(err) if err.kind() == ErrorKind::WouldBlock => {
                     let before = conn.rx.len();
-                    conn.fill().expect("a fill");
+                    fill(conn).expect("a fill");
                     assert!(
                         conn.rx.len() > before,
                         "neither side can move: {} bytes buffered, {} of {} sent",
@@ -423,7 +427,7 @@ mod tests {
                 Err(err) => panic!("the peer could not write: {err}"),
             }
         }
-        conn.fill().expect("a fill");
+        fill(conn).expect("a fill");
     }
 
     /// Takes one frame and decodes it out of the scratch buffer, as the daemon's
@@ -549,7 +553,7 @@ mod tests {
         while sender.wants_write() || reader.has_buffered_input() {
             let before = (sender.tx.len() - sender.tx_pos, buffered(&reader));
             sender.flush_some().expect("a flush");
-            reader.fill().expect("a fill");
+            fill(&mut reader).expect("a fill");
             while let Some(frame) = take(&mut reader, &mut scratch) {
                 let Frame::Output { offset, data } = frame else {
                     panic!("expected Output, got {frame:?}");
@@ -779,7 +783,7 @@ mod tests {
             drop(peer);
 
             for _ in 0..2 {
-                conn.fill().expect("a fill after the peer closed");
+                fill(&mut conn).expect("a fill after the peer closed");
                 assert!(conn.is_eof(), "the close must be reported");
                 assert!(
                     matches!(conn.take_frame(&mut scratch), Ok(None)),
@@ -790,11 +794,11 @@ mod tests {
         }
     }
 
-    /// `send_last` throws the queue away: a client being closed replays from the
-    /// ring anyway, and a small final write is what lets it complete against a peer
-    /// that is barely reading.
+    /// `close_with` given a frame throws the queue away: a client being closed replays
+    /// from the ring anyway, and a small final write is what lets it complete against a
+    /// peer that is barely reading.
     #[test]
-    fn send_last_replaces_whatever_was_queued() {
+    fn a_closing_frame_replaces_whatever_was_queued() {
         let payload = bulk(4096);
         let (mut peer, mut conn) = pair();
         for i in 0..64u64 {
@@ -809,7 +813,7 @@ mod tests {
             code: ErrorCode::Takeover,
             message: "another client attached",
         };
-        conn.send_last(&last);
+        conn.close_with(Some(&last));
 
         let mut got = Vec::new();
         drain(&mut peer, &mut got);

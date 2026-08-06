@@ -23,8 +23,7 @@ version = 2
 allow = ["Apache-2.0", "MIT"]
 
 [bans]
-# `clippy::cargo` allows multiple_crate_versions as unactionable in any real tree, and
-# this agrees rather than contradicting it: duplicates are reported, not failed.
+# Unactionable in any real dependency tree, so duplicates are reported and not failed.
 multiple-versions = "warn"
 
 [sources]

@@ -96,7 +96,7 @@ impl Drop for Scratch {
 /// The mode tests deliberately leave directories nobody can open, including their
 /// owner, and `remove_dir_all` has to read a directory to empty it.
 ///
-/// Symlinks are not followed, which is the same promise `ensure_dir_at` makes. The
+/// Symlinks are not followed, which is the same promise `ensure_run_dir` makes. The
 /// recursion gets that from `read_dir`; the entry point has to buy it, because
 /// `set_permissions` is `chmod(2)`, which follows, and Linux has no `lchmod`. Both
 /// callers hand this a path somebody else may have replaced, so without the check a

@@ -25,7 +25,7 @@ use crate::control::{Liveness, liveness};
 use crate::linger;
 use crate::nbio;
 use crate::pty::{self, Pty};
-use crate::rundir::{SessionPaths, session_ids};
+use crate::rundir::{SessionPaths, ensure_run_dir, session_ids};
 use crate::startup::{arm_stop_signals, leave_login_session, release_startup_state};
 
 /// Default ring capacity: how long a disconnect can last before scrollback is lost,
@@ -93,9 +93,18 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 /// Backlog for the session socket: as deep as this host allows (§ 6.3).
 const SOCKET_BACKLOG: libc::c_int = -1;
 
-/// Fault injection: restores the pre-fix event ordering of § 6.4.1, where the takeover
-/// was serviced before the client it was replacing, so the regression test guarding it
-/// can be *shown* to fail (`scripts/verify-takeover-guard.sh`). A `const` rather than a
+/// The event ordering a takeover is serviced in, and the fault injection that undoes it.
+///
+/// One `poll` can report both a readable client and, from the connection replacing it, the
+/// `Hello` that evicts it. The takeover is never serviced before the client it replaces:
+/// everything that client delivered before this moment is decoded first, in
+/// [`Daemon::poll_once`] and again in [`Daemon::read_pending`]'s final drain, because the
+/// eviction ends that connection for good — nothing resends what was left in its receive
+/// buffer, the peer that would have is gone, and the arriving client resumes from an
+/// `in_applied` those keystrokes never reached. Read, then accept.
+///
+/// Setting this restores the pre-fix ordering, so the regression test guarding the rule can
+/// be *shown* to fail (`scripts/verify-guard.sh takeover`). A `const` rather than a
 /// `#[cfg]` block, so both orderings stay compiled and the branch folds away.
 const ACCEPT_BEFORE_READ: bool = cfg!(nomux_fault_injection);
 
@@ -114,6 +123,9 @@ const PENDING_HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Stop accepting client input once this much is queued for a PTY not taking it (§ 4.1).
 const MAX_PENDING_INPUT: usize = 1 << 20;
+
+/// Capacity the decode scratch keeps between passes rather than hand back.
+const SCRATCH_RETAINED: usize = 64 * 1024;
 
 /// The attached client, and the state that means nothing without one.
 ///
@@ -134,20 +146,6 @@ struct Attached {
     repaint_due: bool,
 }
 
-impl Attached {
-    /// Takes over the session with a connection that has just said `Hello`; `on_hello`
-    /// runs next and resolves everything left provisional here.
-    const fn new(conn: Conn) -> Self {
-        Self {
-            conn,
-            exit_sent: false,
-            sent_through: 0,
-            repaint_ctrl_l: false,
-            repaint_due: false,
-        }
-    }
-}
-
 /// Session state for the lifetime of the daemon process.
 struct Daemon {
     paths: SessionPaths,
@@ -157,6 +155,10 @@ struct Daemon {
     stop_pipe: Option<OwnedFd>,
     /// Set once a stop signal has been seen; the loop leaves on its next pass (§ 6.5).
     stopping: bool,
+    /// Why this session cannot go on, where something it could not do without has failed.
+    /// Read by [`Daemon::stop_reason`]; [`Daemon::start_session`], the only thing that
+    /// sets it, has why the failure is a field here rather than an `Err` on the way out.
+    fatal: Option<&'static str>,
     ring: crate::ring::Ring,
     pty: Option<Pty>,
     client: Option<Attached>,
@@ -176,7 +178,19 @@ struct Daemon {
     in_applied: u64,
     /// Input accepted but not yet written, because the PTY was not writable.
     pending_input: VecDeque<u8>,
+    /// The size the client last asked for, which is not necessarily the one the PTY has:
+    /// [`Daemon::apply_win`] closes the difference once a pass.
     win: WinSize,
+    /// The size this daemon last *successfully* gave the PTY, so a pass that decoded a
+    /// hundred `Resize` frames still issues at most one `TIOCSWINSZ`.
+    ///
+    /// `None` means "no longer known", which is the honest answer more often than it
+    /// looks: the daemon is not the only thing that can call `TIOCSWINSZ` — `stty rows`
+    /// in the session is the everyday spelling — so this is a record of what was sent
+    /// and never a belief about what the terminal is. Every `Hello` clears it, which is
+    /// what keeps § 2.2's "the arriving `Hello`'s winsize is authoritative" true of a
+    /// reattach at an unchanged size.
+    applied_win: Option<WinSize>,
     /// When the PTY master reported end of file. Distinct from `exited`: the status is
     /// usually not readable yet at that moment.
     child_gone: Option<Instant>,
@@ -214,7 +228,7 @@ pub(crate) fn run(session_id: &str, label: Option<&str>) -> io::Result<()> {
 /// The body of [`run`], separated so that every way out of it is logged once.
 fn start(session_id: &str, label: Option<&str>) -> io::Result<()> {
     let paths = SessionPaths::new(session_id)?;
-    paths.ensure_dir()?;
+    ensure_run_dir(paths.dir())?;
 
     // Asked before the lock creates the file, and the whole of what licenses removing it
     // below: `<id>.lock` outlives the daemon that made it, so a name already here is the
@@ -293,6 +307,7 @@ fn start(session_id: &str, label: Option<&str>) -> io::Result<()> {
         listener,
         stop_pipe,
         stopping: false,
+        fatal: None,
         ring: crate::ring::Ring::new(ring_capacity(std::env::var(RING_BYTES_ENV).ok().as_deref())),
         pty: None,
         client: None,
@@ -303,6 +318,7 @@ fn start(session_id: &str, label: Option<&str>) -> io::Result<()> {
         in_applied: 0,
         pending_input: VecDeque::new(),
         win: WinSize::default(),
+        applied_win: None,
         child_gone: None,
         exited: None,
         accept_retry: None,
@@ -413,6 +429,10 @@ fn at_session_ceiling(dir: &Path, mine: &str) -> bool {
 }
 
 /// What one entry of the poll set belongs to.
+///
+/// The discriminant is also the slot in the readiness array [`Daemon::wait`] hands back,
+/// which is why nothing indexes that array without a `get`: a variant added here and not
+/// to [`SINGLE_SOURCES`] sits past its end, and must read as "nothing ready" and not trap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Source {
     /// The session socket, where clients arrive.
@@ -461,17 +481,20 @@ impl Daemon {
     fn event_loop(&mut self) -> io::Result<()> {
         let mut scratch = Vec::new();
         let mut read_buf = vec![0u8; 64 * 1024];
-        let mut ready = Vec::new();
 
         loop {
             if self.stop_reason().is_some() {
                 return Ok(());
             }
-            self.poll_once(&mut read_buf, &mut scratch, &mut ready)?;
-            // Given back so one large `Input` does not leave 256 KiB held for a week.
-            // Cleared first, `shrink_to` not going below the length; `read_buf` stays.
+            let ready = self.wait()?;
+            self.poll_once(&ready, &mut read_buf, &mut scratch);
+            // Given back so one large `Input` does not leave 256 KiB held for a week, and
+            // only then: every pass reaches here, and a pass carrying three keystrokes
+            // must not pay a free and a malloc for the next one. `read_buf` never moves.
             scratch.clear();
-            scratch.shrink_to(0);
+            if scratch.capacity() > SCRATCH_RETAINED {
+                scratch.shrink_to(0);
+            }
         }
     }
 
@@ -504,7 +527,9 @@ impl Daemon {
     /// Why the daemon should stop, if it should — `None` is "keep going". The string is
     /// what goes to syslog, the run files being gone by the time anyone reads it.
     fn stop_reason(&self) -> Option<&'static str> {
-        if self.stopping {
+        if self.fatal.is_some() {
+            self.fatal
+        } else if self.stopping {
             Some("signalled")
         } else if self
             .detach_deadline()
@@ -599,65 +624,42 @@ impl Daemon {
         }
     }
 
-    /// Everything the poll set watches, in the order it is registered, into `ready` and
-    /// `fds` in step. Named rather than positional because the set is variable-length,
-    /// where index arithmetic would apply one fd's readiness to another.
-    fn watches<'a>(&'a self, ready: &mut Vec<(Source, PollFlags)>, fds: &mut [PollFd<'a>]) {
-        let mut watch = |source, fd, flags| {
+    /// Registers everything the poll set watches into `fds`, and which source each of
+    /// those slots belongs to into `order`; answers with how many of each were filled.
+    /// `poll` takes a compacted array, so the two are needed in step: the set is
+    /// variable-length, where index arithmetic would apply one fd's readiness to another.
+    fn watches<'a>(
+        &'a self,
+        order: &mut [Source; POLL_SLOTS],
+        fds: &mut [PollFd<'a>; POLL_SLOTS],
+    ) -> usize {
+        let mut used = 0;
+        for source in SINGLE_SOURCES {
             // Through `get_mut` rather than by index: the budget cannot be reached, so
             // the unreachable state costs a missed wakeup rather than a panic.
-            if let Some(slot) = fds.get_mut(ready.len()) {
+            if let Some((fd, flags)) = self.watch_for(source)
+                && let Some(slot) = fds.get_mut(used)
+                && let Some(place) = order.get_mut(used)
+            {
                 *slot = PollFd::from_borrowed_fd(fd, flags);
-                ready.push((source, PollFlags::empty()));
-            }
-        };
-
-        for source in SINGLE_SOURCES {
-            if let Some((fd, flags)) = self.watch_for(source) {
-                watch(source, fd, flags);
+                *place = source;
+                used += 1;
             }
         }
+        used
     }
 
-    /// Blocks until something in the poll set is ready, and records what into `ready`.
-    /// Split out so [`Daemon::poll_once`] is the § 6.4.1 ordering policy and nothing else,
-    /// and so the borrows of `self` end here. An empty `ready` is the `EINTR` case.
+    /// Expires the deadlines that decide the poll set, blocks until something in it is
+    /// ready, and answers with what each source has to service — indexed by the source, so
+    /// [`Daemon::poll_once`] asks rather than searches. All empty is the `EINTR` case.
     ///
-    /// A failing `poll` deliberately ends the session — § 6.4.1's "never propagated" is
-    /// about client I/O — and `shutdown` still signals the child and clears the run files.
-    fn wait(&self, ready: &mut Vec<(Source, PollFlags)>) -> io::Result<()> {
-        ready.clear();
-        // A fixed frame, the set having a compile-time maximum. `PollFd` has no vacant
-        // spelling, so slots past `ready.len()` are seeded and never shown to `poll`.
-        let mut fds: [PollFd<'_>; POLL_SLOTS] = std::array::from_fn(|_| {
-            PollFd::from_borrowed_fd(self.listener.as_fd(), PollFlags::empty())
-        });
-        self.watches(ready, &mut fds);
-
-        let timeout = self.poll_timeout();
-        match rustix::event::poll(
-            fds.get_mut(..ready.len()).unwrap_or(&mut []),
-            Some(&timeout),
-        ) {
-            Ok(_) => {}
-            // Never restarted, and nothing is lost by that: the handler wrote its byte
-            // before the syscall returned, so the next pass finds the pipe readable.
-            Err(rustix::io::Errno::INTR) => ready.clear(),
-            Err(err) => return Err(err.into()),
-        }
-
-        for ((_, flags), fd) in ready.iter_mut().zip(fds.iter()) {
-            *flags = fd.revents();
-        }
-        Ok(())
-    }
-
-    fn poll_once(
-        &mut self,
-        read_buf: &mut [u8],
-        scratch: &mut Vec<u8>,
-        ready: &mut Vec<(Source, PollFlags)>,
-    ) -> io::Result<()> {
+    /// Split out so `poll_once` is the [`ACCEPT_BEFORE_READ`] ordering and nothing else,
+    /// and so the borrows of `self` end here.
+    ///
+    /// A failing `poll` deliberately ends the session: what is never propagated is client
+    /// I/O ([`Daemon::read_client`]), and this is the loop itself. `shutdown` still signals
+    /// the child and clears the run files.
+    fn wait(&mut self) -> io::Result<[PollFlags; POLL_SLOTS]> {
         if SETTLE_BEFORE_POLL {
             std::thread::sleep(FAULT_SETTLE);
         }
@@ -682,12 +684,44 @@ impl Daemon {
         {
             self.tell_client(&Frame::AgentClose { generation });
         }
-        self.wait(ready)?;
+
+        // A fixed frame, the set having a compile-time maximum. `PollFd` has no vacant
+        // spelling, so slots past `used` are seeded and never shown to `poll`.
+        let mut fds: [PollFd<'_>; POLL_SLOTS] = std::array::from_fn(|_| {
+            PollFd::from_borrowed_fd(self.listener.as_fd(), PollFlags::empty())
+        });
+        let mut order = [Source::Listener; POLL_SLOTS];
+        let used = self.watches(&mut order, &mut fds);
+
+        let timeout = self.poll_timeout();
+        let mut ready = [PollFlags::empty(); POLL_SLOTS];
+        match rustix::event::poll(fds.get_mut(..used).unwrap_or(&mut []), Some(&timeout)) {
+            Ok(_) => {
+                for (source, fd) in order.iter().zip(fds.iter()).take(used) {
+                    if let Some(slot) = ready.get_mut(*source as usize) {
+                        *slot = fd.revents();
+                    }
+                }
+            }
+            // Never restarted, and nothing is lost by that: the handler wrote its byte
+            // before the syscall returned, so the next pass finds the pipe readable.
+            Err(rustix::io::Errno::INTR) => {}
+            Err(err) => return Err(err.into()),
+        }
+        Ok(ready)
+    }
+
+    fn poll_once(
+        &mut self,
+        ready: &[PollFlags; POLL_SLOTS],
+        read_buf: &mut [u8],
+        scratch: &mut Vec<u8>,
+    ) {
         let revents = |want: Source| {
             ready
-                .iter()
-                .find(|(source, _)| *source == want)
-                .map_or(PollFlags::empty(), |(_, flags)| *flags)
+                .get(want as usize)
+                .copied()
+                .unwrap_or_else(PollFlags::empty)
         };
 
         // Nothing is read from the pipe: the byte says only that a signal arrived, and
@@ -712,10 +746,10 @@ impl Daemon {
                     .client
                     .as_ref()
                     .is_some_and(|client| client.conn.has_buffered_input()));
-        // Before the greeting, always (§ 6.4.1): one poll can report both a readable
-        // client and a `Hello` from its replacement.
+        // Before the greeting, always ([`ACCEPT_BEFORE_READ`]): one poll can report both a
+        // readable client and a `Hello` from its replacement.
         if !ACCEPT_BEFORE_READ && client_ready {
-            self.read_client(scratch)?;
+            self.read_client(read_buf, scratch);
         }
         // Reading is not an answer to `HUP` while input is held back: nothing consumes what
         // is left, so `fill` never reaches the zero-length read that would notice.
@@ -726,14 +760,14 @@ impl Daemon {
         // flush evicting a client about to be dropped, past § 6.5's shutdown budget.
         if !self.stopping {
             if revents(Source::Pending).intersects(READABLE) {
-                self.read_pending(scratch)?;
+                self.read_pending(read_buf, scratch);
             }
             if revents(Source::Listener).intersects(READABLE) {
                 self.accept();
             }
         }
         if ACCEPT_BEFORE_READ && client_ready {
-            self.read_client(scratch)?;
+            self.read_client(read_buf, scratch);
         }
 
         let agent_events = revents(Source::AgentChannel);
@@ -745,13 +779,13 @@ impl Daemon {
             self.accept_agent();
         }
 
+        self.apply_win();
         // Immediately before the pump that turns a status into a frame: `poll_timeout`
         // stops clamping to `STATUS_RETRY` once the status is collected, and with the
         // master out of the poll set nothing would wake the pass that sends the `Exit`.
         self.collect_status();
         self.pump_output();
         self.write_client();
-        Ok(())
     }
 
     /// Sleeps until the next deadline that could stop the daemon, and no longer: every
@@ -787,8 +821,8 @@ impl Daemon {
     }
 
     /// Takes a new connection, which waits as `pending` until it says `Hello`: connecting
-    /// is *not* attaching (§ 6.4). Never fails, per § 6.4.1; [`ACCEPT_BACKOFF`] is what
-    /// covers a transient one.
+    /// is *not* attaching (§ 6.4). Never fails — no client I/O does, which is the rule
+    /// [`Daemon::read_client`] states — and [`ACCEPT_BACKOFF`] covers a transient failure.
     fn accept(&mut self) {
         loop {
             match self.listener.accept() {
@@ -827,16 +861,16 @@ impl Daemon {
     ///
     /// Its first frame decides everything: a `Hello` promotes it and evicts whoever held
     /// the session, anything else is a protocol error, and an EOF was a liveness probe.
-    fn read_pending(&mut self, scratch: &mut Vec<u8>) -> io::Result<()> {
+    fn read_pending(&mut self, read_buf: &mut [u8], scratch: &mut Vec<u8>) {
         // Separate from `scratch`, which the outgoing client's final drain below needs
         // while the `Hello` is still borrowed.
         let mut buf = Vec::new();
         let Some((pending, _)) = self.pending.as_mut() else {
-            return Ok(());
+            return;
         };
-        if pending.fill().is_err() {
+        if pending.fill(read_buf).is_err() {
             self.pending = None;
-            return Ok(());
+            return;
         }
         let ty = match pending.take_frame(&mut buf) {
             Ok(Some(ty)) => ty,
@@ -844,11 +878,11 @@ impl Daemon {
                 if pending.is_eof() {
                     self.pending = None;
                 }
-                return Ok(());
+                return;
             }
             Err(_) => {
                 self.reject_pending(ErrorCode::Protocol, "unparseable frame header");
-                return Ok(());
+                return;
             }
         };
         if ty != FrameType::Hello {
@@ -856,33 +890,40 @@ impl Daemon {
                 ErrorCode::Protocol,
                 "first frame from a client must be Hello",
             );
-            return Ok(());
+            return;
         }
         let Ok(Frame::Hello(hello)) = Frame::decode(ty, &buf) else {
             self.reject_pending(ErrorCode::Protocol, "unparseable Hello");
-            return Ok(());
+            return;
         };
         // Before the eviction below, not after (§ 6.4). `on_hello` keeps its own copy of
         // the check, for the client that greets again on an established connection.
         if hello.protocol != PROTOCOL_VERSION {
             self.reject_pending(ErrorCode::Version, "protocol version mismatch");
-            return Ok(());
+            return;
         }
 
         // Final drain of the outgoing connection: input it delivered between the poll
-        // and this moment must not be lost to the takeover (§ 6.4.1).
+        // and this moment must not be lost to the takeover ([`ACCEPT_BEFORE_READ`]).
         if !ACCEPT_BEFORE_READ && self.client.is_some() {
-            drop(self.read_client(scratch));
+            self.read_client(read_buf, scratch);
         }
         // Hands the session over (`IMPLEMENTATION.md` § 6.4), by the same door as any
         // other refusal — which also drops the agent connection the arriving client
         // knows nothing of. With nobody attached this does nothing at all.
         self.reject(ErrorCode::Takeover, "another client attached");
-        self.client = self.pending.take().map(|(conn, _)| Attached::new(conn));
-        self.on_hello(&hello)?;
+        // Only `repaint_due` is meant: `on_hello` runs next and resolves the other three.
+        self.client = self.pending.take().map(|(conn, _)| Attached {
+            conn,
+            exit_sent: false,
+            sent_through: 0,
+            repaint_ctrl_l: false,
+            repaint_due: false,
+        });
+        self.on_hello(&hello);
         // Clients pipeline: input riding behind the `Hello` in the same read is
         // already buffered in the connection that was just promoted.
-        self.read_client(scratch)
+        self.read_client(read_buf, scratch);
     }
 
     /// Turns away a connection that cannot have the session, leaving the session alone.
@@ -890,7 +931,7 @@ impl Daemon {
     /// protocol error differently (`DESIGN.md` § 6.4).
     fn reject_pending(&mut self, code: ErrorCode, message: &'static str) {
         if let Some((pending, _)) = self.pending.take() {
-            pending.send_last(&Frame::Error { code, message });
+            pending.close_with(Some(&Frame::Error { code, message }));
         }
     }
 
@@ -912,10 +953,10 @@ impl Daemon {
         let Some(pty) = self.pty.as_ref() else {
             return;
         };
-        // No PTY error ends the session, in either direction — § 6.4.1's rule for the
-        // client socket. What this must *not* do is record the exit: `child_gone` drops
-        // the master from the poll set, and the read side can still be holding everything
-        // the child wrote on its way out.
+        // No PTY error ends the session, in either direction — [`Daemon::read_client`]
+        // states that rule for the client socket and it holds here too. What this must
+        // *not* do is record the exit: `child_gone` drops the master from the poll set,
+        // and the read side can still be holding everything the child wrote on its way out.
         if nbio::drain_to(&mut self.pending_input, pty.master()).is_err() {
             self.pending_input.clear();
         }
@@ -929,8 +970,8 @@ impl Daemon {
 
     /// Records that the child has let go of the terminal; the stamp starts no clock (§ 6.5).
     ///
-    /// No status is collected here: end of file precedes reapability for about a third of
-    /// exits on this kernel (§ 6.5). [`Daemon::collect_status`] runs later this pass.
+    /// No status is collected here: end of file usually arrives first, for the reason
+    /// [`Daemon::collect_status`] gives, and it runs later this same pass.
     fn on_child_exit(&mut self) {
         if self.child_gone.is_none() {
             self.child_gone = Some(Instant::now());
@@ -943,6 +984,12 @@ impl Daemon {
     }
 
     /// Collects the child's status once `waitpid` will give it up.
+    ///
+    /// End of file is not the exit, and does not even follow it: `do_exit` closes the
+    /// dying process's descriptors — the PTY slave among them — well before it makes the
+    /// process reapable by its parent, so on this kernel the master reports end of file
+    /// ahead of `waitpid` for about a third of exits. That is what [`STATUS_GRACE`] waits
+    /// out, and why nothing may read the missing status as a child still running (§ 6.5).
     ///
     /// Every pass, not only past end of file: the child can exit while something it
     /// started still holds the slave — `sleep 3600 &` then `exit` — and nothing else would
@@ -974,20 +1021,23 @@ impl Daemon {
         }
     }
 
-    fn read_client(&mut self, scratch: &mut Vec<u8>) -> io::Result<()> {
+    fn read_client(&mut self, read_buf: &mut [u8], scratch: &mut Vec<u8>) {
         let Some(client) = self.client.as_mut() else {
-            return Ok(());
+            return;
         };
         // Nothing is asked of a socket whose peer has closed its write half: there is
         // nothing behind that zero, and what it delivered before it is already in the
         // buffer the loop below reads. Such a peer is not gone — `attach` half-closes
         // on stdin EOF and goes on draining output (§ 7) — so what ends this connection
         // is the *write* side, in [`Daemon::write_client`], and never the read side.
-        if !client.conn.is_eof() && client.conn.fill().is_err() {
-            // A connection failing is the normal case, not a daemon failure (§ 6.4.1). What
-            // `fill` had buffered goes undecoded: the client resends from `in_applied` (§ 3).
+        if !client.conn.is_eof() && client.conn.fill(read_buf).is_err() {
+            // The rule for every client I/O failure, in either direction and on either
+            // socket: a connection failing is the normal case and never the daemon's, so
+            // nothing here is propagated out of the event loop — it ends the connection
+            // and the session goes on. What `fill` had buffered goes undecoded: the
+            // client resends from `in_applied` (§ 3).
             self.drop_client();
-            return Ok(());
+            return;
         }
 
         loop {
@@ -998,38 +1048,33 @@ impl Daemon {
                 // skipped: `attach` shuts its write half down on stdin EOF and goes on
                 // draining output (§ 7). `poll_once`'s `has_buffered_input` test re-arms
                 // this loop once `write_pty` has taken some of the queue.
-                return Ok(());
+                return;
             }
             let Some(client) = self.client.as_mut() else {
-                return Ok(());
+                return;
             };
             let ty = match client.conn.take_frame(scratch) {
                 Ok(Some(ty)) => ty,
                 Ok(None) => break,
                 Err(_) => {
                     self.reject(ErrorCode::Protocol, "unparseable frame header");
-                    return Ok(());
+                    return;
                 }
             };
             let Ok(frame) = Frame::decode(ty, scratch) else {
                 self.reject(ErrorCode::Protocol, "unparseable frame payload");
-                return Ok(());
+                return;
             };
-            self.handle_frame(&frame)?;
+            self.handle_frame(&frame);
         }
-        Ok(())
     }
 
-    fn handle_frame(&mut self, frame: &Frame<'_>) -> io::Result<()> {
+    fn handle_frame(&mut self, frame: &Frame<'_>) {
         match *frame {
-            Frame::Hello(hello) => self.on_hello(&hello)?,
+            Frame::Hello(hello) => self.on_hello(&hello),
             Frame::Input { offset, data } => self.on_input(offset, data),
-            Frame::Resize(win) => {
-                self.win = win;
-                if let Some(pty) = self.pty.as_ref() {
-                    drop(pty.resize(win));
-                }
-            }
+            // Recorded rather than applied: [`Daemon::apply_win`] runs once a pass.
+            Frame::Resize(win) => self.win = win,
             Frame::Ping => self.tell_client(&Frame::Pong),
             Frame::Detach => self.drop_client(),
             Frame::AgentData { generation, data } => {
@@ -1046,13 +1091,12 @@ impl Daemon {
             }
             _ => self.reject(ErrorCode::Protocol, "frame is not valid from a client"),
         }
-        Ok(())
     }
 
     /// Binds the agent socket and spawns the child, on the `Hello` that creates the
     /// session — what this session *is*, decided once, as against where a particular
     /// client resumes from, which is [`Daemon::on_hello`]'s job on every attach.
-    fn start_session(&mut self, hello: &Hello<'_>) -> io::Result<()> {
+    fn start_session(&mut self, hello: &Hello<'_>) {
         // Only the creating `Hello` can turn forwarding on: `SSH_AUTH_SOCK` goes into
         // the child's environment, which cannot be changed afterwards (§ 5.3).
         if hello.agent_forward {
@@ -1074,25 +1118,58 @@ impl Daemon {
         };
         match Pty::spawn(&config) {
             Ok(pty) => self.pty = Some(pty),
+            // Recorded rather than returned: the client has already been told, and past
+            // `release_startup_state` there is no stderr for an `Err` to surface on, so
+            // carrying one up would buy nothing but six `io::Result` signatures. What is
+            // left to do with it is name it to syslog and stop the loop.
             Err(err) => {
                 self.reject(ErrorCode::Internal, "failed to start the session shell");
-                return Err(err);
+                crate::syslog::error(self.paths.id(), &format!("session shell: {err}"));
+                self.fatal = Some("the session shell could not be started");
             }
         }
-        Ok(())
     }
 
-    fn on_hello(&mut self, hello: &Hello<'_>) -> io::Result<()> {
+    /// Gives the PTY the size the client last asked for, at most once per pass.
+    ///
+    /// `Resize` touches no queue, so it never breaks [`Daemon::read_client`]'s decode
+    /// loop: a peer sending nothing else fills `MAX_PENDING_READ` with 12-byte frames
+    /// and would, applied per frame, spend one wakeup on ~87 000 `TIOCSWINSZ` calls and
+    /// as many `SIGWINCH`s to the child — all of it while the PTY goes undrained, which
+    /// is the one thing § 4.1 does not allow a client to cause. Only the last size was
+    /// ever real, so coalescing costs nothing but the intermediate ioctls.
+    fn apply_win(&mut self) {
+        if self.applied_win == Some(self.win) {
+            return;
+        }
+        if let Some(pty) = self.pty.as_ref() {
+            // Recorded only where the ioctl took. A failed one leaves the size unknown
+            // rather than applied, so the next pass tries again instead of reading its
+            // own record back as agreement.
+            self.applied_win = pty.resize(self.win).is_ok().then_some(self.win);
+        }
+    }
+
+    fn on_hello(&mut self, hello: &Hello<'_>) {
         if hello.protocol != PROTOCOL_VERSION {
             self.reject(ErrorCode::Version, "protocol version mismatch");
-            return Ok(());
+            return;
         }
         self.win = hello.win;
+        // Restated to the terminal rather than assumed, which is § 2.2's rule and not an
+        // optimisation to be had back: the arriving `Hello`'s winsize is authoritative,
+        // and the child may have moved the master itself since the last one — `stty rows`
+        // needs no permission from this daemon. A reattach at an unchanged size is the
+        // only chance to put that right, so it may not be the pass that skips the ioctl.
+        self.applied_win = None;
 
-        if let Some(pty) = self.pty.as_ref() {
-            drop(pty.resize(hello.win));
-        } else {
-            self.start_session(hello)?;
+        if self.pty.is_none() {
+            self.start_session(hello);
+            // Tested again rather than answered for: a session with no terminal has
+            // nothing to resume anybody from, and the refusal has already gone out.
+            if self.pty.is_none() {
+                return;
+            }
         }
 
         let base = self.ring.base();
@@ -1121,7 +1198,6 @@ impl Daemon {
             linger: self.logind_linger,
             agent: self.agent.is_some(),
         }));
-        Ok(())
     }
 
     /// Asks the child to redraw after a gap, by whichever means this client chose;
@@ -1138,7 +1214,12 @@ impl Daemon {
             // Queued rather than written, and not client input: `in_applied` stays (§ 4.3).
             self.pending_input.push_back(0x0c);
         } else if let Some(pty) = self.pty.as_ref() {
-            drop(pty.nudge_repaint(self.win));
+            // Two resizes, and a failure between them leaves the master a column narrow
+            // with nothing to say so: forget the size rather than record one that was
+            // never reached, and the next pass sets it again.
+            if pty.nudge_repaint(self.win).is_err() {
+                self.applied_win = None;
+            }
         }
     }
 
@@ -1292,18 +1373,9 @@ impl Daemon {
         }
     }
 
-    /// Pushes out what is queued, and is where a connection ends: a socket that has
-    /// failed, a peer past `ABANDON_PENDING_WRITE` and so not reading at all (§ 4.1), or
-    /// one owed nothing further.
-    ///
-    /// The last is the only ending that is not a failure, and is what a half-closed
-    /// peer's end of file is answered with rather than a departure: it can ask for
-    /// nothing more, and past the `Exit` there is nothing more to send it — `child_gone`
-    /// takes the master out of the poll set, so a ring read to its end stays read to its
-    /// end (§ 6.5). Read as a departure, that end of file cost `nomux attach ID < script`
-    /// every byte its child produced after the file ran out, § 7 having the relay go on
-    /// draining; without the close behind it, that same relay drains a socket nothing
-    /// will ever close.
+    /// Pushes out what is queued, and is three of the six endings § 6.4 lists: a socket
+    /// that has failed, a peer past `ABANDON_PENDING_WRITE` (§ 4.1), and the half-closed
+    /// one owed nothing further — the only one of the three that is not a failure.
     ///
     /// Out through [`Daemon::drop_client`] like every other departure — the flush inside
     /// it costs one refused write on a socket that has just refused one, against two
@@ -1325,25 +1397,21 @@ impl Daemon {
     /// Sends a final `Error` and closes the connection.
     fn reject(&mut self, code: ErrorCode, message: &'static str) {
         if let Some(client) = self.client.take() {
-            client.conn.send_last(&Frame::Error { code, message });
+            client
+                .conn
+                .close_with(Some(&Frame::Error { code, message }));
             self.on_detached();
         }
     }
 
-    /// Lets the attached client go, with only what the socket takes this instant.
+    /// Lets the attached client go, with only what the socket takes this instant: § 4.1's
+    /// dropped rather than flushed send queue.
     ///
-    /// Dropping the rest of that queue costs the client nothing it cannot ask for again.
-    /// Everything in it is either per-connection bookkeeping a reattach redoes —
-    /// `sent_through` rewinds to where the arriving client says it *consumed* to (§ 4.2),
-    /// `exit_sent` clears, so the ring and the `Exit` behind it are queued afresh
-    /// (§ 6.5) — or an answer to a frame that connection will not send again. It is
-    /// `send_last`'s argument for throwing its own queue away, and it holds here for the
-    /// same reason: the ring outlives the connection.
-    ///
-    /// Waiting instead is what cannot be afforded. [`Conn::flush_last`] goes blocking for
-    /// up to 500 ms, and this loop is the only thing draining the PTY (§ 4.1) — so a
-    /// detach from a peer that has stopped reading, which is the departure this project
-    /// exists to survive, stops the user's child dead for that half second.
+    /// Waiting instead is what cannot be afforded, and is why that rule is not a matter of
+    /// taste. [`Conn::close_with`] goes blocking for up to 500 ms, and this loop is the
+    /// only thing draining the PTY — so a detach from a peer that has stopped reading,
+    /// which is the departure this project exists to survive, would stop the user's child
+    /// dead for that half second.
     fn drop_client(&mut self) {
         if let Some(mut client) = self.client.take() {
             drop(client.conn.flush_some());
@@ -1367,10 +1435,10 @@ impl Daemon {
         // The one *departure* [`Daemon::drop_client`]'s argument does not reach: nothing
         // survives this to replay from, the ring and the run files going with the
         // process, so what the client is owed is owed now. § 6.5's 500 ms is spent here
-        // and in `send_last`'s eviction and nowhere else — inside `nomux kill`'s two
-        // seconds, with the child's signals still to come.
+        // and in the eviction `reject` closes with and nowhere else — inside `nomux
+        // kill`'s two seconds, with the child's signals still to come.
         if let Some(client) = self.client.take() {
-            client.conn.flush_last();
+            client.conn.close_with(None);
             self.on_detached();
         }
         self.pending = None;
@@ -1423,7 +1491,7 @@ mod tests {
         // own, so nothing but this test can be looking at these two names.
         let paths = SessionPaths::new(&format!("bindrace_{}", std::process::id()))
             .expect("resolve the run directory");
-        paths.ensure_dir().expect("create the run directory");
+        ensure_run_dir(paths.dir()).expect("create the run directory");
         // A name whose `connect` is refused, which is the whole of what § 6.6 means by
         // stale. A plain file earns that answer from the kernel — it is not a socket —
         // and needs no listener of this process's own, which under `cargo test` a
@@ -1451,6 +1519,7 @@ mod tests {
             listener: UnixListener::bind(root.join("session.sock")).expect("bind a session socket"),
             stop_pipe: None,
             stopping: false,
+            fatal: None,
             ring: crate::ring::Ring::new(1024),
             pty: None,
             client: None,
@@ -1461,6 +1530,7 @@ mod tests {
             in_applied: 0,
             pending_input: VecDeque::new(),
             win: WinSize::default(),
+            applied_win: None,
             child_gone: None,
             exited: None,
             accept_retry: None,
@@ -1522,7 +1592,13 @@ mod tests {
         // Attached, so the deadline under test is not shadowed by the session's own:
         // a clientless daemon already wakes for `FIRST_ATTACH_TIMEOUT`, well before it.
         let (_peer, ours) = UnixStream::pair().expect("a socketpair");
-        daemon.client = Some(Attached::new(Conn::new(ours).expect("a connection")));
+        daemon.client = Some(Attached {
+            conn: Conn::new(ours).expect("a connection"),
+            exit_sent: false,
+            sent_through: 0,
+            repaint_ctrl_l: false,
+            repaint_due: false,
+        });
 
         let agent = daemon.agent.as_mut().expect("an agent socket");
         let _served = UnixStream::connect(agent.path()).expect("connect to the agent socket");

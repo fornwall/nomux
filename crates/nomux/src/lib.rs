@@ -6,10 +6,14 @@
 //! A private protocol with no stability guarantee: [`PROTOCOL_VERSION`] exists to
 //! fail fast on a mismatched peer rather than to negotiate (`IMPLEMENTATION.md` § 2).
 //!
+//! What belongs here is what is on the wire, and nothing else: session id validation
+//! and the agent socket's one-at-a-time rule are daemon policy, not codec.
+//!
 //! A library target beside the binary rather than a module inside it, because an
 //! integration test cannot import from a binary and most of the suite speaks this
-//! codec. That also keeps `forbid(unsafe_code)` over a whole target: the seccomp
-//! filter, `pre_exec` and the signal handlers are the binary's.
+//! codec. That also keeps `forbid(unsafe_code)` over a whole target: `pre_exec` and the
+//! signal handlers are the binary's, as is the seccomp filter the binary's *tests* trap
+//! a reach with — the shipped daemon installs none.
 
 #![forbid(unsafe_code)]
 
@@ -22,8 +26,9 @@ pub use frame::{
 
 /// Protocol revision. Bumped on any wire change, including compatible ones.
 ///
-/// `IMPLEMENTATION.md` § 2.2 owns the history, and `tests/wire.rs` holds the constant,
-/// the vectors and the document to each other: a bump has to move all three.
+/// There is no history to consult but `git log`: `IMPLEMENTATION.md` § 2.2 states the
+/// revision in force and nothing before it. `tests/wire.rs` holds the constant, the
+/// vectors and the document to each other, so a bump has to move all three.
 pub const PROTOCOL_VERSION: u16 = 8;
 
 /// Fixed frame header size, so reads are a two-stage `read_exact`.

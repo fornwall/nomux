@@ -19,6 +19,10 @@ const SYSTEMD_MARKER: &str = "/run/systemd/system";
 const LINGER_DIR: &str = "/var/lib/systemd/linger";
 
 /// Reports whether this user's processes outlive their session.
+///
+/// Two file lookups rather than `loginctl show-user -p Linger`, which is a D-Bus round
+/// trip: on a bus that is wedged it blocks for its full 25-second timeout, and this runs
+/// on the daemon's startup path, with the client that asked for the session waiting.
 pub(crate) fn detect() -> Linger {
     if !Path::new(SYSTEMD_MARKER).is_dir() {
         // No `logind`, so nothing kills the daemon at logout and nothing to warn about.
@@ -46,6 +50,10 @@ fn state_of(dir: &Path, user: &str) -> Linger {
 ///
 /// `IMPLEMENTATION.md` § 6.2 has the source order and the refusals. The environment is a
 /// fallback rather than a peer: directory-backed accounts have no line in `/etc/passwd`.
+///
+/// Empty, `/`, NUL, `.` and `..` are refused because this name is joined onto a system
+/// directory and `$USER` is the environment's to set: anything but a single component
+/// asks about a path other than the one [`LINGER_DIR`] holds.
 fn username() -> Option<String> {
     passwd::current()
         .map(|entry| entry.name)

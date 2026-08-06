@@ -193,11 +193,15 @@ fn parse_session_args(
 /// Maps a fallible operation onto an exit code, reporting failure on stderr.
 ///
 /// Both of `IMPLEMENTATION.md` § 10's tables, which are one table. Every mode gives
-/// `InvalidInput` `EX_USAGE`: [`rundir::SessionPaths::new`] is the crate's only
-/// source of it, so it always means an id that could never have named a session
-/// rather than an operation that failed — a distinction the client acts on, caching
-/// "unattachable" per host and otherwise caching its own typo. `relay` selects
-/// § 10's other table, the one `spawn` and `attach` are scored against.
+/// `InvalidInput` `EX_USAGE`: [`rundir::SessionPaths::new`] is the only place the crate
+/// *constructs* one, so it means an id that could never have named a session rather than
+/// an operation that failed — a distinction the client acts on, caching "unattachable"
+/// per host and otherwise caching its own typo. That makes this kind a reserved word
+/// here: an `EINVAL` from anywhere would decode to it and be reported as the user's
+/// spelling, which is why a run file that cannot be read is `InvalidData`
+/// ([`rundir::read_prefix`]) and why `Hello.term` is refused for an interior NUL before
+/// it can reach `Command::env`. `relay` selects § 10's other table, the one `spawn` and
+/// `attach` are scored against.
 fn report(result: std::io::Result<()>, relay: bool) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,

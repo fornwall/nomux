@@ -3,11 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
-    # A `v*` tag is what publishes a release; the `publish` job at the bottom is what
-    # does it, from the artifact the release job built rather than from a build of its
-    # own. Promoting those exact bytes is what makes the published checksums the ones
-    # the size gate and `SHA256SUMS` were computed over — a rebuild would be
-    # byte-identical by § 8, but "would be" is a claim and this is not one.
+    # A `v*` tag publishes a release: the `publish` job promotes the exact bytes the release
+    # job built, so the published checksums are the ones the size gate computed over. A
+    # rebuild would be byte-identical by § 8, but "would be" is a claim and this is not one.
     tags: ['v*']
   pull_request:
     # Not on `push` above, which owes every main commit a set of artifacts. Branch
@@ -33,12 +31,10 @@ env:
   # backtrace in the log.
   RUST_BACKTRACE: 1
 
-# Third-party actions are pinned to a commit, not to a tag: the release job below
-# builds the binaries whose SHA-256 the client is designed to pin, and a tag is a
-# mutable pointer in someone else's repository. The version rides in the trailing
-# comment, since the SHA does not say which one it is. The `actions/*` steps stay on
-# their major tag deliberately — GitHub's own, inside a trust boundary the job is
-# already entirely within.
+# Third-party actions are pinned to a commit, not a tag: a tag is a mutable pointer in
+# someone else's repository, and the release job builds the binaries whose SHA-256 the client
+# pins. The version rides in the trailing comment. `actions/*` stay on their major tag —
+# GitHub's own, inside a trust boundary the job is already entirely within.
 jobs:
   # One job, so the workspace and its dependencies are compiled against a single cache.
   check:
@@ -47,21 +43,30 @@ jobs:
     # The session tests spawn a real PTY, shells and unix sockets; a wedged child
     # would otherwise hold the runner for the six-hour default.
     timeout-minutes: 20
-    # Where the deny lives, and the reason it is here rather than in
-    # [workspace.lints] is written down in Cargo.toml.
-    #
-    # Job-level rather than repeated per step, so every cargo invocation below sees
-    # the same value: RUSTFLAGS is part of cargo's fingerprint and of the rust-cache
-    # key, and a step that differed would rebuild the workspace from cold.
-    #
-    # Deliberately not on the release job: scripts/build-release.sh sets
-    # CARGO_ENCODED_RUSTFLAGS, which makes cargo ignore RUSTFLAGS entirely, so a deny
-    # there would be silently absent rather than enforced — and lint gating is this
-    # job's business anyway.
+    # Job-level rather than per step, so every cargo below sees one value: RUSTFLAGS is part
+    # of cargo's fingerprint and of the rust-cache key, and a step that differed would
+    # rebuild from cold. Why the deny lives here rather than in [workspace.lints] is in
+    # Cargo.toml. Not on the release job, whose script sets CARGO_ENCODED_RUSTFLAGS — which
+    # makes cargo ignore RUSTFLAGS entirely, so a deny there would be silently absent.
     env:
       RUSTFLAGS: -D warnings
     steps:
+      # `persist-credentials: false`: nothing in this workflow pushes, and the default
+      # leaves the job token in .git/config while a step below executes `entry:` shell out
+      # of the pull request's own .pre-commit-config.yaml.
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # A tag naming a version nobody bumped otherwise burns every job in this workflow
+      # before failing on a one-line comparison. The `publish` job asks the built binary the
+      # same question and remains the authority; this only moves the answer an hour earlier.
+      - name: Check the tag names the workspace version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(awk -F'"' '/^version *=/ { print $2; exit }' Cargo.toml)
+          [ "$version" = "${GITHUB_REF_NAME#v}" ] ||
+              { echo "tag $GITHUB_REF_NAME does not name Cargo.toml's $version" >&2; exit 1; }
 
       # Bare `toolchain install` reads rust-toolchain.toml, so the 1.97.1 pin and
       # its components stay stated in exactly one place.
@@ -71,25 +76,16 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       # Prebuilt binaries; `cargo install` would build each from source on every
-      # cache miss.
+      # cache miss. shellcheck too, so what fails a build is a pinned version rather than
+      # whatever the runner image happens to ship this week.
       - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
         with:
-          tool: cargo-nextest,cargo-deny,prek
+          tool: cargo-nextest,cargo-deny,prek,shellcheck
 
-      # Advisories, because dependabot schedules version bumps monthly and a CVE does
-      # not wait for the month; licences and sources, because the binary ships other
-      # people's object code and `clippy::cargo` checks this crate's manifest metadata
-      # rather than what is in the tree. Seconds against two direct dependencies.
-      #
-      # `--locked` for the reason .pre-commit-config.yaml gives every compiling hook, and
-      # more sharply here: cargo-deny shells out to `cargo metadata`, which resolves a
-      # stale lock into a fresh one to make itself work — and this is the job's first
-      # cargo, so every `--locked` below would then be asserting against a lock this step
-      # had just written. A flag rather than a reordering, which the next step added here
-      # would have to know about.
-      #
-      # Before the subcommand: it is an option of `cargo-deny` itself, and `check` rejects
-      # it outright, so a misplaced one fails the job rather than quietly doing nothing.
+      # Advisories, because dependabot bumps monthly and a CVE does not wait; licences and
+      # sources, because the binary ships other people's object code. `--locked`, and before
+      # the subcommand where it is cargo-deny's own option: this is the job's first cargo and
+      # it shells out to `cargo metadata`, which rewrites a stale lock to make itself work.
       - run: cargo deny --locked check advisories bans licenses sources
 
       # The released binary, by checksum. Built from source it would need a Go
@@ -115,19 +111,16 @@ jobs:
       # to run twice. shellcheck and actionlint are both on $PATH by here.
       - run: prek run --all-files --skip cargo-nextest
 
-      # rustdoc has its own lint namespace, so `rustdoc::broken_intra_doc_links` is
-      # reached by neither the clippy hook above nor RUSTFLAGS — and this tree links
-      # between items constantly, where a renamed function turns a link into nothing
-      # rather than into an error. `--document-private-items` because the binary target
-      # is almost entirely private and would otherwise be documented empty. `--lib
-      # --bins` because the two targets share the package's name, and a bare `cargo doc`
-      # then documents the lib alone and silently stops checking every link in the
-      # daemon; naming both runs rustdoc over each. The collision warning cargo prints
-      # is about which HTML survives, and nothing reads the HTML. Seconds against the
-      # warm cache: only this package's targets are rebuilt, their dependencies having
-      # been built by the step above. Not a hook, because a pre-commit run should not be
-      # waiting on rustdoc.
+      # rustdoc's lints are a namespace of their own, reached by neither the clippy hook nor
+      # RUSTFLAGS, and a renamed item turns a link into nothing rather than into an error.
+      # `--document-private-items` because the binary is almost entirely private; `--lib
+      # --bins` because a bare `cargo doc` documents only the lib when both share a name.
       - run: RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps --document-private-items --lib --bins
+
+      # nextest cannot run doctests, so they need a pass of their own or doc examples go
+      # unexercised. Here rather than in a hook: the workspace has one, which is not worth a
+      # cargo front-end invocation on every commit that touches a `*.rs`.
+      - run: cargo test --locked --doc --workspace
 
       # The cargo-nextest hook's command plus the two flags that only make sense here.
       # `--run-ignored all`: the one ignored test sits out a real reaping timeout,
@@ -137,14 +130,31 @@ jobs:
       # else, which is most of the value of a CI run over a local one.
       - run: cargo nextest run --locked --workspace --run-ignored all --no-fail-fast
 
-  # Its own job: the script rebuilds `nomux` and its session tests under
-  # `--cfg nomux_fault_injection`, which shares no artifacts with the job above.
-  takeover-guard:
-    name: takeover guard
+  # A matrix rather than one job running both scripts: the three builds involved — the
+  # session suite under `nomux_fault_settle` and again under `nomux_fault_injection`, the
+  # binary's unit tests under `nomux_fault_unreaped` — share no fingerprint with each other
+  # or with the job above, so one job would compile them in series where two compile at
+  # once, and rust-cache keys one blob per job. Two names, because a failure of the second
+  # is about § 6.5's grace and would mislead anyone reading it under "takeover guard".
+  guards:
+    name: ${{ matrix.name }}
     runs-on: ubuntu-latest
-    # A compile error is paid for once rather than in three jobs at the same time.
+    # A compile error is paid for once rather than in both guards at the same time.
     needs: check
     timeout-minutes: 20
+    strategy:
+      # Each guard answers a different question, so the second is still worth an answer when
+      # the first has failed; the default would cancel it.
+      fail-fast: false
+      matrix:
+        include:
+          # Separate target directories, separate fingerprints, separate caches.
+          - name: takeover guard
+            guard: takeover
+            key: fault-injection
+          - name: hangup grace guard
+            guard: hangup-grace
+            key: fault-unreaped
     steps:
       - uses: actions/checkout@v7
 
@@ -153,52 +163,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          # Separate target directory, separate fingerprints, separate cache. Named for
-          # the ordering this job is about, the guard below it having a key of its own.
-          key: fault-injection
+          key: ${{ matrix.key }}
 
       - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
         with:
           tool: cargo-nextest
 
-      # Asserts the regression test still fails on the pre-fix ordering; a guard that
-      # passes on the bug guards nothing.
-      - run: sh scripts/verify-takeover-guard.sh
-
-  # Beside the job above rather than a step inside it, though both run a script under a
-  # fault cfg. They share no build: that one compiles the session integration suite under
-  # `nomux_fault_settle` and again under `nomux_fault_injection`, this one compiles the
-  # binary's unit tests under `nomux_fault_unreaped`, and no two of those four fingerprints
-  # agree. So one job would run the compiles in series where two run them at once, and
-  # rust-cache keys one blob per job — a shared job would save and restore every target
-  # directory on every run of either. The names are the rest of it: a failure here is
-  # about § 6.5's grace, and reading it under "takeover guard" would send the first
-  # person to look at § 6.4.1.
-  hangup-grace-guard:
-    name: hangup grace guard
-    runs-on: ubuntu-latest
-    # A compile error is paid for once rather than in three jobs at the same time.
-    needs: check
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install the pinned toolchain
-        run: rustup toolchain install --profile minimal --no-self-update
-
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          # Separate target directory, separate fingerprints, separate cache.
-          key: fault-unreaped
-
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
-        with:
-          tool: cargo-nextest
-
-      # Asserts the regression test still fails without the grace loop's reap. The bug it
-      # guards costs half a second of shutdown and nothing else, so nothing but this says
-      # the test is still looking.
-      - run: sh scripts/verify-hangup-grace-guard.sh
+      # Asserts the regression test still fails with the fix undone; a guard that passes on
+      # the bug guards nothing.
+      - run: sh scripts/verify-guard.sh ${{ matrix.guard }}
 
   # The 400 KiB budget is correctness-adjacent — the cold upload happens over
   # cellular — and is the one thing the local hooks cannot check.
@@ -209,15 +182,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Read rather than repeated here, so this job and a laptop build use one compiler
-      # and their sizes are comparable (scripts/build-release.sh says why).
-      #
-      # A plain assignment, not `echo "version=$(cat ...)"`: the default shell is
-      # `bash -e` without `pipefail`, so a failed substitution inside `echo` would leave
-      # this step green with an empty value. `set -e` does fail the assignment form.
-      #
-      # An output rather than $GITHUB_ENV, so it reaches only the step below and nothing
-      # else in the job can read a compiler from anywhere but the pinned file.
+      # Read rather than repeated here, so this job and a laptop build use one compiler and
+      # their sizes are comparable (scripts/build-release.sh says why). A plain assignment
+      # rather than `echo "version=$(cat ...)"`, since the default `bash -e` has no
+      # `pipefail` and would leave the step green with an empty value. An output rather than
+      # $GITHUB_ENV, so it reaches only the step below.
       - name: Read the pinned release nightly
         id: nightly
         run: |
@@ -246,14 +215,10 @@ jobs:
           key: musl-${{ steps.nightly.outputs.version }}
 
       # Owns the target list and the size budget; exits non-zero if a binary is over.
-      #
-      # The companions are asked for everywhere except a pull request. Building them
-      # doubles the cross builds — a second `-Zbuild-std` fat-LTO link per target —
-      # for artifacts that only the tag path ever publishes, and a PR's expire unread.
-      # `main` and tags still build them, so the script's `.text` correspondence check
-      # between each shipping binary and its companion keeps running on every commit
-      # that could ship, rather than first on the tag that does. `0` rather than an
-      # unset value because the script tests the variable for exactly `1`.
+      # Companions everywhere except a pull request: they double the cross builds for
+      # artifacts only the tag path publishes, and a PR's expire unread — while `main` and
+      # tags keep the script's `.text` correspondence check running on every commit that
+      # could ship. `0` rather than an unset value, because the script tests for exactly `1`.
       - run: sh scripts/build-release.sh
         env:
           NOMUX_DEBUG: ${{ github.event_name == 'pull_request' && '0' || '1' }}
@@ -281,18 +246,15 @@ jobs:
           path: target/dist/
           if-no-files-found: error
 
-  # What P3 asked for: the checksums somewhere a client can read them. An artifact
-  # expires after ninety days and sits behind a login; a release asset does neither.
-  #
-  # Its own job for two reasons. It `needs` every job above, so a tag cannot publish a
-  # release whose tests failed — parallel jobs with no dependency would have raced, and
-  # the release build passing says only that the binaries fit, not that they work. And
-  # it is the only job that wants a write token, so it is the only one that gets one;
-  # the other three keep the read-only token the header grants.
+  # What P3 asked for: the checksums somewhere a client can read them, an artifact expiring
+  # after ninety days and sitting behind a login. Its own job because it `needs` every job
+  # above — so a tag cannot publish a release whose tests failed, where parallel jobs with no
+  # dependency would have raced — and because it is the only one that wants a write token,
+  # which is why the other three keep the read-only one the header grants.
   publish:
     name: publish the release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [check, takeover-guard, hangup-grace-guard, release]
+    needs: [check, guards, release]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -315,19 +277,16 @@ jobs:
           sha256sum -c SHA256SUMS
           sha256sum -c SHA256SUMS.debug
 
-      # Artifacts do not carry the executable bit, and the step below runs one of these
-      # to ask it its version. It has no bearing on what is published — a release asset
-      # is a plain file and every install path chmods it anyway.
+      # Artifacts do not carry the executable bit, and the step below runs one to ask its
+      # version. No bearing on what is published — every install path chmods it anyway.
       - run: chmod +x dist/nomux-*
 
-      # Asked of the artifact rather than read out of Cargo.toml, because the tag's
-      # whole job is to name what these binaries are, and Cargo.toml is not what
-      # anyone downloads. The musl x86_64 binary is static-pie and the runner is
-      # x86_64, so the one witness to the version that ships can simply be asked.
-      #
-      # Checked before anything is published, because a tag cannot be quietly corrected
-      # afterwards: the sums under `v0.1.0` are what a client pins, and a `v0.2.0`
-      # carrying 0.1.0 binaries is a release that has to be deleted rather than amended.
+      # Asked of the artifact rather than read out of Cargo.toml — the tag's whole job is to
+      # name what these binaries are, and the x86_64 musl binary is static-pie on an x86_64
+      # runner, so the one witness to the version that ships can simply be asked. The `check`
+      # job compares the same tag against Cargo.toml an hour earlier; this is the authority.
+      # Before anything is published, because a tag cannot be quietly corrected: the sums
+      # under `v0.1.0` are what a client pins.
       - name: Check the tag names the version the binaries report
         run: |
           built=$(dist/nomux-x86_64-unknown-linux-musl --version)
@@ -341,17 +300,12 @@ jobs:
               ;;
           esac
 
-      # `SHA256SUMS` goes up beside the binaries it covers, in the format `sha256sum -c`
-      # already reads, so verifying needs no API and no tooling. GitHub computes its own
-      # immutable SHA-256 per asset at upload time on top of that, exposed as `digest`
-      # on the releases API — worth having both, since the file is portable and signed
-      # by nothing while the digest is GitHub's and cannot be rewritten afterwards.
-      #
-      # The body carries the sums inline as well, so the number a human is asked to
-      # compare is on the page they are already reading.
-      #
-      # `--verify-tag` so a ref that names no tag fails here rather than creating one
-      # against a commit nobody tagged.
+      # `SHA256SUMS` goes up beside the binaries it covers, in the format `sha256sum -c` reads,
+      # so verifying needs no API and no tooling. GitHub also computes an immutable SHA-256 per
+      # asset, exposed as `digest` on the releases API — worth both, the file being portable and
+      # signed by nothing while the digest is GitHub's and unrewritable. The body carries the
+      # sums inline so the number a human compares is on the page they are reading already.
+      # `--verify-tag`, so a ref naming no tag fails rather than creating one nobody tagged.
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -380,17 +334,11 @@ jobs:
               cat dist/SHA256SUMS.debug
               echo '```'
           } > "$notes"
-          # Exactly what the two manifests name, rather than a `dist/nomux-*` glob that
-          # would happen to sweep the companions in beside the binaries. The build
-          # script makes the same distinction for the same reason — the two sets are
-          # checksummed separately and a glob does not know which is which — and a
-          # release that carried a file no manifest covers would be a release nobody
-          # could verify.
-          #
-          # Counted, because `set -e` does not see into a process substitution: an awk
-          # that failed would leave the array empty and publish a release of two
-          # manifests and no binaries — which is worse than no release, since a tag
-          # cannot be amended. Two architectures and their two companions is four.
+          # Exactly what the two manifests name, rather than a `dist/nomux-*` glob that would
+          # sweep the companions in beside the binaries: the sets are checksummed separately
+          # and a glob does not know which is which. Counted, because `set -e` does not see
+          # into a process substitution — a failed awk would publish two manifests and no
+          # binaries, and a tag cannot be amended. Two architectures and companions is four.
           mapfile -t assets < <(awk '{print "dist/" $2}' dist/SHA256SUMS dist/SHA256SUMS.debug)
           if [ "${#assets[@]}" -ne 4 ]; then
               echo "the manifests name ${#assets[@]} files, not the expected 4:" >&2
@@ -402,4 +350,3 @@ jobs:
               --notes-file "$notes" \
               --verify-tag \
               "${assets[@]}" dist/SHA256SUMS dist/SHA256SUMS.debug
-
