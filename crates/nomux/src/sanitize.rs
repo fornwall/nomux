@@ -18,14 +18,19 @@ pub(crate) const MAX_LABEL_LEN: usize = 256;
 /// Where a syslog daemon listens, on every implementation this can expect to meet.
 const SOCKET: &str = "/dev/log";
 
+/// Longest datagram [`send`] hands to [`SOCKET`]: RFC 5424 § 6.1 obliges every receiver to
+/// take 480 octets and asks for 2048, so past here a collector was free to cut anyway.
+/// Bounded at all because the id in a line can still be argv's, and a datagram over
+/// `SO_SNDBUF` is an `EMSGSIZE` swallowed with the rest — losing the one line that would
+/// have explained the refusal.
+const MAX_LINE_LEN: usize = 2048;
+
 /// Drops every character that would let text say one thing and mean another once a terminal
 /// draws it.
 ///
 /// One function for both surfaces that print text somebody else chose, because both are
-/// terminals: `list` writes a label to the operator's, and [`send`] hands a line to a
-/// journal read on one. Dropped rather than escaped, so nothing supplied here can occupy
-/// width at all. What goes is [`is_deceptive`]'s classes, and what stays out of them is
-/// ZWJ and ZWNJ.
+/// terminals (§ 11): `list` writes a label to the operator's, [`send`] a line to a journal.
+/// Dropped rather than escaped, so nothing supplied here can occupy width at all.
 pub(crate) fn sanitize_text(text: &str) -> String {
     text.chars().filter(|ch| !is_deceptive(*ch)).collect()
 }
@@ -40,11 +45,10 @@ pub(crate) fn sanitize_text(text: &str) -> String {
 /// which occupy no width at all, so two labels carrying different ones draw identically
 /// in the column a human reads to decide what to kill.
 ///
-/// The intent is narrow: invisible `Cf` goes, *except* ZWJ and ZWNJ (U+200C and U+200D),
-/// which are how Indic scripts and emoji sequences are spelled — and U+200B sits directly
-/// beside them while being none of that. It is spelled as a named set rather than as that
-/// sentence because std has no general-category test to write the sentence with, so a
-/// codepoint missing from the set is a gap rather than a decision.
+/// The intent is narrow: invisible `Cf` goes, *except* § 6.6's ZWJ and ZWNJ (U+200C and
+/// U+200D), with U+200B sitting directly beside them while being none of that. Spelled as a
+/// named set rather than as that sentence because std has no general-category test to write
+/// it with, so a codepoint missing from the set is a gap rather than a decision.
 const fn is_deceptive(ch: char) -> bool {
     ch.is_control()
         || matches!(ch,
@@ -58,7 +62,6 @@ const fn is_deceptive(ch: char) -> bool {
 ///
 /// A tab title chosen by a human, so it arrives with whatever they typed — [`sanitize_text`]
 /// takes back out the `ESC ]0;` that would retitle the window of whoever ran `list`.
-/// Truncation is at a character boundary, so the result is always valid UTF-8.
 pub(crate) fn sanitize_label(label: &str) -> String {
     let mut out = sanitize_text(label);
     out.truncate(out.floor_char_boundary(MAX_LABEL_LEN));
@@ -73,21 +76,19 @@ pub(crate) fn sanitize_label(label: &str) -> String {
 /// Every failure is swallowed on purpose. A host may have no syslog at all — a
 /// minimal container being the ordinary case — and a daemon that declined to start
 /// because it could not describe itself would be worse than one nobody can diagnose.
-/// This is the same trade `startup::release_startup_state` makes with its discarded
-/// results.
 ///
 /// No timestamp and no hostname: an RFC 3164 timestamp is local time, so it would mean
 /// carrying a timezone database to restate what every collector stamps anyway.
 fn send(priority: u8, session_id: &str, message: &str) {
-    // Filtered over the whole assembled line rather than over the message alone: the text
-    // beside a session id is usually an `io::Error` carrying a run directory somebody else
-    // chose, and the id is not always validated either — `daemon::run` reports a startup
-    // failure before anything has looked at its argument. A newline in a datagram is how
-    // one log line becomes two.
-    let line = sanitize_text(&format!(
+    // Filtered over the whole assembled line rather than over the message alone (§ 11): the
+    // text beside a session id is usually an `io::Error` carrying a run directory somebody
+    // else chose, and the id is not always validated either — `daemon::run` reports a
+    // startup failure before anything has looked at its argument.
+    let mut line = sanitize_text(&format!(
         "<{priority}>nomux[{pid}]: session {session_id}: {message}",
         pid = std::process::id(),
     ));
+    line.truncate(line.floor_char_boundary(MAX_LINE_LEN));
     if let Ok(socket) = UnixDatagram::unbound() {
         // A full collector must not park the daemon inside a `send`. Dropping the
         // line is the right answer to a log nobody is draining.
@@ -96,12 +97,10 @@ fn send(priority: u8, session_id: &str, message: &str) {
     }
 }
 
-/// Reports a failure, identified by the session it belongs to.
 pub(crate) fn error(session_id: &str, message: &str) {
     send(11, session_id, message);
 }
 
-/// Reports something ordinary in a session's life.
 pub(crate) fn info(session_id: &str, message: &str) {
     send(14, session_id, message);
 }

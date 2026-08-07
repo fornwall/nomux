@@ -37,9 +37,9 @@ use std::time::{Duration, Instant};
 use nomux::PROTOCOL_VERSION;
 
 use harness::{
-    Reaper, Session, Spawned, collect, control, daemon_reaper, entries, leads_a_process_group,
-    nomux, nomux_with_shell, poll_by, poll_until, process_alive, run_root, stderr, stdout,
-    succeeded, wait_for, wedge_socket, while_nothing_forks,
+    Flock, HeldLock, Reaper, Session, Spawned, collect, control, daemon_reaper, entries,
+    leads_a_process_group, nomux, nomux_with_shell, poll_by, poll_until, process_alive, run_root,
+    stderr, stdout, succeeded, wait_for, wait_until_flock, wedge_socket, while_nothing_forks,
 };
 
 /// How long any one test here may spend waiting, across every wait it makes.
@@ -59,7 +59,7 @@ fn a_held_spawn_lock_survives_a_concurrent_list() {
     let session = StaleSession::create("lk1");
     fs::write(session.dir.join("lk1.journal"), b"").expect("plant a later version's file");
     fs::write(session.dir.join("lk2.journal"), b"").expect("plant an id that is nothing else");
-    let lock = session.hold_lock();
+    let lock = HeldLock::take(&session.lock_path());
 
     let listed = session.run(&["list"]);
     succeeded(&listed, "list failed");
@@ -104,7 +104,7 @@ fn a_held_spawn_lock_survives_a_concurrent_list() {
 #[test]
 fn kill_refuses_to_leave_a_locked_session_behind() {
     let session = StaleSession::create("lk2");
-    let lock = session.hold_lock();
+    let lock = HeldLock::take(&session.lock_path());
 
     let killed = session.run(&["kill", "lk2"]);
     assert_eq!(
@@ -127,104 +127,6 @@ fn kill_refuses_to_leave_a_locked_session_behind() {
     succeeded(
         &session.run(&["kill", "lk2"]),
         "kill failed with the lock free",
-    );
-}
-
-/// A spawn whose lock is collected while it waits goes back for the file that is now
-/// at the path.
-///
-/// This is the half of the fix that is not "take the lock first": `flock` attaches
-/// to the inode, so a spawn that was blocked on a lock file somebody unlinked
-/// wakes up holding a lock nobody else can see. The next spawn creates a fresh
-/// file at the same path, locks that, and both start a daemon for one session.
-///
-/// `spawn` rather than `attach` because creating is what takes this lock at all
-/// (§ 6.3): `attach` connects to a session that is already there and never reaches
-/// the region under test.
-///
-/// The interleaving is forced rather than hoped for: the collection happens only
-/// once `/proc/locks` shows something blocked on this test's lock.
-#[test]
-fn a_spawn_re_takes_a_spawn_lock_that_was_collected() {
-    let deadline = Instant::now() + PATIENCE;
-    let session = StaleSession::empty("lk3");
-    let lock = session.hold_lock();
-    let held = lock.metadata().expect("stat the held lock");
-    let orphan = held.ino();
-
-    let _relay = Spawned::spawn(
-        nomux_with_shell(&session.root, &["spawn", &session.id])
-            .env("NOMUX_RING_BYTES", "65536")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()),
-    );
-
-    wait_until_flock(
-        Flock::Queued,
-        held.dev(),
-        orphan,
-        "the spawn waited for the spawn lock",
-        deadline,
-    );
-
-    // Exactly what collection used to do to a lock in use.
-    fs::remove_file(session.lock_path()).expect("unlink the lock");
-    drop(lock);
-
-    assert!(
-        poll_by(deadline, || session.socket().exists()),
-        "the spawn never brought up a socket for the session"
-    );
-    // The one session here not collected by an explicit `nomux kill`: the guard has
-    // to cover the failing assertions below too.
-    let (_pid, _reaper) = daemon_reaper(&session.root, &session.id);
-
-    assert!(
-        session.lock_path().exists(),
-        "the session came up without the spawn lock the layout promises, so the \
-         spawn started it holding an unlinked inode"
-    );
-}
-
-/// Regression: a daemon holds `<id>.lock` across claiming its id, so nothing can
-/// collect the session it is in the middle of publishing.
-///
-/// `spawn` holds that lock from before the fork until `<id>.pid` exists (§ 6.3) and
-/// `list` and `kill` take it before they unlink anything (§ 6.6) — but a `nomux daemon
-/// <id>` started by hand, which § 6.2 is written for, took nothing at all. A `list`
-/// that had already probed the stale socket then unlinked the socket and pidfile this
-/// daemon had bound in between, and through `kill` the same interleaving exits 0
-/// reporting no such session while a daemon holds the user's shell.
-///
-/// The window is three syscalls wide, so it is held open rather than waited for:
-/// `bind_socket` probes the socket before it touches anything, and a `connect` to a
-/// listener whose backlog is full blocks, so [`wedge_socket`] parks the daemon inside
-/// the region under test for as long as this test likes.
-#[test]
-fn a_daemon_holds_the_spawn_lock_while_it_claims_the_id() {
-    let deadline = Instant::now() + PATIENCE;
-    let session = StaleSession::empty("lka");
-    // Created here so the wait below has an inode to name; the daemon opens this same
-    // path, and `SpawnLock` checks that what it locked is still the file at it.
-    let lock = File::create(session.lock_path()).expect("create the spawn lock");
-    let lock = lock.metadata().expect("stat the spawn lock");
-
-    let _wedged = wedge_socket(&session.socket());
-
-    let _daemon = Spawned::spawn(
-        nomux_with_shell(&session.root, &["daemon", &session.id])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()),
-    );
-
-    wait_until_flock(
-        Flock::Granted,
-        lock.dev(),
-        lock.ino(),
-        "the daemon took the spawn lock before it went near the socket",
-        deadline,
     );
 }
 
@@ -1693,46 +1595,8 @@ impl StaleSession {
         self.dir.join(format!("{}.pid", self.id))
     }
 
-    /// Takes the spawn lock the way `spawn` does, and keeps it until the
-    /// returned guard is dropped.
-    fn hold_lock(&self) -> HeldLock {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(self.lock_path())
-            .expect("open the spawn lock");
-        rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
-            .expect("take the spawn lock");
-        HeldLock(file)
-    }
-
     fn run(&self, args: &[&str]) -> Output {
         control(&self.root, args)
-    }
-}
-
-/// The spawn lock, released as a property of the open file description rather than
-/// by closing a descriptor.
-///
-/// `fork` duplicates the descriptor into every other test's children, and `flock(2)`
-/// holds the lock until *all* of those duplicates are closed — but releases it on an
-/// explicit `LOCK_UN` through any one of them, because they share one open file
-/// description. So this is the same shape as `abandon_socket`'s `shutdown` — the release
-/// is a property of the object rather than of a descriptor, and no stray copy can undo
-/// it.
-struct HeldLock(File);
-
-impl HeldLock {
-    fn metadata(&self) -> std::io::Result<fs::Metadata> {
-        self.0.metadata()
-    }
-}
-
-impl Drop for HeldLock {
-    fn drop(&mut self) {
-        let _ = rustix::fs::flock(&self.0, rustix::fs::FlockOperation::Unlock);
     }
 }
 
@@ -1918,81 +1782,4 @@ fn inode(path: &Path) -> u64 {
     fs::metadata(path)
         .unwrap_or_else(|err| panic!("stat {}: {err}", path.display()))
         .ino()
-}
-
-/// Which of the two states `/proc/locks` reports an `flock` request in.
-#[derive(Clone, Copy)]
-enum Flock {
-    /// Still queued behind somebody else's lock on the same file.
-    Queued,
-    /// Granted, and held until whoever took it lets go.
-    Granted,
-}
-
-/// Waits until an `flock` on `dev:ino` is in `state`, or says what never happened.
-///
-/// Every caller is trying to catch another process mid-operation, and without this each
-/// would race the very thing it means to observe: the spawn test would collect the
-/// lock before anything was waiting on it, and the `kill` tests would move the ground
-/// under `kill` before it had reached the region they are about. None asserts anything
-/// then, and none says so — which is what makes a fixed sleep the wrong tool for any of
-/// them. `/proc/locks` lists queued requests alongside granted ones, so both are
-/// conditions to wait on.
-///
-/// The deadline is the caller's, per [`PATIENCE`].
-fn wait_until_flock(state: Flock, dev: u64, ino: u64, what: &str, deadline: Instant) {
-    let reached = poll_by(deadline, || {
-        // A kernel without `/proc/locks` cannot be waited on, and the assertions
-        // that follow would then pass without ever having reached the window they
-        // are about. Failing loudly is the point: a guard that quietly stops
-        // guarding is worse than one that is not there.
-        let locks = fs::read_to_string("/proc/locks").unwrap_or_else(|err| {
-            panic!(
-                "/proc/locks is unreadable ({err}), so nothing here can tell \
-                    whether {what}"
-            )
-        });
-        locks.lines().any(|line| is_flock(line, state, dev, ino))
-    });
-    assert!(reached, "nothing ever showed that {what}, for inode {ino}");
-}
-
-/// Whether one `/proc/locks` line reports an `flock` on `dev:ino` in `state`:
-///
-/// ```text
-/// 1:    FLOCK  ADVISORY  WRITE 3389 08:01:7746 0 EOF
-/// 2: -> FLOCK  ADVISORY  WRITE 3390 08:01:7746 0 EOF
-/// ```
-///
-/// The `->` is the whole of the difference between the two: it marks a request still
-/// queued behind the lock above it, and a line without one is a lock somebody holds.
-/// Neither that field nor the file's is recognised by position, since the columns
-/// before them vary with the lock type.
-fn is_flock(line: &str, state: Flock, dev: u64, ino: u64) -> bool {
-    if line.contains("->") != matches!(state, Flock::Queued) {
-        return false;
-    }
-    line.contains("FLOCK")
-        && line
-            .split_whitespace()
-            .any(|field| names_the_file(field, dev, ino))
-}
-
-/// Whether a `/proc/locks` field is the `MAJOR:MINOR:INODE` of one file.
-///
-/// The kernel prints it as `%02x:%02x:%llu` — the device in hex, the inode in
-/// decimal — and all three are checked. Inode numbers are unique only within a
-/// filesystem, and `CARGO_TARGET_TMPDIR` need not be on the same one as anything
-/// else this process has open, so matching the inode alone would match a stranger's
-/// lock on a stranger's file.
-fn names_the_file(field: &str, dev: u64, ino: u64) -> bool {
-    let mut parts = field.split(':');
-    let (Some(major), Some(minor), Some(inode), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        return false;
-    };
-    u32::from_str_radix(major, 16) == Ok(libc::major(dev))
-        && u32::from_str_radix(minor, 16) == Ok(libc::minor(dev))
-        && inode.parse::<u64>() == Ok(ino)
 }

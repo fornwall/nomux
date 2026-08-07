@@ -2,20 +2,29 @@
 # warning and then waits for ever, so a session test whose daemon never answers holds the
 # runner with no failing test to point at.
 #
-# Twenty seconds clears the slowest ordinary test, which finishes in ten. Terminating at two
-# periods puts the kill at forty, above every deadline a test gives itself — so a test that
-# runs out fails on the wait it was still owed and names it, where the kill here could only
-# say the test was slow.
+# Twenty seconds clears the slowest ordinary test, which finishes in ten. Forty is a backstop
+# against a run that has stopped making progress, and deliberately not a ceiling above every
+# deadline a test gives itself — it cannot be one. `Session::connect` mints a fresh
+# `FRAME_PATIENCE` per client, so a test that reconnects in a loop owes fifteen seconds a
+# round: `a_takeover_never_discards_input_already_delivered` stacks fifteen rounds onto an
+# `attached` for 250 seconds, and a kill above that would be a four-minute ceiling on
+# everything, catching nothing.
+#
+# The cost of that is real and worth naming rather than papering over: a test slow enough to
+# reach forty is reported slow rather than on the wait it was actually owed, and for chaos.rs
+# without the seed that would reproduce it. The fix is in the harness — a `connect` taking the
+# caller's deadline, which `Client::waits_by` already allows and chaos.rs already does by hand
+# at every reconnect — and not one this file can make by choosing a larger number.
 [profile.default]
 slow-timeout = { period = "20s", terminate-after = 2 }
 
 # The one exception, and the reason the budget above is not simply everyone's:
-# `a_daemon_nobody_ever_attaches_to_reaps_itself` sits out a real deadline of the
-# daemon's rather than waiting for something to happen — 30 seconds of first-attach
-# timeout, and it waits 45 for the socket to go. Forty is not room for that, and
-# raising the default to fit it hands every other test a ceiling twice what it needs,
-# so the four periods stay here where they are earned. CI is what runs this, with
-# `--run-ignored all`.
+# `a_daemon_nobody_ever_attaches_to_reaps_itself` sits out a real deadline of the daemon's
+# rather than waiting for something to happen — 30 seconds of first-attach timeout, and it
+# waits 45 for the socket to go. Five periods rather than four, because four is where it lands
+# under the regression it exists to catch: that 45 runs in full only when the daemon overstays,
+# and behind an attach and a second session it puts the assertion at 80 — racing the kill that
+# was meant to be safely behind it. CI is what runs this, with `--run-ignored all`.
 [[profile.default.overrides]]
 filter = 'test(=a_daemon_nobody_ever_attaches_to_reaps_itself)'
-slow-timeout = { period = "20s", terminate-after = 4 }
+slow-timeout = { period = "20s", terminate-after = 5 }

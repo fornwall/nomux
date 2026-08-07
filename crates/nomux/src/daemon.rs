@@ -37,8 +37,9 @@ const DEFAULT_RING_CAPACITY: usize = 4 << 20;
 /// Environment override for the ring capacity, in bytes.
 const RING_BYTES_ENV: &str = "NOMUX_RING_BYTES";
 
-/// Largest ring this daemon will honour, whatever [`RING_BYTES_ENV`] asks for:
-/// `VecDeque::with_capacity` answers a request it cannot serve by aborting the process.
+/// Largest ring this daemon will honour, whatever [`RING_BYTES_ENV`] asks for (§ 4). A
+/// policy ceiling and not an allocation guard: a gigabyte is already more than many hosts
+/// will hand over, and one that refuses aborts here whatever this number is.
 const MAX_RING_CAPACITY: usize = 1 << 30;
 
 /// Resolves the ring capacity from what [`RING_BYTES_ENV`] asked for; nothing here
@@ -555,6 +556,17 @@ impl Daemon {
         self.pending_input.len() >= MAX_PENDING_INPUT
     }
 
+    /// Whether the client holds bytes the input cap left undecoded and the queue has since
+    /// made room: no second `POLLIN` announces them (§ 4.1), so [`Daemon::poll_once`] tests
+    /// this itself on both sides of the `write_pty` that makes the room.
+    fn input_backlog(&self) -> bool {
+        !self.input_is_saturated()
+            && self
+                .client
+                .as_ref()
+                .is_some_and(|client| client.conn.buffered() > 0)
+    }
+
     /// Queues a control frame for the attached client, if there is one: these are
     /// answers, and a session with nobody attached has nowhere to put them.
     fn tell_client(&mut self, frame: &Frame<'_>) {
@@ -779,14 +791,7 @@ impl Daemon {
         if pty_events.intersects(READABLE) {
             self.read_pty(read_buf);
         }
-        // Frames the input cap left undecoded are not announced a second time, so
-        // draining the queue just above is itself the event that lets them through.
-        let client_ready = client_events.intersects(READABLE)
-            || (!self.input_is_saturated()
-                && self
-                    .client
-                    .as_ref()
-                    .is_some_and(|client| client.conn.buffered() > 0));
+        let client_ready = client_events.intersects(READABLE) || self.input_backlog();
         // Before the greeting below, always. One `poll` can report both a readable client
         // and, from the connection replacing it, the `Hello` that evicts it — and the
         // eviction ends that connection for good, nothing resending what was left in its
@@ -830,6 +835,14 @@ impl Daemon {
         // cost a whole extra pass. That `POLLOUT` still wakes the pass for a master that
         // had no room, which is the case this one cannot serve.
         self.write_pty();
+        // Again for what that drain un-blocked: `client_ready` was decided before it, and a
+        // pass ending on a decodable frame with the master out of the poll set sleeps for
+        // [`IDLE_TICK`]. In the pass rather than as a [`Daemon::poll_timeout`] term, which
+        // would spin — [`Conn::buffered`] counts a half-arrived frame too. Nothing is left
+        // owed: this stops on the cap, which owes a `POLLOUT`, or on a frame `POLLIN` ends.
+        if self.input_backlog() {
+            self.read_client(read_buf, scratch);
+        }
         // Immediately before the pump that turns a status into a frame: nothing arranges a
         // wakeup for a status already collected, so with the master out of the poll set an
         // `Exit` left for the next pass waits on [`IDLE_TICK`].

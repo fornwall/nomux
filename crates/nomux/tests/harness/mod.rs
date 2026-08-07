@@ -804,6 +804,125 @@ pub(crate) fn wedge_socket(path: &Path) -> (UnixListener, UnixStream) {
     (listener, queued)
 }
 
+/// The spawn lock at `<id>.lock`, held until the guard is dropped, and released as a
+/// property of the open file description rather than by closing a descriptor.
+///
+/// `fork` duplicates the descriptor into every other test's children ([`FORKS`]), and
+/// `flock(2)` holds the lock until *all* of those duplicates are closed — but releases it
+/// on an explicit `LOCK_UN` through any one of them, because they share one open file
+/// description. So this is the same shape as the `shutdown` that abandons a listening
+/// socket: the release is a property of the object rather than of a descriptor, and no
+/// stray copy can undo it.
+pub(crate) struct HeldLock(fs::File);
+
+impl HeldLock {
+    /// Takes the lock at `path` the way `spawn` takes it (§ 6.3), creating the file if
+    /// nothing is there — which is what `rundir::try_lock_spawn` does, and what makes
+    /// the inode this hands back the one another process will queue behind.
+    pub(crate) fn take(path: &Path) -> Self {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .expect("open the spawn lock");
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+            .expect("take the spawn lock");
+        Self(file)
+    }
+
+    /// What was locked, for a caller naming its `dev:ino` to [`wait_until_flock`] — the
+    /// file this guard holds rather than whatever is at the path by then, which is the
+    /// whole distinction one of those callers is about.
+    pub(crate) fn metadata(&self) -> std::io::Result<fs::Metadata> {
+        self.0.metadata()
+    }
+}
+
+impl Drop for HeldLock {
+    fn drop(&mut self) {
+        let _ = rustix::fs::flock(&self.0, rustix::fs::FlockOperation::Unlock);
+    }
+}
+
+/// Which of the two states `/proc/locks` reports an `flock` request in.
+#[derive(Clone, Copy)]
+pub(crate) enum Flock {
+    /// Still queued behind somebody else's lock on the same file.
+    Queued,
+    /// Granted, and held until whoever took it lets go.
+    Granted,
+}
+
+/// Waits until an `flock` on `dev:ino` is in `state`, or says what never happened.
+///
+/// Every caller is trying to catch another process mid-operation, and without this each
+/// would race the very thing it means to observe: `tests/lifecycle.rs`'s spawn test would
+/// collect the lock before anything was waiting on it, and `tests/control.rs`'s `kill`
+/// test would move the ground under `kill` before it had reached the region it is about.
+/// None asserts anything then, and none says so — which is what makes a fixed sleep the
+/// wrong tool for any of them. `/proc/locks` lists queued requests alongside granted ones,
+/// so both are conditions to wait on.
+///
+/// The deadline is the caller's, per [`poll_by`].
+pub(crate) fn wait_until_flock(state: Flock, dev: u64, ino: u64, what: &str, deadline: Instant) {
+    let reached = poll_by(deadline, || {
+        // A kernel without `/proc/locks` cannot be waited on, and the assertions
+        // that follow would then pass without ever having reached the window they
+        // are about. Failing loudly is the point: a guard that quietly stops
+        // guarding is worse than one that is not there.
+        let locks = fs::read_to_string("/proc/locks").unwrap_or_else(|err| {
+            panic!(
+                "/proc/locks is unreadable ({err}), so nothing here can tell \
+                    whether {what}"
+            )
+        });
+        locks.lines().any(|line| is_flock(line, state, dev, ino))
+    });
+    assert!(reached, "nothing ever showed that {what}, for inode {ino}");
+}
+
+/// Whether one `/proc/locks` line reports an `flock` on `dev:ino` in `state`:
+///
+/// ```text
+/// 1:    FLOCK  ADVISORY  WRITE 3389 08:01:7746 0 EOF
+/// 2: -> FLOCK  ADVISORY  WRITE 3390 08:01:7746 0 EOF
+/// ```
+///
+/// The `->` is the whole of the difference between the two: it marks a request still
+/// queued behind the lock above it, and a line without one is a lock somebody holds.
+/// Neither that field nor the file's is recognised by position, since the columns
+/// before them vary with the lock type.
+fn is_flock(line: &str, state: Flock, dev: u64, ino: u64) -> bool {
+    if line.contains("->") != matches!(state, Flock::Queued) {
+        return false;
+    }
+    line.contains("FLOCK")
+        && line
+            .split_whitespace()
+            .any(|field| names_the_file(field, dev, ino))
+}
+
+/// Whether a `/proc/locks` field is the `MAJOR:MINOR:INODE` of one file.
+///
+/// The kernel prints it as `%02x:%02x:%llu` — the device in hex, the inode in
+/// decimal — and all three are checked. Inode numbers are unique only within a
+/// filesystem, and `CARGO_TARGET_TMPDIR` need not be on the same one as anything
+/// else this process has open, so matching the inode alone would match a stranger's
+/// lock on a stranger's file.
+fn names_the_file(field: &str, dev: u64, ino: u64) -> bool {
+    let mut parts = field.split(':');
+    let (Some(major), Some(minor), Some(inode), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    u32::from_str_radix(major, 16) == Ok(libc::major(dev))
+        && u32::from_str_radix(minor, 16) == Ok(libc::minor(dev))
+        && inode.parse::<u64>() == Ok(ino)
+}
+
 /// A protocol client: enough of one to assert on daemon behaviour.
 pub(crate) struct Client {
     stream: UnixStream,

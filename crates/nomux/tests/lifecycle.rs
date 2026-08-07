@@ -1,10 +1,11 @@
 //! What a session's processes do at their two ends.
 //!
-//! Starting: a daemon that detaches from whoever launched it (`IMPLEMENTATION.md`
-//! § 6.2) and a child that inherits nothing but its stdio. Ending: the exit status
-//! the client is owed and when it arrives (§ 6.5, § 10), the reaping of everything
-//! the session leaves behind it — including the child a synthesised status has
-//! already spoken for — and the shutdown a signal or an idle deadline sets off.
+//! Starting: the id a daemon claims and the spawn lock it holds while claiming it
+//! (`IMPLEMENTATION.md` § 6.3), the detachment from whoever launched it (§ 6.2), and
+//! a child that inherits nothing but its stdio. Ending: the exit status the client is
+//! owed and when it arrives (§ 6.5, § 10), the reaping of everything the session
+//! leaves behind it — including the child a synthesised status has already spoken
+//! for — and the shutdown a signal or an idle deadline sets off.
 
 #![allow(
     clippy::expect_used,
@@ -17,6 +18,7 @@
 mod harness;
 
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -26,10 +28,20 @@ use std::time::{Duration, Instant};
 use nomux::{Frame, FrameType, RESUME_FROM_START};
 
 use harness::{
-    Client, Cue, FRAME_PATIENCE, MAX_SESSIONS, Reaper, Rng, SETTLE, SPIN_WINDOW, Session, Spawned,
-    StatField, control, cpu_ticks, entries, leads_a_process_group, nomux_with_shell, poll_until,
-    process_alive, process_state, run_root, stat_field, still_serving, succeeded, wait_for,
+    Client, Cue, FRAME_PATIENCE, Flock, HeldLock, MAX_SESSIONS, Reaper, Rng, SETTLE, SPIN_WINDOW,
+    Session, Spawned, StatField, control, cpu_ticks, daemon_reaper, entries, leads_a_process_group,
+    nomux_with_shell, poll_by, poll_until, process_alive, process_state, run_root, stat_field,
+    still_serving, succeeded, wait_for, wait_until_flock, wedge_socket,
 };
+
+/// How long a test that waits on a second process reaching a window may spend waiting,
+/// across every wait it makes.
+///
+/// One figure per test rather than one per wait, for `harness::poll_by`'s reason. Above
+/// [`SETTLE`], which bounds one wait for this process's own filesystem to catch up,
+/// because what the two spawn-lock tests at the end of this file wait for is another
+/// process arriving somewhere under whatever load the rest of the suite is applying.
+const PATIENCE: Duration = Duration::from_secs(30);
 
 /// A child that was killed is reported as `Signalled` carrying the signal, not as a
 /// process that returned one (`IMPLEMENTATION.md` § 10).
@@ -874,6 +886,110 @@ fn a_daemon_refused_by_a_live_session_leaves_that_session_its_lock() {
     let mut client = session.connect();
     client.hello(RESUME_FROM_START);
     still_serving(&mut client, "NOMUX-AFTER-DUP");
+}
+
+/// A spawn whose lock is collected while it waits goes back for the file that is now
+/// at the path.
+///
+/// This is the half of the fix that is not "take the lock first": `flock` attaches
+/// to the inode, so a spawn that was blocked on a lock file somebody unlinked
+/// wakes up holding a lock nobody else can see. The next spawn creates a fresh
+/// file at the same path, locks that, and both start a daemon for one session.
+///
+/// `spawn` rather than `attach` because creating is what takes this lock at all
+/// (§ 6.3): `attach` connects to a session that is already there and never reaches
+/// the region under test.
+///
+/// The interleaving is forced rather than hoped for: the collection happens only
+/// once `/proc/locks` shows something blocked on this test's lock.
+#[test]
+fn a_spawn_re_takes_a_spawn_lock_that_was_collected() {
+    let deadline = Instant::now() + PATIENCE;
+    let root = run_root("collected_lock");
+    let dir = root.join("nomux");
+    fs::create_dir_all(&dir).expect("create the run directory");
+    let lock_path = dir.join("collected.lock");
+    let lock = HeldLock::take(&lock_path);
+    let held = lock.metadata().expect("stat the held lock");
+    let orphan = held.ino();
+
+    let _relay = Spawned::spawn(
+        nomux_with_shell(&root, &["spawn", "collected"])
+            .env("NOMUX_RING_BYTES", "65536")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    );
+
+    wait_until_flock(
+        Flock::Queued,
+        held.dev(),
+        orphan,
+        "the spawn waited for the spawn lock",
+        deadline,
+    );
+
+    // Exactly what collection used to do to a lock in use.
+    fs::remove_file(&lock_path).expect("unlink the lock");
+    drop(lock);
+
+    let socket = dir.join("collected.sock");
+    assert!(
+        poll_by(deadline, || socket.exists()),
+        "the spawn never brought up a socket for the session"
+    );
+    // Nothing collects this session by an explicit `nomux kill`, and the guard has to
+    // cover the failing assertion below too.
+    let (_pid, _reaper) = daemon_reaper(&root, "collected");
+
+    assert!(
+        lock_path.exists(),
+        "the session came up without the spawn lock the layout promises, so the \
+         spawn started it holding an unlinked inode"
+    );
+}
+
+/// Regression: a daemon holds `<id>.lock` across claiming its id, so nothing can
+/// collect the session it is in the middle of publishing.
+///
+/// `spawn` holds that lock from before the fork until `<id>.pid` exists (§ 6.3) and
+/// `list` and `kill` take it before they unlink anything (§ 6.6) — but a `nomux daemon
+/// <id>` started by hand, which § 6.2 is written for, took nothing at all. A `list`
+/// that had already probed the stale socket then unlinked the socket and pidfile this
+/// daemon had bound in between, and through `kill` the same interleaving exits 0
+/// reporting no such session while a daemon holds the user's shell.
+///
+/// The window is three syscalls wide, so it is held open rather than waited for:
+/// `bind_socket` probes the socket before it touches anything, and a `connect` to a
+/// listener whose backlog is full blocks, so [`wedge_socket`] parks the daemon inside
+/// the region under test for as long as this test likes.
+#[test]
+fn a_daemon_holds_the_spawn_lock_while_it_claims_the_id() {
+    let deadline = Instant::now() + PATIENCE;
+    let root = run_root("claimed_lock");
+    let dir = root.join("nomux");
+    fs::create_dir_all(&dir).expect("create the run directory");
+    // Created here so the wait below has an inode to name; the daemon opens this same
+    // path, and `SpawnLock` checks that what it locked is still the file at it.
+    let lock = fs::File::create(dir.join("claimed.lock")).expect("create the spawn lock");
+    let lock = lock.metadata().expect("stat the spawn lock");
+
+    let _wedged = wedge_socket(&dir.join("claimed.sock"));
+
+    let _daemon = Spawned::spawn(
+        nomux_with_shell(&root, &["daemon", "claimed"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    );
+
+    wait_until_flock(
+        Flock::Granted,
+        lock.dev(),
+        lock.ino(),
+        "the daemon took the spawn lock before it went near the socket",
+        deadline,
+    );
 }
 
 /// Every file in `dir` belonging to session `id`, by name.

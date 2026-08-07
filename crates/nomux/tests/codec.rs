@@ -638,17 +638,20 @@ mod generated {
 /// bump and an edit to § 2.2, or a bug. It is never a test that needs relaxing.
 ///
 /// The same table is written out beside this file as `wire-vectors.txt`, in a form an
-/// implementation in another language reads without parsing Rust;
-/// [`vectors::the_hex_fixture_carries_the_same_table`] renders these vectors and holds that
-/// file to the rendering, so neither can move alone.
+/// implementation in another language reads without parsing Rust. It is transcribed from
+/// § 2.2 by hand as these vectors are, not generated from them;
+/// [`vectors::the_hex_fixture_carries_the_same_table`] parses it and holds the two against
+/// each other, so neither can move alone and a slip in either is caught by the other.
 mod vectors {
+    use std::{cell::Cell, fmt::Debug};
+
     use nomux::{
         ErrorCode, ExitKind, Frame, FrameType, HEADER_LEN, Hello, HelloOk, Linger, MAX_PAYLOAD,
         PROTOCOL_VERSION, RESUME_FROM_START, WinSize,
     };
 
-    /// The language-neutral copy of the table below, compiled in rather than read: a test
-    /// holding a file it cannot open is a test that cannot quietly rewrite it.
+    /// The language-neutral transcription of the table below, compiled in rather than opened:
+    /// a test holding a file it has no handle to is a test that cannot quietly rewrite it.
     const FIXTURE: &str = include_str!("wire-vectors.txt");
 
     /// Distinct in all four fields on purpose: `cols`, `rows`, `xpixel` and `ypixel`
@@ -1136,172 +1139,375 @@ mod vectors {
         }
     }
 
-    /// A byte string as the fixture writes one.
-    fn hex(bytes: &[u8]) -> String {
-        let mut out = String::from("0x");
-        // `'?'` is unreachable, a nibble being a base-16 digit by construction; it stands in
-        // for an `unwrap` the lint wall refuses outside a `#[test]`.
-        out.extend(
-            bytes
-                .iter()
-                .flat_map(|byte| [byte >> 4, byte & 0x0f])
-                .map(|nibble| char::from_digit(u32::from(nibble), 16).unwrap_or('?')),
-        );
-        out
-    }
-
-    /// The four fields of a winsize, destructured so that a fifth would not be dropped
-    /// silently from the fixture.
-    fn win_lines(win: WinSize) -> [String; 4] {
-        let WinSize {
-            cols,
-            rows,
-            xpixel,
-            ypixel,
-        } = win;
-        [
-            format!("cols {cols:#06x}"),
-            format!("rows {rows:#06x}"),
-            format!("xpixel {xpixel:#06x}"),
-            format!("ypixel {ypixel:#06x}"),
-        ]
-    }
-
-    /// One vector as `wire-vectors.txt` writes it.
+    /// A value as the fixture's grammar writes one.
     ///
-    /// The values are the frame's, not the wire's: booleans where § 2.3 has flag bits, a
-    /// name where the wire has a discriminant, no `term_len` an encoder can count for
-    /// itself. Rendering the wire form instead would make each record a restatement of its
-    /// own `bytes`, which is the one thing a reader must not be handed.
-    fn record(vector: &Vector) -> String {
-        let &Vector { frame, bytes } = vector;
-        let mut lines = vec![format!("frame {:?}", frame.frame_type())];
-        match frame {
-            Frame::Hello(Hello {
-                protocol,
-                agent_forward,
-                repaint_ctrl_l,
-                out_offset,
-                win,
-                term,
-            }) => {
-                lines.push(format!("protocol {protocol:#06x}"));
-                lines.push(format!("agent_forward {agent_forward}"));
-                lines.push(format!("repaint_ctrl_l {repaint_ctrl_l}"));
-                lines.push(format!("out_offset {out_offset:#018x}"));
-                lines.extend(win_lines(win));
-                lines.push(format!("term {}", hex(term.as_bytes())));
-            }
-            Frame::HelloOk(HelloOk {
-                resume_from,
-                in_applied,
-                linger,
-                agent,
-            }) => {
-                lines.push(format!("resume_from {resume_from:#018x}"));
-                lines.push(format!("in_applied {in_applied:#018x}"));
-                lines.push(format!("linger {linger:?}"));
-                lines.push(format!("agent {agent}"));
-            }
-            Frame::Input { offset, data } | Frame::Output { offset, data } => {
-                lines.push(format!("offset {offset:#018x}"));
-                lines.push(format!("data {}", hex(data)));
-            }
-            Frame::InputAck { applied_through } => {
-                lines.push(format!("applied_through {applied_through:#018x}"));
-            }
-            Frame::Resize(win) => lines.extend(win_lines(win)),
-            Frame::Gap { new_base_offset } => {
-                lines.push(format!("new_base_offset {new_base_offset:#018x}"));
-            }
-            Frame::Exit {
-                status,
-                kind,
-                since_exit_secs,
-            } => {
-                lines.push(format!("status {status}"));
-                lines.push(format!("kind {kind:?}"));
-                lines.push(format!("since_exit_secs {since_exit_secs:#010x}"));
-            }
-            Frame::Error { code, message } => {
-                lines.push(format!("code {code:?}"));
-                lines.push(format!("message {}", hex(message.as_bytes())));
-            }
-            Frame::AgentOpen { generation } | Frame::AgentClose { generation } => {
-                lines.push(format!("generation {generation:#010x}"));
-            }
-            Frame::AgentData { generation, data } => {
-                lines.push(format!("generation {generation:#010x}"));
-                lines.push(format!("data {}", hex(data)));
-            }
-            Frame::Detach | Frame::Ping | Frame::Pong => {}
+    /// Hex is decoded at the line that carries it rather than where it is read, so a value
+    /// that is not hex names its own line. What the bytes then mean — a number as wide as its
+    /// field, or the field's own bytes — is the frame type's business, and is read below.
+    enum Value<'a> {
+        /// Lowercase hex behind an `0x`. An empty `term` is this, carrying nothing.
+        Hex(Vec<u8>),
+        /// A bare word: `true`, `false`, an enumerator, or the decimal `status` is written in.
+        Word(&'a str),
+    }
+
+    /// One `key value` line under a `frame`.
+    struct Field<'a> {
+        /// Where it was written, so a complaint can name it.
+        line: usize,
+        /// The key, spelled as § 2.2 names that field.
+        key: &'a str,
+        /// The value under it.
+        value: Value<'a>,
+        /// Whether the frame this record describes asked for it.
+        ///
+        /// The one risk a parser runs and a renderer does not: a reader that stepped over what
+        /// it did not recognise would turn a mistyped key into a field this file quietly stops
+        /// pinning, and the fixture into a no-op one line at a time.
+        read: Cell<bool>,
+    }
+
+    /// A `frame` line, the fields under it, and the `bytes` that close it.
+    struct Record<'a> {
+        /// The line the `frame` sits on.
+        line: usize,
+        /// The message it names, spelled as the [`FrameType`] variant.
+        name: &'a str,
+        /// The fields under it, read below by name — so a file whose lines were reordered
+        /// still passes, and what is pinned is the value under each key.
+        fields: Vec<Field<'a>>,
+        /// The whole frame, four-byte header included, once `closed`.
+        bytes: Vec<u8>,
+        /// Whether a `bytes` line has closed it. Tracked rather than read off `bytes`, the
+        /// grammar letting `0x` stand for no bytes at all.
+        closed: bool,
+    }
+
+    /// One lowercase hex digit. Uppercase is refused rather than folded: the grammar writes
+    /// one spelling, and a file written in two is one whose diffs stop reading cleanly.
+    fn nibble(digit: char) -> Option<u8> {
+        if digit.is_ascii_uppercase() {
+            return None;
         }
-        lines.push(format!("bytes {}", hex(bytes)));
-        lines.join("\n")
+        u8::try_from(digit.to_digit(16)?).ok()
     }
 
-    /// The whole table as the fixture writes it.
-    fn rendered_fixture() -> String {
-        let records: Vec<String> = vectors().iter().map(record).collect();
-        format!("{}\n", records.join("\n\n"))
+    /// The bytes behind an `0x`, or what is wrong with the value.
+    fn hex(line: usize, value: &str) -> Result<Vec<u8>, String> {
+        let complaint =
+            || format!("wire-vectors.txt:{line}: `{value}` is not lowercase hex behind an `0x`");
+        let mut digits = value.strip_prefix("0x").ok_or_else(complaint)?.chars();
+        let mut bytes = Vec::new();
+        while let Some(high) = digits.next() {
+            let low = digits.next().ok_or_else(complaint)?;
+            let (Some(high), Some(low)) = (nibble(high), nibble(low)) else {
+                return Err(complaint());
+            };
+            bytes.push((high << 4) | low);
+        }
+        Ok(bytes)
     }
 
-    /// The lines of a fixture that say something, numbered from one — the reader its own
-    /// grammar promises, which is the one thing here that has to be naive.
-    fn content(text: &str) -> Vec<(usize, String)> {
-        text.lines()
-            .enumerate()
-            .map(|(index, line)| {
-                (
-                    index + 1,
-                    line.split_whitespace().collect::<Vec<_>>().join(" "),
-                )
+    /// The value of a closed set that `Debug` spells `word`, swept from the set's own `ALL` so
+    /// that a value added to the protocol is spelled here without this being edited.
+    fn by_name<T: Copy + Debug>(all: &[T], word: &str) -> Option<T> {
+        all.iter()
+            .copied()
+            .find(|value| format!("{value:?}") == word)
+    }
+
+    impl Record<'_> {
+        /// A complaint about one of this record's fields.
+        fn wrong(&self, key: &str, detail: &str) -> String {
+            format!(
+                "wire-vectors.txt:{}: `{key}` under this `frame {}` {detail}",
+                self.line, self.name
+            )
+        }
+
+        /// The value under `key`, marked read.
+        fn value(&self, key: &str) -> Result<&Value<'_>, String> {
+            let field = self
+                .fields
+                .iter()
+                .find(|field| field.key == key)
+                .ok_or_else(|| self.wrong(key, "is missing"))?;
+            field.read.set(true);
+            Ok(&field.value)
+        }
+
+        /// A field the grammar writes in hex.
+        fn bytes(&self, key: &str) -> Result<&[u8], String> {
+            match self.value(key)? {
+                Value::Hex(bytes) => Ok(bytes),
+                Value::Word(_) => Err(self.wrong(key, "is not `0x` hex")),
+            }
+        }
+
+        /// A field the grammar writes as a bare word.
+        fn word(&self, key: &str) -> Result<&str, String> {
+            match self.value(key)? {
+                Value::Word(word) => Ok(word),
+                Value::Hex(_) => Err(self.wrong(key, "is hex where a word belongs")),
+            }
+        }
+
+        /// A number as wide as § 2.2 gives it, big-endian.
+        ///
+        /// The width is the array's, so a value written short — which the grammar's
+        /// zero-padding rules out and a hand-edit does not — fails here rather than reading
+        /// back as a number that happens to be equal.
+        fn fixed<const N: usize>(&self, key: &str) -> Result<[u8; N], String> {
+            let bytes = self.bytes(key)?;
+            let width = bytes.len();
+            <[u8; N]>::try_from(bytes)
+                .map_err(|_| self.wrong(key, &format!("is {width} bytes, not § 2.2's {N}")))
+        }
+
+        /// A `u16` field.
+        fn u16(&self, key: &str) -> Result<u16, String> {
+            Ok(u16::from_be_bytes(self.fixed(key)?))
+        }
+
+        /// A `u32` field.
+        fn u32(&self, key: &str) -> Result<u32, String> {
+            Ok(u32::from_be_bytes(self.fixed(key)?))
+        }
+
+        /// A `u64` field.
+        fn u64(&self, key: &str) -> Result<u64, String> {
+            Ok(u64::from_be_bytes(self.fixed(key)?))
+        }
+
+        /// The one signed field on this wire, and so the one value written in decimal: a
+        /// two's-complement pattern is a reinterpretation the fixture does not ask for.
+        fn decimal(&self, key: &str) -> Result<i32, String> {
+            let word = self.word(key)?;
+            word.parse()
+                .map_err(|_| self.wrong(key, "is no decimal `i32`"))
+        }
+
+        /// A flag, where § 2.3 has a bit.
+        fn flag(&self, key: &str) -> Result<bool, String> {
+            match self.word(key)? {
+                "true" => Ok(true),
+                "false" => Ok(false),
+                _ => Err(self.wrong(key, "is neither `true` nor `false`")),
+            }
+        }
+
+        /// A text field: bytes here, UTF-8 on the wire (§ 2.2).
+        fn text(&self, key: &str) -> Result<&str, String> {
+            str::from_utf8(self.bytes(key)?).map_err(|_| self.wrong(key, "is not UTF-8"))
+        }
+
+        /// An enumerator of a closed set, by the name it is written under.
+        fn enumerator<T: Copy + Debug>(&self, key: &str, all: &[T]) -> Result<T, String> {
+            let word = self.word(key)?;
+            by_name(all, word).ok_or_else(|| self.wrong(key, "names no value § 2.2 gives it"))
+        }
+
+        /// The four fields of a winsize, wherever one is written out.
+        fn win(&self) -> Result<WinSize, String> {
+            Ok(WinSize {
+                cols: self.u16("cols")?,
+                rows: self.u16("rows")?,
+                xpixel: self.u16("xpixel")?,
+                ypixel: self.u16("ypixel")?,
             })
-            .filter(|(_, line)| !line.is_empty() && !line.starts_with('#'))
-            .collect()
+        }
+
+        /// The frame this record describes, built from its field lines.
+        ///
+        /// From the fields and never from `bytes`, which are what the frame is then held
+        /// against: a record decoded from its own bytes would agree with itself while every
+        /// field line above them went unread. The match is exhaustive on [`FrameType`], so a
+        /// frame added to the protocol is one this has to learn to read rather than one the
+        /// fixture silently never carries.
+        fn frame(&self) -> Result<Frame<'_>, String> {
+            let Some(frame_type) = by_name(&FrameType::ALL, self.name) else {
+                return Err(format!(
+                    "wire-vectors.txt:{}: `{}` names no frame in § 2.2's table",
+                    self.line, self.name
+                ));
+            };
+            let frame = match frame_type {
+                FrameType::Hello => Frame::Hello(Hello {
+                    protocol: self.u16("protocol")?,
+                    agent_forward: self.flag("agent_forward")?,
+                    repaint_ctrl_l: self.flag("repaint_ctrl_l")?,
+                    out_offset: self.u64("out_offset")?,
+                    win: self.win()?,
+                    term: self.text("term")?,
+                }),
+                FrameType::HelloOk => Frame::HelloOk(HelloOk {
+                    resume_from: self.u64("resume_from")?,
+                    in_applied: self.u64("in_applied")?,
+                    linger: self.enumerator("linger", &Linger::ALL)?,
+                    agent: self.flag("agent")?,
+                }),
+                FrameType::Input => Frame::Input {
+                    offset: self.u64("offset")?,
+                    data: self.bytes("data")?,
+                },
+                FrameType::InputAck => Frame::InputAck {
+                    applied_through: self.u64("applied_through")?,
+                },
+                FrameType::Output => Frame::Output {
+                    offset: self.u64("offset")?,
+                    data: self.bytes("data")?,
+                },
+                FrameType::Resize => Frame::Resize(self.win()?),
+                FrameType::Gap => Frame::Gap {
+                    new_base_offset: self.u64("new_base_offset")?,
+                },
+                FrameType::Exit => Frame::Exit {
+                    status: self.decimal("status")?,
+                    kind: self.enumerator("kind", &ExitKind::ALL)?,
+                    since_exit_secs: self.u32("since_exit_secs")?,
+                },
+                FrameType::Detach => Frame::Detach,
+                FrameType::Ping => Frame::Ping,
+                FrameType::Pong => Frame::Pong,
+                FrameType::Error => Frame::Error {
+                    code: self.enumerator("code", &ErrorCode::ALL)?,
+                    message: self.text("message")?,
+                },
+                FrameType::AgentOpen => Frame::AgentOpen {
+                    generation: self.u32("generation")?,
+                },
+                FrameType::AgentData => Frame::AgentData {
+                    generation: self.u32("generation")?,
+                    data: self.bytes("data")?,
+                },
+                FrameType::AgentClose => Frame::AgentClose {
+                    generation: self.u32("generation")?,
+                },
+            };
+
+            if let Some(field) = self.fields.iter().find(|field| !field.read.get()) {
+                return Err(format!(
+                    "wire-vectors.txt:{}: `{}` is a line no {frame_type:?} reads — a key that \
+                     frame does not have, or a second value under one it does",
+                    field.line, field.key
+                ));
+            }
+            Ok(frame)
+        }
     }
 
-    /// `wire-vectors.txt` says what this table says, so a second implementation can be
-    /// built against these bytes without reading Rust.
+    /// The fixture's records in file order, or the first thing about it that is not the
+    /// grammar its own header states.
     ///
-    /// The table is the original and the fixture is rendered from it rather than the other
-    /// way round: what the two tests above are worth rests on the vectors being literals
-    /// read out of § 2.2 by hand and reviewed as a diff, and the fixture's `bytes` come from
-    /// those literals rather than from `encode`, so what it offers another implementation is
-    /// the document and not this codec's opinion of it. Both sides are read through the
-    /// ignorable-line rule the fixture states, so a re-commented or hand-aligned file still
-    /// passes and only the data is pinned.
+    /// Every line opens a record, closes one, or lands in the open one; a key with nowhere to
+    /// go fails rather than being stepped over. Blank lines, `#` comments and the alignment
+    /// are all that is thrown away, so a re-commented or hand-aligned file still passes and
+    /// only the data is pinned.
+    fn records(text: &str) -> Result<Vec<Record<'_>>, String> {
+        let mut records: Vec<Record<'_>> = Vec::new();
+        for (index, raw) in text.lines().enumerate() {
+            let (line, raw) = (index + 1, raw.trim());
+            if raw.is_empty() || raw.starts_with('#') {
+                continue;
+            }
+            let complaint = |detail| format!("wire-vectors.txt:{line}: `{raw}` {detail}");
+            let Some((key, value)) = raw.split_once(char::is_whitespace) else {
+                return Err(complaint("is a key with no value"));
+            };
+            let value = value.trim();
+            if key == "frame" {
+                records.push(Record {
+                    line,
+                    name: value,
+                    fields: Vec::new(),
+                    bytes: Vec::new(),
+                    closed: false,
+                });
+            } else if let Some(record) = records.last_mut().filter(|record| !record.closed) {
+                if key == "bytes" {
+                    record.bytes = hex(line, value)?;
+                    record.closed = true;
+                } else {
+                    let value = match value.strip_prefix("0x") {
+                        Some(_) => Value::Hex(hex(line, value)?),
+                        None => Value::Word(value),
+                    };
+                    let field = Field {
+                        line,
+                        key,
+                        value,
+                        read: Cell::new(false),
+                    };
+                    record.fields.push(field);
+                }
+            } else {
+                return Err(complaint(
+                    "is under no open record, preceding the first `frame` or following the \
+                     `bytes` that closed one",
+                ));
+            }
+        }
+        if let Some(open) = records.iter().find(|record| !record.closed) {
+            return Err(format!(
+                "wire-vectors.txt:{}: this `frame {}` reaches the end of the file with no \
+                 `bytes` line to close it",
+                open.line, open.name
+            ));
+        }
+        Ok(records)
+    }
+
+    /// `wire-vectors.txt` says what this table says, so a second implementation can be built
+    /// against these bytes without reading Rust.
     ///
-    /// A stale fixture fails here and is never rewritten: [`FIXTURE`] is `include_str!`, so
-    /// this test has no handle to write through, and the rendering rides on the failure
-    /// instead — which is what a maintainer pastes, a vector added or dropped having moved
-    /// every line after it.
+    /// Neither side is generated from the other. Both are § 2.2 transcribed by hand — once as
+    /// the Rust literals above, once in the fixture's own notation — and this reads the file
+    /// back and holds the two against each other, so a wire change has to be made twice and a
+    /// slip in either is caught by the other. A file rendered from the table would instead
+    /// have carried whatever the table said, mistakes included: a fixture that agrees with
+    /// this code by construction is evidence about nothing, and the second reading of § 2.2 is
+    /// the whole of what it has to offer.
+    ///
+    /// The record's own fields are read and the frame built from them, which is then held
+    /// against `bytes`. So a record is wrong if any line of it is, and neither half of one can
+    /// be right on account of the other.
+    ///
+    /// [`FIXTURE`] is `include_str!`, so there is no handle to write the file through and no
+    /// flag that would rewrite it: a disagreement is settled against § 2.2 rather than blessed.
     #[test]
     fn the_hex_fixture_carries_the_same_table() {
-        let rendered = rendered_fixture();
-        let table = content(&rendered);
-        let carried = content(FIXTURE);
+        let records = records(FIXTURE).unwrap_or_else(|complaint| panic!("{complaint}"));
+        let table = vectors();
 
-        let complaint = table
-            .iter()
-            .enumerate()
-            .find_map(|(index, (_, want))| match carried.get(index) {
-                Some((_, found)) if found == want => None,
-                Some((number, found)) => Some(format!(
-                    "wire-vectors.txt:{number} carries `{found}`, and this table renders `{want}`"
-                )),
-                None => Some(format!(
-                    "wire-vectors.txt ends before this table does, at `{want}`"
-                )),
-            })
-            .or_else(|| {
-                carried.get(table.len()).map(|(number, extra)| {
-                    format!("wire-vectors.txt:{number} carries `{extra}`, which no vector renders")
-                })
-            });
+        for (index, record) in records.iter().enumerate() {
+            let Some(&Vector { frame, bytes }) = table.get(index) else {
+                panic!(
+                    "wire-vectors.txt:{} carries a `frame {}` no vector in this table answers",
+                    record.line, record.name
+                );
+            };
+            let carried = record
+                .frame()
+                .unwrap_or_else(|complaint| panic!("{complaint}"));
+            assert_eq!(
+                carried, frame,
+                "wire-vectors.txt:{} describes a frame this table writes otherwise",
+                record.line
+            );
+            assert_eq!(
+                record.bytes,
+                bytes,
+                "wire-vectors.txt:{} gives {:?} bytes this table does not",
+                record.line,
+                frame.frame_type()
+            );
+        }
 
-        if let Some(complaint) = complaint {
-            panic!("{complaint}\n\nthe table renders:\n\n{rendered}");
+        if let Some(Vector { frame, .. }) = table.get(records.len()) {
+            panic!(
+                "this table holds a {:?} vector that wire-vectors.txt has no record for",
+                frame.frame_type()
+            );
         }
     }
 

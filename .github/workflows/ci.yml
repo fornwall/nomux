@@ -32,6 +32,13 @@ env:
   # A failure in the PTY suite is awkward to reproduce off the runner, so keep the backtrace.
   RUST_BACKTRACE: 1
 
+# `-e` alone, GitHub's default for `run:`, says nothing about a pipeline — `git archive | tar -x`
+# below would report only tar's status. Naming the shell is what adds `pipefail`; bash rather than
+# sh, the publish job reading an array. The only other pipeline here feeds sha256sum from an echo.
+defaults:
+  run:
+    shell: bash
+
 # Every action pinned to a commit, GitHub's own included: a tag is a mutable pointer in someone
 # else's repository, and `download-artifact` feeds the one job holding `contents: write`.
 jobs:
@@ -242,16 +249,23 @@ jobs:
       # The checksums are the point of this job — the client pins one per architecture — so they
       # have to outlive the log they were printed to. On a tag the release below is where they
       # land; this keeps every other commit's set reachable for the ninety days an artifact lasts.
+      # Also on failure: build-release.sh disarms its cleanup trap before the size gates, so an
+      # over-budget build keeps its binaries for whoever has to measure them, and dropping them
+      # here would undo that. `ignore` follows — a failure earlier than that is the trap firing.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: success() || failure()
         with:
           name: musl-binaries
           path: target/dist/
-          if-no-files-found: error
+          if-no-files-found: ignore
 
   # What P3 asked for: the checksums somewhere a client can read them, an artifact expiring after
   # ninety days and sitting behind a login. Its own job because it `needs` both jobs above — so a
   # tag cannot publish a release whose tests failed — and because it is the only one that wants a
-  # write token, which is why the others keep the read-only one the header grants.
+  # write token, which is why the others keep the read-only one the header grants. Rehearsed by
+  # nothing: no pull request reaches the download, the checksum check or `gh release create`. Nor
+  # cheaply — what the check below proves is that the bytes survived the artifact store, where the
+  # same `sha256sum -c` in `release` re-hashes what build-release.sh hashed to write SHA256SUMS.
   publish:
     name: publish the release
     if: startsWith(github.ref, 'refs/tags/v')
