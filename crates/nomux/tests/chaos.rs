@@ -39,13 +39,9 @@ use std::time::{Duration, Instant};
 
 use nomux::{Frame, MAX_PAYLOAD, RESUME_FROM_START};
 
-use harness::{Rng, Session, assert_same_stream, poll_by, reconnect_until_gap, socket_capacity};
-
-/// `conn::MAX_PENDING_WRITE`, private to the daemon: what § 4.1 has it queue for a slow
-/// client before it stops adding. Mirrored here as the harness mirrors its neighbours,
-/// and the two must move together. Both tests below want it as an upper bound on how
-/// far ahead of a client's own reads the daemon can be.
-const MAX_PENDING_WRITE: usize = 1 << 20;
+use harness::{
+    MAX_PENDING_WRITE, Rng, Session, StreamModel, poll_by, reconnect_until_gap, socket_capacity,
+};
 
 /// How long a chaos test waits for its workload before calling it stalled.
 ///
@@ -736,41 +732,10 @@ impl Replay<'_> {
         usize::try_from(at.saturating_sub(self.stream_start)).unwrap_or(usize::MAX)
     }
 
-    /// Fails unless `got` is what the child wrote at `at`.
-    ///
-    /// Against the model by absolute offset rather than against what arrived before it:
-    /// contiguity checked relative to the daemon's own numbers cannot fail whatever they
-    /// say, since a base too low replays bytes the client has and one too high drops
-    /// bytes it never will, and both arrive perfectly contiguous.
-    fn check(&self, at: u64, got: &[u8]) {
-        let index = self.index(at);
-        let seed = self.seed;
-        let want = self
-            .screen
-            .bytes
-            .get(index..index + got.len())
-            .unwrap_or_else(|| {
-                panic!(
-                    "the daemon sent {} bytes at offset {at}, running past the end of \
-                     everything the child ever wrote (seed {seed})",
-                    got.len(),
-                )
-            });
-        assert_same_stream(want, got, at, |diff| {
-            format!(
-                ", {} bytes into {} (seed {seed})",
-                index + diff,
-                self.screen.straddled(index + diff).map_or_else(
-                    || "no escape sequence".to_owned(),
-                    |seq| format!("the escape sequence at {}..{}", seq.start, seq.end)
-                ),
-            )
-        });
-    }
-
     /// Takes output until the stream reaches `through` or `budget` bytes of it have been
-    /// taken, whichever comes first, checking every byte against the byte its offset
-    /// names and following any gap the daemon announces.
+    /// taken, whichever comes first — `harness::StreamModel::follow` against this
+    /// replay's model, folding what the daemon's boundaries landed on into the tallies
+    /// the final assertions read.
     fn follow(
         &mut self,
         client: &mut harness::Client,
@@ -779,35 +744,33 @@ impl Replay<'_> {
         budget: usize,
     ) -> u64 {
         let seed = self.seed;
-        let mut offset = from;
-        let mut taken = 0usize;
-        while offset < through && taken < budget {
-            let (ty, payload) = frame_by(client, self.deadline, seed, "the child's output");
-            match Frame::decode(ty, &payload).expect("decode frame") {
-                Frame::Output { offset: at, data } => {
-                    assert_eq!(
-                        at, offset,
-                        "output must join up unless a Gap said otherwise (seed {seed})"
-                    );
-                    self.check(at, data);
-                    self.straddling_frames += u64::from(self.straddles(at));
-                    offset += data.len() as u64;
-                    taken += data.len();
-                }
-                Frame::Gap { new_base_offset } => {
-                    assert!(
-                        new_base_offset > offset,
-                        "a gap must move the stream forward (seed {seed})"
-                    );
-                    self.straddling_gaps += u64::from(self.straddles(new_base_offset));
-                    self.gaps.push((offset, new_base_offset));
-                    offset = new_base_offset;
-                }
-                Frame::InputAck { .. } | Frame::Pong => {}
-                other => panic!("unexpected {other:?} (seed {seed})"),
-            }
-        }
-        offset
+        let model = StreamModel {
+            bytes: &self.screen.bytes,
+            stream_start: self.stream_start,
+            context: format!(" (seed {seed})"),
+        };
+        let taken = model.follow(client, from, through, budget, self.deadline, |at| {
+            format!(
+                ", {} bytes into {} (seed {seed})",
+                at,
+                self.screen.straddled(at).map_or_else(
+                    || "no escape sequence".to_owned(),
+                    |seq| format!("the escape sequence at {}..{}", seq.start, seq.end)
+                ),
+            )
+        });
+        self.straddling_frames += taken
+            .frame_starts
+            .iter()
+            .filter(|at| self.straddles(**at))
+            .count() as u64;
+        self.straddling_gaps += taken
+            .gaps
+            .iter()
+            .filter(|(_, base)| self.straddles(*base))
+            .count() as u64;
+        self.gaps.extend_from_slice(&taken.gaps);
+        taken.offset
     }
 
     /// Whether the stream is cut inside an escape sequence at `at`.

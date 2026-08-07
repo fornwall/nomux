@@ -31,9 +31,9 @@ use nomux::{
 };
 
 use harness::{
-    Client, DEFAULT_TEST_RING, FRAME_PATIENCE, Rng, Session, Spawned, assert_same_stream,
-    hello_frame, nomux_with_shell, poll_by, poll_until, read_uninterrupted, reconnect_until_gap,
-    run_root, still_serving,
+    Client, DEFAULT_TEST_RING, FRAME_PATIENCE, Rng, Session, Spawned, StreamModel, hello_frame,
+    nomux_with_shell, poll_by, poll_until, read_uninterrupted, reconnect_until_gap, run_root,
+    still_serving,
 };
 
 /// A client claiming output the session never produced is clamped down to the end of
@@ -260,66 +260,28 @@ fn plant_blob(
 }
 
 /// Reads the session's output to the end of `planted.expected`, checking every byte
-/// against the byte its offset names, and returns the gaps followed on the way.
-///
-/// The assertion the gap tests exist for. Checking contiguity *relative to* the base the
-/// daemon reported cannot fail whatever it says: a base N too low replays N bytes the
-/// client already has, one N too high drops N it never will, and both produce a
-/// perfectly contiguous stream that corrupts the user's scrollback. Indexing a model of
-/// the child's own output by absolute offset is what makes that falsifiable.
+/// against the byte its offset names (`harness::StreamModel`, and the canonical
+/// statement of why the check is by absolute offset), and returns the gaps followed
+/// on the way.
 fn read_against(client: &mut Client, planted: &Planted, from: u64) -> Vec<(u64, u64)> {
-    let expected = &planted.expected;
-    let end = planted.stream_start + expected.len() as u64;
-    let mut offset = from;
-    let mut gaps = Vec::new();
-    let awaiting = format!("the {} bytes the child wrote", expected.len());
-    let deadline = Instant::now() + FRAME_PATIENCE;
-    while offset < end {
-        let (ty, payload) = client.frame_before(deadline, &awaiting).unwrap_or_else(|| {
-            panic!(
-                "the session stopped {} bytes short of everything the child wrote, \
-                 with the stream standing at {offset}",
-                end - offset
-            )
-        });
-        match Frame::decode(ty, &payload).expect("decode frame") {
-            Frame::Output { offset: at, data } => {
-                assert_eq!(
-                    at,
-                    offset,
-                    "output must join up unless a Gap said otherwise, and this frame \
-                     opens {} bytes from where the stream stood",
-                    at.abs_diff(offset)
-                );
-                let index = usize::try_from(at.saturating_sub(planted.stream_start))
-                    .expect("an offset within a stream this test wrote");
-                let want = expected.get(index..index + data.len()).unwrap_or_else(|| {
-                    panic!(
-                        "the daemon sent {} bytes at offset {at}, running {} past the \
-                         end of everything the child ever wrote",
-                        data.len(),
-                        index + data.len() - expected.len()
-                    )
-                });
-                // Nothing to add to the offset: this model has no structure of its own
-                // to place a byte in, and nothing here is drawn from a seed.
-                assert_same_stream(want, data, at, |_| String::new());
-                offset += data.len() as u64;
-            }
-            Frame::Gap { new_base_offset } => {
-                assert!(
-                    new_base_offset > offset,
-                    "a Gap must name a base past what the client was sent: \
-                     {new_base_offset} against {offset}"
-                );
-                gaps.push((offset, new_base_offset));
-                offset = new_base_offset;
-            }
-            Frame::InputAck { .. } | Frame::Pong => {}
-            other => panic!("unexpected {other:?} while reading the session's output"),
-        }
-    }
-    gaps
+    let model = StreamModel {
+        bytes: &planted.expected,
+        stream_start: planted.stream_start,
+        context: String::new(),
+    };
+    let end = planted.stream_start + planted.expected.len() as u64;
+    // Nothing for `sits_in` to add to the offset: this model has no structure of its
+    // own to place a byte in, and nothing here is drawn from a seed.
+    model
+        .follow(
+            client,
+            from,
+            end,
+            usize::MAX,
+            Instant::now() + FRAME_PATIENCE,
+            |_| String::new(),
+        )
+        .gaps
 }
 
 /// A gap reported at the handshake must name the byte the stream really resumes at.

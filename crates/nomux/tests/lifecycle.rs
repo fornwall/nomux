@@ -29,9 +29,9 @@ use nomux::{Frame, FrameType, RESUME_FROM_START};
 
 use harness::{
     Client, Cue, FRAME_PATIENCE, Flock, HeldLock, MAX_SESSIONS, Reaper, Rng, SETTLE, SPIN_WINDOW,
-    Session, Spawned, StatField, control, cpu_ticks, daemon_reaper, entries, leads_a_process_group,
-    nomux_with_shell, poll_by, poll_until, process_alive, process_state, run_root, stat_field,
-    still_serving, succeeded, wait_for, wait_until_flock, wedge_socket,
+    Session, Spawned, StatField, control, control_with_shell, cpu_ticks, daemon_reaper, entries,
+    leads_a_process_group, nomux_with_shell, poll_by, poll_until, process_alive, process_state,
+    run_root, stat_field, still_serving, succeeded, wait_for, wait_until_flock, wedge_socket,
 };
 
 /// How long a test that waits on a second process reaching a window may spend waiting,
@@ -70,25 +70,10 @@ fn a_child_killed_by_a_signal_is_reported_as_signalled_rather_than_as_a_status()
 
     client.input(0, b"kill -9 $$\n");
 
-    let deadline = Instant::now() + FRAME_PATIENCE;
-    let awaiting = "the fate of a child that killed itself with SIGKILL";
-    let (status, kind, since_terminal_closed_secs) = loop {
-        let (ty, payload) = client
-            .frame_before(deadline, awaiting)
-            .unwrap_or_else(|| panic!("timed out waiting for {awaiting}"));
-        match Frame::decode(ty, &payload).expect("decode") {
-            Frame::Exit {
-                status,
-                kind,
-                since_terminal_closed_secs,
-            } => break (status, kind, since_terminal_closed_secs),
-            Frame::Output { .. } | Frame::InputAck { .. } | Frame::Pong => {}
-            other => panic!("unexpected {other:?} while waiting for the exit"),
-        }
-    };
+    let replay = replay_to_the_exit(&mut client);
 
     assert_eq!(
-        (status, kind),
+        (replay.status, replay.kind),
         (9, nomux::ExitKind::Signalled),
         "a child killed by SIGKILL must arrive as the signal that killed it, not as \
          a status a process chose"
@@ -98,10 +83,10 @@ fn a_child_killed_by_a_signal_is_reported_as_signalled_rather_than_as_a_status()
     // the end of file it measures from, and a whole second would have to pass before
     // this could read as anything but zero.
     assert_eq!(
-        since_terminal_closed_secs, 0,
+        replay.since_terminal_closed_secs, 0,
         "the client that watched the exit happen was told the shell had been gone \
-         for {since_terminal_closed_secs} s, so the field measures something other than the end \
-         of file"
+         for {} s, so the field measures something other than the end of file",
+        replay.since_terminal_closed_secs
     );
 }
 
@@ -153,31 +138,18 @@ fn an_unknown_outcome_is_sent_on_the_pass_that_decides_it() {
     );
     let began = Instant::now();
 
-    // Far above `BOUND`, so what decides this test is still the measurement below —
-    // this only replaces a hang with a sentence.
-    let deadline = Instant::now() + FRAME_PATIENCE;
-    let awaiting = "the status of a child that closed the terminal without exiting";
-    let (elapsed, status, kind) = loop {
-        let (ty, payload) = client
-            .frame_before(deadline, awaiting)
-            .unwrap_or_else(|| panic!("timed out waiting for {awaiting}"));
-        match Frame::decode(ty, &payload).expect("decode") {
-            Frame::Exit {
-                status,
-                kind,
-                since_terminal_closed_secs: _,
-            } => break (began.elapsed(), status, kind),
-            Frame::Output { .. } | Frame::InputAck { .. } | Frame::Pong => {}
-            other => panic!("unexpected {other:?} while waiting for the exit"),
-        }
-    };
+    // `replay_to_the_exit`'s own patience is far above `BOUND`, so what decides this
+    // test is still the measurement below — the wait only replaces a hang with a
+    // sentence.
+    let replay = replay_to_the_exit(&mut client);
+    let elapsed = began.elapsed();
 
     assert_eq!(
-        status, 0,
+        replay.status, 0,
         "a child that closed the terminal without exiting has no status of its own"
     );
     assert_eq!(
-        kind,
+        replay.kind,
         nomux::ExitKind::Unknown,
         "closing the terminal is not evidence that the child exited successfully"
     );
@@ -634,7 +606,7 @@ fn a_daemon_that_leads_a_process_group_detaches_by_forking() {
     assert_detached(&detachment, recorded);
 }
 
-/// Turns two different ids away at the ceiling through `mode`, and asserts that neither
+/// Turns each id in `ids` away at the ceiling through `mode`, and asserts that no
 /// refusal left anything in the run directory.
 ///
 /// The sessions are planted as `<id>.sock` files rather than started: 64 daemons is 64
@@ -642,10 +614,16 @@ fn a_daemon_that_leads_a_process_group_detaches_by_forking() {
 ///
 /// Asserted twice over, because either half alone is satisfiable by the bug. That no
 /// `<id>.*` is left is the property; that the *count* has not moved is what it was for,
-/// and it is the one a reader can check against [`MAX_SESSIONS`] — so the second
-/// refusal has to name a different id from the first, or a lock left behind by the
-/// first would be excluded from the second's count as its own.
-fn refusals_at_the_session_ceiling_leave_nothing_behind(name: &str, mode: &str, refusal: i32) {
+/// and it is the one a reader can check against [`MAX_SESSIONS`]. Whether that ratchet
+/// needs a second, differently named id to be falsifiable is the caller's to say — a
+/// lock left behind by one refusal would be excluded from a repeat of the *same* id's
+/// count as its own.
+fn refusals_at_the_session_ceiling_leave_nothing_behind(
+    name: &str,
+    mode: &str,
+    refusal: i32,
+    ids: &[&str],
+) {
     let root = run_root(name);
     let dir = root.join("nomux/run");
     fs::create_dir_all(&dir).expect("create the run directory");
@@ -653,13 +631,8 @@ fn refusals_at_the_session_ceiling_leave_nothing_behind(name: &str, mode: &str, 
         fs::write(dir.join(format!("full{n}.sock")), b"").expect("plant a session");
     }
 
-    for id in ["over1", "over2"] {
-        let refused = harness::collect(
-            nomux_with_shell(&root, &[mode, id])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped()),
-        );
+    for &id in ids {
+        let refused = control_with_shell(&root, &[mode, id]);
         let complaint = harness::stderr(&refused);
         assert_eq!(
             refused.status.code(),
@@ -703,7 +676,15 @@ fn refusals_at_the_session_ceiling_leave_nothing_behind(name: &str, mode: &str, 
 /// from it: 64, 65, 66, with only `nomux list` able to bring it back.
 #[test]
 fn a_spawn_refused_at_the_session_ceiling_leaves_no_lock_behind() {
-    refusals_at_the_session_ceiling_leave_nothing_behind("ceiling_lock", "daemon", 1);
+    // Two ids, because the count ratchet is this test's to prove: a lock left behind
+    // by the first refusal would be excluded from a repeat of the same id's count as
+    // its own, so the second refusal has to name a different id.
+    refusals_at_the_session_ceiling_leave_nothing_behind(
+        "ceiling_lock",
+        "daemon",
+        1,
+        &["over1", "over2"],
+    );
 }
 
 /// The same property through the mode a user actually runs, where a different process
@@ -716,13 +697,15 @@ fn a_spawn_refused_at_the_session_ceiling_leaves_no_lock_behind() {
 /// relay therefore remains responsible for removing that name when publication fails.
 /// That ownership boundary is the half of the ratchet the test above cannot reach.
 ///
-/// Costs two `attach::SPAWN_TIMEOUT`s. The daemon refuses at once, but nothing on the
+/// Costs one `attach::SPAWN_TIMEOUT`. The daemon refuses at once, but nothing on the
 /// socket distinguishes a daemon that refused from one that is slow to bind, so the
 /// relay waits out its deadline and reports § 10's 127 with the daemon's complaint
-/// attached.
+/// attached — which is also why one id is all this variant is run with: the ownership
+/// boundary needs only one refusal, and the count ratchet is the sibling's to prove
+/// with two.
 #[test]
 fn a_relay_refused_at_the_session_ceiling_leaves_no_lock_behind() {
-    refusals_at_the_session_ceiling_leave_nothing_behind("ceiling_relay", "spawn", 127);
+    refusals_at_the_session_ceiling_leave_nothing_behind("ceiling_relay", "spawn", 127, &["over1"]);
 }
 
 /// Regression: a spawn whose socket cannot be bound leaves nothing behind either.
@@ -748,12 +731,7 @@ fn a_spawn_whose_socket_cannot_be_bound_leaves_no_lock_behind() {
     fs::create_dir(dir.join("wedged.sock")).expect("plant a name no bind can take");
     let before = entries(&dir);
 
-    let refused = harness::collect(
-        nomux_with_shell(&root, &["daemon", "wedged"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
-    );
+    let refused = control_with_shell(&root, &["daemon", "wedged"]);
 
     let complaint = harness::stderr(&refused);
     assert_eq!(
@@ -861,12 +839,7 @@ fn a_daemon_refused_by_a_live_session_leaves_that_session_its_lock() {
         "the live session left no spawn lock, so nothing below is about one"
     );
 
-    let refused = harness::collect(
-        nomux_with_shell(&session.root, &["daemon", &session.id])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
-    );
+    let refused = control_with_shell(&session.root, &["daemon", &session.id]);
 
     let complaint = harness::stderr(&refused);
     assert_eq!(
