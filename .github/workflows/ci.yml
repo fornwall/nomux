@@ -107,7 +107,7 @@ jobs:
       # lands a new check turns a green tree red with no commit behind it. Dependabot does
       # not read these — the `github-actions` ecosystem updates the `uses:` SHA above and
       # nothing inside `with:` — so they are bumped by hand, which is the point.
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
+      - uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.85.8
         with:
           tool: cargo-nextest@0.9.143,cargo-deny@0.20.2,prek@0.4.12,shellcheck@0.11.0
 
