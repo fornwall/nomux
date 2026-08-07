@@ -1,5 +1,18 @@
 version: 2
 
+# Two pins here are covered by no ecosystem below and by no gate anywhere:
+# `rust-toolchain.toml`'s stable channel and `scripts/nightly-version`'s dated release. That
+# is accepted rather than automated, and the reason is that neither is a version number a bot
+# could move on its own. The nightly decides the bytes of a binary whose SHA-256 a client
+# pins, so a bump is only correct alongside a `scripts/size-baseline` refresh someone has
+# looked at; and the stable bump lands a new wall of lints on a tree whose gates deny
+# warnings, which is a change with a diff rather than a one-line edit. Both are read by a
+# person, in a commit that carries whatever else the bump broke.
+#
+# What that leaves unattended is a compiler-side fix nobody notices. It is the dependency
+# tree — everybody else's code, which is the larger surface — that the weekly `advisories`
+# job in .github/workflows/ci.yml watches on a timer, precisely because those move without
+# this repository moving.
 updates:
   # Action majors are tracked by a moving tag, minors are not; without this the
   # workflow silently ages.

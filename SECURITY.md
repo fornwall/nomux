@@ -11,15 +11,10 @@ button, or by email to fredrik@fornwall.net. Please do not open a public issue.
 
 There is no SLA — this is a personal project — but reports are read.
 
-## Scope
+## Supported versions
 
-No released version of nomux receives security updates; fixes land on
-`main`. The threat model is [DESIGN.md § 8](DESIGN.md#8-security-model). The gap worth
-naming here: a `v*` tag publishes per-architecture checksums, and nothing verifies an
-upload against them yet — that half is the client's, and it is unwritten.
+None. No released version receives security updates; fixes land on `main`.
 
-Two things are deliberate, both in [DESIGN.md § 8](DESIGN.md#8-security-model): an
-attacker who is already the user — though a *different* user replacing a binary the
-victim then execs is a real gap, and in scope — and the wire protocol's lack of
-authentication, its sockets being `0600` inside a `0700` run directory, so reaching
-one already means being the user.
+What is in scope, what is deliberately accepted, and who each boundary holds against are
+[DESIGN.md § 8](DESIGN.md#8-security-model); the gaps that are known and open are
+[PLAN.md](PLAN.md).

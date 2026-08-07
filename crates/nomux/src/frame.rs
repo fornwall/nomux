@@ -24,7 +24,7 @@ pub struct WinSize {
 wire_enum! {
     /// How the child process terminated.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    ExitKind: u8, as_byte / from_byte,
+    ExitKind: u8,
     /// Returned a status from `main` or `exit`.
     Exited = 0,
     /// Killed by a signal.
@@ -34,7 +34,7 @@ wire_enum! {
 wire_enum! {
     /// Reason the daemon is closing a connection.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    ErrorCode: u16, as_u16 / from_u16,
+    ErrorCode: u16,
     /// Malformed or out-of-sequence frame.
     Protocol = 1,
     /// Another client attached and took the session over.
@@ -55,12 +55,17 @@ pub const RESUME_FROM_START: u64 = u64::MAX;
 ///
 /// Never set silently: it bypasses the user's `ForwardAgent` decision
 /// (`DESIGN.md` § 5.4).
-pub const HELLO_AGENT_FORWARD: u8 = 1 << 0;
+const HELLO_AGENT_FORWARD: u8 = 1 << 0;
 
 /// Wire bit for [`Hello::repaint_ctrl_l`] (`IMPLEMENTATION.md` § 2.3).
-pub const HELLO_REPAINT_CTRL_L: u8 = 1 << 1;
+const HELLO_REPAINT_CTRL_L: u8 = 1 << 1;
 
 /// Bits defined in `Hello`'s flags byte. Anything else set is a protocol error.
+///
+/// The byte never leaves this module, which is why all three constants are private:
+/// [`Hello`] carries the two bits as bools, and packing and unpacking them is
+/// [`Hello::flags`] and `decode`'s work alone. `tests/codec.rs`'s vector table is what
+/// pins the values.
 const HELLO_FLAG_BITS: u8 = HELLO_AGENT_FORWARD | HELLO_REPAINT_CTRL_L;
 
 /// Refuses a [`Hello::term`] carrying an interior NUL, on the way *out* as well as in,
@@ -79,11 +84,10 @@ pub struct Hello<'a> {
     /// there being no negotiation (`DESIGN.md` § 6.4). The only revision on the wire,
     /// for the reason `IMPLEMENTATION.md` § 2 gives.
     pub protocol: u16,
-    /// Whether to serve an `ssh-agent` socket ([`HELLO_AGENT_FORWARD`]). Honoured only
-    /// on the `Hello` that creates the session; ignored when resuming one.
+    /// Whether to serve an `ssh-agent` socket. Honoured only on the `Hello` that
+    /// creates the session; ignored when resuming one.
     pub agent_forward: bool,
-    /// Whether to repaint after a gap with `Ctrl-L` rather than a `SIGWINCH` pair
-    /// ([`HELLO_REPAINT_CTRL_L`]).
+    /// Whether to repaint after a gap with `Ctrl-L` rather than a `SIGWINCH` pair.
     pub repaint_ctrl_l: bool,
     /// Next output byte the client wants, or [`RESUME_FROM_START`].
     pub out_offset: u64,
@@ -113,7 +117,7 @@ wire_enum! {
     /// Reported rather than worked around, and a byte of [`HelloOk`] in its own right
     /// rather than bits inside its flags (`IMPLEMENTATION.md` § 6.2, § 2.3).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    Linger: u8, as_byte / from_byte,
+    Linger: u8,
     /// Not determined: no `systemd`, or its state is unreadable. Do not warn —
     /// on a host without `logind` there is nothing to warn about.
     Unknown = 0,
@@ -231,9 +235,7 @@ pub enum Frame<'a> {
     /// A process connected to the session's agent socket, and the client is to open one
     /// of its own to the real agent.
     AgentOpen {
-        /// Names this incarnation of the one slot. Local peers are accepted out of band
-        /// from the client's stream, so the connections that hold it in turn are
-        /// otherwise indistinguishable — one at a time in *space* only
+        /// Names this incarnation of the session's one agent channel
         /// (`IMPLEMENTATION.md` § 6.7).
         generation: u32,
     },
@@ -299,15 +301,28 @@ impl<'a> Frame<'a> {
         out.extend_from_slice(&[0; HEADER_LEN]);
         self.encode_payload(out)?;
 
-        let header = u32::try_from(out.len() - start - HEADER_LEN)
-            .map_err(|_| ProtoError::PayloadTooLarge(u32::MAX))
-            .and_then(|len| encode_header(self.frame_type(), len))?;
-        // Unreachable after the `extend_from_slice`; fallible for `indexing_slicing`.
+        // The cap is compared in `usize`: narrowing *first* and testing the result reports
+        // every payload past 4 GiB as `PayloadTooLarge(u32::MAX)`, a length nothing
+        // counted, and `tests/codec.rs` holds the decode direction to reporting only what
+        // it read. The saturation below outlives that only because `PayloadTooLarge`
+        // carries a `u32`, and reaching it needs a caller in this process handing over a
+        // 4 GiB field — never a peer, whose frames `decode_header` has already bounded.
+        let payload_len = out.len() - start - HEADER_LEN;
+        let len = u32::try_from(payload_len).unwrap_or(u32::MAX);
+        if payload_len > crate::MAX_PAYLOAD as usize {
+            return Err(ProtoError::PayloadTooLarge(len));
+        }
+        let header = encode_header(self.frame_type(), len)?;
+        // Unreachable after the `extend_from_slice`; fallible for `indexing_slicing`. The
+        // complaint names the encoder rather than the peer: `Malformed` is what `Conn::send`
+        // would turn into a wire error, and nothing arriving on a socket can reach here.
         let Some(slot) = out
             .get_mut(start..)
             .and_then(<[u8]>::first_chunk_mut::<HEADER_LEN>)
         else {
-            return Err(ProtoError::Malformed("the header slot went missing"));
+            return Err(ProtoError::Malformed(
+                "encoder invariant: the reserved header slot went missing",
+            ));
         };
         *slot = header;
         Ok(())
@@ -331,7 +346,7 @@ impl<'a> Frame<'a> {
             Self::HelloOk(ok) => {
                 out.extend_from_slice(&ok.resume_from.to_be_bytes());
                 out.extend_from_slice(&ok.in_applied.to_be_bytes());
-                out.push(ok.linger.as_byte());
+                out.push(ok.linger.as_wire());
                 out.push(ok.flags());
             }
             Self::Input { offset, data } | Self::Output { offset, data } => {
@@ -351,12 +366,12 @@ impl<'a> Frame<'a> {
                 since_exit_secs,
             } => {
                 out.extend_from_slice(&status.to_be_bytes());
-                out.push(kind.as_byte());
+                out.push(kind.as_wire());
                 out.extend_from_slice(&since_exit_secs.to_be_bytes());
             }
             Self::Detach | Self::Ping | Self::Pong => {}
             Self::Error { code, message } => {
-                out.extend_from_slice(&code.as_u16().to_be_bytes());
+                out.extend_from_slice(&code.as_wire().to_be_bytes());
                 out.extend_from_slice(message.as_bytes());
             }
             Self::AgentOpen { generation } | Self::AgentClose { generation } => {
@@ -414,7 +429,7 @@ impl<'a> Frame<'a> {
             FrameType::HelloOk => {
                 let resume_from = r.u64()?;
                 let in_applied = r.u64()?;
-                let linger = Linger::from_byte(r.u8()?)
+                let linger = Linger::from_wire(r.u8()?)
                     .ok_or(ProtoError::Malformed("unknown linger state"))?;
                 let flags = r.u8()?;
                 if flags & !HELLOOK_AGENT != 0 {
@@ -444,7 +459,7 @@ impl<'a> Frame<'a> {
             },
             FrameType::Exit => Self::Exit {
                 status: r.i32()?,
-                kind: ExitKind::from_byte(r.u8()?)
+                kind: ExitKind::from_wire(r.u8()?)
                     .ok_or(ProtoError::Malformed("unknown exit kind"))?,
                 since_exit_secs: r.u32()?,
             },
@@ -452,7 +467,7 @@ impl<'a> Frame<'a> {
             FrameType::Ping => Self::Ping,
             FrameType::Pong => Self::Pong,
             FrameType::Error => Self::Error {
-                code: ErrorCode::from_u16(r.u16()?)
+                code: ErrorCode::from_wire(r.u16()?)
                     .ok_or(ProtoError::Malformed("unknown error code"))?,
                 message: core::str::from_utf8(r.rest())
                     .map_err(|_| ProtoError::Malformed("error message is not UTF-8"))?,
@@ -786,7 +801,7 @@ mod tests {
         assert_eq!(buf.len(), before, "the buffer must be left untouched");
 
         // Built by encoding a well-formed `Hello` and overwriting one byte of its
-        // `TERM`, so this does not restate the layout `wire.rs` pins.
+        // `TERM`, so this does not restate the layout `tests/codec.rs`'s vectors pin.
         let mut wire = Vec::new();
         Frame::Hello(Hello {
             protocol: PROTOCOL_VERSION,

@@ -18,14 +18,14 @@ use rustix::io::Errno;
 
 /// Outcome of one [`read_or_eof`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Read {
+pub(crate) enum ReadOutcome {
     /// Bytes are available in the buffer.
     Data(usize),
     /// The peer is gone, or the descriptor failed. One ending: the payload is opaque,
     /// so there is nothing worth telling apart.
     Eof,
     /// Nothing buffered right now, which is the whole reason this is an enum: on a
-    /// non-blocking descriptor this and [`Read::Eof`] both arrive as an error return,
+    /// non-blocking descriptor this and [`ReadOutcome::Eof`] both arrive as an error return,
     /// and confusing the two would end the session on every spurious wakeup.
     WouldBlock,
 }
@@ -50,13 +50,22 @@ pub(crate) fn read(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<usize, Errno> {
 /// at once (`daemon.rs`, around `ACCEPT_BEFORE_READ`), and `daemon::Daemon::read_client`
 /// states the rule this is the other half of — a failure on one descriptor ends that
 /// connection and never the event loop. An errno this does not know is a descriptor nothing
-/// can be read from, and both callers answer [`Read::Eof`] by dropping it out of the poll
+/// can be read from, and both callers answer [`ReadOutcome::Eof`] by dropping it out of the poll
 /// set, so nothing spins on one either.
-pub(crate) fn read_or_eof(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Read {
+///
+/// An empty `buf` answers [`ReadOutcome::WouldBlock`]: `read(fd, &mut [])` is `Ok(0)`, which every
+/// caller here reads as the peer having gone, and the caller that would act on it hardest
+/// (`daemon.rs`'s `on_child_exit`) would declare a session over with its child still alive.
+/// No call site passes one today — all three hand over the whole 64 KiB buffer — so this is
+/// the arm that keeps it that way rather than one anybody reaches.
+pub(crate) fn read_or_eof(fd: BorrowedFd<'_>, buf: &mut [u8]) -> ReadOutcome {
+    if buf.is_empty() {
+        return ReadOutcome::WouldBlock;
+    }
     match read(fd, buf) {
-        Ok(n) if n > 0 => Read::Data(n),
-        Err(Errno::AGAIN) => Read::WouldBlock,
-        Ok(_) | Err(_) => Read::Eof,
+        Ok(n) if n > 0 => ReadOutcome::Data(n),
+        Err(Errno::AGAIN) => ReadOutcome::WouldBlock,
+        Ok(_) | Err(_) => ReadOutcome::Eof,
     }
 }
 
@@ -76,13 +85,9 @@ pub(crate) fn read_or_eof(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Read {
 /// `write` alone comes back `Ok(0)`, after which the queue never drains again.
 ///
 /// `Ok(0)` on a non-empty queue is "come back on `POLLOUT`" here, and deliberately not the
-/// `WriteZero` that `Conn::flush_some` makes of the same count. The difference is what is
-/// being written to: `flush_some` only ever holds a `UnixStream`, which cannot answer a
-/// non-empty write with zero, while every fd reaching here is a tty or a pipe. A `^S` in
-/// the session arrives as the `EAGAIN` beside this arm rather than as a zero — the master
-/// is `O_NONBLOCK`, and `n_tty_write` turns the driver's zero into `EAGAIN` before
-/// userspace sees it — so what this arm is for is a count that says only "nothing moved",
-/// which is never grounds for tearing down a queue that still owes its bytes.
+/// `WriteZero` that `Conn::flush_some` makes of the same count: no descriptor in this tree
+/// answers a non-empty write with zero, so a zero can only mean nothing moved, which is
+/// never grounds for tearing down a queue that still owes its bytes.
 pub(crate) fn drain_to(queue: &mut VecDeque<u8>, fd: BorrowedFd<'_>) -> Result<(), Errno> {
     if queue.is_empty() {
         return Ok(());

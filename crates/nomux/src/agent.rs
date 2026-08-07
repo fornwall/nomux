@@ -12,7 +12,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::nbio::Read;
+use crate::nbio::ReadOutcome;
 
 /// Most the served connection may hold for a local peer that has stopped reading
 /// (`IMPLEMENTATION.md` § 6.7).
@@ -23,11 +23,21 @@ use crate::nbio::Read;
 const MAX_CHANNEL_QUEUE: usize = 256 * 1024;
 
 /// How long the served connection may move no byte in either direction before the
-/// daemon gives it up (`IMPLEMENTATION.md` § 6.7, which has why a whole minute and why
-/// it runs from the last byte rather than from the accept).
+/// daemon gives it up (`IMPLEMENTATION.md` § 6.7, which has why it runs from the last
+/// byte rather than from the accept).
 ///
 /// There being only the one slot, without this a peer that connects and never closes
-/// holds every later agent user off for the life of the session.
+/// holds every later agent user off for the life of the session. What it bounds is that
+/// peer's *own* wait and nothing more: `rundir::bind_socket_private` takes std's default
+/// `UnixListener` backlog and an `AF_UNIX` `connect` into a full one blocks rather than
+/// being refused (§ 6.3), so what a peer standing behind `n` stalled ones waits is
+/// `n` times this. `git submodule update --jobs 8` behind one stalled connection is
+/// eight of these in series.
+///
+/// Left at a minute all the same, against that: the window closes an exchange that is
+/// *live*, and § 6.7's reason for a generous one — the client may be putting a signature
+/// in front of a human, who may be reaching for a hardware key — is a wait no shorter
+/// figure survives. A slot nothing else can use is the cheaper thing to spend.
 #[expect(
     clippy::duration_suboptimal_units,
     reason = "Duration::from_mins is unstable on the pinned 1.97.1 toolchain"
@@ -55,9 +65,8 @@ pub(crate) enum Flush {
     /// Still in use, whether or not anything is left queued.
     Open,
     /// Nothing more will be written: the client closed this connection and the last of
-    /// what it sent has reached the waiting process, or there is no connection at all
-    /// because it closed while a frame for it was in flight. Forget it *without*
-    /// telling the client, which closed it and is not waiting to hear so.
+    /// what it sent has reached the waiting process. Forget it *without* telling the
+    /// client, which closed it and is not waiting to hear so.
     Finished,
     /// The write failed on a connection the client still holds; the local peer is gone
     /// and the client needs telling.
@@ -99,10 +108,7 @@ pub(crate) struct Agent {
     /// of the wire ahead of the next accept: `Ping` is client→daemon and `Pong`
     /// daemon→client, so the daemon has nothing it can send that forces a round trip.
     ///
-    /// A `u32` because what bounds the distance between a stale frame and the live
-    /// channel is the queue a client is dropped at — `ABANDON_PENDING_WRITE`, 8 MiB, so
-    /// half a million unread boundary frames: past a `u16`, four orders under this. So
-    /// wrapping is unreachable rather than merely unlikely.
+    /// Monotonic for the life of the session, and a `u32` does not wrap inside one.
     next_generation: u32,
 }
 
@@ -115,7 +121,10 @@ impl Agent {
     /// to a session without forwarding rather than refusing to start.
     pub(crate) fn bind(path: &Path) -> io::Result<Self> {
         // Only ever reached while holding this session's id, so anything still here is
-        // a leftover.
+        // a leftover. Two syscalls on one name, where `rundir::write_private` needs
+        // `O_EXCL` to survive the same window: `bind(2)` resolves through
+        // `filename_create`, which refuses a trailing symlink with `EEXIST`, so a name
+        // planted between the unlink and the bind cannot send this socket anywhere else.
         drop(fs::remove_file(path));
         // Never briefly world-connectable: this is the socket that hands out signatures.
         let listener = crate::rundir::bind_socket_private(path)?;
@@ -148,19 +157,15 @@ impl Agent {
 
     /// The served connection's generation, for the frames the daemon sends about it.
     #[must_use]
-    pub(crate) const fn generation(&self) -> Option<u32> {
-        match self.channel.as_ref() {
-            Some(chan) => Some(chan.generation),
-            None => None,
-        }
+    pub(crate) fn generation(&self) -> Option<u32> {
+        self.channel.as_ref().map(|chan| chan.generation)
     }
 
     /// The served connection as `(fd, wants_write, wants_read)`, for the poll set.
     ///
-    /// A closing connection wants no reads, and asking for them would spin the loop at
-    /// full tilt: `close_from_client` shuts the read half down, and a unix socket in that
-    /// state reports itself readable on every pass for ever. It stays in the poll set on
-    /// `POLLOUT` alone, which is the only thing that can still move it.
+    /// A closing connection asks for no reads: nothing it could still send has anywhere
+    /// to go, and its shut-down read half would report itself readable on every pass for
+    /// ever. `POLLOUT` is all that can move it.
     pub(crate) fn watch(&self) -> Option<(BorrowedFd<'_>, bool, bool)> {
         let chan = self.channel.as_ref()?;
         Some((chan.stream.as_fd(), !chan.pending.is_empty(), !chan.closing))
@@ -250,20 +255,26 @@ impl Agent {
     }
 
     /// Reads from the served connection's socket.
-    pub(crate) fn read(&mut self, buf: &mut [u8]) -> Read {
+    ///
+    /// **A half-close is a close.** `nbio::read_or_eof` folds `read() == 0` into
+    /// [`ReadOutcome::Eof`] and the daemon answers that by ending the channel, so a peer that
+    /// shuts down its own write side and waits for a reply — the idiomatic Go
+    /// `io.Copy` plus `CloseWrite` shape — is dropped rather than answered.
+    /// `AgentClose` has no half-close spelling on the wire (§ 2.2), so there is nothing
+    /// this could report instead; `ssh-agent` clients keep the connection open for the
+    /// reply, which is why it has never cost anything.
+    pub(crate) fn read(&mut self, buf: &mut [u8]) -> ReadOutcome {
         let Some(chan) = self.channel.as_mut() else {
-            return Read::Eof;
+            return ReadOutcome::Eof;
         };
-        // A connection the client has closed has had its read half shut down by
-        // `close_from_client`, so it answers every read with the end of file we
-        // ourselves caused. Taking that at face value would drop the very reply
-        // [`Flush::Finished`] exists to deliver, and would tell the client of a close
-        // it made itself.
+        // Nothing is read from a connection the client has closed: what is left to do
+        // with it is hand on the queue behind it ([`Flush::Finished`]), and reading is
+        // what would end it early.
         if chan.closing {
-            return Read::WouldBlock;
+            return ReadOutcome::WouldBlock;
         }
         let read = crate::nbio::read_or_eof(chan.stream.as_fd(), buf);
-        if matches!(read, Read::Data(_)) {
+        if matches!(read, ReadOutcome::Data(_)) {
             chan.touch();
         }
         read
@@ -292,8 +303,12 @@ impl Agent {
         if chan.pending.len() + data.len() > MAX_CHANNEL_QUEUE {
             return false;
         }
+        // Queued and not touched: [`Channel::touch`] is for a byte that *moved*, and
+        // [`Agent::flush`] does it whenever one did. Refreshing the deadline here would
+        // have every arriving frame push it out over a peer that has stopped reading,
+        // which is the one connection the clock is there to end — it would live to
+        // [`MAX_CHANNEL_QUEUE`] instead.
         chan.pending.extend(data);
-        chan.touch();
         true
     }
 
@@ -341,6 +356,10 @@ impl Agent {
             return;
         };
         chan.closing = true;
+        // For the peer rather than for us — [`Channel::closing`] is what keeps the daemon
+        // off this read side. Linux propagates `SEND_SHUTDOWN` across an `AF_UNIX` pair,
+        // so the peer's next write fails with `EPIPE` instead of blocking against a
+        // reader that will never come back.
         drop(chan.stream.shutdown(std::net::Shutdown::Read));
         if self.flush() != Flush::Open {
             let _ = self.forget();
@@ -460,7 +479,7 @@ mod tests {
 
         let mut buf = [0u8; 8];
         assert!(
-            matches!(agent.read(&mut buf), Read::Data(5) if &buf[..5] == b"\0\0\0\x01\x0b"),
+            matches!(agent.read(&mut buf), ReadOutcome::Data(5) if &buf[..5] == b"\0\0\0\x01\x0b"),
             "the request written while it waited must still be there to read"
         );
     }
@@ -545,6 +564,10 @@ mod tests {
     /// The window is against the last byte, not against the accept: `ssh(1)` holds one
     /// agent connection across a whole authentication and issues several requests down
     /// it, so a first-byte deadline would cut a working exchange off partway.
+    ///
+    /// A byte that *moved*, which is the whole of what `Agent::flush` touches on: the
+    /// daemon queues in one pass and writes on the next, so the reply below is delivered
+    /// exactly as the loop delivers one.
     #[test]
     fn traffic_either_way_pushes_the_idle_deadline_out() {
         let root = Scratch::new("agent-traffic");
@@ -558,6 +581,11 @@ mod tests {
             agent.deliver(live, b"\0\0\0\x05\x0c-reply"),
             "the client answers"
         );
+        assert_eq!(
+            agent.flush(),
+            Flush::Open,
+            "and the daemon hands it to the peer"
+        );
         assert!(
             agent.close_if_idle(accepted_at).is_none(),
             "a reply from the client is traffic, and the old deadline must not close it"
@@ -567,12 +595,73 @@ mod tests {
         peer.write_all(b"\0\0\0\x01\x0b").expect("a second request");
         let mut buf = [0u8; 8];
         assert!(
-            matches!(agent.read(&mut buf), Read::Data(5)),
+            matches!(agent.read(&mut buf), ReadOutcome::Data(5)),
             "and reaches us"
         );
         assert!(
             agent.close_if_idle(moved_at).is_none(),
             "so is a second request from the peer, which is the ssh(1) case"
+        );
+    }
+
+    /// Regression: a frame that reached the queue and got no further is not traffic.
+    ///
+    /// `deliver` touched for bytes it had only *queued*, so the one connection the clock
+    /// exists to end — a peer that has stopped reading, with a client still sending at it
+    /// — had its window refreshed by every frame that arrived and lived to
+    /// [`MAX_CHANNEL_QUEUE`] instead of to [`AGENT_IDLE_TIMEOUT`]. `flush` touches
+    /// whenever the queue actually moved, which is the healthy case and covers it.
+    #[test]
+    fn a_queue_that_cannot_be_written_does_not_push_the_deadline_out() {
+        let root = Scratch::new("agent-queued");
+        let mut agent = bind_in(&root, "u.agent");
+        let (_peer, live) = open(&mut agent);
+
+        // Filled until this host's socket buffer stops taking it, as
+        // `a_stalled_close_frees_the_slot_without_announcing_itself` does and for its
+        // reason: only the kernel knows when a write can no longer move anything.
+        loop {
+            assert!(
+                agent.deliver(live, &vec![b'q'; 64 * 1024]),
+                "the queue is emptied every round until it is not, so the cap is never \
+                 in question"
+            );
+            assert_eq!(agent.flush(), Flush::Open, "the peer is still there");
+            if !agent
+                .channel
+                .as_ref()
+                .expect("the served connection")
+                .pending
+                .is_empty()
+            {
+                break;
+            }
+        }
+
+        // Read after the last write that moved something, so what follows has to leave
+        // it exactly where it is.
+        let due = agent
+            .deadline()
+            .expect("a served connection has a deadline");
+        assert!(
+            agent.deliver(live, &vec![b'q'; 64 * 1024]),
+            "the client sends another frame at a peer reading none of them"
+        );
+        assert_eq!(
+            agent.deadline(),
+            Some(due),
+            "queuing is not moving: a frame the peer never reads must not buy the \
+             connection another window"
+        );
+        assert_eq!(
+            agent.flush(),
+            Flush::Open,
+            "and the write that cannot place it is not a failure either"
+        );
+        assert_eq!(
+            agent.deadline(),
+            Some(due),
+            "nor does the attempt to write it, which moved no byte"
         );
     }
 

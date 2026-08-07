@@ -17,7 +17,7 @@ visible surface for one property.
 Nothing here aims to be a general terminal tool, and the client that drives this binary
 versions as one unit with it, so:
 
-- The wire protocol is **private**: no negotiation, no extension points, no stability guarantee. Enums are exhaustive, so an unknown value is a bug rather than a forward-compatibility case; nothing is on the wire that nothing reads; and nothing here is published, since a crates.io version would be a stability promise this bullet refuses to make.
+- The wire protocol is **private**: no negotiation, no extension points, no stability guarantee. Enums are exhaustive, so an unknown value is a bug rather than a forward-compatibility case; nothing is on the wire that nothing reads; and nothing here is published, a crates.io version being a promise of stability that nothing here intends to keep.
 - Behaviour goes to whichever side it is cheapest on: emulator reset on gap recovery is the client's because the client already holds the emulator, and either end can tell there was a gap by comparing offsets ([IMPLEMENTATION.md § 4.2](IMPLEMENTATION.md#42-attach-with-from--base)).
 - Version skew has exactly one real case (§6.4), bounded and not designed around.
 
@@ -56,9 +56,10 @@ binary on the host first, which is why people fall back to the `tmux` already th
 
 No network listener, no key exchange, no cipher selection, no certificate handling —
 nothing new for a firewall to block, and confidentiality and authentication stay SSH's
-unchanged. What the daemon listens on is the filesystem: a unix socket at `0600` inside
-a `0700` directory per session, plus `<id>.agent` beside it for sessions that opted
-into agent forwarding (§5.4). That local surface, not a protocol, is what §8 reviews.
+unchanged. What the daemon listens on is the filesystem: a unix socket per session inside
+a directory only its owner may open, plus `<id>.agent` beside it for sessions that opted
+into agent forwarding (§5.4) — [IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket) has
+the exact modes. That local surface, not a protocol, is what §8 reviews.
 
 ## 4. Architecture
 
@@ -127,10 +128,11 @@ and user-named sessions.
 
 ### 5.2 Reaping
 
-A clientless session is reaped 7 days after the last detach, not currently tunable; one
-that never started a PTY gets 30 s instead, which removes a daemon nobody ever reached.
+A clientless session is reaped a generous while after the last detach, not currently
+tunable; one that never started a PTY goes much sooner, which removes a daemon nobody ever
+reached ([IMPLEMENTATION.md § 6.5](IMPLEMENTATION.md#65-shutdown) has both deadlines).
 The child having exited is not a second rule beside it: a session that has served
-somebody stays on the week whatever became of its shell, and a client arriving days
+somebody stays on the same clock whatever became of its shell, and a client arriving days
 later gets the replay and *then* the status, carrying `Exit.since_exit_secs` lest a
 days-old exit read as fresh ([IMPLEMENTATION.md § 2.2](IMPLEMENTATION.md#22-messages)).
 Output volume cannot be the signal — nothing in it separates a multi-hour build that
@@ -146,7 +148,10 @@ reconstruction, because nomux starts *inside* an SSH session
 process's environment cannot be mutated, so what the creating connection brought is
 frozen for the session's lifetime and a later reconnect's `DISPLAY` or `AcceptEnv` is
 invisible to the child: inherent to persistence, `tmux`'s too, and §5.4 is the one case
-worth solving.
+worth solving. It is worth solving on *both* sides of the opt-in — a session created over
+`ForwardAgent` without §5.4 turned on freezes a path to a socket sshd will unlink, and
+nothing here can tell that path from a local agent's, so the warning is the client's
+([PLAN.md § P1](PLAN.md#p1--the-client)).
 
 ### 5.4 Agent forwarding
 
@@ -159,7 +164,7 @@ over the session's own stream, answered from the client's own key store. Nothing
 or needs refreshing, and no environment has to be re-read — which the warm path (§6.1)
 could not do anyway, running no process on the server.
 
-- The agent is a **single serialized pipe**, not a sub-channel: one peer served at a time, the next left waiting in the listen backlog ([IMPLEMENTATION.md § 6.7](IMPLEMENTATION.md#67-agent-forwarding)). So §2's refusal to multiplex holds with no exception at all, and what it costs is a bounded wait — bounded because a stalled peer is given up after a minute, generous enough that the client can put a signature in front of a human first.
+- The agent is a **single serialized pipe**, not a sub-channel: one peer served at a time, the next left waiting in the listen backlog ([IMPLEMENTATION.md § 6.7](IMPLEMENTATION.md#67-agent-forwarding)). So §2's refusal to multiplex holds with no exception at all, and what it costs is a wait bounded per *connection* — each stalled one is given up after a generous window, generous because the client may be putting a signature in front of a human reaching for a hardware key. What a peer at the back of the queue waits is that window once per stalled connection ahead of it, which is the real price of serialising and is paid by parallel tooling rather than by a person at a prompt.
 - It works **without** `ForwardAgent`, bypassing a deliberate user decision, so it is opt-in per host and off by default.
 - Because the client sees every request it *can* prompt per signature or name the asking session, which plain `ssh -A` can never do.
 - It **loses** OpenSSH's destination constraints: `ssh-add -h` binds a key to a hop and `ssh(1)` enforces that with `session-bind@openssh.com` down each forwarded agent connection, but the daemon here is an opaque byte pipe and the client re-originates against the real agent, so without a synthesised binding for the session's hop a constrained key is refused outright or used with its constraint silently unapplied ([IMPLEMENTATION.md § 6.7](IMPLEMENTATION.md#67-agent-forwarding)). The per-host opt-in is the compensating control.
@@ -211,7 +216,7 @@ session, cached per host so it is not re-probed, on the conditions in
 
 - **No new *network* attack surface.** No listening TCP or UDP port. The local surface is what follows: a unix socket per session, an optional agent socket, and a process outliving the login. The uploaded binary is not part of it — anyone who can write `~/.local/share/nomux/` can already edit `.bashrc`.
 - **That equivalence holds for the same user only.** The run directory is checked (`O_NOFOLLOW`, uid, mode — [IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)) while the install directory is only created ([§ 5.2](IMPLEMENTATION.md#52-upload-and-attach-in-one-round-trip)), so another user able to write there replaces the binary every connection on the exec path runs: code execution as the victim. The published command line holds `mkdir -p -m 700` and `set -C`, and the client must check a directory that already exists and refuse a parent that is not the user's.
-- **No new secrets.** No keys, no tokens, no crypto. Authentication is the unix socket's filesystem permissions (`0600` in a `0700` directory) plus SSH itself. The daemon also refuses an accepted connection whose `SO_PEERCRED` uid is not its own ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)) — defence in depth for a host whose modes do not hold, rather than a second authenticator.
+- **No new secrets.** No keys, no tokens, no crypto. Authentication is the unix socket's filesystem permissions ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)) plus SSH itself. The daemon also refuses an accepted connection whose `SO_PEERCRED` uid is not its own ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)) — defence in depth for a host whose modes do not hold, rather than a second authenticator.
 - **No abstract sockets.** They are namespace-scoped, not permission-scoped, and would be reachable by any local user.
 - **Agent forwarding is a real capability expansion — the only one here.** The daemon serves an `ssh-agent` socket of its own, so a session reaches the user's keys over a connection that never set `ForwardAgent`, and only a session created with the flag set gets one (§5.4).
 - **Auditability.** A persistent shell can outlive the login session that spawned it. On hosts with session recording that is a policy question, not a technical one, and it is why the feature is opt-in per host.
@@ -243,8 +248,10 @@ one as a gap.
 - **Negotiating the ring capacity in `Hello`.** `NOMUX_RING_BYTES` already tunes it, and
   the default is the whole question: raise it and every session reserves address space
   no administrator agreed to, lower it and a twenty-minute disconnect loses a build.
-- **Compressing the output ring.** Measured at `b71db5f`, whose commit message holds the
-  tables: `lz4_flex` buys a median 4.6× more scrollback for 6–8 KiB of binary and costs
+- **Compressing the output ring.** Measured on the `measurement/ring-compression` tag,
+  whose commit message holds the tables — a tag rather than a hash, the commit being
+  reachable from nothing else and an abbreviated hash growing ambiguous as the tree does:
+  `lz4_flex` buys a median 4.6× more scrollback for 6–8 KiB of binary and costs
   21× on the PTY push path, 2.8 ms a MiB on the x86_64 the throughput was taken on. It
   trades memory for CPU, and a larger default ring buys the same scrollback for neither.
 - **A server-side screen snapshot on overflow.** This is the second, lossier emulator §3

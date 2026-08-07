@@ -39,8 +39,16 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// wedged daemon to print the same line.
 const LIST_PROBE: Duration = Duration::ZERO;
 
-/// How long a terminated daemon has to exit before it is killed outright.
-const TERM_GRACE: Duration = Duration::from_secs(2);
+/// How long `kill` gives another process to reach a point of its own: the spawn lock to
+/// come free (§ 6.6), a live daemon to publish `<id>.pid`, and a terminated one to exit
+/// before it is killed outright.
+///
+/// One figure for the three because each is the same bet — a process still on its way
+/// arrives in milliseconds, and an escape hatch that waited longer would be one nobody can
+/// use. The publish wait is the least obvious of them: the daemon binds its socket before
+/// it writes the pidfile (§ 6.2), so a `kill` landing in that window finds a session
+/// unmistakably there and no pid to signal.
+const GRACE: Duration = Duration::from_secs(2);
 
 /// How long a killed daemon has to actually go before `kill` concludes that the signal
 /// never reached whatever is serving the socket.
@@ -56,22 +64,19 @@ const KILL_GRACE: Duration = Duration::from_millis(500);
 /// them: each waits on another process reaching a point of its own.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-/// How long `kill` waits for the spawn lock before giving up (see [`hold_spawn_lock`]).
-const SPAWN_LOCK_GRACE: Duration = Duration::from_secs(2);
-
-/// How long `kill` waits for a live daemon to publish `<id>.pid` (§ 6.6): the daemon binds
-/// its socket before it writes the pidfile (§ 6.2), so a `kill` landing in that window
-/// finds a session unmistakably there and no pid to signal.
-const PUBLISH_GRACE: Duration = Duration::from_secs(2);
-
-/// The kernel's longest path, which is what bounds a resolved `argv[0]`.
+/// The kernel's longest path, which is as long as `argv[0]` gets for a daemon *this*
+/// program starts: `spawn` execs it by a resolved path (§ 5.2).
 const PATH_MAX: usize = 4096;
 
-/// Longest `/proc/<pid>/cmdline` prefix [`is_daemon_for`] reads: `argv[0]`, bounded by the
-/// kernel's [`PATH_MAX`] rather than by anything this program picks, then the mode, then an
-/// id of at most [`MAX_SESSION_ID_LEN`], with a NUL after each. Deliberately *not* sized
-/// for the whole command line, which has no bound: nothing past the id is read as
-/// anything but padding.
+/// Longest `/proc/<pid>/cmdline` prefix [`is_daemon_for`] reads: enough for a well-formed
+/// `nomux daemon <id>`, which is a path of at most [`PATH_MAX`], the mode, and an id of at
+/// most [`MAX_SESSION_ID_LEN`], with a NUL after each.
+///
+/// A bound on what this program *writes*, and on nothing it may be pointed at. `execve`
+/// lets `argv[0]` be any length at all and real command lines carry theirs in `argv[1..]`,
+/// so the pid here — whatever number a pidfile named — can fill this buffer without being
+/// truncated in any way that matters. What settles a read that reached the end of it is
+/// [`is_daemon_for`]'s rule about `argv[1]`, never the size of this.
 const MAX_CMDLINE_LEN: usize = PATH_MAX + 1 + "daemon".len() + 1 + MAX_SESSION_ID_LEN + 1;
 
 /// State of one session as seen from the run directory alone.
@@ -90,16 +95,6 @@ pub(crate) enum Liveness {
     Unknown(io::Error),
 }
 
-/// Turns the § 6.3 run-directory check into "is there one?" rather than an error to be
-/// matched. Both modes read its absence as the question already answered.
-fn present(checked: io::Result<()>) -> io::Result<bool> {
-    match checked {
-        Ok(()) => Ok(true),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(err),
-    }
-}
-
 /// Prints one line per live session: id, pid and label.
 ///
 /// A reader that closes stdout early ends the listing (§ 10) but not the sweep, since
@@ -114,14 +109,17 @@ fn present(checked: io::Result<()>) -> io::Result<bool> {
 pub(crate) fn list() -> io::Result<()> {
     let dir = run_dir()?;
     // § 6.3, before any name in this directory is trusted.
-    if !present(check_run_dir(&dir))? {
+    if !check_run_dir(&dir)? {
         return Ok(());
     }
     let stdout = io::stdout();
     let mut out = stdout.lock();
     let mut listening = true;
     for id in session_ids(&dir) {
-        let paths = match SessionPaths::new(&id) {
+        // Against the directory already resolved above rather than one per entry: it is the
+        // directory these names came out of, so re-reading the environment could only
+        // disagree with the `read_dir` this is iterating.
+        let paths = match SessionPaths::in_dir(&dir, &id) {
             Ok(paths) => paths,
             // § 6.3's `sun_path` refusal, a property of this directory rather than of the
             // id: files are here that no mode can address, so this is the one session
@@ -146,10 +144,8 @@ pub(crate) fn list() -> io::Result<()> {
         }
         let mut buf = [0u8; MAX_PID_LEN];
         let (filed, _) = pidfile(&paths.pid(), &mut buf).unwrap_or_default();
-        let pid = chosen(&paths, filed).map_or_else(
-            || "?".to_owned(),
-            |chosen| chosen.pid.as_raw_nonzero().to_string(),
-        );
+        let pid = identified(&paths, filed)
+            .map_or_else(|| "?".to_owned(), |pid| pid.as_raw_nonzero().to_string());
         // Sanitised on read as well as on write (§ 6.6): the daemon that wrote it may
         // be any version.
         let label = read_label(&paths.label());
@@ -180,7 +176,7 @@ pub(crate) fn kill(session_id: &str) -> io::Result<()> {
     // The same check `list` makes, and this is where it bites hardest: what follows reads
     // a pid out of a file and signals it. Checked and never created — being told to remove
     // a session must not be what brings a run directory into existence.
-    if !present(check_run_dir(paths.dir()))? {
+    if !check_run_dir(paths.dir())? {
         return Ok(());
     }
     // Held from here to the end of the function (§ 6.6): without it, an attach that starts
@@ -193,7 +189,7 @@ pub(crate) fn kill(session_id: &str) -> io::Result<()> {
         // Liveness first, deadline second, so a daemon that let go on the last interval is
         // not signalled again — `SIGKILL` being the one signal nothing survives, and the
         // descriptor guaranteeing only that it lands on the process this call pinned.
-        let mut deadline = Instant::now() + TERM_GRACE;
+        let mut deadline = Instant::now() + GRACE;
         let mut killed = false;
         loop {
             match liveness(&paths.socket(), PROBE_TIMEOUT) {
@@ -243,11 +239,13 @@ pub(crate) fn kill(session_id: &str) -> io::Result<()> {
 /// # Errors
 ///
 /// Reports [`io::ErrorKind::ResourceBusy`] when the lock is still held at the deadline,
-/// rather than claim a postcondition it did not establish.
+/// rather than claim a postcondition it did not establish — and passes on the refusal a
+/// host that can hold no lock at all earns, which polling would only turn into that same
+/// busy message about a process that does not exist.
 fn hold_spawn_lock(paths: &SessionPaths) -> io::Result<SpawnLock> {
-    let deadline = Instant::now() + SPAWN_LOCK_GRACE;
+    let deadline = Instant::now() + GRACE;
     loop {
-        if let Some(lock) = paths.try_lock_spawn() {
+        if let Some(lock) = paths.try_lock_spawn_or_refuse()? {
             return Ok(lock);
         }
         if Instant::now() >= deadline {
@@ -272,7 +270,7 @@ fn hold_spawn_lock(paths: &SessionPaths) -> io::Result<SpawnLock> {
 /// comes back is a [`Chosen`] rather than the number itself, because the same reuse
 /// happens again between here and each of the two signals.
 fn resolve(paths: &SessionPaths) -> io::Result<Option<Chosen>> {
-    let deadline = Instant::now() + PUBLISH_GRACE;
+    let deadline = Instant::now() + GRACE;
     loop {
         // The probe's errno is kept rather than matched away, because every refusal below
         // is [`unresolved`]'s to word and that is what it words them by. The connection is
@@ -327,7 +325,7 @@ fn pidfile<'a>(path: &Path, buf: &'a mut [u8; MAX_PID_LEN]) -> io::Result<(Optio
 ///
 /// The two are not the same thing, and that is the whole reason this is a struct. A pid
 /// is a number the kernel is free to reissue the moment its process is reaped, while
-/// [`kill`] signals twice with a grace of [`TERM_GRACE`] in between and reads `/proc`
+/// [`kill`] signals twice with a [`GRACE`] in between and reads `/proc`
 /// before either. Everything it establishes is about a process; everything a number can
 /// deliver is about whoever wears it at the instant of the call.
 #[derive(Debug)]
@@ -335,27 +333,22 @@ struct Chosen {
     /// What the refusals print and what `list` shows: a descriptor is nothing a user can
     /// carry to another command, so the number is still the whole of what is reportable.
     pid: Pid,
-    /// What the signals go through.
-    reach: Reach,
-}
-
-/// What there is to reach a [`Chosen`] process *with*.
-#[derive(Debug)]
-enum Reach {
-    /// A descriptor onto the process the number named when it was opened. It goes on
-    /// meaning that one process for as long as it is held, so a signal through it either
-    /// arrives there or answers `ESRCH` — never at whoever the kernel handed the number
-    /// to in between. The only thing here that ever signals.
-    Pidfd(OwnedFd),
-    /// No descriptor, so nothing is signalled and [`kill`] establishes what became of the
-    /// session by probing the socket alone. Carries the errno that declined the
-    /// descriptor, which is the whole of what says why no signal went out: it is
-    /// [`pin`]'s `ESRCH` — a daemon that has exited, and the postcondition arriving
-    /// early — or one of the errnos that cannot be told from it, where the session goes
-    /// on running and every clause about a signal is false. That set now includes a host
-    /// with no `pidfd_open` at all ([`pin`]). Only [`still_answering`] reads it, that
-    /// being the one path where the difference is visible.
-    Nothing(io::Error),
+    /// What the signals go through, or the errno that would give none up.
+    ///
+    /// A descriptor onto the process the number named when it was opened goes on meaning
+    /// that one process for as long as it is held, so a signal through it either arrives
+    /// there or answers `ESRCH` — never at whoever the kernel handed the number to in
+    /// between. It is the only thing here that ever signals.
+    ///
+    /// An error is no descriptor, so nothing is signalled and [`kill`] establishes what
+    /// became of the session by probing the socket alone. The errno is then the whole of
+    /// what says why no signal went out: it is [`pin`]'s `ESRCH` — a daemon that has
+    /// exited, and the postcondition arriving early — or one of the errnos that cannot be
+    /// told from it, where the session goes on running and every clause about a signal is
+    /// false. That set includes a host with no `pidfd_open` at all ([`pin`]). Only
+    /// [`still_answering`] reads it, that being the one path where the difference is
+    /// visible.
+    reach: io::Result<OwnedFd>,
 }
 
 impl Chosen {
@@ -366,9 +359,8 @@ impl Chosen {
     /// rather than failing, and [`kill`] settles what actually happened by probing the
     /// socket either way.
     fn signal(&self, sig: Signal) {
-        match &self.reach {
-            Reach::Pidfd(pidfd) => drop(pidfd_send_signal(pidfd, sig)),
-            Reach::Nothing(_) => {}
+        if let Ok(pidfd) = &self.reach {
+            let _ = pidfd_send_signal(pidfd, sig);
         }
     }
 }
@@ -395,33 +387,37 @@ impl Chosen {
 /// errno rather than one that signals a number it cannot vouch for. That refusal is
 /// recoverable — `list` still prints the pid, so the number is a `kill(1)` away — where a
 /// signal delivered to a stranger's process is not.
-fn pin(pid: Pid) -> Reach {
-    match pidfd_open(pid, PidfdFlags::empty()) {
-        Ok(pidfd) => Reach::Pidfd(pidfd),
-        // Carried rather than discarded: nothing here can tell a reaped process from a
-        // host that has no such call, so the refusal reports the errno instead of
-        // describing signals it never sent.
-        Err(err) => Reach::Nothing(err.into()),
-    }
+///
+/// The errno is carried rather than discarded: nothing here can tell a reaped process from
+/// a host that has no such call, so the refusal reports it instead of describing signals it
+/// never sent.
+fn pin(pid: Pid) -> io::Result<OwnedFd> {
+    pidfd_open(pid, PidfdFlags::empty()).map_err(io::Error::from)
 }
 
-/// The published pid, where `/proc` does not rule it out, held by the process rather than
-/// by the number ([`pin`]).
+/// The published pid, where `/proc` does not rule it out.
 ///
 /// Shared by both modes, so the number `list` prints is the number `kill` would signal —
 /// which matters most in the case `kill` refuses, since it recommends no repair there and
-/// a user who wants to act asks `list` what to signal. `list` pays for a descriptor it
-/// then drops unread, which is one syscall a session and the price of the two modes
-/// answering out of the same code.
+/// a user who wants to act asks `list` what to signal.
 ///
 /// § 6.6 has the rest of the weighing: only a *positive* "it is not" declines the pid, and
 /// what is deliberately not asked is which process holds the *socket*.
-fn chosen(paths: &SessionPaths, filed: Option<Pid>) -> Option<Chosen> {
+fn identified(paths: &SessionPaths, filed: Option<Pid>) -> Option<Pid> {
     let pid = filed?;
-    // Held before it is examined and never after: these two lines are in this order for
-    // [`pin`]'s reason and for no other, and swapping them gives the window back.
-    let reach = pin(pid);
-    (is_daemon_for(pid, paths.id()) != Some(false)).then_some(Chosen { pid, reach })
+    (is_daemon_for(pid, paths.id()) != Some(false)).then_some(pid)
+}
+
+/// [`identified`], held by the process rather than by the number ([`pin`]).
+///
+/// For `kill`, which is what needs the hold. The descriptor is taken *before* the
+/// identification, and these two lines are in that order for [`pin`]'s reason and for no
+/// other: swapping them gives the window back. `list` prints a number and signals nothing,
+/// so it goes through [`identified`] alone rather than opening a descriptor per session to
+/// drop unread.
+fn chosen(paths: &SessionPaths, filed: Option<Pid>) -> Option<Chosen> {
+    let reach = pin(filed?);
+    identified(paths, filed).map(|pid| Chosen { pid, reach })
 }
 
 /// A number that still names a process this user may signal, or nothing.
@@ -441,10 +437,12 @@ fn extant(pid: i32) -> Option<Pid> {
 /// documents the same words typed by hand.
 ///
 /// `None` is "could not tell", and keeping it apart from `Some(false)` is the whole reason
-/// this returns an `Option`: an invisible daemon is a session [`chosen`] refuses to
-/// identify for as long as it runs. So finding the pair is an answer whether or not the
-/// read reached the end — which keeps a session with a long `--label` killable — and only
-/// *failing* to find it leaves the truncation to decide.
+/// this returns an `Option`: [`chosen`] admits `None`, so a `None` here is a `SIGTERM` and
+/// then a `SIGKILL` to whatever wears the number. Finding the pair is an answer whether or
+/// not the read reached the end — which keeps a session with a long `--label` killable —
+/// and so is *not* finding it wherever `argv[1]` arrived whole, since
+/// [`names_daemon_for`] gives up on the mode before anything past it could have mattered.
+/// Only a read that stopped inside `argv[0]` or `argv[1]` is left saying nothing.
 fn is_daemon_for(pid: Pid, id: &str) -> Option<bool> {
     let mut buf = [0u8; MAX_CMDLINE_LEN];
     let cmdline = PathBuf::from(format!("/proc/{}/cmdline", pid.as_raw_nonzero()));
@@ -459,8 +457,13 @@ fn is_daemon_for(pid: Pid, id: &str) -> Option<bool> {
     if names_daemon_for(whole, id) {
         return Some(true);
     }
-    // Not there — which is only news if the read saw everything there was.
-    (body.len() < MAX_CMDLINE_LEN).then_some(false)
+    // Not there. A read that ended before the buffer did saw the whole command line, and a
+    // read that filled it still settles the question wherever `argv[1]` arrived whole:
+    // `whole` holds a NUL exactly when it did, and [`names_daemon_for`] bails on the mode
+    // strictly before the truncation could reach anything it reads. Both are a definitive
+    // "no" — [`MAX_CMDLINE_LEN`] has why leaving a full buffer to mean "could not tell"
+    // took `java -cp <20 KiB of classpath>` for a daemon.
+    (body.len() < MAX_CMDLINE_LEN || whole.contains(&0)).then_some(false)
 }
 
 /// Whether a NUL-separated command line is `<exe> daemon <id>`, however it was spelled.
@@ -508,14 +511,11 @@ fn running_but(paths: &SessionPaths, problem: &str) -> io::Error {
 /// Which refusal a session [`resolve`] could not name a process for has earned — decided
 /// by the probe rather than by the pidfile.
 ///
-/// [`running_but`] opens by saying the session *is running*, and the only thing that ever
-/// established that is a connection a daemon accepted. Where the probe failed instead,
-/// § 6.3 makes it evidence of neither death nor life, so there is no session to describe
-/// and no publish window to have been caught in the middle of: § 6.6's account of that
-/// state is [`unprobeable`], which names the errno — the one thing about *this* call
-/// anybody can repair. What the pidfile was doing is left unsaid there rather than added
-/// to it, since a session that turns out to have stopped owes no explanation for a file
-/// it was never going to be asked for.
+/// [`running_but`] opens by saying the session *is running*, and only a connection a daemon
+/// accepted ever established that. Where the probe failed instead, § 6.3 makes it evidence
+/// of neither death nor life, so [`unprobeable`] names the errno and leaves the pidfile
+/// unmentioned: a session that may have stopped owes no account of a file it was never
+/// going to be asked for.
 fn unresolved(paths: &SessionPaths, unprobed: Option<&io::Error>, problem: &str) -> io::Error {
     unprobed.map_or_else(
         || running_but(paths, problem),
@@ -548,13 +548,13 @@ fn unidentified(id: &str, filed: Option<Pid>, body: &[u8]) -> String {
 }
 
 /// The refusal to collect a session that was answering still when both graces ran out, in
-/// the words the [`Reach`] it was escalated *through* earns.
+/// the words the [`Chosen::reach`] it was escalated *through* earns.
 ///
 /// The answering is established either way — the caller reaches this only from a
 /// connection a daemon accepted. The rest turns on whether a signal went out. Through a
 /// descriptor one did, so a session that outlived `SIGKILL`, which nothing survives, says
-/// the pid signalled is not the process serving the socket. Through [`Reach::Nothing`]
-/// none did: `pidfd_open` declined the process before either grace began, and the same
+/// the pid signalled is not the process serving the socket. Through an errno none did:
+/// `pidfd_open` declined the process before either grace began, and the same
 /// two-and-a-half seconds of answering then say nothing whatever about the pid. What is
 /// reportable there is the errno that declined it, which is also the only part of the
 /// state anybody can repair.
@@ -565,12 +565,12 @@ fn unidentified(id: &str, filed: Option<Pid>, body: &[u8]) -> String {
 fn still_answering(id: &str, chosen: &Chosen) -> String {
     let pid = chosen.pid.as_raw_nonzero();
     match &chosen.reach {
-        Reach::Pidfd(_) => format!(
+        Ok(_) => format!(
             "session {id} is still answering after SIGTERM and SIGKILL to pid {pid}, so \
              that pid is not the process serving it; leaving it alone rather than \
              unlinking a live session's files"
         ),
-        Reach::Nothing(err) => format!(
+        Err(err) => format!(
             "session {id} is still answering, and pid {pid} could not be held to be \
              signalled ({err}), so neither SIGTERM nor SIGKILL was sent and nothing here \
              established what is serving it; leaving it alone rather than unlinking a \
@@ -616,6 +616,10 @@ fn bound_since(paths: &SessionPaths) -> io::Error {
 /// The probe that got us here is a hint rather than a verdict, so collection takes
 /// `<id>.lock` and decides liveness again under it (§ 6.6). It gives up rather than waits:
 /// the entry stays collectable for as long as it stays dead.
+///
+/// A host that can hold no lock at all is given up on in the same silence, `list`'s job
+/// being to print rather than to explain why a sweep behind it did nothing. A user who
+/// wants that session gone runs `kill`, which says.
 fn collect(paths: &SessionPaths) {
     let Some(lock) = paths.try_lock_spawn() else {
         return;
@@ -643,11 +647,13 @@ pub(crate) fn liveness(socket: &Path, within: Duration) -> Liveness {
 #[cfg(test)]
 mod tests {
     use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    use std::{fs, thread};
 
     use rustix::io::Errno;
     use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
 
-    use super::{Chosen, Reach, names_daemon_for, pin, still_answering};
+    use super::{Chosen, MAX_CMDLINE_LEN, is_daemon_for, names_daemon_for, pin, still_answering};
 
     /// Joins argv the way `/proc/<pid>/cmdline` presents it, minus the trailing NUL
     /// that [`is_daemon_for`](super::is_daemon_for) has already trimmed.
@@ -706,7 +712,7 @@ mod tests {
         let pid = Pid::from_raw(i32::try_from(child.id()).expect("a pid fits in an i32"))
             .expect("a spawned child has a pid");
 
-        let Reach::Pidfd(pidfd) = pin(pid) else {
+        let Ok(pidfd) = pin(pid) else {
             child.kill().expect("stop the process");
             child.wait().expect("reap it");
             panic!("`pin` gave up no descriptor on a host that has them");
@@ -723,11 +729,12 @@ mod tests {
         );
     }
 
-    /// The refusal after both graces says what the escalation did, and a [`Reach`] that
-    /// sent nothing is never described as having sent two signals.
+    /// The refusal after both graces says what the escalation did, and a
+    /// [`Chosen::reach`](super::Chosen::reach) that sent nothing is never described as
+    /// having sent two signals.
     ///
     /// Put to the sentence where it is built rather than to a `kill`, because the state
-    /// behind it cannot be arranged from a test: [`Reach::Nothing`] over a session that
+    /// behind it cannot be arranged from a test: a declined descriptor over a session that
     /// goes on answering needs `pidfd_open` to fail at that one call, and nothing a test
     /// may do produces such a failure. `RLIMIT_NOFILE` is the lever that looks like it
     /// would: it cannot, because the probe and the pidfile read each take a descriptor
@@ -742,7 +749,7 @@ mod tests {
             "one",
             &Chosen {
                 pid,
-                reach: Reach::Nothing(Errno::MFILE.into()),
+                reach: Err(Errno::MFILE.into()),
             },
         );
         assert!(
@@ -768,7 +775,7 @@ mod tests {
                 "one",
                 &Chosen {
                     pid,
-                    reach: Reach::Pidfd(pidfd),
+                    reach: Ok(pidfd),
                 },
             );
             assert!(
@@ -777,6 +784,59 @@ mod tests {
                  number it was sent to: {signalled:?}"
             );
         }
+    }
+
+    /// Regression: a command line too long to read the end of is still a definitive "no"
+    /// where `argv[1]` arrived whole.
+    ///
+    /// [`chosen`](super::chosen) admits `None` — "could not tell" is not a positive "it is
+    /// not" — so a rule that let a full buffer decide had `nomux kill` send `SIGTERM` and
+    /// then `SIGKILL` to any recycled pid whose command line ran past the buffer. That is
+    /// no corner: `java -cp <20 KiB of classpath>` reaches it, and so does anything else
+    /// that keeps its length in `argv[1..]`, which is where every real program keeps it.
+    ///
+    /// A shell blocked on `read` rather than anything shorter: it takes the padding as
+    /// `$0` and ignores it, it is a builtin so nothing replaces the command line by
+    /// `exec`ing, and it leaves no grandchild behind when this stops it. The command line
+    /// is waited for rather than assumed, `/proc/<pid>/cmdline` showing the *parent's*
+    /// argv until the `exec` lands.
+    #[test]
+    fn a_long_command_line_that_is_not_a_daemon_is_answered_rather_than_left_unknown() {
+        let padding = "x".repeat(MAX_CMDLINE_LEN);
+        let mut child = Command::new("sh")
+            .args(["-c", "read line", &padding])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start a process whose command line runs past the buffer");
+        let pid = Pid::from_raw(i32::try_from(child.id()).expect("a pid fits in an i32"))
+            .expect("a spawned child has a pid");
+
+        let cmdline = format!("/proc/{}/cmdline", child.id());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let seen = loop {
+            let seen = fs::read(&cmdline).unwrap_or_default();
+            if seen.len() > MAX_CMDLINE_LEN || Instant::now() >= deadline {
+                break seen;
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        let answer = is_daemon_for(pid, "one");
+        child.kill().expect("stop the process");
+        child.wait().expect("reap it");
+
+        assert!(
+            seen.len() > MAX_CMDLINE_LEN,
+            "the fixture must overrun the buffer, or this asserts nothing: {} bytes",
+            seen.len()
+        );
+        assert_eq!(
+            answer,
+            Some(false),
+            "a command line whose `argv[1]` was read in full and is not `daemon` is a \
+             positive `it is not`, whatever the read could not reach past it"
+        );
     }
 
     /// Regression: a label is not an id, however much it looks like one in argv. The

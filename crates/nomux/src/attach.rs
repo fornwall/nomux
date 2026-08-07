@@ -18,13 +18,8 @@
 //! | accepted          | relay to it                 | [`already_running`], 126   |
 //! | neither           | [`unattachable`], 126       | [`may_be_running`], 126    |
 //!
-//! The last row is the wedged daemon: an `AF_UNIX` `connect` to a full backlog blocks
-//! rather than being refused, so [`crate::usock::connect_within`] gives up with `TimedOut`
-//! over a socket somebody bound and stopped accepting on — evidence *of* a session, and
-//! § 10's "no such session" had `DESIGN.md` § 7's client cache a live one as an id it had
-//! got wrong. The two 126s keep separate kinds all the same: `AlreadyExists` answers a
-//! question only the creating mode asks, so `attach` reports the `ResourceBusy` that
-//! `control::hold_spawn_lock` gives the same state.
+//! [`crate::usock::connect_within`] has why the last row is the wedged daemon rather than
+//! an absent one.
 
 use std::collections::VecDeque;
 use std::env;
@@ -38,7 +33,6 @@ use std::process::{ChildStderr, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags};
-use rustix::pipe::SpliceFlags;
 
 use crate::control::{Liveness, liveness};
 use crate::rundir::{SessionPaths, check_run_dir, ensure_run_dir};
@@ -63,11 +57,18 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// of every session creation.
 const PUBLISH_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
-/// Largest transfer asked of `splice` in one call.
+/// Largest transfer either direction makes in one call, and the whole of what a [`Pump`]
+/// can be holding: [`Pump::wants_source`] is false while [`Pump::has_data`], so a
+/// direction reads again only once what it read last has gone, which is why neither of
+/// the two needs a cap of its own.
 ///
-/// A pipe holds 64 KiB by default, so a larger request only comes back short while
-/// a smaller one buys nothing but extra syscalls.
-const SPLICE_CHUNK: usize = 64 * 1024;
+/// Copied through, where this used to reach for `splice(2)` first and fall back: one
+/// memcpy of this size per this many bytes of session traffic, against the AES the same
+/// bytes meet one hop away, on a relay that exists only on hosts that could not open a
+/// `direct-streamlocal` channel — and the fast path engaged only where exactly one of
+/// stdin and stdout was a pipe. What it cost was the one state a reader of this file had
+/// to hold that nothing else here needs: a destination full with nothing buffered.
+const RELAY_CHUNK: usize = 16 * 1024;
 
 /// Whether this invocation may bring the session into being — the whole of the
 /// distinction between the two modes (`DESIGN.md` § 5.1).
@@ -87,14 +88,35 @@ pub(crate) enum Intent<'a> {
 ///
 /// # Errors
 ///
-/// Fails if the session cannot be reached or created, or if relaying fails.
+/// Fails if the session cannot be reached or created, or if relaying fails. The two are
+/// separate kinds, which is [`relay_failed`]'s whole job.
 pub(crate) fn run(session_id: &str, intent: Intent<'_>) -> io::Result<()> {
     let paths = SessionPaths::new(session_id)?;
     let stream = match intent {
         Intent::Create(label) => create(&paths, label)?,
         Intent::Resume => resume(&paths)?,
     };
-    relay(&stream)
+    relay(&stream).map_err(|err| relay_failed(&err))
+}
+
+/// Renames a failure of the relay itself, which has already had the session.
+///
+/// Everything else out of [`run`] answers the question § 10's table asks — whether this
+/// mode can have this session — and every kind that table does not name scores 126,
+/// "this mode cannot have the session", which `DESIGN.md` § 7 has the client cache per
+/// host. A relay that connected, ran for an hour and then met `ENOSPC` writing the stdout
+/// the user redirected has answered that question already and answered it *yes*:
+/// `nomux attach work > /var/log/big` on a filesystem that fills would otherwise take the
+/// host out of the client's rotation over a full disk.
+///
+/// One kind for all of them, since none of what `relay` can propagate — `poll`,
+/// [`copy_in`], [`Pump::drain_to`] — says anything about the session, and nothing else in
+/// this crate constructs it.
+fn relay_failed(err: &io::Error) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::ConnectionAborted,
+        format!("relaying to the session failed: {err}"),
+    )
 }
 
 /// Connects to a session that is already there, and refuses to invent one that is not.
@@ -102,10 +124,8 @@ fn resume(paths: &SessionPaths) -> io::Result<UnixStream> {
     // Checked and never created, which is `list` and `kill`'s rule (§ 6.3) and is
     // this mode's now that it creates nothing either. A directory that is not there
     // holds no session, which is the refusal below rather than a failure of its own.
-    match check_run_dir(paths.dir()) {
-        Ok(()) => {}
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Err(no_such_session(paths)),
-        Err(err) => return Err(err),
+    if !check_run_dir(paths.dir())? {
+        return Err(no_such_session(paths));
     }
     match liveness(&paths.socket(), CONNECT_TIMEOUT) {
         Liveness::Alive(stream) => Ok(stream),
@@ -128,7 +148,7 @@ fn no_such_session(paths: &SessionPaths) -> io::Error {
     )
 }
 
-/// `attach` on an id whose socket answered neither death nor life (the module's last row).
+/// `attach` on an id whose socket answered neither death nor life.
 fn unattachable(paths: &SessionPaths, err: &io::Error) -> io::Error {
     io::Error::new(
         io::ErrorKind::ResourceBusy,
@@ -191,12 +211,6 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> io::Result<UnixStream> {
     // the path.
     let _spawn_lock = paths.lock_spawn()?;
 
-    // Whether a failure gives `<id>.lock` back is that failure's own to say and cannot be
-    // decided out here off the error: the two below that establish the id is nobody's
-    // call [`released`] themselves, and every other way out leaves the name alone. It was
-    // one release point for all of them, which is the shape that unlinked a run file of a
-    // live session — an exit that established nothing was told it had established death.
-    // Still under the lock wherever it lands, `_spawn_lock` outliving the call.
     spawn_and_join(paths, label)
 }
 
@@ -363,9 +377,9 @@ fn daemon_complaint(stderr: Option<ChildStderr>) -> Option<String> {
 
 /// Moves bytes between stdio and the socket until either side closes.
 fn relay(stream: &UnixStream) -> io::Result<()> {
-    // `SPLICE_F_NONBLOCK` governs the *pipe* end of a pair alone, so a splice into a socket
-    // that is full parks the whole relay inside the kernel unless the socket itself is
-    // non-blocking. Everything below already reads `EAGAIN` as "not now".
+    // Everything below reads `EAGAIN` as "not now", and the speculative write towards the
+    // socket depends on it: a blocking socket would park the whole relay inside one write
+    // with the other direction unserved.
     stream.set_nonblocking(true)?;
 
     let stdin = io::stdin();
@@ -379,7 +393,7 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
     // One buffer for both directions, which never transfer within the same call, and
     // hoisted out of the loop: it is handed by reference to an opaque syscall wrapper,
     // so a fresh one per read is a memset nothing can elide — 32 KiB per keystroke.
-    let mut chunk = [0u8; 16 * 1024];
+    let mut chunk = [0u8; RELAY_CHUNK];
     let mut stdin_open = true;
     let mut socket_open = true;
     // The only one of the three about a *destination*: the session's output having
@@ -391,9 +405,9 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
         stdin_flags.set(PollFlags::IN, stdin_open && to_socket.wants_source());
         let mut socket_flags = PollFlags::empty();
         socket_flags.set(PollFlags::IN, socket_open && to_stdout.wants_source());
-        socket_flags.set(PollFlags::OUT, to_socket.wants_dest());
+        socket_flags.set(PollFlags::OUT, to_socket.has_data());
         let mut stdout_flags = PollFlags::empty();
-        stdout_flags.set(PollFlags::OUT, to_stdout.wants_dest());
+        stdout_flags.set(PollFlags::OUT, to_stdout.has_data());
         // A fixed frame, seeded as `daemon::wait` seeds its slots and for its reasons.
         let mut fds: [PollFd<'_>; 3] =
             std::array::from_fn(|_| PollFd::from_borrowed_fd(sock_fd, PollFlags::empty()));
@@ -410,7 +424,7 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
                 watched += 1;
             }
         }
-        // Unreachable, [`Pump::wants_source`] being exactly `!wants_dest()`, and kept
+        // Unreachable, [`Pump::wants_source`] being exactly `!has_data()`, and kept
         // because what it stands between is a `poll` on an empty set, which blocks
         // for ever.
         if watched == 0 {
@@ -444,16 +458,12 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
         // and spin in the poll set.
         let readable = PollFlags::IN | PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL;
 
-        if stdin_events.intersects(readable)
-            && !to_socket.transfer(stdin_fd, sock_fd, &mut chunk)?
-        {
+        if stdin_events.intersects(readable) && !to_socket.fill_from(stdin_fd, &mut chunk)? {
             stdin_open = false;
             // Half-close propagation (§ 7).
             drop(stream.shutdown(Shutdown::Write));
         }
-        if socket_events.intersects(readable)
-            && !to_stdout.transfer(sock_fd, stdout_fd, &mut chunk)?
-        {
+        if socket_events.intersects(readable) && !to_stdout.fill_from(sock_fd, &mut chunk)? {
             socket_open = false;
         }
         // Speculative on a non-empty buffer as well as on `POLLOUT`, which stdout below
@@ -464,9 +474,9 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
         if socket_events.contains(PollFlags::OUT) || to_socket.has_data() {
             let _ = to_socket.drain_to(sock_fd)?;
         }
-        // `POLLOUT` is the only thing that clears `Pump::dest_full`, and a destination
-        // whose reader has gone never reports it — a full pipe with no reader is not
-        // writable, it is broken.
+        // Before the write and not through it: a destination whose reader has gone never
+        // reports `POLLOUT` — a full pipe with no reader is not writable, it is broken —
+        // so this is the only way that ending arrives on a pipe.
         if stdout_events.intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL) {
             stdout_open = false;
         } else if stdout_events.contains(PollFlags::OUT) {
@@ -506,109 +516,36 @@ fn copy_in(fd: BorrowedFd<'_>, buf: &mut VecDeque<u8>, chunk: &mut [u8]) -> io::
     }
 }
 
-/// What one `splice` attempt achieved.
-#[derive(Debug)]
-enum Spliced {
-    /// Bytes handed over inside the kernel; 0 means the source is at EOF.
-    Moved(usize),
-    /// The destination would not take them yet. Neither an error nor EOF.
-    Full,
-    /// The kernel will not splice this pair — now or ever.
-    Unusable,
-    /// Something else went wrong, and it is about this moment rather than about the
-    /// pair. The copying path meets the same condition on its own read.
-    Failed,
-}
-
-/// Moves up to [`SPLICE_CHUNK`] bytes from `src` to `dst` without them ever
-/// entering this process.
-///
-/// Whether `splice` works for a pair is a property of the host rather than of this code,
-/// so it is discovered by trying: under sshd this process's stdio is a pipe on some builds
-/// and a socket on others, and only a pair with a pipe in it can be spliced.
-fn splice_once(src: BorrowedFd<'_>, dst: BorrowedFd<'_>) -> Spliced {
-    let flags = SpliceFlags::MOVE | SpliceFlags::NONBLOCK;
-    loop {
-        return match rustix::pipe::splice(src, None, dst, None, SPLICE_CHUNK, flags) {
-            Ok(moved) => Spliced::Moved(moved),
-            Err(rustix::io::Errno::INTR) => continue,
-            // Only ever reached with the source already reported readable, so this
-            // is the destination refusing and never a source that had nothing.
-            Err(rustix::io::Errno::AGAIN) => Spliced::Full,
-            // `EINVAL` for a pair with neither end a pipe, `ENOSYS` for a kernel
-            // without the call: the two that say something about the pair rather than
-            // about the moment, and can therefore be believed for the rest of the run.
-            Err(rustix::io::Errno::INVAL | rustix::io::Errno::NOSYS) => Spliced::Unusable,
-            Err(_) => Spliced::Failed,
-        };
-    }
-}
-
-/// One direction of the relay, whose two paths cannot interleave: `splice` is attempted
-/// only while `buf` below is empty, and never puts anything into it.
+/// One direction of the relay, whose whole state is whatever the destination would not
+/// take yet: which of the two ends the poll set wants is that and its negation.
 #[derive(Debug, Default)]
 struct Pump {
-    /// Bytes the destination would not take yet; only ever filled by the copying path.
+    /// Bytes the destination would not take yet, never more than one [`RELAY_CHUNK`].
     buf: VecDeque<u8>,
-    /// Set for good the first time `splice` refuses the *pair* rather than the moment:
-    /// neither reason it can refuse for can change while the relay runs, so retrying
-    /// would buy a wasted syscall per wakeup for ever.
-    splice_refused: bool,
-    /// `splice` reported the destination full. Distinct from a non-empty buffer in
-    /// that nothing is held here: it records only that the source must be left alone
-    /// until the destination reports `POLLOUT`, re-reading it having nowhere to go.
-    dest_full: bool,
 }
 
 impl Pump {
-    /// Whether the source is worth polling: only with the destination caught up,
-    /// so nothing can overtake bytes that are already owed to it.
+    /// Whether the source is worth polling: only with the destination caught up, so
+    /// nothing can overtake bytes that are already owed to it — and so what [`copy_in`]
+    /// appends is all [`Pump::buf`] ever holds.
     fn wants_source(&self) -> bool {
-        !self.wants_dest()
+        !self.has_data()
     }
 
-    /// Whether the destination is worth polling for writability.
-    fn wants_dest(&self) -> bool {
-        self.has_data() || self.dest_full
-    }
-
-    /// Whether anything is still held in userspace for the destination.
+    /// Whether anything is still held in userspace for the destination, which is also
+    /// the only reason to poll that destination for writability.
     fn has_data(&self) -> bool {
         !self.buf.is_empty()
     }
 
-    /// Moves one batch from `src` towards `dst`. `false` means `src` reached EOF.
-    ///
-    /// Falling back within the same call keeps a host that cannot splice from losing
-    /// a wakeup to the discovery.
-    fn transfer(
-        &mut self,
-        src: BorrowedFd<'_>,
-        dst: BorrowedFd<'_>,
-        chunk: &mut [u8],
-    ) -> io::Result<bool> {
-        if !self.splice_refused && !self.has_data() {
-            match splice_once(src, dst) {
-                Spliced::Moved(moved) => return Ok(moved != 0),
-                Spliced::Full => {
-                    self.dest_full = true;
-                    return Ok(true);
-                }
-                Spliced::Unusable => self.splice_refused = true,
-                Spliced::Failed => {}
-            }
-        }
+    /// Takes one batch off `src` for the destination. `false` means `src` reached EOF.
+    fn fill_from(&mut self, src: BorrowedFd<'_>, chunk: &mut [u8]) -> io::Result<bool> {
         copy_in(src, &mut self.buf, chunk)
     }
 
-    /// Hands the destination whatever is owed it, and forgets that it was full.
-    /// `false` means the destination has stopped reading.
-    ///
-    /// Clearing [`Pump::dest_full`] is sound from either of the two call sites: it
-    /// only ever gates re-reading the source, and the write below is what establishes
-    /// whether the destination has room.
+    /// Hands the destination whatever is owed it. `false` means the destination has
+    /// stopped reading.
     fn drain_to(&mut self, fd: BorrowedFd<'_>) -> io::Result<bool> {
-        self.dest_full = false;
         match crate::nbio::drain_to(&mut self.buf, fd) {
             // `EPIPE` is `nbio`'s to report and each caller's to interpret: here it is
             // the destination's reader having gone — an ordinary ending rather than a

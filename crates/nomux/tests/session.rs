@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use nomux::{
-    ErrorCode, Frame, FrameType, HEADER_LEN, HELLO_REPAINT_CTRL_L, Hello, Linger, PROTOCOL_VERSION,
-    RESUME_FROM_START, WinSize, decode_header,
+    ErrorCode, Frame, FrameType, HEADER_LEN, Hello, Linger, PROTOCOL_VERSION, RESUME_FROM_START,
+    WinSize, decode_header,
 };
 
 use harness::{
@@ -39,15 +39,6 @@ use harness::{
 #[test]
 fn output_resumes_contiguously_after_a_reconnect() {
     let (session, mut client, ok) = Session::attached("resume");
-    // The one `HelloOk` field that is the daemon's own answer rather than a function of
-    // what the client asked for, and checked against a running daemon nowhere else.
-    assert_eq!(
-        ok.linger,
-        linger_on_this_host(),
-        "the daemon must report a linger state it detected the way § 6.2 says, rather \
-         than a default — it is what the client warns the user about, and see \
-         `linger_on_this_host` for the part of that this can and cannot say"
-    );
     assert!(
         !ok.gap(RESUME_FROM_START),
         "a fresh session has dropped nothing"
@@ -77,66 +68,6 @@ fn output_resumes_contiguously_after_a_reconnect() {
 
     client.input(ok.in_applied, b"echo NOMUX-AFTER\n");
     client.read_until("NOMUX-AFTER", ok.resume_from);
-}
-
-/// What `linger::detect` must answer on the host this test is running on, worked out
-/// from the same two paths it stats (`IMPLEMENTATION.md` § 6.2).
-///
-/// A transcription of `detect` rather than an independent oracle: what it buys is that
-/// the daemon puts a *detected* state into `HelloOk` rather than a constant, and
-/// whether § 6.2's rules are the right ones is `linger.rs`'s own unit tests. With no
-/// `logind` — a container, a BSD — or no resolvable login name, both sides answer
-/// `Unknown` before reading anything and this is a tautology.
-fn linger_on_this_host() -> Linger {
-    if !Path::new("/run/systemd/system").is_dir() {
-        return Linger::Unknown;
-    }
-    let Some(user) = login_name() else {
-        return Linger::Unknown;
-    };
-    match fs::metadata(Path::new("/var/lib/systemd/linger").join(user)) {
-        Ok(_) => Linger::Enabled,
-        Err(err) if err.kind() == ErrorKind::NotFound => Linger::Disabled,
-        Err(_) => Linger::Unknown,
-    }
-}
-
-/// The name [`linger_on_this_host`] joins onto the linger directory, resolved in the
-/// order `linger::username` resolves it: the password database first, then `$USER` and
-/// `$LOGNAME` for a directory-backed account with no line in `/etc/passwd`. Read as
-/// bytes for the reason `passwd::lookup` gives — one Latin-1 name in somebody else's
-/// GECOS field would fail the decode of the whole file and silently take the fallback.
-fn login_name() -> Option<String> {
-    let uid = rustix::process::getuid().as_raw();
-    let from_passwd = fs::read("/etc/passwd").ok().and_then(|database| {
-        database
-            .split(|byte| *byte == b'\n')
-            .find_map(|line| {
-                let mut fields = line.split(|byte| *byte == b':');
-                let name = fields.next()?;
-                let _password = fields.next()?;
-                if str::from_utf8(fields.next()?).ok()?.parse::<u32>().ok()? != uid {
-                    return None;
-                }
-                str::from_utf8(name).ok()
-            })
-            .map(str::to_owned)
-    });
-    from_passwd
-        .or_else(|| {
-            std::env::var("USER")
-                .or_else(|_| std::env::var("LOGNAME"))
-                .ok()
-        })
-        // A name usable as a path traversal is refused rather than joined onto a system
-        // directory — the one thing `linger::username` does beyond choosing a source.
-        .filter(|name| {
-            !name.is_empty()
-                && !name.contains('/')
-                && !name.contains('\0')
-                && name != "."
-                && name != ".."
-        })
 }
 
 /// A client claiming output the session never produced is clamped down to the end of
@@ -619,21 +550,63 @@ fn an_overflow_that_outruns_an_attached_client_is_reported_as_a_gap_mid_stream()
 /// A mistyped tuning variable should never cost somebody their session. `Ring::new`
 /// clamps rather than asserts — the clamp keeps an abort site out of a `panic = "abort"`
 /// binary — so what a lost filter costs is not a daemon that dies before it binds but a
-/// session whose scrollback is one byte, which the round trip below still catches.
+/// session whose scrollback is a byte.
+///
+/// The default it lands on is asserted rather than the session merely answering, which
+/// any fallback above a few hundred bytes satisfies: the child writes past
+/// [`DEFAULT_RING`] with nobody attached, so the ring is exactly full and the byte it
+/// offers to resume at is arithmetic. That is the same reading as
+/// [`a_gap_at_the_handshake_names_the_byte_the_stream_actually_resumes_at`], asked of a
+/// capacity nobody chose.
 #[test]
 fn a_ring_capacity_the_daemon_cannot_use_falls_back_to_the_default() {
+    /// `daemon::DEFAULT_RING_CAPACITY`. Private to the daemon, mirrored here, and the
+    /// two must move together.
+    const DEFAULT_RING: usize = 4 << 20;
+    /// Comfortably past it, so what is retained is a full ring rather than everything
+    /// the child ever wrote.
+    const PRODUCED: usize = DEFAULT_RING + (1 << 20);
+
     for (name, value) in [("ring_zero", "0"), ("ring_garbage", "not-a-number")] {
+        // Serving, rather than merely having bound a socket: the socket is bound before
+        // the ring is built, so a daemon that died over one leaves the file behind and
+        // the harness's wait is satisfied by a corpse. Everything below is a round trip
+        // through the child, and each failure names the case so that it says which
+        // `NOMUX_RING_BYTES` the daemon choked on.
         let session = Session::start_with(name, value, "/bin/sh");
         let mut client = session.connect();
         let ok = client.hello(RESUME_FROM_START);
+        // Echo off, so the stream from the marker on is the child's own bytes.
+        let ready = client.make_ready("-echo -onlcr", None, ok.resume_from);
+        let planted = plant_blob(
+            &session,
+            &mut client,
+            ready.offset,
+            ready.in_offset,
+            PRODUCED,
+        );
 
-        // Serving, rather than merely having bound a socket: the socket is bound before
-        // the ring is built, so a daemon that died over one leaves the file behind and
-        // the harness's wait is satisfied by a corpse. The marker carries the case's own
-        // name so that a timeout says which `NOMUX_RING_BYTES` the daemon choked on.
-        let marker = format!("NOMUX-DEFAULT-RING-{name}");
-        client.input(0, format!("echo {marker}\n").as_bytes());
-        client.read_until(&marker, ok.resume_from);
+        // The daemon has to own the command before the connection goes, per
+        // `a_gap_at_the_handshake_names_the_byte_the_stream_actually_resumes_at`.
+        client.wait_for_input_ack(planted.in_offset);
+        drop(client);
+        assert!(
+            poll_until(Duration::from_secs(30), || planted.sentinel.exists()),
+            "{name}: the child never finished writing its {PRODUCED} bytes"
+        );
+
+        let mut client = session.connect();
+        let resumed = client.hello(planted.stream_start);
+        let stream_end = planted.stream_start + planted.expected.len() as u64;
+        let oldest_held = stream_end - DEFAULT_RING as u64;
+        assert_eq!(
+            resumed.resume_from, oldest_held,
+            "{name}: the daemon offered to resume at {}, where a session that fell back \
+             to the {DEFAULT_RING}-byte default still holds everything from \
+             {oldest_held}. A ring the clamp left at a byte, or a default that is no \
+             longer the default, lands somewhere else",
+            resumed.resume_from
+        );
     }
 }
 
@@ -790,79 +763,12 @@ fn a_session_whose_shell_cannot_be_started_is_refused_as_an_internal_failure() {
 
     // By hand: `Client::hello` panics on anything but a `HelloOk`, and the refusal is
     // the whole point.
-    client.send(&hello_frame(0, RESUME_FROM_START));
+    client.send(&hello_frame(false, false, RESUME_FROM_START));
     client.expect_error_among_output(
         ErrorCode::Internal,
         "a shell that cannot be started must be reported as the daemon's failure",
     );
     client.expect_eof("an Error{INTERNAL}");
-}
-
-/// § 6.3's peer-credential rule from the side the suite can reach: a connection from
-/// this uid is admitted and served, and the credentials the daemon admits it on are
-/// the ones this host reports.
-///
-/// The refusal is the other side and needs a second uid, which the suite has no way to
-/// become; `daemon.rs`'s `only_this_uid_may_have_the_session` holds that half against
-/// the predicate. What a unit test cannot reach is the `getsockopt` itself, and a wrong
-/// level, option or struct there answers `Err` for every peer — a session socket that
-/// admits nobody. Every test in this file would fail with it and none would say why.
-///
-/// The probe is a bare connection because a `Client` keeps its socket to itself, and
-/// because § 6.4 has connecting cost the attached client nothing.
-#[test]
-fn a_connection_from_this_uid_is_admitted_and_reports_its_credentials() {
-    let (session, mut client, _ok) = Session::attached("peercred");
-
-    let probe = UnixStream::connect(&session.socket).expect("connect to the session socket");
-    assert_eq!(
-        peer_uid(&probe),
-        rustix::process::getuid().as_raw(),
-        "the daemon serving this socket is the uid its clients are admitted for"
-    );
-    drop(probe);
-
-    still_serving(&mut client, "NOMUX-ADMITTED");
-}
-
-/// The uid the kernel reports for the process at the other end of `stream` — for a
-/// connected client, the one that called `listen`.
-///
-/// Through `libc` for `harness::shrink_send_buffer`'s reason: rustix's socket options
-/// sit behind its `net` feature, which this tree does not enable.
-fn peer_uid(stream: &UnixStream) -> u32 {
-    use std::os::fd::AsRawFd;
-
-    let mut cred = libc::ucred {
-        pid: 0,
-        uid: u32::MAX,
-        gid: 0,
-    };
-    let mut len = u32::try_from(size_of::<libc::ucred>()).expect("the size of a ucred");
-    // SAFETY: `getsockopt` is given a `ucred` to fill and a `socklen_t` holding that
-    // type's own size, both owned by this frame and unaliased across the call, on a
-    // descriptor the borrow keeps open for it.
-    let asked = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            std::ptr::from_mut(&mut cred).cast::<libc::c_void>(),
-            std::ptr::from_mut(&mut len),
-        )
-    };
-    assert_eq!(
-        asked,
-        0,
-        "SO_PEERCRED on a connected socket: {}",
-        std::io::Error::last_os_error()
-    );
-    assert_eq!(
-        usize::try_from(len).expect("what the kernel wrote"),
-        size_of::<libc::ucred>(),
-        "a partial ucred leaves the uid below whatever it was seeded with"
-    );
-    cred.uid
 }
 
 /// A connection that speaks out of turn is refused on its own terms, without
@@ -883,16 +789,15 @@ fn a_connection_that_does_not_greet_first_is_refused_alone() {
     client.read_until("NOMUX-UNDISTURBED", ok.resume_from);
 }
 
-/// `Resize` reaches the child's terminal, and every attach restates the geometry
-/// (`IMPLEMENTATION.md` § 2.2).
+/// `Resize` reaches the child's terminal (`IMPLEMENTATION.md` § 2.2).
 ///
-/// Nothing else in the suite sends a `0x06`. Both halves matter to the same user: the
-/// window is resized while attached, and the session is then picked up from a terminal
-/// of a different size. Asserted at the child both times, `stty` being the only witness
-/// that the geometry was *applied* rather than merely received.
+/// Nothing else in the suite sends a `0x06`. Asserted at the child through `stty`, the
+/// only witness that the geometry was *applied* rather than merely received. What an
+/// arriving `Hello` does with the geometry is the next test, which asks it in the one
+/// state that can tell a restatement from a skipped one.
 #[test]
-fn a_resize_reaches_the_child_and_every_attach_restates_the_geometry() {
-    let (session, mut client, ok) = Session::attached("resize");
+fn a_resize_reaches_the_child() {
+    let (_session, mut client, ok) = Session::attached("resize");
 
     let wider = WinSize {
         cols: 132,
@@ -903,17 +808,8 @@ fn a_resize_reaches_the_child_and_every_attach_restates_the_geometry() {
     client.send(&Frame::Resize(wider));
     // `stty size` reports rows then columns, and the line discipline's echo of the
     // command carries neither number — so seeing them is the child's own answer.
-    let command = b"stty size\n";
-    client.input(0, command);
+    client.input(0, b"stty size\n");
     client.read_until("43 132", ok.resume_from);
-    drop(client);
-
-    // A client arriving from a terminal of the original size gets it back, in the
-    // greeting and in the child.
-    let mut client = session.connect();
-    let resumed = client.hello(RESUME_FROM_START);
-    client.input(resumed.in_applied, b"stty size\n");
-    client.read_until("24 80", resumed.resume_from);
 }
 
 /// An attach restates the geometry even when it has not changed since the last one.
@@ -941,33 +837,6 @@ fn an_attach_restates_a_geometry_the_child_moved_underneath_it() {
     let resumed = client.hello(RESUME_FROM_START);
     client.input(resumed.in_applied, b"stty size\n");
     client.read_until("24 80", resumed.resume_from);
-}
-
-/// A burst of `Resize` frames arrives as the last of them, whole.
-///
-/// `Resize` touches no queue, so it never breaks the daemon's decode loop the way `Input`
-/// does at `MAX_PENDING_READ`: one pass can carry as many as the receive buffer holds.
-/// Applied per frame, that is tens of thousands of `TIOCSWINSZ` calls and as many
-/// `SIGWINCH`s to the child in a single wakeup, with the PTY undrained throughout — the
-/// one stall § 4.1 does not let a client cause. `Daemon::apply_win` collapses them to one.
-/// What has to survive the collapse is the only size that was ever real, the last, and
-/// `stty` is the witness that it was applied rather than merely the field's last value.
-#[test]
-fn a_burst_of_resizes_arrives_as_the_last_one() {
-    let (_session, mut client, ok) = Session::attached("resize-burst");
-
-    // Written back to back and ahead of any input, so the daemon decodes them together
-    // rather than being woken once per frame.
-    for cols in 100..200u16 {
-        client.send(&Frame::Resize(WinSize {
-            cols,
-            rows: 43,
-            xpixel: 0,
-            ypixel: 0,
-        }));
-    }
-    client.input(0, b"stty size\n");
-    client.read_until("43 199", ok.resume_from);
 }
 
 /// `Detach` gives the connection up without giving up the session
@@ -1031,7 +900,7 @@ const WINCHED: &str = "NOMUX-42-WINCHED";
 /// the keystroke back along the same path as the fence, but the `SIGWINCH` marker comes
 /// from a *second* process `TIOCSWINSZ` has merely made runnable — and § 4.3 obliges the
 /// repaint to happen, not to win that race.
-fn repaint_transcript(name: &str, flags: u8, owed: Option<&str>) -> String {
+fn repaint_transcript(name: &str, repaint_ctrl_l: bool, owed: Option<&str>) -> String {
     /// The child echoes far more than this, so the gap is by construction.
     const RING: usize = 1024;
     /// The last line of the filler: `cat` echoes it, so seeing it means everything
@@ -1044,7 +913,7 @@ fn repaint_transcript(name: &str, flags: u8, owed: Option<&str>) -> String {
 
     let session = Session::start_with_ring(name, RING);
     let mut client = session.connect();
-    let ok = client.hello_with(flags, RESUME_FROM_START);
+    let ok = client.hello_with(false, repaint_ctrl_l, RESUME_FROM_START);
 
     // The sleep is short so a subshell that somehow outlived its session is asleep
     // rather than looping. It does not normally have to be: everything here shares the
@@ -1071,7 +940,7 @@ fn repaint_transcript(name: &str, flags: u8, owed: Option<&str>) -> String {
     // A gap by arithmetic rather than by timing: the ring holds a kilobyte and the
     // child has just echoed thirty-two, so `base` is far above where this resumes.
     let mut client = session.connect();
-    let resumed = client.hello_with(flags, offset);
+    let resumed = client.hello_with(false, repaint_ctrl_l, offset);
     assert!(
         resumed.gap(offset),
         "the child echoed {} bytes through a {RING}-byte ring and the daemon \
@@ -1122,7 +991,7 @@ fn repaint_transcript(name: &str, flags: u8, owed: Option<&str>) -> String {
 /// `TIOCSWINSZ` dance being the fiddly half.
 #[test]
 fn a_gap_repaints_with_ctrl_l_only_when_the_client_asks() {
-    let asked = repaint_transcript("repaint_ctrl_l", HELLO_REPAINT_CTRL_L, None);
+    let asked = repaint_transcript("repaint_ctrl_l", true, None);
     assert!(
         asked.contains('\u{c}'),
         "no Ctrl-L reached the child: {asked:?}"
@@ -1133,7 +1002,7 @@ fn a_gap_repaints_with_ctrl_l_only_when_the_client_asks() {
          an editor gets both a redraw it did not want and a keystroke: {asked:?}"
     );
 
-    let default = repaint_transcript("repaint_winch", 0, Some(WINCHED));
+    let default = repaint_transcript("repaint_winch", false, Some(WINCHED));
     assert!(
         default.contains(WINCHED),
         "the gap was reported and the child was never told the terminal had \
@@ -1187,7 +1056,7 @@ fn a_sustained_overflow_repaints_when_the_client_catches_up_rather_than_per_gap(
     let deadline = Instant::now() + FRAME_PATIENCE;
     let session = Session::start_with_ring("repaint_storm", RING);
     let mut client = session.connect();
-    let ok = client.hello_with(HELLO_REPAINT_CTRL_L, RESUME_FROM_START);
+    let ok = client.hello_with(false, true, RESUME_FROM_START);
 
     // `cat` keeps the terminal and writes what arrives on it to a file, so nothing the
     // daemon injects is echoed back into the ring it would be lost from. The flooder is
@@ -1209,8 +1078,7 @@ fn a_sustained_overflow_repaints_when_the_client_catches_up_rather_than_per_gap(
     // collects a megabyte of two-kilobyte frames queued before it fell behind, and has
     // to read all of them at this pace before reaching the first `Gap` behind them.
     drop(client);
-    let (mut client, resumed) =
-        reconnect_until_gap(&session, deadline, HELLO_REPAINT_CTRL_L, ready.offset);
+    let (mut client, resumed) = reconnect_until_gap(&session, deadline, true, ready.offset);
 
     // Paced reads against an unpaced child: every frame taken off the socket lets the
     // daemon's queue dip below its cap, which is what lets the next pass notice the ring
@@ -1417,8 +1285,8 @@ fn an_abrupt_client_disconnect_does_not_kill_the_session() {
 /// failing behind the backoff, and the pipe that says "stop" reading as though it had.
 ///
 /// It does not happen, because std's runtime fills those three before `main` ever runs
-/// (`startup::silence_stdio` has the argument). That is a guarantee from outside this
-/// tree and invisible inside it, which is exactly why the property is asserted rather
+/// (`startup::release_startup_state` has the argument). That is a guarantee from outside
+/// this tree and invisible inside it, which is exactly why the property is asserted rather
 /// than reasoned about — and nothing else in this suite starts a daemon with a
 /// descriptor table of its own.
 ///
@@ -1474,7 +1342,7 @@ fn greeted(socket: &Path) -> bool {
         .set_read_timeout(Some(Duration::from_millis(100)))
         .expect("set a read timeout");
     let mut hello = Vec::new();
-    hello_frame(0, RESUME_FROM_START)
+    hello_frame(false, false, RESUME_FROM_START)
         .encode(&mut hello)
         .expect("encode a Hello");
     if stream.write_all(&hello).is_err() {

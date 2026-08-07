@@ -1,4 +1,10 @@
 > [!WARNING]
+> **There is nothing to run yet.** This repository is the server half; the SSH client and
+> terminal emulator that drive it are a separate, unreleased project. Without that client
+> there is no way to get a shell out of this — the relay modes speak a binary frame
+> protocol over stdio rather than driving a terminal, and what works standalone today is
+> `nomux list` and `nomux kill`.
+>
 > **Experimental.** This project is AI-generated and has not seen real world usage.
 
 # nomux
@@ -14,24 +20,23 @@ reporting and scrollback all work unchanged.
 `attach`; `list` and `kill` are the control surface, frozen across versions.
 `nomux --help` has the rest.
 
-Four properties drive the system — this binary plus the client that pushes and drives
-it, versioned as one unit. Two, the resume path and the zero install, are the client's.
-What each one costs is [DESIGN.md § 3](DESIGN.md#3-key-properties):
+The system is this binary plus the client that pushes and drives it, versioned and shipped
+as one unit — which is why the wire protocol is private and carries no stability guarantee
+([DESIGN.md § 2](DESIGN.md#2-scope)).
 
-- **Byte-stream replay, not screen-state sync** — no terminal emulator on the server.
-- **Resume over a fresh SSH connection, not a side channel** — inherits ProxyJump, certificates, 2FA, agent forwarding.
-- **Zero server-side install** — the client carries the binary and pushes it on first use.
-- **No new ports, no new crypto** — the only endpoints are unix sockets at `0600` inside a `0700` directory, one per session, plus one more when agent forwarding is enabled.
+Four properties drive it, and two of them are held on this side. What each one costs is
+[DESIGN.md § 3](DESIGN.md#3-key-properties):
 
-**There is nothing to run yet.** This repository is the server half; the SSH client
-and terminal emulator that drive it are a separate, unreleased project. The relay
-modes speak a binary frame protocol over stdio rather than driving a terminal, so
-without that client there is no way to get a shell out of this — what works standalone
-today is `nomux list` and `nomux kill`. The two halves ship as one unit, so the wire
-protocol is private and carries no stability guarantee ([DESIGN.md § 2](DESIGN.md#2-scope)).
+- **Byte-stream replay, not screen-state sync** — no terminal emulator on the server. *This repository.*
+- **No new ports, no new crypto** — the only endpoints are unix sockets, one per session, plus one more when agent forwarding is enabled ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket) has the modes). *This repository.*
+- **Resume over a fresh SSH connection, not a side channel** — inherits ProxyJump, certificates, 2FA, agent forwarding. *The client's.*
+- **Zero server-side install** — the client carries the binary and pushes it on first use. *The client's.*
+
+Three documents, and none of them repeats another:
 
 - [DESIGN.md](DESIGN.md) — problem, properties, architecture, security model, prior art, rejected alternatives.
 - [IMPLEMENTATION.md](IMPLEMENTATION.md) — wire protocol, ring buffer, PTY handling, bootstrap, build.
+- [PLAN.md](PLAN.md) — what is open, the client above it.
 
 ## Build
 
@@ -57,7 +62,7 @@ Complete and under test on Linux at the protocol revision
 - **Platform** — Linux only; everywhere else, plain SSH ([DESIGN.md § 7](DESIGN.md#7-degradation)).
 - **Suite** — layers and invariants in [IMPLEMENTATION.md § 9](IMPLEMENTATION.md#9-testing); CI adds `--run-ignored all`.
 - **Release** — both musl targets build reproducibly inside the size and growth gates, and a `v*` tag builds, checks and publishes them ([IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)).
-- **Not started** — the client. Every piece of it has a server-side contract fixed in [IMPLEMENTATION.md](IMPLEMENTATION.md).
+- **Not started** — the client ([PLAN.md § P1](PLAN.md#p1--the-client)). Every piece of it has a server-side contract already fixed in [IMPLEMENTATION.md](IMPLEMENTATION.md).
 
 ## License
 

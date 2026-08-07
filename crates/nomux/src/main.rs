@@ -14,7 +14,6 @@ mod control;
 mod daemon;
 mod linger;
 mod nbio;
-mod passwd;
 mod pty;
 mod ring;
 mod rundir;
@@ -22,7 +21,6 @@ mod sanitize;
 #[cfg(test)]
 mod scratch;
 mod startup;
-mod syslog;
 mod usock;
 
 use std::env;
@@ -66,7 +64,7 @@ fn main() -> ExitCode {
     };
 
     match mode.to_str() {
-        Some(word @ "list") => only(args, word, || report(control::list(), false)),
+        Some(word @ "list") => only(args, word, || report(control::list())),
         Some(word @ ("--version" | "-V")) => only(args, word, || {
             println!(
                 "nomux {} (protocol {})",
@@ -79,10 +77,28 @@ fn main() -> ExitCode {
             print!("{USAGE}");
             ExitCode::SUCCESS
         }),
-        Some(word @ "daemon") => run_session_mode(Mode::Daemon, word, args),
-        Some(word @ "spawn") => run_session_mode(Mode::Spawn, word, args),
-        Some(word @ "attach") => run_session_mode(Mode::Attach, word, args),
-        Some(word @ "kill") => run_session_mode(Mode::Kill, word, args),
+        Some(word @ "daemon") => with_session(word, args, |session, label| {
+            report(daemon::run(session, label))
+        }),
+        Some(word @ "spawn") => with_session(word, args, |session, label| {
+            report_relay(attach::run(session, attach::Intent::Create(label)))
+        }),
+        Some(word @ "attach") => with_session(word, args, |session, label| {
+            // Refused rather than dropped on the floor: a `--label` on `attach` is a
+            // caller that still believes `attach` might create the session. `kill`
+            // parses and ignores one, `IMPLEMENTATION.md` § 6.6 having frozen what it
+            // accepts.
+            if label.is_some() {
+                return usage_error(Some(
+                    "`attach` takes no `--label`: a label is recorded when the session \
+                     is created, which `spawn` does",
+                ));
+            }
+            report_relay(attach::run(session, attach::Intent::Resume))
+        }),
+        Some(word @ "kill") => {
+            with_session(word, args, |session, _| report(control::kill(session)))
+        }
         _ => usage_error(Some(&format!("unknown mode `{}`", mode.display()))),
     }
 }
@@ -114,20 +130,17 @@ fn usage_error(message: Option<&str>) -> ExitCode {
     ExitCode::from(EXIT_USAGE)
 }
 
-/// The four modes that take a session id.
+/// The command line the four modes that take a session id share, parsed once and handed
+/// to whichever of them `main` matched.
 ///
-/// An enum rather than the `&str` `main` matched on, so that the dispatch below is
-/// exhaustive and a fifth mode cannot silently fall into a catch-all arm.
-#[derive(Clone, Copy)]
-enum Mode {
-    Daemon,
-    Spawn,
-    Attach,
-    Kill,
-}
-
-/// Dispatches the modes that take a session id. `word` is the one `main` matched on.
-fn run_session_mode(mode: Mode, word: &str, args: impl Iterator<Item = OsString>) -> ExitCode {
+/// `word` is that mode, carried only so a refusal can name it. What each mode then does
+/// with the id and the label is its own arm above, which is where the one match on the
+/// mode is: a fifth would be a fifth arm there and nothing else.
+fn with_session(
+    word: &str,
+    args: impl Iterator<Item = OsString>,
+    run: impl FnOnce(&str, Option<&str>) -> ExitCode,
+) -> ExitCode {
     let (session, label) = match parse_session_args(args) {
         Ok(parsed) => parsed,
         Err(message) => return usage_error(Some(&message)),
@@ -135,25 +148,7 @@ fn run_session_mode(mode: Mode, word: &str, args: impl Iterator<Item = OsString>
     let Some(session) = session else {
         return usage_error(Some(&format!("`{word}` requires a session id")));
     };
-    // Refused rather than dropped on the floor: a `--label` on `attach` is a caller
-    // that still believes `attach` might create the session. `kill` parses and ignores
-    // one, `IMPLEMENTATION.md` § 6.6 having frozen what it accepts.
-    if matches!(mode, Mode::Attach) && label.is_some() {
-        return usage_error(Some(
-            "`attach` takes no `--label`: a label is recorded when the session is \
-             created, which `spawn` does",
-        ));
-    }
-
-    match mode {
-        Mode::Daemon => report(daemon::run(&session, label.as_deref()), false),
-        Mode::Spawn => report(
-            attach::run(&session, attach::Intent::Create(label.as_deref())),
-            true,
-        ),
-        Mode::Attach => report(attach::run(&session, attach::Intent::Resume), true),
-        Mode::Kill => report(control::kill(&session), false),
-    }
+    run(&session, label.as_deref())
 }
 
 /// Splits a session-mode command line into its id and optional label.
@@ -194,41 +189,62 @@ fn parse_session_args(
 
 /// Maps a fallible operation onto an exit code, reporting failure on stderr.
 ///
-/// Both of `IMPLEMENTATION.md` § 10's tables, which are one table. Every mode gives
-/// `InvalidInput` `EX_USAGE`: [`rundir::SessionPaths::new`] is the only place the crate
+/// `IMPLEMENTATION.md` § 10's first table, which `daemon`, `list` and `kill` are scored
+/// against: a failure is a failure. What both tables share is `InvalidInput`, which every
+/// mode gives `EX_USAGE`: [`rundir::SessionPaths::new`] is the only place the crate
 /// *constructs* one, so it means an id that could never have named a session rather than
 /// an operation that failed — a distinction the client acts on, caching "unattachable"
 /// per host and otherwise caching its own typo. That makes this kind a reserved word
 /// here: an `EINVAL` from anywhere would decode to it and be reported as the user's
 /// spelling, which is why a run file that cannot be read is `InvalidData`
 /// ([`rundir::read_prefix`]) and why `Hello.term` is refused for an interior NUL before
-/// it can reach `Command::env`. `relay` selects § 10's other table, the one `spawn` and
-/// `attach` are scored against.
-fn report(result: std::io::Result<()>, relay: bool) -> ExitCode {
+/// it can reach `Command::env`.
+fn report(result: std::io::Result<()>) -> ExitCode {
+    reported(result, |_| ExitCode::FAILURE)
+}
+
+/// [`report`] for the two modes that relay, which § 10 scores on a table of their own:
+/// `spawn` and `attach` distinguish a session that is not there from one they may not
+/// have, because their client acts on the difference.
+fn report_relay(result: std::io::Result<()>) -> ExitCode {
+    reported(result, |kind| match kind {
+        // A failure *during* the relay, which `attach::relay_failed` renames to this
+        // kind and nothing else in the crate constructs. The one row here that says
+        // nothing about the session: `nomux attach work > /var/log/big` on a filesystem
+        // that fills had the session for an hour and then could not write to its own
+        // stdout. Scored 126, that takes a working host out of the client's rotation as
+        // unattachable; 1 says what happened, which is that this attempt failed.
+        std::io::ErrorKind::ConnectionAborted => ExitCode::FAILURE,
+        // `NotFound` is the session `attach` refused to invent; `TimedOut` is a daemon
+        // `spawn` started that never bound — the same "not found", reached by waiting.
+        // The other wait that runs out is a `connect` to a socket somebody bound and
+        // stopped accepting on, which is a session and not a missing one; that this
+        // line cannot tell the two apart is why both modes rename it first, through
+        // `attach::may_be_running` and `attach::unattachable`, and never leave it as
+        // `TimedOut`.
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::TimedOut => {
+            ExitCode::from(EXIT_NO_SESSION)
+        }
+        _ => ExitCode::from(EXIT_UNATTACHABLE),
+    })
+}
+
+/// The half the two share: success, the message on stderr, and § 10's one reserved kind.
+/// `failed` scores everything else, which is the whole of what the two tables differ by.
+fn reported(
+    result: std::io::Result<()>,
+    failed: impl FnOnce(std::io::ErrorKind) -> ExitCode,
+) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("nomux: {err}");
             let kind = err.kind();
-            ExitCode::from(if kind == std::io::ErrorKind::InvalidInput {
-                EXIT_USAGE
-            } else if !relay {
-                1
-            } else if matches!(
-                kind,
-                // `NotFound` is the session `attach` refused to invent; `TimedOut` is a
-                // daemon `spawn` started that never bound — the same "not found",
-                // reached by waiting. The other wait that runs out is a `connect` to a
-                // socket somebody bound and stopped accepting on, which is a session
-                // and not a missing one; that this line cannot tell the two apart is
-                // why both modes rename it first, through `attach::may_be_running` and
-                // `attach::unattachable`, and never leave it as `TimedOut`.
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::TimedOut
-            ) {
-                EXIT_NO_SESSION
+            if kind == std::io::ErrorKind::InvalidInput {
+                ExitCode::from(EXIT_USAGE)
             } else {
-                EXIT_UNATTACHABLE
-            })
+                failed(kind)
+            }
         }
     }
 }

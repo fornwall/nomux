@@ -36,7 +36,14 @@ aarch64-unknown-linux-musl'
 # targets — by walking up from where it was started, and rustup reads rust-toolchain.toml the
 # same way; from another crate's directory that walk lands on that crate and builds it. The
 # cd is what makes "runs from anywhere" above mean what it says.
-repo=$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)
+#
+# `pwd -P` rather than the logical path, for the reason $target_root below resolves one too:
+# rustc records the physical path it opened a file through, and both uses of $repo are held
+# against that record — the --remap-path-prefix that has to cover it, and the check_leaks
+# needle that has to find it if the remap missed. Run through a symlinked checkout, the
+# logical path names a directory rustc never wrote down; the remap would then rewrite nothing
+# and the grep would agree, and the real path would ship unremapped and unreported.
+repo=$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd -P)
 cd "$repo"
 
 dist="$repo/target/dist"
@@ -49,33 +56,32 @@ update_baseline="${NOMUX_UPDATE_BASELINE:-0}"
 # builds, and only the publishing path keeps what they produce.
 companions="${NOMUX_DEBUG:-0}"
 
+# The file holds one `target bytes` pair per line, # comments ignored; this prints nothing at
+# all for a target it has no usable figure for, which is the only thing either caller asks.
+# One reader for both of them — the pre-flight just below and the gate itself, hundreds of
+# lines apart — so a line the gate would silently skip cannot be one the pre-flight accepted.
+baseline_for() {
+    [ -r "$baseline_file" ] || return 0
+    awk -v t="$1" '{ sub(/#.*/, "") }
+        $1 == t && NF == 2 && $2 ~ /^[0-9]+$/ { print $2; exit }' "$baseline_file"
+}
+
 # Read before building: finding a typo here after the cross builds have run is finding it too
 # late. Missing, malformed, and a line dropped from an otherwise fine file are one condition —
 # the gate has no reference for some target — and all refused rather than reported as a first
 # build. The last is likeliest and worst: it parses, it passes, and it leaves the gate
 # present, running, and unable to fail.
-baselines=''
-if [ -e "$baseline_file" ]; then
-    baselines=$(awk '
-        { sub(/#.*/, "") }
-        NF == 0 { next }
-        NF != 2 || $2 !~ /^[0-9]+$/ { exit 1 }
-        { print $1, $2 }
-    ' "$baseline_file") || baselines=''
-fi
 if [ "$update_baseline" != 1 ]; then
     unknown=''
     for target in $targets; do
-        printf '%s\n' "$baselines" | awk -v t="$target" '$1 == t { hit = 1 } END { exit !hit }' ||
-            unknown="$unknown $target"
+        [ -n "$(baseline_for "$target")" ] || unknown="$unknown $target"
     done
-    if [ -n "$unknown" ]; then
+    [ -z "$unknown" ] ||
         die "no usable entry in ${baseline_file#"$repo"/}, the growth gate's only reference," \
             "  for:$unknown" \
             "  It holds one \`target bytes\` pair per line, # comments ignored. Restore the" \
             "  line if it was dropped or its target misspelled; if the architecture is new," \
             "  rerun with NOMUX_UPDATE_BASELINE=1 and commit the recorded sizes."
-    fi
 fi
 
 # Through RUSTUP_TOOLCHAIN rather than a `+toolchain` argument, so every rustc and cargo
@@ -98,6 +104,23 @@ fi
 case "$nightly" in
 *[!A-Za-z0-9._-]*) die "${nightly_file#"$repo"/} must hold one plain toolchain name: '$nightly'" ;;
 esac
+
+# Installed rather than detected and complained about. Past the compiler this build needs std's
+# sources (-Zbuild-std compiles it here), both musl rust-std components (that build still links
+# their CRT objects and libc.a) and llvm-tools (the $readobj every run checks a binary with,
+# and the $objcopy a companion is checked with). Each used to be probed for separately, to
+# trade cargo's wall of linker errors for a `rustup` line to paste; running that line is
+# shorter, idempotent, and leaves nothing to be detected wrong. CI ran it as a step of its own
+# until this took it over, so a runner and a laptop now provision from one command.
+#
+# Ahead of every rustc call below, which run under RUSTUP_TOOLCHAIN=$nightly and would fail
+# outright without it; behind the charset check above, the name now reaching rustup as an
+# argument. The target list is joined out of $targets rather than restated, so what is
+# installed cannot drift from what is built. Chatter to stderr: stdout is the size table's.
+rustup toolchain install "$nightly" --profile minimal --no-self-update \
+    --component rust-src,llvm-tools \
+    --target "$(printf '%s' "$targets" | tr '\n' ',')" >&2
+
 RUSTUP_TOOLCHAIN="$nightly"
 export RUSTUP_TOOLCHAIN
 toolchain="$nightly"
@@ -107,36 +130,16 @@ toolchain="$nightly"
 version=$(rustc --version)
 
 # -Zbuild-std and -Cpanic=immediate-abort are nightly-only, and scripts/nightly-version is the
-# one place a stable toolchain can now get in: it passes every check below, which looks at the
-# sysroot and so says nothing about the channel, then dies minutes into the first cross build
-# nowhere near the cause. Asked of rustc, not matched on the name, so a linked nightly stands.
+# one place a stable toolchain can now get in: rustup installs one just as willingly as a
+# nightly, and nothing after this point looks at the channel — so unchecked it would die
+# minutes into the first cross build, nowhere near the cause. Asked of rustc rather than
+# matched on the name, so a linked nightly stands.
 case "$version" in
 *-nightly* | *-dev*) ;;
 *) die "$toolchain is not a nightly toolchain: $version" \
         "  the shipping build rebuilds std with panics compiled out, which only" \
         "  nightly accepts. Name a nightly in ${nightly_file#"$repo"/}." ;;
 esac
-
-# The gate holds this build's bytes against another build's, which is a comparison only if one
-# compiler produced both: a bump moves these by hundreds of bytes against a threshold of a few
-# thousand. So the baseline records the compiler that wrote it, and nightly-version and
-# size-baseline are checked against each other rather than trusted to move in one commit.
-if [ "$update_baseline" != 1 ]; then
-    measured_by=$(awk '/^#[[:space:]]*Measured on/ {
-        getline; sub(/^#[[:space:]]*/, ""); print; exit }' "$baseline_file")
-    if [ -z "$measured_by" ]; then
-        die "no \`# Measured on\` stamp in ${baseline_file#"$repo"/}: its figures name no" \
-            "  compiler, so this check cannot run. NOMUX_UPDATE_BASELINE=1 writes one."
-    fi
-    if [ "$measured_by" != "$version" ]; then
-        die "${baseline_file#"$repo"/} was measured by a different compiler than" \
-            "  ${nightly_file#"$repo"/} names, so its figures are not this build's:" \
-            "    building with: $version" \
-            "    measured by:   $measured_by" \
-            "  the two move in one commit. Rerun with NOMUX_UPDATE_BASELINE=1 and commit" \
-            "  the refreshed baseline beside the toolchain bump."
-    fi
-fi
 
 # Joined by U+001F as CARGO_ENCODED_RUSTFLAGS, not a whitespace-split RUSTFLAGS: three of
 # these interpolate a path — $CARGO_HOME, the sysroot, $repo — and one space in any of them
@@ -150,7 +153,10 @@ us=$(printf '\037')
 # dependency cannot quietly reintroduce the problem.
 sysroot=$(rustc --print sysroot)
 # Beside the toolchain's own `rust-lld`, so it is the same LLVM that linked and they read every
-# target the cross builds emit. Resolved after the toolchain is chosen, which decides which.
+# target the cross builds emit. Out of the toolchain rather than off the host for that reason:
+# one of the two targets is cross-compiled, and a host binutils that cannot read aarch64 is the
+# ordinary case rather than the odd one. Resolved after the toolchain is chosen, which decides
+# which — and after the install above, which is what put them there.
 # `llvm-readobj` rather than `llvm-readelf`: llvm-tools ships only the former, and it is the
 # same program — readelf is that binary under another name, differing in default output style.
 objcopy="$(rustc --print target-libdir)/../bin/llvm-objcopy"
@@ -168,6 +174,22 @@ case "$target_root" in
     /*) ;;
     *) die "CARGO_TARGET_DIR must be an absolute path or an existing directory: $target_root" ;;
 esac
+
+# The `t` hazard above, which is not particular to $CARGO_TARGET_DIR: check_leaks searches each
+# artifact for these four paths as bare substrings, and a short one turns up in any 175 KiB
+# binary by chance. `CARGO_TARGET_DIR=/t` is only the reachable case — it clears the check just
+# above and then fails every build on a coincidence — but a checkout or a $CARGO_HOME can be
+# just as short. Held up front rather than inside check_leaks: it is a property of the setting,
+# so it earns one message naming the setting, not one per artifact blaming an artifact that is
+# fine.
+for leak in "${CARGO_HOME:-$HOME/.cargo}" "$sysroot" "$repo" "$target_root"; do
+    [ "${#leak}" -ge 8 ] || die \
+        "the build path '$leak' is too short to search a binary for. Every artifact is" \
+        "  grepped for it, and something that short appears in any of them by chance, so" \
+        "  the build would fail on a coincidence rather than on a leak. Give the checkout," \
+        "  \$CARGO_HOME or \$CARGO_TARGET_DIR a longer path."
+done
+
 companion_dir="$target_root/companion"
 remap="--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
 remap="$remap$us--remap-path-prefix=$sysroot=/rust"
@@ -184,29 +206,6 @@ remap="$remap$us--remap-path-prefix=$repo=/nomux"
 # a host we know nothing about, discovered at a user's shell rather than here.
 rustflags="-Clink-self-contained=yes$us-Ctarget-feature=+crt-static$us$remap"
 rustflags="$rustflags$us-Zunstable-options$us-Cpanic=immediate-abort"
-
-# build-std compiles std from source but still links the musl CRT objects and libc.a out of
-# the target's rust-std component, so the component is needed even so. Checked here because
-# cargo's failure without it is an unreadable wall of linker errors.
-for target in $targets; do
-    libdir=$(rustc --print target-libdir --target "$target" 2>/dev/null) || libdir=''
-    if [ -z "$libdir" ] || [ ! -e "$libdir/self-contained/libc.a" ]; then
-        die "no rust-std for $target" "  rustup target add --toolchain $toolchain $target"
-    fi
-done
-if [ ! -e "$sysroot/lib/rustlib/src/rust/library/std/Cargo.toml" ]; then
-    die "build-std needs the standard library sources." \
-        "  rustup component add --toolchain $toolchain rust-src"
-fi
-# These ship with the toolchain rather than the host: one target is cross-compiled, and a host
-# binutils that cannot read aarch64 is the ordinary case rather than the odd one. llvm-readobj
-# is wanted on every run — check_static below is what makes the crt-static flag a fact rather
-# than a request — and llvm-objcopy only when the companions are built.
-if [ ! -x "$readobj" ] || { [ "$companions" = 1 ] && [ ! -x "$objcopy" ]; }; then
-    die "every binary is checked for runtime dependencies before it ships, and a debug" \
-        "  companion against the binary it describes." \
-        "  rustup component add --toolchain $toolchain llvm-tools"
-fi
 
 rm -rf "$dist"
 mkdir -p "$dist"
@@ -233,6 +232,45 @@ check_leaks() {
                 "      the artifact is reproducible only on this machine."
         fi
     done
+
+    # Those four are worth what the environment they were read out of is worth: they say what
+    # $CARGO_HOME, $HOME and rustup claim the paths are, which need not be how rustc spelled
+    # the ones it embedded — and a needle naming a path nothing was compiled through cannot
+    # match. A remap that never fired then reads exactly like one that worked.
+    #
+    # The textbook answer is a positive control — assert each artifact *does* carry the
+    # remapped `/cargo` and `/rust`. Measured here, it would fail every build: neither shipping
+    # binary nor either companion holds one occurrence of `/cargo`, `/rust`, `/nomux` or
+    # `/target`, there being no path left in them at all. [profile.release] sets no `debug`, so
+    # there is no DWARF even in the companion (`-Cstrip=none` restores the symbol table and
+    # nothing else), and -Cpanic=immediate-abort compiles out the `Location` strings that are
+    # the last paths an ordinary release binary carries. A control asserting what the build
+    # never emits is not a control but a gate that can only fail.
+    #
+    # What can be had is needles chosen by shape rather than by value: substrings that survive
+    # only in an *un*remapped path, however this machine spells $HOME, $CARGO_HOME or its
+    # sysroot, and that cannot occur in a correct one — every correct one reading `/cargo/…`,
+    # `/rust/…`, `/nomux/…` or `/target/…`. Being literals rather than paths this script
+    # derived, they cannot be defeated by its deriving one wrongly, which is the hole above.
+    #
+    #   .cargo/registry     remapped, a dependency path reads `/cargo/registry/src/…`: the byte
+    #                       before `cargo` is always `/`, never `.`. Bare `cargo/registry` is
+    #                       the needle that cannot be used, being a substring of that.
+    #   rustup/toolchains   the sysroot remaps to `/rust`, under which nothing is named
+    #                       `rustup`. No leading dot, so a $RUSTUP_HOME like /usr/local/rustup
+    #                       is caught as well as `~/.rustup`.
+    #
+    # `rustlib/src/rust` fails this test and is not usable: std's sources sit at
+    # $sysroot/lib/rustlib/src/rust/library/, so the correctly remapped path reads
+    # `/rust/lib/rustlib/src/rust/library/std/src/lib.rs` and contains it verbatim. A shape
+    # needle has to be held against the remapped form of the path, not only against the raw one.
+    for leak in .cargo/registry rustup/toolchains; do
+        if LC_ALL=C grep -qaF -- "$leak" "$1"; then
+            die "FAIL: ${1##*/} embeds an unremapped build path containing '$leak'" \
+                "      the remap flags name paths this script derived, and rustc wrote down" \
+                "      one they do not cover — so the exact needles above missed it too."
+        fi
+    done
 }
 
 # The rustflags above ask for a static binary; this is what says one came out. Asking is not
@@ -244,6 +282,18 @@ check_leaks() {
 # matches nothing and calls the binary clean.
 check_static() {
     elf=$("$readobj" --program-headers --dynamic-table "$1")
+    # That the output was parsed at all, before any weight is put on its silence. The verdict
+    # below is drawn from two patterns *not* matching — which is equally what an empty output,
+    # a readobj that wrote its complaint to stderr and exited 0, or a future release that
+    # renamed these fields would produce, and every binary would then be pronounced static
+    # without having been looked at. Every ELF that runs has at least one PT_LOAD; if that is
+    # missing, nothing was read and there is no verdict to give.
+    case "$elf" in
+    *PT_LOAD*) ;;
+    *) die "FAIL: could not read the program headers of ${1##*/}: $readobj reported no" \
+            "      PT_LOAD, so it did not parse the file, and its silence about PT_INTERP" \
+            "      and NEEDED says nothing about what this binary needs at runtime." ;;
+    esac
     if printf '%s\n' "$elf" | grep -qE 'PT_INTERP|NEEDED'; then
         die "FAIL: ${1##*/} is dynamically linked:" \
             "$(printf '%s\n' "$elf" | grep -E 'PT_INTERP|NEEDED')" \
@@ -332,7 +382,7 @@ for target in $targets; do
     # Bytes rather than a percentage: this is the number the gate compares, `sh` having no
     # floating point to round one with. Empty only on a refresh run, every target having been
     # held against the baseline before the builds started.
-    base=$(printf '%s\n' "$baselines" | awk -v t="$target" '$1 == t { print $2; exit }')
+    base=$(baseline_for "$target")
     delta=new
     if [ -n "$base" ]; then
         diff=$((bytes - base))
@@ -365,6 +415,12 @@ if [ "$update_baseline" = 1 ]; then
         # binary is still too big for the one gate that is not negotiable.
         echo "baseline left alone: a build that misses the cap is not one to record." >&2
     else
+        # The compiler that measured these, written down but deliberately not checked against
+        # the one building. A bump moves the figures by hundreds of bytes, tenths of a percent
+        # — see max_growth_pct above — against a threshold of some four thousand, so a stamp
+        # that disagrees never means a delta anyone would act on, and refusing to build on one
+        # only taught people to reach for the escape hatch. It stays as a comment, for a reader
+        # working out why a number moved between two commits.
         printf '%s\n# Measured on %s by:\n#   %s\n%s' \
             '# Per-target size baseline for scripts/build-release.sh, which says what it is for.' \
             "$(date -u '+%Y-%m-%d')" "$version" "$measured" > "$baseline_file"

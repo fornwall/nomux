@@ -13,7 +13,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 
-use nomux::{Frame, FrameType, HELLO_AGENT_FORWARD, RESUME_FROM_START};
+use nomux::{Frame, FrameType, RESUME_FROM_START};
 
 use harness::{
     Client, SPIN_WINDOW, Session, cpu_ticks, read_uninterrupted, socket_capacity, still_serving,
@@ -65,7 +65,7 @@ fn agent_forwarding_is_off_unless_asked_for() {
 /// announced, and bytes cross in both directions untouched.
 #[test]
 fn agent_forwarding_proxies_a_connection_in_both_directions() {
-    let (session, mut client, ok) = Session::attached_with("agent", HELLO_AGENT_FORWARD);
+    let (session, mut client, ok) = Session::attached_with("agent", true, false);
     assert!(ok.agent, "daemon should report the agent socket as served");
 
     // The child must be able to find it.
@@ -132,7 +132,7 @@ fn an_agent_socket_that_cannot_be_bound_leaves_an_honest_flag_and_a_live_session
         .expect("plant a directory where the agent socket goes");
 
     let mut client = session.connect();
-    let ok = client.hello_with(HELLO_AGENT_FORWARD, RESUME_FROM_START);
+    let ok = client.hello_with(true, false, RESUME_FROM_START);
     assert!(
         !ok.agent,
         "the daemon reported an agent socket it never bound"
@@ -164,7 +164,7 @@ fn an_agent_socket_that_cannot_be_bound_leaves_an_honest_flag_and_a_live_session
 /// returning client hears no `AgentOpen` for it and would answer nothing.
 #[test]
 fn agent_connections_fail_fast_while_detached() {
-    let (session, mut client, _) = Session::attached_with("agent_detached", HELLO_AGENT_FORWARD);
+    let (session, mut client, _) = Session::attached_with("agent_detached", true, false);
 
     // Confirmed open before the client leaves, otherwise the read below could be
     // answered by a socket the daemon had not yet accepted.
@@ -206,7 +206,7 @@ fn agent_connections_fail_fast_while_detached() {
 /// then hangs up rather than one that takes a moment.
 #[test]
 fn a_second_agent_connection_waits_for_the_one_being_served() {
-    let (session, mut client, ok) = Session::attached_with("agent_serial", HELLO_AGENT_FORWARD);
+    let (session, mut client, ok) = Session::attached_with("agent_serial", true, false);
     client.make_ready("-echo", None, ok.resume_from);
 
     let first = session.connect_agent();
@@ -271,7 +271,7 @@ fn a_second_agent_connection_waits_for_the_one_being_served() {
 /// longer holds, which is exactly what a frame overtaken by the turnover is.
 #[test]
 fn frames_for_a_peer_that_ended_are_not_answered_by_its_successor() {
-    let (session, mut client, ok) = Session::attached_with("agent_turnover", HELLO_AGENT_FORWARD);
+    let (session, mut client, ok) = Session::attached_with("agent_turnover", true, false);
     client.make_ready("-echo", None, ok.resume_from);
 
     let ending = session.connect_agent();
@@ -373,7 +373,7 @@ fn an_agent_connection_whose_queue_outgrows_the_cap_is_closed_alone() {
     /// has to sit in the queue.
     const OVERSHOOT: usize = 256 * 1024;
 
-    let (session, mut client, ok) = Session::attached_with("agent_queue", HELLO_AGENT_FORWARD);
+    let (session, mut client, ok) = Session::attached_with("agent_queue", true, false);
     client.make_ready("-echo", None, ok.resume_from);
 
     let capacity = socket_capacity();
@@ -478,7 +478,7 @@ fn overqueued_then_closed(name: &str) -> Overqueued {
     /// has to keep, and it stays comfortably short of `MAX_CHANNEL_QUEUE`.
     const OVERSHOOT: usize = 96 * 1024;
 
-    let (session, mut client, ok) = Session::attached_with(name, HELLO_AGENT_FORWARD);
+    let (session, mut client, ok) = Session::attached_with(name, true, false);
     // `-echo`, so everything on the output stream is the child answering rather than
     // the line discipline repeating the question, and the markers below can be read
     // one after another from a stream that joins up.

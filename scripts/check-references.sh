@@ -1,146 +1,108 @@
 #!/bin/sh
 # Every `§ N` in this tree names a section of IMPLEMENTATION.md or DESIGN.md, and nothing
-# checks that the section is there. The documents carry 700-odd of these citations and the
-# source carries most of them, so a renumbering breaks references in files no one reopens
-# and the loss is silent: a comment pointing at a section that no longer exists reads
-# exactly like one that does.
+# checks that the section is there. The tree carries ~700 of these, most of them in source
+# comments, so a renumbering breaks references in files no one reopens and the loss is
+# silent: a comment pointing at a section that has gone reads exactly like one that has not.
+# Markdown links rot the same way and in two halves — the path, which a rename empties, and
+# the `#anchor`, which a retitled heading empties while the link still opens the right file.
 #
-# The rule this enforces is the convention the tree already follows: a citation qualified
-# with a document name means that document, an unqualified one means IMPLEMENTATION.md
-# from the source and the enclosing document from a document. RFC citations are named as
-# such and are nobody's section number here.
+# The rule enforced is the convention the tree already follows: a citation qualified with a
+# document name means that document, an unqualified one means IMPLEMENTATION.md from the
+# source and the enclosing document from within a document. RFC citations are somebody
+# else's numbers and PLAN.md numbers its own sections `P3`, so neither is checked here.
 #
-# Exits non-zero listing every citation that resolves to nothing.
+# Exits non-zero listing every citation and link that resolves to nothing.
 set -eu
+unset CDPATH
+cd -- "$(dirname -- "$0")/.."
 
-repo=$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)
-cd "$repo"
-
-# The numbered headings each document defines: `## 6. Daemon` and `### 6.3 Socket` both
-# define a section, and `#### Identification` defines none. The trailing dot is optional
-# and inconsistent in the tree, so it is stripped on both sides of the comparison.
-sections() {
-    sed -n 's/^#\{2,4\} \([0-9][0-9.]*\)\.\? .*/\1/p' "$1" | sed 's/\.$//'
+# One awk over the whole tree: the shell read-loop this replaced spawned ~2,300 sed and grep
+# to do the same work, and took twelve seconds over it. NUL-delimited so a path with a space
+# survives; `scripts/` picks up the extensionless `nightly-version` and `size-baseline` the
+# extension globs miss. awk opens each file itself rather than taking them as operands: a
+# path can be in the index and gone from the worktree mid-rename, where `getline` answers -1
+# instead of dying, and a name holding `=` cannot be mistaken for a variable assignment.
+git ls-files -z '*.rs' '*.md' '*.sh' '*.toml' '*.yml' '*.yaml' scripts/ | tr '\0' '\n' | awk '
+function bad(f, n, m) { printf "%s:%s: %s\n", f, n, m > "/dev/stderr"; fails++ }
+function whose(q) {  # the document a citation names; "-" for one that is not ours to check
+    if (q ~ /RFC/) return "-"
+    if (q ~ /DESIGN\.md/) return "DESIGN.md"
+    if (q ~ /PLAN\.md/) return "-"
+    return (q ~ /IMPLEMENTATION\.md/) ? "IMPLEMENTATION.md" : ""
 }
-
-impl_sections=$(sections IMPLEMENTATION.md)
-design_sections=$(sections DESIGN.md)
-
-# The fragment a heading answers to, by the rule GitHub renders with: lowercased, with
-# everything that is not alphanumeric, a space or a hyphen dropped — backticks, dots and
-# `§` included — and spaces then turned into hyphens. `### 6.1.1 What the child runs`
-# becomes `611-what-the-child-runs`.
-anchors() {
-    sed -n 's/^#\{1,6\} //p' "$1" |
-        tr '[:upper:]' '[:lower:]' |
-        sed 's/[^a-z0-9 -]//g; s/ /-/g'
+# The headings of one file, read once. `## 6. Daemon` and `### 6.3 Socket` each define a
+# section and `#### Identification` defines none; the trailing dot is inconsistent in the
+# tree, so it is stripped on both sides. Every heading also answers to the fragment GitHub
+# derives: lowercased, all but alphanumeric, space and hyphen dropped, spaces to hyphens.
+function load(p,   r, l, h, n) {
+    if (p in done) return
+    done[p] = ex[p] = 1
+    while ((r = (getline l < p)) > 0) {
+        if (l !~ /^#+ /) continue
+        h = substr(l, index(l, " ") + 1)
+        if (l ~ /^###?#? / && match(h, /^[0-9][0-9.]* /)) {
+            n = substr(h, 1, RLENGTH - 1); sub(/\.$/, "", n); sec[p, n] = 1
+        }
+        h = tolower(h); gsub(/[^a-z0-9 -]/, "", h); gsub(/ /, "-", h); anc[p, h] = 1
+    }
+    if (r < 0) ex[p] = 0
+    close(p)
 }
-
-# A citation is `§` plus a number, optionally preceded on the same line by the document it
-# names. `RFC <n> §` is a citation into somebody else's document and is skipped.
-#
-# grep -o loses the line number, so the scan is per file per line: the tree is small and
-# this runs in well under a second.
-failures=0
-report() {
-    printf '%s:%s: § %s does not name a section of %s\n' "$1" "$2" "$3" "$4" >&2
-    failures=$((failures + 1))
+# A link target is not prose, and reading it as prose is how `[§ 5.2](IMPLEMENTATION.md#…)`
+# came to be checked against DESIGN.md: the qualifier was whatever filename happened to sit
+# in a neighbouring URL. So every link collapses to its visible text, with the target kept in
+# front only when that text carries a `§` — the one citation that target may speak for.
+function delink(s,   t, g, i, r) {
+    while (match(s, /\[[^][]*\]\([^()]*\)/)) {
+        t = substr(s, RSTART, RLENGTH); i = index(t, "](")
+        g = substr(t, i + 2, length(t) - i - 2); t = substr(t, 2, i - 2)
+        r = (t ~ /§/) ? g " " t : t
+        s = substr(s, 1, RSTART - 1) r substr(s, RSTART + RLENGTH)
+    }
+    return s
 }
-
-for file in $(git ls-files '*.rs' '*.md' '*.sh' '*.toml' '*.yml'); do
-    case "$file" in
-        # This script names section numbers only as examples.
-        scripts/check-references.sh) continue ;;
-    esac
-    line_no=0
-    # SC2094: `report` names the file being read, but writes only to stderr.
-    # shellcheck disable=SC2094
-    while IFS= read -r line || [ -n "$line" ]; do
-        line_no=$((line_no + 1))
-        case "$line" in
-            *§*) ;;
-            *) continue ;;
-        esac
-        # Each `§` on the line, with the text before it, so the qualifier is visible.
-        rest=$line
-        while :; do
-            case "$rest" in
-                *§*) ;;
-                *) break ;;
-            esac
-            before=${rest%%§*}
-            rest=${rest#*§}
-            number=$(printf '%s' "$rest" | sed -n 's/^ \{0,1\}\([0-9][0-9.]*\).*/\1/p' | sed 's/\.$//')
-            [ -n "$number" ] || continue
-            # Whose section is it? The last document named before the `§` wins; an RFC
-            # citation is not ours to check.
-            case "$before" in
-                *RFC*) continue ;;
-                *DESIGN.md*) doc=DESIGN.md; known=$design_sections ;;
-                *PLAN.md*) continue ;;
-                *IMPLEMENTATION.md*) doc=IMPLEMENTATION.md; known=$impl_sections ;;
-                *)
-                    case "$file" in
-                        DESIGN.md) doc=DESIGN.md; known=$design_sections ;;
-                        *) doc=IMPLEMENTATION.md; known=$impl_sections ;;
-                    esac
-                    ;;
-            esac
-            printf '%s\n' "$known" | grep -qxF "$number" || report "$file" "$line_no" "$number" "$doc"
-        done
-    done < "$file"
-done
-
-# Markdown links to files in this repository. A document that is deleted or renamed takes
-# every link to it down silently, and the § check above cannot see it: a citation of
-# `PLAN.md § P3` names a section of a file rather than one of ours, so it is skipped there
-# and would be missed entirely.
-for md in $(git ls-files '*.md'); do
-    line_no=0
-    while IFS= read -r line || [ -n "$line" ]; do
-        line_no=$((line_no + 1))
-        rest=$line
-        while :; do
-            case "$rest" in
-                *']('*) ;;
-                *) break ;;
-            esac
-            rest=${rest#*](}
-            target=${rest%%)*}
-            case "$target" in
-                # Other people's servers, mail, and same-document anchors.
-                http://* | https://* | mailto:* | '#'*) continue ;;
-            esac
-            path=${target%%#*}
-            [ -n "$path" ] || continue
-            if [ ! -e "$repo/$path" ]; then
-                printf '%s:%s: link to %s, which is not in the repository\n' \
-                    "$md" "$line_no" "$path" >&2
-                failures=$((failures + 1))
-                continue
-            fi
-            # The `#anchor` half, which rots exactly as quietly as the path: a renamed
-            # heading leaves a link that still opens the right file at the wrong place.
-            case "$target" in
-                *'#'*) ;;
-                *) continue ;;
-            esac
-            case "$path" in
-                *.md) ;;
-                *) continue ;;
-            esac
-            anchor=${target#*#}
-            printf '%s\n' "$(anchors "$repo/$path")" | grep -qxF "$anchor" || {
-                printf '%s:%s: %s has no heading anchored at #%s\n' \
-                    "$md" "$line_no" "$path" "$anchor" >&2
-                failures=$((failures + 1))
-            }
-        done
-    done < "$md"
-done
-
-if [ "$failures" -ne 0 ]; then
-    printf '\n%s dangling reference(s).\n' "$failures" >&2
-    exit 1
-fi
-printf 'all § references and document links resolve\n'
+function scan(f,   n, l, t, m, g, p, a, q, k, doc, num, prev) {
+    while ((getline l < f) > 0) {
+        n++; t = l
+        # Links into the repository, from the documents that carry them; other servers, mail
+        # and same-document anchors are nothing here to resolve.
+        while (f ~ /\.md$/ && match(t, /\]\([^()]*\)/)) {
+            g = substr(t, RSTART + 2, RLENGTH - 3); t = substr(t, RSTART + RLENGTH)
+            if (g ~ /^(https?:|mailto:|#)/) continue
+            p = g; sub(/#.*/, "", p); a = substr(g, index(g, "#") + 1); load(p)
+            if (!ex[p]) bad(f, n, "link to " p ", which is not in the repository")
+            else if (index(g, "#") && p ~ /\.md$/ && !((p, a) in anc))
+                bad(f, n, p " has no heading anchored at #" a)
+        }
+        # A citation is `§` and a number, or the same thing spelled out — `IMPLEMENTATION.md
+        # 6.6` is user-visible in `--help` and rots identically. What qualifies it is the
+        # text back to the previous citation on the line, and nothing further.
+        t = l = delink(l); k = 0
+        while (match(t, /(§ ?|(IMPLEMENTATION|DESIGN)\.md )[0-9][0-9.]*/)) {
+            q = substr(t, 1, RSTART - 1); m = substr(t, RSTART, RLENGTH); k++
+            t = substr(t, RSTART + RLENGTH)
+            num = m; sub(/^[^0-9]*/, "", num); sub(/\.$/, "", num)
+            if (m ~ /^§/) doc = whose(q); else { doc = m; sub(/ .*/, "", doc) }
+            # A citation wraps: a comment names DESIGN.md at the end of one line and cites
+            # `§ 6.4` at the start of the next. So the window carries over the break — but
+            # only what the line before left after its own last citation, or a document
+            # already spoken for there would qualify this one too.
+            if (doc == "" && k == 1 && f !~ /\.md$/) doc = whose(prev)
+            if (doc == "-") continue
+            if (doc == "") doc = (f == "DESIGN.md") ? f : "IMPLEMENTATION.md"
+            if (!((doc, num) in sec)) bad(f, n, "§ " num " does not name a section of " doc)
+        }
+        prev = t
+    }
+    close(f)
+}
+{ if ($0 != "scripts/check-references.sh") list[++nf] = $0 }  # this one cites by example only
+END {
+    # Documents first: one that links to itself would otherwise have awk reopen the very
+    # file it is in the middle of reading.
+    for (i = 1; i <= nf; i++) if (list[i] ~ /\.md$/) load(list[i])
+    for (i = 1; i <= nf; i++) scan(list[i])
+    if (fails) { printf "\n%d dangling reference(s).\n", fails > "/dev/stderr"; exit 1 }
+    print "all § references and document links resolve"
+}
+'

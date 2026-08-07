@@ -11,11 +11,11 @@
 //! under the flock, and the conversation behind it.
 //!
 //! The relay half is § 7 and belongs to neither mode: the byte pipe between the
-//! client's stdio and the session socket, in both the `splice` and the copying
-//! spelling, and every way it has to leave. Those tests start no daemon at all. The
-//! relay parses nothing, so a socket the test binds itself is a complete peer, the
-//! assertions are about bytes rather than about the protocol, and `attach` is what
-//! they run — a session is already there, which is exactly what that mode asks for.
+//! client's stdio and the session socket, and every way it has to leave. Those tests
+//! start no daemon at all. The relay parses nothing, so a socket the test binds itself
+//! is a complete peer, the assertions are about bytes rather than about the protocol,
+//! and `attach` is what they run — a session is already there, which is exactly what
+//! that mode asks for.
 
 #![allow(
     clippy::expect_used,
@@ -37,8 +37,8 @@ use nomux::{Frame, RESUME_FROM_START};
 use harness::{
     Rng, SETTLE, Session, Spawned, accept_within, collect, control, daemon_reaper, entries,
     has_unread_bytes, hello_frame, join_before, nomux, nomux_with_shell, poll_by, poll_until,
-    process_state, push_until_refused, read_uninterrupted, run_root, shrink_send_buffer, stderr,
-    stdout, still_serving, succeeded, wedge_socket, while_nothing_forks, write_frame,
+    process_state, read_uninterrupted, run_root, shrink_send_buffer, stderr, stdout, still_serving,
+    succeeded, wedge_socket, while_nothing_forks, write_frame,
 };
 
 /// A daemon that cannot publish `<id>.pid` refuses to start rather than serving a
@@ -96,11 +96,14 @@ fn a_daemon_that_cannot_publish_its_pidfile_refuses_to_start() {
 /// The other half of the relay's exit table: a session that is not there and could
 /// not be started is 127, the shell's "not found" (`IMPLEMENTATION.md` § 10).
 ///
-/// The pair matters more than either number. `DESIGN.md` § 7 has the client cache a
-/// host as *unattachable* on 126 and go on trying on 127, so the two are read as
-/// "stop" and "try again" — and until this test and the one above them, nothing in
-/// the suite would have noticed them swapped, collapsed into 1, or both answered
-/// with whichever branch `run_session_mode` reached first.
+/// The set matters more than any one number. `DESIGN.md` § 7 has the client cache a
+/// host as *unattachable* on 126, go on trying on 127, and read 1 as this attempt alone
+/// having failed — "stop", "try again", and "nothing follows about the session" — so
+/// the three arms of `main::report_relay`'s match are three different things a client
+/// does next. Until these tests, nothing in the suite would have noticed any two of
+/// them swapped, or all three collapsed into whichever arm that match reached first.
+/// The third is
+/// [`a_relay_that_fails_mid_stream_is_not_a_host_the_client_gives_up_on`].
 ///
 /// `spawn`'s now that `attach` starts nothing, and the row it exercises is the one
 /// only `spawn` can reach: `TimedOut`, a daemon that never came up. § 10 puts that on
@@ -247,9 +250,9 @@ fn spawn_refuses_a_wedged_session_without_unlinking_the_lock_it_took() {
 ///
 /// Both spellings of "nothing answers", because they reach the refusal through
 /// different code and only one of them was ever a refusal: a run directory this host
-/// has never made, where `check_dir` answers `NotFound`, and one that exists and
+/// has never made, where `check_run_dir` answers `false`, and one that exists and
 /// holds no such session, where the `connect` does. The first is why `attach` had to
-/// stop calling `ensure_dir` — being asked to join a session must not be what brings
+/// stop calling `ensure_run_dir` — being asked to join a session must not be what brings
 /// the directory it would have lived in into existence, which is `list` and `kill`'s
 /// rule (§ 6.3) and is now this mode's too.
 #[test]
@@ -348,10 +351,9 @@ fn refuses(out: &Output, code: i32, must_say: &str, what: &str) {
 ///
 /// Named for what it asserts. It used to say "relays transparently", and what it
 /// looks for is a substring in a byte stream — which says the frames got through in
-/// *some* form and nothing about transparency. That property has tests of its own
-/// and they are byte-exact over both the `splice` and the copying paths of § 7;
-/// this one is about the spawn, and the round trip through the child is how it
-/// establishes that the daemon it started is really serving.
+/// *some* form and nothing about transparency. That property has a test of its own
+/// and it is byte-exact; this one is about the spawn, and the round trip through the
+/// child is how it establishes that the daemon it started is really serving.
 #[test]
 fn spawn_starts_a_daemon_for_a_session_that_does_not_exist_yet() {
     use std::sync::mpsc;
@@ -389,7 +391,7 @@ fn spawn_starts_a_daemon_for_a_session_that_does_not_exist_yet() {
         }
     });
 
-    write_frame(&mut stdin, &hello_frame(0, RESUME_FROM_START));
+    write_frame(&mut stdin, &hello_frame(false, false, RESUME_FROM_START));
     write_frame(
         &mut stdin,
         &Frame::Input {
@@ -547,19 +549,11 @@ fn spawn_starts_the_binary_it_is_running_not_the_one_now_at_its_path() {
 
 /// Bulk traffic through the attach relay, both ways at once.
 ///
-/// The relay moves bytes with `splice(2)` where the kernel allows it and by
-/// copying where it does not, decided per direction at runtime — two paths through
-/// the one component that must never break. Bulk is what makes that
-/// interesting: enough to fill and refill the pipe and the socket, so both paths
-/// hit short transfers and full destinations. A chunk dropped, replayed or
-/// reordered at a path boundary then shows up as a first-difference index instead
-/// of as output that still looks plausible.
-///
-/// Which of the two this one takes is not in doubt, though: `Stdio::piped()` puts a
-/// pipe on one end of every transfer, which is exactly what `splice` asks for, so
-/// both directions here splice and neither ever copies. The test below is the same
-/// traffic over stdio the kernel refuses, and is the only thing that pins the other
-/// path.
+/// The relay copies every byte through a per-direction buffer of one `RELAY_CHUNK`, so
+/// bulk is what makes this interesting: enough to fill and refill the pipe and the
+/// socket, so both directions hit short reads and full destinations. A chunk dropped,
+/// replayed or reordered at a buffer boundary then shows up as a first-difference index
+/// instead of as output that still looks plausible.
 ///
 /// No daemon here on purpose. The relay never parses a frame, so a bare socket is
 /// a complete peer, and the assertions can be about bytes rather than about the
@@ -568,8 +562,9 @@ fn spawn_starts_the_binary_it_is_running_not_the_one_now_at_its_path() {
 fn the_relay_moves_bulk_traffic_both_ways_without_losing_a_byte() {
     // Eight pipes and two and a half socket buffers per direction, which is what
     // "fill and refill" above asks for. It was two megabytes, on no argument beyond
-    // being a round number; the figure is the sibling below's, and so is the reason
-    // for it.
+    // being a round number: what a mis-slice or a swallowed short read does at one
+    // buffer boundary it does at every one of them, so the extra megabytes buy only
+    // seconds.
     const BULK: usize = 512 * 1024;
 
     let (mut child, peer, _listener) = relay_onto_a_socket("relay_bulk", Stdio::piped());
@@ -595,64 +590,6 @@ fn the_relay_moves_bulk_traffic_both_ways_without_losing_a_byte() {
     );
 }
 
-/// The same traffic again, over stdio no kernel will splice — which is the only way
-/// to reach the half of the relay the test above never runs.
-///
-/// `Pump::transfer` reaches for `splice` first and copies through a 16 KiB buffer
-/// only once the kernel has refused the pair, latching that refusal for the life of
-/// the direction. Stdio on a `socketpair` is what takes the pipe away, and is the
-/// case `splice_once` names in so many words: sshd handing the client socket-backed
-/// stdio instead of pipes. Socket to socket is `EINVAL`, which is neither `EINTR`
-/// nor `EAGAIN` and so arrives as `Spliced::Unusable`, so from the first wakeup in
-/// each direction every byte below crosses through `copy_in` and `drain_to` and none
-/// through the kernel.
-///
-/// Both endings are the fallback's too: the half-close on stdin and the one on the
-/// socket each reach the relay as `copy_in` reading zero, and getting either wrong
-/// truncates or hangs one of the two comparisons below.
-#[test]
-fn the_relay_moves_the_same_traffic_by_copying_when_the_kernel_will_not_splice_it() {
-    use std::net::Shutdown;
-    use std::os::fd::OwnedFd;
-
-    // The same as the splice test moves, and 32 buffers per direction: what a
-    // mis-slice or a swallowed short read does at one 16 KiB boundary it does at
-    // every one of them, so the extra megabytes buy only seconds. Copying is the
-    // slower path by construction — one `read` and one `writev` per chunk, against
-    // one `splice` per 64 KiB.
-    const BULK: usize = 512 * 1024;
-
-    let (mut feed, relay_stdin) = UnixStream::pair().expect("a socketpair for the relay's stdin");
-    let (mut drain, relay_stdout) =
-        UnixStream::pair().expect("a socketpair for the relay's stdout");
-    let (child, peer, _listener) = relay_onto_a_socket_over(
-        "relay_copy",
-        Stdio::from(OwnedFd::from(relay_stdin)),
-        Stdio::from(OwnedFd::from(relay_stdout)),
-        Stdio::piped(),
-    );
-
-    assert_relay_moves_bulk(
-        child,
-        peer,
-        BULK,
-        (0x0c07_9114, 0xc0de_5a1e),
-        move |data| {
-            feed.write_all(data).expect("write to relay stdin");
-            // The half-close the relay must turn into shutdown(SHUT_WR) on the
-            // socket while it goes on draining the other direction. A socket's, not
-            // a pipe's, but `copy_in` reads the same zero from either.
-            feed.shutdown(Shutdown::Write)
-                .expect("half-close the relay's stdin");
-        },
-        move || {
-            let mut got = Vec::new();
-            drain.read_to_end(&mut got).expect("read relay stdout");
-            got
-        },
-    );
-}
-
 /// The budget a relay test gives the relay, as a whole rather than per wait.
 ///
 /// Far above the second or so the transfers really take, and far below the
@@ -667,11 +604,6 @@ fn the_relay_moves_the_same_traffic_by_copying_when_the_kernel_will_not_splice_i
 const RELAY_PATIENCE: Duration = Duration::from_secs(25);
 
 /// Moves `bulk` bytes each way through a relay and compares both directions.
-///
-/// Shared by the two tests above, which differ only in the stdio the relay is handed
-/// — and therefore in whether the kernel will splice it — and in how the feeding side
-/// half-closes. Everything else was written twice: the same four threads, the same
-/// order of joins, and the same pair of comparisons.
 ///
 /// `feed` writes the upstream bytes and then half-closes; `drain` reads the
 /// downstream ones to end of file. Both own their descriptor, so the choice of pipe
@@ -694,9 +626,9 @@ fn assert_relay_moves_bulk(
     let downstream = Rng::new(seeds.1).bytes(bulk);
 
     // Four threads because all four flows must run at once: with any one of them
-    // parked the relay's back pressure would deadlock the other three. More sharply
-    // on the copying path, which writes to a *blocking* stdout — there a reader that
-    // stops reading stops the relay rather than filling a buffer.
+    // parked the relay's back pressure would deadlock the other three. Sharply so,
+    // the relay writing to a *blocking* stdout: a reader that stops reading stops the
+    // relay rather than filling a buffer.
     let feeder = {
         let data = upstream.clone();
         thread::spawn(move || feed(&data))
@@ -745,53 +677,6 @@ fn assert_relay_moves_bulk(
     assert_same(&downstream, &downlink, "socket -> stdout", &complaints);
 }
 
-/// Regression: the relay must leave when its output has nowhere left to go.
-///
-/// `splice` into a full destination reports `EAGAIN`, which the relay records as
-/// `dest_full` and answers by polling that destination for `POLLOUT` and holding
-/// off on reading the source. If the destination's peer then dies, `poll` reports
-/// `POLLERR` — never `POLLOUT`, because a pipe nobody is reading never becomes
-/// writable — and the drain that would clear the latch was guarded on `POLLOUT`
-/// alone, so nothing in the iteration could act and the loop spun at the speed of
-/// the scheduler.
-///
-/// A bare socket for a peer, as in the bulk test above — the relay parses nothing,
-/// so a daemon here would only add a protocol conversation the bug does not need.
-#[test]
-fn the_relay_exits_when_its_stdout_dies_with_the_destination_latched_full() {
-    /// Far more than the ~264 KiB the socket buffer and the stdout pipe hold between
-    /// them, so the push below cannot end by simply running out of bytes.
-    const PUSH: usize = 8 << 20;
-
-    let (mut child, mut peer, _listener) = relay_onto_a_socket("relay_spin", Stdio::null());
-    // Stdin stays open and idle throughout. It is in the poll set the whole time,
-    // which is the point: the wakeups being spun on come from stdout, so a relay
-    // that blocked on stdin instead would hide the bug.
-    let _stdin = child.stdin.take().expect("stdin");
-    let stdout = child.stdout.take().expect("stdout");
-
-    // Push until the kernel stops taking it: that is the socket buffer *and* the
-    // stdout pipe both full, which is what leaves the relay's last `splice` sitting
-    // on `EAGAIN` with `dest_full` latched and its buffer empty.
-    peer.set_nonblocking(true).expect("nonblocking peer");
-    let sent = push_until_refused(&mut peer, &vec![b'x'; PUSH], Duration::from_secs(1));
-    // Asserted rather than assumed: every other way out of that push leaves the
-    // destination unlatched, and stdout is then not in the relay's poll set at all —
-    // which is the state the *next* test is about, and this one would pass while
-    // proving it a second time.
-    assert!(
-        sent < PUSH,
-        "the relay's socket and stdout pipe took all {PUSH} bytes, so nothing was \
-         ever latched full"
-    );
-
-    // Nothing has read a byte of stdout, so the pipe is full and the relay is
-    // waiting for it to become writable. Now take away the reader.
-    drop(stdout);
-
-    assert_relay_left(child, "with its stdout gone and its buffer empty");
-}
-
 /// Regression: the relay must leave when its stdout dies while nothing is owed to it,
 /// which is the state it is in almost all of the time. It used to answer the `EPIPE`
 /// by dropping the buffer and carrying on, discarding every byte the session produced
@@ -804,7 +689,8 @@ fn the_relay_exits_when_its_stdout_dies_with_the_destination_latched_full() {
 /// read end is gone then answers `POLLOUT | POLLERR` and the `ERR` branch wins, so the
 /// relay leaves without attempting the write at all. A socket that has shut down its
 /// read half answers `POLLOUT` alone and the `EPIPE` from the write is the only report
-/// there is, which is [`the_relay_exits_when_a_stdout_it_can_only_copy_to_stops_reading`].
+/// there is, which is
+/// [`the_relay_exits_when_a_stdout_that_still_reports_itself_writable_stops_reading`].
 ///
 /// Asserted as the relay exiting rather than as bytes not moving, because that is the
 /// only thing that tells the two apart: a discard loop accepts everything it is handed
@@ -815,8 +701,8 @@ fn the_relay_exits_when_its_stdout_dies_with_the_destination_latched_full() {
 /// flight holds a copy of everything open here.
 #[test]
 fn the_relay_exits_when_its_stdout_dies_with_nothing_owed_to_it() {
-    // Before a single byte has crossed, so the direction is idle rather than
-    // latched: nothing buffered, and no `splice` left sitting on a full pipe.
+    // Before a single byte has crossed, so the direction is idle: nothing buffered,
+    // and so stdout not in the poll set at all.
     let broken = while_nothing_forks(|| {
         let (reader, writer) = std::io::pipe().expect("a pipe for the relay's stdout");
         drop(reader);
@@ -834,36 +720,31 @@ fn the_relay_exits_when_its_stdout_dies_with_nothing_owed_to_it() {
     let _stdin = child.stdin.take().expect("stdin");
 
     // One chunk is the whole provocation. The relay wakes on the readable socket,
-    // takes it — by `splice` where the kernel allows it, which a pipe with no
-    // reader refuses, and then by copying — and finds on the write that there is
-    // nobody left to hand it to.
+    // buffers it, and finds on the next pass that there is nobody left to hand it to.
     peer.write_all(&vec![b'x'; 8 * 1024])
         .expect("write to the relay's socket");
 
     assert_relay_left(child, "with its stdout gone and its buffer idle");
 }
 
-/// The same ending on a relay that was already copying before its stdout died.
+/// The same ending reached the other way: through the write rather than through `poll`.
 ///
-/// The two above take stdio the kernel will splice, so the death and the fallback
-/// arrive together: `splice` into a pipe with no reader is `EPIPE`, `splice_once`
-/// folds that into `Spliced::Unusable`, and the copying path is switched on *by* the
-/// very thing it then has to report. Which leaves the ordinary case untested — a
-/// relay that has been copying all along, on a host that never had a pipe to splice
-/// through, losing its reader mid-session. Over a `socketpair` the two come apart:
-/// `splice` is refused for being handed no pipe at all, and the `EPIPE` arrives
-/// later and from somewhere else, `nbio::drain_to`'s `writev`, with `splice_refused`
-/// long since latched.
+/// The test above takes a *pipe* for its stdout, and a pipe with no reader answers
+/// `POLLOUT | POLLERR`, so the relay leaves on the `ERR` branch without ever attempting
+/// the write. A `socketpair` whose peer has shut down its read half reports `POLLOUT`
+/// alone and takes the write, and `nbio::drain_to`'s `writev` answering `EPIPE` is then
+/// the only report there is — which is the shape a socket-backed stdout gives, and sshd
+/// hands the client one on some builds.
 ///
 /// Cheap enough to be worth having: one chunk, one process, and no timing to get
 /// right, since the reader stops reading before the relay has anything to hand it.
 #[test]
-fn the_relay_exits_when_a_stdout_it_can_only_copy_to_stops_reading() {
+fn the_relay_exits_when_a_stdout_that_still_reports_itself_writable_stops_reading() {
     use std::net::Shutdown;
     use std::os::fd::OwnedFd;
 
-    // Held open and idle, as in the two tests above: the socket is the test's own, so
-    // a stdin closed here would half-close the one direction that could otherwise end
+    // Held open and idle, as in the test above: the socket is the test's own, so a
+    // stdin closed here would half-close the one direction that could otherwise end
     // this relay for a reason that is not the one under test.
     let (_stdin, relay_stdin) = UnixStream::pair().expect("a socketpair for the relay's stdin");
     let (reader, relay_stdout) = UnixStream::pair().expect("a socketpair for the relay's stdout");
@@ -879,8 +760,8 @@ fn the_relay_exits_when_a_stdout_it_can_only_copy_to_stops_reading() {
     // the copy another test's `fork` in flight is holding cannot undo it where a close
     // could.
     //
-    // Before a byte has crossed, so nothing is owed to it and nothing is latched: the
-    // relay is not watching this descriptor and cannot be told about it.
+    // Before a byte has crossed, so nothing is owed to it: the relay is not watching
+    // this descriptor and cannot be told about it.
     reader
         .shutdown(Shutdown::Read)
         .expect("stop reading the relay's stdout");
@@ -888,11 +769,11 @@ fn the_relay_exits_when_a_stdout_it_can_only_copy_to_stops_reading() {
     peer.write_all(&vec![b'x'; 8 * 1024])
         .expect("write to the relay's socket");
 
-    assert_relay_left(child, "with a stdout it could only copy to gone");
+    assert_relay_left(child, "with a stdout that had stopped reading");
 }
 
-/// The ending the three tests above share: the relay leaves, and § 10 gives exit 0 to
-/// one whose own stdout was closed by its reader — whichever of the three ways it
+/// The ending the two tests above share: the relay leaves, and § 10 gives exit 0 to
+/// one whose own stdout was closed by its reader — whichever of the two ways it
 /// finds that out. Nothing asserted the status, so the only part of § 10's row that
 /// was ever under test was that the process stopped.
 fn assert_relay_left(mut child: Spawned, still_running: &str) {
@@ -912,6 +793,69 @@ fn assert_relay_left(mut child: Spawned, still_running: &str) {
     );
 }
 
+/// The third number in § 10's relay table: a relay that had the session and then broke
+/// is 1, and says nothing about the session.
+///
+/// Everything else out of `attach::run` answers § 10's question — whether this mode can
+/// have this session — and every kind that table does not name is 126, which
+/// `DESIGN.md` § 7 has the client cache *per host*. A write that fails an hour in has
+/// already answered that question, and answered it yes: scored 126, `nomux attach work >
+/// /var/log/big` on a filesystem that fills takes a working host out of the client's
+/// rotation over a full disk, and nothing but the disk has to be repaired to bring it
+/// back. So this row is the one the client must not act on, which is why it is worth a
+/// test of its own rather than an eyeball over `attach::relay_failed`.
+///
+/// A stdout opened read-only, which is the shape `ENOSPC` has and the only one a test
+/// can produce on demand: a descriptor `poll` calls writable — `/dev/null` and a
+/// regular file are both always ready — that the kernel then refuses on the write, for
+/// a reason that is not `EPIPE`. `EPIPE` is the one errno `Pump::drain_to` reads as an
+/// ending rather than a failure, so it is exactly the neighbouring case, and it is the
+/// two tests above.
+///
+/// Both halves are asserted because they fail apart: the number is what the client
+/// branches on and the line is the whole of what the user gets, and a relay that
+/// scored 1 for having failed to *connect* would pass on the number alone.
+#[test]
+fn a_relay_that_fails_mid_stream_is_not_a_host_the_client_gives_up_on() {
+    let deadline = Instant::now() + RELAY_PATIENCE;
+    let (mut child, mut peer, _listener) = relay_onto_a_socket_over(
+        "relay_wr",
+        Stdio::piped(),
+        Stdio::from(fs::File::open("/dev/null").expect("a stdout opened for reading")),
+        Stdio::piped(),
+    );
+    // Held open and idle, as in the two tests above: the socket is the test's own, so
+    // the only thing that can end this relay is the stdout it cannot write to.
+    let _stdin = child.stdin.take().expect("stdin");
+
+    // One chunk is the whole provocation, and it takes two passes: the pass that reads
+    // it only buffers it, which is what puts stdout in the poll set for the next one.
+    peer.write_all(&vec![b'x'; 8 * 1024])
+        .expect("write to the relay's socket");
+
+    assert!(
+        poll_by(deadline, || !child.is_running()),
+        "the relay was still running with a stdout it could not write a byte to"
+    );
+    let finished = child
+        .into_exited()
+        .wait_with_output()
+        .expect("collect the relay");
+    assert_eq!(
+        finished.status.code(),
+        Some(1),
+        "a relay that had the session and then failed is exit 1 (§ 10), not the 126 \
+         that would cache this host as unattachable: {:?}",
+        stderr(&finished)
+    );
+    assert!(
+        stderr(&finished).contains("relaying to the session failed"),
+        "the line has to say the relay failed rather than name a session that was \
+         never in doubt: {:?}",
+        stderr(&finished)
+    );
+}
+
 /// Regression: a session that ends with the relay's own input still unread is a
 /// clean exit, and what is buffered for stdout still gets there.
 ///
@@ -923,15 +867,11 @@ fn assert_relay_left(mut child: Spawned, still_running: &str) {
 /// orderly close gives it a zero.
 ///
 /// `copy_in` mapped only `EIO` to an ending, so that reset came back out of `relay` as
-/// `nomux: Connection reset by peer` and exit 126, where § 10 gives 0 to "the session
+/// `nomux: Connection reset by peer` and a refusal, where § 10 gives 0 to "the session
 /// ended and the `Exit` frame was delivered". The last of the session's output went
 /// with it — a `relay` that returns `Err` never goes back for what stdout is owed, and
 /// the buffer holds it precisely here, a direction with nothing queued when `poll` was
 /// called not yet asking for `POLLOUT`.
-///
-/// Stdio on a socketpair is what makes the bug reachable at all: the first `splice`
-/// consumes the socket's pending error, so a host whose stdio is a pipe never sees the
-/// reset. § 7 gives the other kind a socketpair.
 #[test]
 fn a_session_that_ends_with_the_relays_input_unread_still_exits_clean() {
     use std::os::fd::OwnedFd;
@@ -1016,8 +956,7 @@ fn a_session_that_ends_with_the_relays_input_unread_still_exits_clean() {
 /// the limit, so the write made on `POLLOUT` always transfers at least one segment
 /// before it stops. Shrinking the buffer is what makes 16 KiB more than one segment;
 /// at the default 208 KiB the whole write is a single one, which either fits or is
-/// refused outright. A socket is also a destination the kernel will not splice into,
-/// which keeps the relay on the copying path `drain_to` belongs to (§ 7).
+/// refused outright.
 #[test]
 fn a_write_to_stdout_a_signal_cut_short_does_not_park_the_relay_again() {
     use std::os::fd::OwnedFd;
@@ -1152,12 +1091,11 @@ fn relay_onto_a_socket(id: &str, complaints: Stdio) -> (Spawned, UnixStream, Uni
 
 /// [`relay_onto_a_socket`] with the relay's stdin and stdout chosen by the caller.
 ///
-/// What is on the far end of those two is not a detail of the scaffolding for the
-/// tests about the copying path: `splice` wants one end of each transfer to be a
-/// pipe, so `Stdio::piped()` is the reason the relay never copies, and a
-/// `socketpair` is the reason it always does. Kept apart from the common form so
-/// that the tests which only want a relay do not have to say which of the two they
-/// are getting — the answer is the pipes everybody assumes.
+/// What is on the far end of those two is not a detail of the scaffolding wherever a
+/// test is about how a stdout reports its death: a pipe answers `POLLERR` and a
+/// `socketpair` answers `EPIPE` on the write. Kept apart from the common form so that
+/// the tests which only want a relay do not have to say which of the two they are
+/// getting — the answer is the pipes everybody assumes.
 fn relay_onto_a_socket_over(
     id: &str,
     input: Stdio,

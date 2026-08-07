@@ -22,7 +22,6 @@ impl Ring {
     ///
     /// The clamp is unreachable — `daemon::ring_capacity` filters zero — but clamping
     /// rather than asserting keeps an abort site out of a `panic = "abort"` binary.
-    #[must_use]
     pub(crate) fn new(capacity: usize) -> Self {
         let capacity = capacity.max(1);
         Self {
@@ -33,13 +32,11 @@ impl Ring {
     }
 
     /// Offset of the oldest retained byte.
-    #[must_use]
     pub(crate) const fn base(&self) -> u64 {
         self.base
     }
 
     /// Offset one past the newest byte, i.e. the total ever written.
-    #[must_use]
     pub(crate) fn end(&self) -> u64 {
         self.base + self.buf.len() as u64
     }
@@ -52,7 +49,11 @@ impl Ring {
         // One number for both sides of the eviction: what falls out of the window is
         // `retained + new - capacity` however it splits between the buffer's head and
         // this write's own, and `base` advances by the whole of it.
-        let overflow = (self.buf.len() + data.len()).saturating_sub(self.capacity);
+        let overflow = self
+            .buf
+            .len()
+            .saturating_add(data.len())
+            .saturating_sub(self.capacity);
         let from_buf = overflow.min(self.buf.len());
         self.base += overflow as u64;
         self.buf.drain(..from_buf);
@@ -70,7 +71,6 @@ impl Ring {
     /// The two stay in stream order, and either may be empty — including the *first*,
     /// once `from` is past the front half — so a caller walking them must skip an
     /// empty part rather than stop at one.
-    #[must_use]
     pub(crate) fn slices_from(&self, from: u64) -> [&[u8]; 2] {
         let skip = usize::try_from(from.saturating_sub(self.base)).unwrap_or(usize::MAX);
         let (front, back) = self.buf.as_slices();

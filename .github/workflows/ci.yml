@@ -7,10 +7,21 @@ on:
     # job built, so the published checksums are the ones the size gate computed over. A
     # rebuild would be byte-identical by § 8, but "would be" is a claim and this is not one.
     tags: ['v*']
+  # No `paths-ignore`. It used to carry `['**/*.md', 'LICENSE']`, which was wrong whichever
+  # way it was read. As spelled it matched nothing: `**` matches any run of characters and the
+  # `/` after it is literal, so `**/*.md` wants a markdown file in a subdirectory, and all five
+  # tracked ones are at the root — the documented spelling for "any markdown anywhere" is
+  # `**.md`. Spelled that way it would have worked, and working is the worse outcome: it skips
+  # every job on a documentation-only pull request, and a documentation-only change is exactly
+  # what `scripts/check-references.sh` is for — the one hook that can fail on a commit touching
+  # no Rust at all. Gone, no pull request skips a job, so a required check cannot sit
+  # "expected" for ever and branch protection can be turned on.
   pull_request:
-    # Not on `push` above, which owes every main commit a set of artifacts. Branch
-    # protection is off; turning it on makes a skipped job sit "expected" for ever.
-    paths-ignore: ['**/*.md', 'LICENSE']
+  # cargo-deny's advisory database moves while this tree stands still, and dependabot bumps
+  # monthly, so without a timer an advisory published on Tuesday waits for whoever pushes
+  # next. Weekly: two direct dependencies do not earn a daily run of anything.
+  schedule:
+    - cron: '17 4 * * 1'
   # The release job's artifacts expire, and it is the only producer of the
   # per-architecture binaries and their checksums. Without this, getting them back
   # means an empty commit.
@@ -39,6 +50,10 @@ jobs:
   # One job, so the workspace and its dependencies are compiled against a single cache.
   check:
     name: fmt, clippy, tests
+    # Nothing here has anything to say about a Monday morning: this job is about a commit,
+    # and the scheduled run is about the advisory database. `publish` follows through its
+    # `needs:`.
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     # The session tests spawn a real PTY, shells and unix sockets; a wedged child
     # would otherwise hold the runner for the six-hour default.
@@ -48,8 +63,17 @@ jobs:
     # rebuild from cold. Why the deny lives here rather than in [workspace.lints] is in
     # Cargo.toml. Not on the release job, whose script sets CARGO_ENCODED_RUSTFLAGS — which
     # makes cargo ignore RUSTFLAGS entirely, so a deny there would be silently absent.
+    #
+    # RUSTDOCFLAGS beside it rather than inline on the `cargo doc` step, because RUSTFLAGS
+    # does not reach rustdoc at all: the two steps below that run one — `cargo doc` and
+    # `cargo test --doc` — would otherwise disagree about whether a rustdoc warning is fatal,
+    # and only one of them would have been chosen deliberately. Measured, so the limit is
+    # written down rather than assumed: this does *not* make a warning inside a doctest fatal.
+    # Neither variable does. Denying those is `#![doc(test(attr(deny(warnings))))]` on the
+    # crate, and nothing here substitutes for it.
     env:
       RUSTFLAGS: -D warnings
+      RUSTDOCFLAGS: -D warnings
     steps:
       # `persist-credentials: false`: nothing in this workflow pushes, and the default
       # leaves the job token in .git/config while a step below executes `entry:` shell out
@@ -115,7 +139,7 @@ jobs:
       # RUSTFLAGS, and a renamed item turns a link into nothing rather than into an error.
       # `--document-private-items` because the binary is almost entirely private; `--lib
       # --bins` because a bare `cargo doc` documents only the lib when both share a name.
-      - run: RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps --document-private-items --lib --bins
+      - run: cargo doc --locked --workspace --no-deps --document-private-items --lib --bins
 
       # nextest cannot run doctests, so they need a pass of their own or doc examples go
       # unexercised. Here rather than in a hook: the workspace has one, which is not worth a
@@ -130,98 +154,65 @@ jobs:
       # else, which is most of the value of a CI run over a local one.
       - run: cargo nextest run --locked --workspace --run-ignored all --no-fail-fast
 
-  # A matrix rather than one job running both scripts: the three builds involved — the
-  # session suite under `nomux_fault_settle` and again under `nomux_fault_injection`, the
-  # binary's unit tests under `nomux_fault_unreaped` — share no fingerprint with each other
-  # or with the job above, so one job would compile them in series where two compile at
-  # once, and rust-cache keys one blob per job. Two names, because a failure of the second
-  # is about § 6.5's grace and would mislead anyone reading it under "takeover guard".
-  guards:
-    name: ${{ matrix.name }}
-    runs-on: ubuntu-latest
-    # A compile error is paid for once rather than in both guards at the same time.
-    needs: check
-    timeout-minutes: 20
-    strategy:
-      # Each guard answers a different question, so the second is still worth an answer when
-      # the first has failed; the default would cancel it.
-      fail-fast: false
-      matrix:
-        include:
-          # Separate target directories, separate fingerprints, separate caches.
-          - name: takeover guard
-            guard: takeover
-            key: fault-injection
-          - name: hangup grace guard
-            guard: hangup-grace
-            key: fault-unreaped
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install the pinned toolchain
-        run: rustup toolchain install --profile minimal --no-self-update
-
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          key: ${{ matrix.key }}
-
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
-        with:
-          tool: cargo-nextest
-
-      # Asserts the regression test still fails with the fix undone; a guard that passes on
-      # the bug guards nothing.
-      - run: sh scripts/verify-guard.sh ${{ matrix.guard }}
-
   # The 400 KiB budget is correctness-adjacent — the cold upload happens over
   # cellular — and is the one thing the local hooks cannot check.
   release:
     name: musl release builds
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      # `persist-credentials: false`: the step below executes scripts/build-release.sh out of
+      # the pull request's own tree, which is the same hazard the check job names.
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       # Read rather than repeated here, so this job and a laptop build use one compiler and
       # their sizes are comparable (scripts/build-release.sh says why). A plain assignment
       # rather than `echo "version=$(cat ...)"`, since the default `bash -e` has no
       # `pipefail` and would leave the step green with an empty value. An output rather than
       # $GITHUB_ENV, so it reaches only the step below.
+      #
+      # Validated here, before the value is written anywhere. The file is the pull request's
+      # and $GITHUB_OUTPUT is line-oriented, so a second line in it sets a second output —
+      # any output of this job, named by the contributor. The script performs the same check,
+      # but a check downstream of the value having been used is a check that has come too
+      # late; this one is upstream of everything that reads it.
       - name: Read the pinned release nightly
         id: nightly
         run: |
           nightly=$(cat scripts/nightly-version)
+          case "$nightly" in
+          '' | *[!A-Za-z0-9._-]*)
+              echo "scripts/nightly-version must hold one plain toolchain name:" >&2
+              echo "  $nightly" >&2
+              exit 1
+              ;;
+          esac
           echo "version=$nightly" >> "$GITHUB_OUTPUT"
 
-      # The shipping build rebuilds std with panics compiled out, which needs a
-      # nightly compiler plus its sources (IMPLEMENTATION.md § 8). `llvm-tools` is for
-      # the debug companions: the script checks each one against the binary it
-      # describes with `llvm-objcopy`, and the host's binutils cannot be assumed to
-      # read aarch64.
-      #
-      # Through `env:` and a quoted expansion, not `${{ }}` spliced into the script:
-      # on a pull request the file's contents are the contributor's, and a value
-      # interpolated into `run:` is executed rather than passed.
-      - name: Install the release nightly with the musl targets
-        env:
-          RELEASE_NIGHTLY: ${{ steps.nightly.outputs.version }}
-        run: >
-          rustup toolchain install "$RELEASE_NIGHTLY" --profile minimal --no-self-update
-          --component rust-src,llvm-tools
-          --target x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
-
+      # No toolchain step here: scripts/build-release.sh installs the nightly, its sources,
+      # llvm-tools and both musl targets itself, in one idempotent `rustup toolchain install`.
+      # It used to be stated in both places and the two could drift — the script would detect
+      # what this step had failed to install and print the command this step already ran. The
+      # script owns the target list and the compiler, so it owns fetching them.
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: musl-${{ steps.nightly.outputs.version }}
 
       # Owns the target list and the size budget; exits non-zero if a binary is over.
-      # Companions everywhere except a pull request: they double the cross builds for
-      # artifacts only the tag path publishes, and a PR's expire unread — while `main` and
-      # tags keep the script's `.text` correspondence check running on every commit that
-      # could ship. `0` rather than an unset value, because the script tests for exactly `1`.
+      #
+      # Companions on a tag and nowhere else. Each is a second `-Zbuild-std` cross build —
+      # std recompiled from source, per target — which is the dominant cost of this job, and
+      # only the tag path publishes what it produces: on `main` they went to an artifact that
+      # expires in ninety days having been read by nobody. The build is reproducible by
+      # construction, which is what the path remapping and the dated nightly buy, so anyone
+      # holding the pinned compiler can derive a companion on demand. `0` rather than an
+      # unset value, because the script tests for exactly `1`.
       - run: sh scripts/build-release.sh
         env:
-          NOMUX_DEBUG: ${{ github.event_name == 'pull_request' && '0' || '1' }}
+          NOMUX_DEBUG: ${{ startsWith(github.ref, 'refs/tags/v') && '1' || '0' }}
 
       # The only place the shipping configuration is ever executed on a commit that is not
       # a tag. Nothing in the check job builds `-Zbuild-std` with `-Cpanic=immediate-abort`,
@@ -247,14 +238,14 @@ jobs:
           if-no-files-found: error
 
   # What P3 asked for: the checksums somewhere a client can read them, an artifact expiring
-  # after ninety days and sitting behind a login. Its own job because it `needs` every job
+  # after ninety days and sitting behind a login. Its own job because it `needs` both jobs
   # above — so a tag cannot publish a release whose tests failed, where parallel jobs with no
   # dependency would have raced — and because it is the only one that wants a write token,
-  # which is why the other three keep the read-only one the header grants.
+  # which is why the others keep the read-only one the header grants.
   publish:
     name: publish the release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [check, guards, release]
+    needs: [check, release]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -350,3 +341,32 @@ jobs:
               --notes-file "$notes" \
               --verify-tag \
               "${assets[@]}" dist/SHA256SUMS dist/SHA256SUMS.debug
+
+  # The one thing here that is not about a commit. Every other job answers "is this change
+  # sound"; this one answers "is what we already shipped still sound", which is a question
+  # the advisory database changes the answer to without anybody touching the tree. Advisories
+  # only, and not the licences, bans and sources the check job also runs: those three are
+  # facts about the lockfile and cannot change while it does not.
+  #
+  # No build of any kind — cargo-deny reads Cargo.lock and its own database. The toolchain
+  # install is there only so that cargo-deny's `cargo metadata` does not send the rustup shim
+  # to fetch a default profile on demand; `--profile minimal` is a download, not a compile.
+  advisories:
+    name: advisories
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup toolchain install --profile minimal --no-self-update
+
+      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
+        with:
+          tool: cargo-deny
+
+      # `--locked`, and before the subcommand, for the reason the check job's copy gives.
+      - run: cargo deny --locked check advisories

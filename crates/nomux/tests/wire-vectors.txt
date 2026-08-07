@@ -4,9 +4,9 @@
 # come back. Nothing here was produced by the encoder under test — these are the
 # document's bytes, not this codec's, which is what makes them a check on it.
 #
-# Not the original. `crates/nomux/tests/wire.rs` holds the same table as Rust literals
-# read out of § 2.2 by hand, renders this file from them and fails if the two disagree,
-# so a wire change reaches both or neither.
+# Not the original. The `vectors` module of `crates/nomux/tests/codec.rs` holds the same
+# table as Rust literals read out of § 2.2 by hand, renders this file from them and fails
+# if the two disagree, so a wire change reaches both or neither.
 #
 # Grammar, so a reader needs no library: a line is blank, a comment — `#` its first
 # non-blank character — or a key and a value separated by whitespace. `frame` opens a

@@ -71,30 +71,21 @@ fn a_child_that_stops_reading_input_does_not_wedge_the_daemon() {
     // never comes and this fails here rather than below.
     client.wait_for_input_ack(offset);
 
-    // The daemon must still be answering: with a blocking master this does not
-    // return until the sleep does.
-    let began = Instant::now();
+    // The daemon must still be answering: with a blocking master this does not return
+    // until the sleep does, and [`FRAME_PATIENCE`] — which `next_of` spends waiting —
+    // is what ends the run rather than the whole suite's.
     client.send(&Frame::Ping);
-    let payload = client.next_of(FrameType::Pong);
-    assert_eq!(
-        Frame::decode(FrameType::Pong, &payload).expect("decode pong"),
-        Frame::Pong
-    );
-    assert!(
-        began.elapsed() < Duration::from_secs(10),
-        "daemon took {:?} to answer a ping behind a full PTY buffer",
-        began.elapsed()
-    );
+    drop(client.next_of(FrameType::Pong));
 }
 
 /// A client writing faster than the child reads is back-pressured rather than
 /// buffered without limit, and reconnecting does not raise the ceiling.
 ///
 /// Holding a client out of the poll set throttles only the reads the poll set drives,
-/// and that is not where the queue grows: the takeover path `daemon.rs`'s
-/// `ACCEPT_BEFORE_READ` orders reaches the decode loop twice without passing through the
-/// poll set at all — once to drain the outgoing connection, once for the input pipelined
-/// behind the arriving `Hello` — so each reconnect injected another queue's worth. The
+/// and that is not where the queue grows: `daemon.rs`'s takeover path reaches the decode
+/// loop twice without passing through the poll set at all — once to drain the outgoing
+/// connection, once for the input pipelined behind the arriving `Hello` — so each
+/// reconnect injected another queue's worth. The
 /// cap therefore has to be enforced between frames in the decode loop, and every round
 /// after the first is what says so.
 ///
@@ -105,7 +96,12 @@ fn a_child_that_stops_reading_input_does_not_wedge_the_daemon() {
 fn reconnecting_does_not_raise_the_input_ceiling() {
     /// Enough per round that the old growth — a third of a megabyte a takeover —
     /// would be plain in the total, and enough to refill whatever the queue took.
-    const BLAST: usize = 4 << 20;
+    ///
+    /// Comfortably past [`TOLERATED`], which is what makes the assertion below a
+    /// question rather than an identity: [`push_until_refused`] hands back at most what
+    /// it was given, so a blast under that ceiling is one a daemon with no input cap at
+    /// all satisfies by running out of bytes to offer.
+    const BLAST: usize = 16 << 20;
     /// Linear growth over this many would be a megabyte past the cap and plain in
     /// the total; a ceiling is a ceiling after the second.
     const ROUNDS: usize = 4;
@@ -381,7 +377,7 @@ fn a_half_closed_client_is_served_to_the_end_and_let_go_there() {
     drop(setup);
 
     let mut peer = UnixStream::connect(&session.socket).expect("connect");
-    write_frame(&mut peer, &hello_frame(0, RESUME_FROM_START));
+    write_frame(&mut peer, &hello_frame(false, false, RESUME_FROM_START));
     // The half-close § 7 has the relay make on stdin EOF, with the read half left open
     // — a peer that is still there and still owed.
     peer.shutdown(Shutdown::Write)
@@ -775,7 +771,7 @@ fn detaching_a_stalled_client_does_not_stop_the_child() {
 /// The socket is handed back rather than dropped, for the reason the caller keeps it.
 fn stalled_detach(session: &Session, pings: &[u8]) -> UnixStream {
     let mut socket = UnixStream::connect(&session.socket).expect("connect");
-    write_frame(&mut socket, &hello_frame(0, RESUME_FROM_START));
+    write_frame(&mut socket, &hello_frame(false, false, RESUME_FROM_START));
     // Blocking, and so paced by the daemon: a round can only hand its pings over as fast
     // as they are read, which is what makes the loop above cost one whole flush deadline
     // per round under the defect rather than firing every round into a socket buffer.
@@ -849,7 +845,7 @@ fn frames(bytes: &[u8]) -> Vec<Frame<'_>> {
 /// before the daemon stopped taking it.
 fn blaster(session: &Session) -> UnixStream {
     let mut socket = UnixStream::connect(&session.socket).expect("connect");
-    write_frame(&mut socket, &hello_frame(0, RESUME_FROM_START));
+    write_frame(&mut socket, &hello_frame(false, false, RESUME_FROM_START));
     socket.set_nonblocking(true).expect("stop blocking");
     socket
 }

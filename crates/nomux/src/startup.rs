@@ -3,7 +3,7 @@
 //! `IMPLEMENTATION.md` § 6.2 for the detachment, § 6.5 for the stop signals.
 
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd, OwnedFd};
+use std::os::fd::{BorrowedFd, IntoRawFd, OwnedFd};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use rustix::fs::{Mode, OFlags};
@@ -19,11 +19,10 @@ static STOP_PIPE: AtomicI32 = AtomicI32::new(-1);
 
 /// The entirety of what happens in a signal handler: one byte down the self-pipe.
 ///
-/// Async-signal-safety is the constraint that shapes this. `write(2)` is on the
-/// permitted list, the descriptor is non-blocking so a filled pipe cannot park the
-/// daemon inside a handler, and a refused write means a byte is already waiting —
-/// the whole of the message. Nor can this perturb `errno`: rustix issues the syscall
-/// directly on the `linux_raw` backend every shipped target selects.
+/// Non-blocking, so a full pipe cannot park the daemon inside a handler — and a write
+/// it refuses is the message already waiting rather than a message lost. `errno` is
+/// not perturbed either: rustix issues the syscall directly on the `linux_raw` backend
+/// every shipped target selects.
 extern "C" fn note_stop_signal(_signum: libc::c_int) {
     let raw = STOP_PIPE.load(Ordering::Relaxed);
     if raw >= 0 {
@@ -53,6 +52,24 @@ pub(crate) fn arm_stop_signals() -> io::Result<OwnedFd> {
     // process exit, including after the `Daemon` has been dropped, and a handler
     // holding a closed descriptor would write its byte into whatever was opened next.
     STOP_PIPE.store(write.into_raw_fd(), Ordering::Relaxed);
+
+    // A disposition is nothing without delivery, and the mask is the half that survives
+    // `exec`: a daemon started from a parent holding `SIGTERM` blocked — § 6.2's
+    // `nomux daemon x 0<&- 1>&- 2>&-` typed into such a shell, a systemd unit, a test
+    // harness — would install the handlers below and never hear from them. `nomux kill`
+    // would then wait out its two-second grace and `SIGKILL`, so the shell would run no
+    // exit trap and § 6.5's shutdown would not run at all. Nothing in this crate blocks
+    // a signal, so there is nothing here to preserve.
+    //
+    // SAFETY: `sigemptyset` initialises the set this frame owns, and `sigprocmask` is
+    // then handed that same initialised set and a null pointer for the old mask it is
+    // not being asked for. Single-threaded, so no other thread has a mask to disagree
+    // about.
+    unsafe {
+        let mut empty = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+        libc::sigemptyset(empty.as_mut_ptr());
+        libc::sigprocmask(libc::SIG_SETMASK, empty.as_ptr(), std::ptr::null_mut());
+    }
 
     // `sighandler_t` is an integer wide enough for a pointer, and a function item
     // has to be laundered through one to reach it.
@@ -135,35 +152,29 @@ fn has_controlling_terminal() -> bool {
 }
 
 /// Cuts the daemon loose from the rest of the state it inherited: the working
-/// directory and the standard descriptors (`IMPLEMENTATION.md` § 6.2).
+/// directory, and then the standard descriptors, last of all for the reason
+/// `IMPLEMENTATION.md` § 6.2 gives.
 ///
 /// Failures are not propagated: a daemon that cannot `chdir` still works, and the
-/// mount it might pin is the cheaper of the two outcomes.
+/// mount it might pin is the cheaper of the two outcomes; a daemon that cannot open
+/// `/dev/null` keeps whatever it was handed, which is worse and still no reason to
+/// refuse somebody a session.
+///
+/// What makes pointing the three at `/dev/null` safe is not the ordering, which cannot
+/// help: by here the daemon has bound its socket and armed its stop pipe, and nothing
+/// below can tell an inherited terminal from a descriptor of its own. It is that these
+/// three numbers were never free — std's runtime opens `/dev/null` onto any of them that
+/// `main` would have inherited closed, and aborts rather than starting without them, so
+/// the lowest free number a `bind` here can be given is 3. Started as § 6.2's
+/// `nomux daemon x 0<&- 1>&- 2>&-` without that, the listener would land on fd 1 and the
+/// pipe's read end on fd 2, and the `dup2`s below would silence both — an id claimed by
+/// a daemon nothing can ever reach. `tests/session.rs` starts one that way and greets it.
 pub(crate) fn release_startup_state() {
     let _ = rustix::process::chdir("/");
-    let _ = silence_stdio();
-}
-
-/// Points the three standard descriptors at `/dev/null`, last of all for the reason
-/// § 6.2 gives.
-///
-/// What makes that safe is not the ordering, which cannot help: by here the daemon has
-/// bound its socket and armed its stop pipe, and nothing below can tell an inherited
-/// terminal from a descriptor of its own. It is that these three numbers were never
-/// free — std's runtime opens `/dev/null` onto any of them that `main` would have
-/// inherited closed, and aborts rather than starting without them, so the lowest free
-/// number a `bind` here can be given is 3. Started as § 6.2's `nomux daemon x 0<&- 1>&-
-/// 2>&-` without that, the listener would land on fd 1 and the pipe's read end on fd 2,
-/// and the `dup2`s below would silence both — an id claimed by a daemon nothing can
-/// ever reach. `tests/session.rs` starts one that way and greets it.
-fn silence_stdio() -> io::Result<()> {
-    let null = rustix::fs::open("/dev/null", OFlags::RDWR, Mode::empty())?;
-    rustix::stdio::dup2_stdin(&null)?;
-    rustix::stdio::dup2_stdout(&null)?;
-    rustix::stdio::dup2_stderr(&null)?;
-    if null.as_raw_fd() <= libc::STDERR_FILENO {
-        // Dropping it closes a standard descriptor, freeing it for the next `accept`.
-        let _ = null.into_raw_fd();
-    }
-    Ok(())
+    let Ok(null) = rustix::fs::open("/dev/null", OFlags::RDWR, Mode::empty()) else {
+        return;
+    };
+    let _ = rustix::stdio::dup2_stdin(&null);
+    let _ = rustix::stdio::dup2_stdout(&null);
+    let _ = rustix::stdio::dup2_stderr(&null);
 }

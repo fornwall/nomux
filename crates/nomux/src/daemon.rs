@@ -93,36 +93,36 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 /// Backlog for the session socket: as deep as this host allows (§ 6.3).
 const SOCKET_BACKLOG: libc::c_int = -1;
 
-/// The event ordering a takeover is serviced in, and the fault injection that undoes it.
-///
-/// One `poll` can report both a readable client and, from the connection replacing it, the
-/// `Hello` that evicts it. The takeover is never serviced before the client it replaces:
-/// everything that client delivered before this moment is decoded first, in
-/// [`Daemon::poll_once`] and again in [`Daemon::read_pending`]'s final drain, because the
-/// eviction ends that connection for good — nothing resends what was left in its receive
-/// buffer, the peer that would have is gone, and the arriving client resumes from an
-/// `in_applied` those keystrokes never reached. Read, then accept.
-///
-/// Setting this restores the pre-fix ordering, so the regression test guarding the rule can
-/// be *shown* to fail (`scripts/verify-guard.sh takeover`). A `const` rather than a
-/// `#[cfg]` block, so both orderings stay compiled and the branch folds away.
-const ACCEPT_BEFORE_READ: bool = cfg!(nomux_fault_injection);
-
-/// Fault injection: pause before each `poll`, so a client's input and the takeover that
-/// follows it arrive in the same wakeup. `--cfg nomux_fault_settle` enables this alone,
-/// under which the guard must still *pass* — proof the delay is not doing the work.
-const SETTLE_BEFORE_POLL: bool = cfg!(nomux_fault_injection) || cfg!(nomux_fault_settle);
-
-/// How long that pause is.
-const FAULT_SETTLE: Duration = Duration::from_millis(20);
-
 /// How long a connection that has not said `Hello` keeps the one pending slot: a peer
 /// that connects and then says nothing would otherwise hold every later attach off for
 /// the life of the session. Generous against a relayed `Hello`'s round trip (§ 7).
 const PENDING_HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Stop accepting client input once this much is queued for a PTY not taking it (§ 4.1).
+///
+/// The first of the four caps § 4.1 presents as one table, and they are here together
+/// because the figures are chosen against each other rather than one at a time: the two
+/// receive-side megabytes bound a connection's undecoded buffer against the queue it
+/// feeds, and the gap between the two output bounds is clear of the first plus a whole
+/// output chunk, so only the frames that *answer* a client can reach the second. Three
+/// of them are spent inside [`Conn`], which measures with [`Conn::queued`] and
+/// [`Conn::buffered`] and decides nothing.
 const MAX_PENDING_INPUT: usize = 1 << 20;
+
+/// Stop queueing output once this much is already waiting for a slow client (§ 4.1).
+pub(crate) const MAX_PENDING_WRITE: usize = 1 << 20;
+
+/// Queue size at which a client is treated as gone rather than slow (§ 4.1).
+const ABANDON_PENDING_WRITE: usize = 8 << 20;
+
+/// Stop reading from a connection once this much undecoded input is already buffered.
+///
+/// [`Conn::fill`] loops until `EAGAIN`, and against a peer that keeps writing that loop
+/// has no natural end: every chunk it takes frees exactly that much room in the kernel's
+/// buffer for the peer to refill. The cap is what leaves the bytes where the peer blocks
+/// on them instead — load-bearing rather than defensive, because nothing empties that
+/// buffer while the daemon has stopped *decoding* (§ 4.1).
+pub(crate) const MAX_PENDING_READ: usize = 1 << 20;
 
 /// Capacity the decode scratch keeps between passes rather than hand back.
 const SCRATCH_RETAINED: usize = 64 * 1024;
@@ -146,6 +146,23 @@ struct Attached {
     repaint_due: bool,
 }
 
+impl Attached {
+    /// The connection promoted by a `Hello` that has not been answered yet.
+    ///
+    /// Three of the four are what [`Daemon::on_hello`] decides next, off that same
+    /// greeting. `exit_sent` is the one it does not touch: a connection hears the status
+    /// once, and this is the only place a fresh one starts owed it.
+    const fn greeting(conn: Conn) -> Self {
+        Self {
+            conn,
+            exit_sent: false,
+            sent_through: 0,
+            repaint_ctrl_l: false,
+            repaint_due: false,
+        }
+    }
+}
+
 /// Session state for the lifetime of the daemon process.
 struct Daemon {
     paths: SessionPaths,
@@ -153,12 +170,10 @@ struct Daemon {
     /// Read end of the self-pipe [`crate::startup::arm_stop_signals`] armed, or
     /// `None` on a host where it could not be armed at all.
     stop_pipe: Option<OwnedFd>,
-    /// Set once a stop signal has been seen; the loop leaves on its next pass (§ 6.5).
-    stopping: bool,
-    /// Why this session cannot go on, where something it could not do without has failed.
-    /// Read by [`Daemon::stop_reason`]; [`Daemon::start_session`], the only thing that
-    /// sets it, has why the failure is a field here rather than an `Err` on the way out.
-    fatal: Option<&'static str>,
+    /// Why this session is ending, once anything has decided it should: a stop signal,
+    /// or something it could not do without having failed. The loop leaves on its next
+    /// pass (§ 6.5), and until then nothing new is accepted.
+    stop: Option<&'static str>,
     ring: crate::ring::Ring,
     pty: Option<Pty>,
     client: Option<Attached>,
@@ -166,7 +181,7 @@ struct Daemon {
     /// deadline by which it must. Usually a liveness probe from `list`.
     pending: Option<(Conn, Instant)>,
     /// Agent socket and the connection it is serving, once a session created with
-    /// [`nomux::HELLO_AGENT_FORWARD`] has bound one.
+    /// [`nomux::Hello::agent_forward`] has bound one.
     agent: Option<Agent>,
     /// Where the child starts, captured before the daemon moved to `/`.
     child_dir: PathBuf,
@@ -220,7 +235,7 @@ pub(crate) fn run(session_id: &str, label: Option<&str>) -> io::Result<()> {
     if let Err(err) = &result {
         // Also to syslog, not only through the `Err` the caller prints: past
         // `release_startup_state` there is no stderr left to reach anybody through.
-        crate::syslog::error(session_id, &err.to_string());
+        crate::sanitize::error(session_id, &err.to_string());
     }
     result
 }
@@ -306,8 +321,7 @@ fn start(session_id: &str, label: Option<&str>) -> io::Result<()> {
         paths,
         listener,
         stop_pipe,
-        stopping: false,
-        fatal: None,
+        stop: None,
         ring: crate::ring::Ring::new(ring_capacity(std::env::var(RING_BYTES_ENV).ok().as_deref())),
         pty: None,
         client: None,
@@ -327,12 +341,12 @@ fn start(session_id: &str, label: Option<&str>) -> io::Result<()> {
     };
 
     // The only record that this session ever existed, once its run files are gone.
-    crate::syslog::info(session_id, "started");
+    crate::sanitize::info(session_id, "started");
     let result = daemon.event_loop();
     // `None` where the loop ended for a reason that is not one of its stop
     // conditions, which is `event_loop` returning on a failed `poll`.
     let reason = daemon.stop_reason().unwrap_or("the event loop ended");
-    crate::syslog::info(session_id, &format!("exiting: {reason}"));
+    crate::sanitize::info(session_id, &format!("exiting: {reason}"));
     daemon.shutdown();
     result
 }
@@ -408,9 +422,14 @@ fn bind_socket(paths: &SessionPaths) -> io::Result<UnixListener> {
 
     // A `<id>.pid` outliving its socket lets `attach`'s wait for that path to *exist* be
     // satisfied by a dead daemon's number, after which `kill` signals an unrelated
-    // process. Before the `bind` so there is no window: past the match above, any pidfile
-    // here is a dead daemon's by the evidence that licensed removing the socket.
+    // process. Before the `bind` so there is no window: past the match above, both names
+    // are a dead daemon's by the evidence that licensed removing the socket.
     paths.clear_pid();
+    // The same two syscalls for the name `list` prints. `write_pid` clears this too, which
+    // is what makes it *right*; here is what makes it right in time — between the bind and
+    // that call this daemon has forked (§ 6.2), and for the whole of it the socket answers
+    // as a live session under the display name of the one whose id it took.
+    paths.clear_label();
 
     let listener = crate::rundir::bind_socket_private(&path)?;
     listener.set_nonblocking(true)?;
@@ -426,6 +445,16 @@ fn at_session_ceiling(dir: &Path, mine: &str) -> bool {
         .filter(|id| id.as_str() != mine)
         .count()
         >= MAX_SESSIONS
+}
+
+/// Sends a final `Error` down `conn` and closes it.
+///
+/// The `code` is a parameter because the client acts on a version mismatch and a
+/// protocol error differently (`DESIGN.md` § 6.4). A free function because the two
+/// callers differ only in which slot they empty: [`Daemon::reject_pending`] the
+/// connection that has not attached, [`Daemon::reject`] the one that has.
+fn refuse(conn: Conn, code: ErrorCode, message: &'static str) {
+    conn.close_with(Some(&Frame::Error { code, message }));
 }
 
 /// What one entry of the poll set belongs to.
@@ -493,7 +522,7 @@ impl Daemon {
             // must not pay a free and a malloc for the next one. `read_buf` never moves.
             scratch.clear();
             if scratch.capacity() > SCRATCH_RETAINED {
-                scratch.shrink_to(0);
+                scratch.shrink_to(SCRATCH_RETAINED);
             }
         }
     }
@@ -527,22 +556,17 @@ impl Daemon {
     /// Why the daemon should stop, if it should — `None` is "keep going". The string is
     /// what goes to syslog, the run files being gone by the time anyone reads it.
     fn stop_reason(&self) -> Option<&'static str> {
-        if self.fatal.is_some() {
-            self.fatal
-        } else if self.stopping {
-            Some("signalled")
-        } else if self
-            .detach_deadline()
-            .is_some_and(|at| Instant::now() >= at)
-        {
-            Some(if self.pty.is_none() {
-                "no client ever attached"
-            } else {
-                "idle with no client"
-            })
-        } else {
-            None
-        }
+        self.stop.or_else(|| {
+            self.detach_deadline()
+                .is_some_and(|at| Instant::now() >= at)
+                .then(|| {
+                    if self.pty.is_none() {
+                        "no client ever attached"
+                    } else {
+                        "idle with no client"
+                    }
+                })
+        })
     }
 
     /// What to ask `poll` about `source`, or `None` where it is not in the set now.
@@ -578,8 +602,8 @@ impl Daemon {
                     PollFlags::IN
                 };
                 // Ring bytes still owed count as wanting to write: `pump_output` stops at
-                // `MAX_PENDING_WRITE`, so a replay ends passes with the queue drained.
-                if client.conn.wants_write() || client.sent_through < self.ring.end() {
+                // [`MAX_PENDING_WRITE`], so a replay ends passes with the queue drained.
+                if client.conn.queued() > 0 || client.sent_through < self.ring.end() {
                     flags |= PollFlags::OUT;
                 }
                 // Registered even when the mask is empty: `HUP` and `ERR` are reported
@@ -606,7 +630,7 @@ impl Daemon {
                 let saturated = self
                     .client
                     .as_ref()
-                    .is_some_and(|client| client.conn.is_write_saturated());
+                    .is_some_and(|client| client.conn.queued() >= MAX_PENDING_WRITE);
                 let mut flags = if saturated || !wants_read {
                     PollFlags::empty()
                 } else {
@@ -653,16 +677,13 @@ impl Daemon {
     /// ready, and answers with what each source has to service — indexed by the source, so
     /// [`Daemon::poll_once`] asks rather than searches. All empty is the `EINTR` case.
     ///
-    /// Split out so `poll_once` is the [`ACCEPT_BEFORE_READ`] ordering and nothing else,
-    /// and so the borrows of `self` end here.
+    /// Split out so `poll_once` is the servicing order and nothing else, and so the
+    /// borrows of `self` end here.
     ///
     /// A failing `poll` deliberately ends the session: what is never propagated is client
     /// I/O ([`Daemon::read_client`]), and this is the loop itself. `shutdown` still signals
     /// the child and clears the run files.
     fn wait(&mut self) -> io::Result<[PollFlags; POLL_SLOTS]> {
-        if SETTLE_BEFORE_POLL {
-            std::thread::sleep(FAULT_SETTLE);
-        }
         // Cleared in one place rather than tested at each of the two that read them, so
         // "back in the set" and "no wakeup left to arrange" cannot disagree.
         let now = Instant::now();
@@ -727,7 +748,11 @@ impl Daemon {
         // Nothing is read from the pipe: the byte says only that a signal arrived, and
         // the loop leaves on its next pass, too soon to spin on a readable descriptor.
         if revents(Source::Signal).intersects(READABLE) {
-            self.stopping = true;
+            // Never over a reason already recorded: a session that has just lost its
+            // shell says so, and the signal is what it was going to do anyway.
+            if self.stop.is_none() {
+                self.stop = Some("signalled");
+            }
         }
 
         let pty_events = revents(Source::Pty);
@@ -745,10 +770,13 @@ impl Daemon {
                 && self
                     .client
                     .as_ref()
-                    .is_some_and(|client| client.conn.has_buffered_input()));
-        // Before the greeting, always ([`ACCEPT_BEFORE_READ`]): one poll can report both a
-        // readable client and a `Hello` from its replacement.
-        if !ACCEPT_BEFORE_READ && client_ready {
+                    .is_some_and(|client| client.conn.buffered() > 0));
+        // Before the greeting below, always. One `poll` can report both a readable client
+        // and, from the connection replacing it, the `Hello` that evicts it — and the
+        // eviction ends that connection for good: nothing resends what was left in its
+        // receive buffer, the peer that would have is gone, and the arriving client
+        // resumes from an `in_applied` those keystrokes never reached. Read, then accept.
+        if client_ready {
             self.read_client(read_buf, scratch);
         }
         // Reading is not an answer to `HUP` while input is held back: nothing consumes what
@@ -757,17 +785,16 @@ impl Daemon {
             self.drop_client();
         }
         // Nothing arriving now can be served: a takeover here would spend a second 500 ms
-        // flush evicting a client about to be dropped, past § 6.5's shutdown budget.
-        if !self.stopping {
+        // flush evicting a client about to be dropped, past § 6.5's shutdown budget — and
+        // a session whose shell could not be started would take a connection's `shutdown`
+        // and then drop it unanswered. One guard, because both are this loop's last pass.
+        if self.stop.is_none() {
             if revents(Source::Pending).intersects(READABLE) {
                 self.read_pending(read_buf, scratch);
             }
             if revents(Source::Listener).intersects(READABLE) {
                 self.accept();
             }
-        }
-        if ACCEPT_BEFORE_READ && client_ready {
-            self.read_client(read_buf, scratch);
         }
 
         let agent_events = revents(Source::AgentChannel);
@@ -780,6 +807,12 @@ impl Daemon {
         }
 
         self.apply_win();
+        // Here rather than only on the master's `POLLOUT`, which [`Daemon::watch_for`]
+        // decided before `read_client` had queued anything: a keystroke arriving on this
+        // pass would otherwise wait for the next one to be written, so every one of them
+        // cost a whole extra loop pass. That `POLLOUT` is still what wakes a pass for a
+        // master that had no room, which is the case this one cannot serve.
+        self.write_pty();
         // Immediately before the pump that turns a status into a frame: `poll_timeout`
         // stops clamping to `STATUS_RETRY` once the status is collected, and with the
         // master out of the poll set nothing would wake the pass that sends the `Exit`.
@@ -830,12 +863,8 @@ impl Daemon {
                 // ([`Daemon::watch_for`]), so nobody is accepted only to be dropped unheard.
                 Ok((stream, _)) => {
                     // Before the slot is taken and before a byte is read, so a peer that
-                    // is not this uid's never becomes the session's business. Returning
-                    // as the served case does, rather than going round for the next
-                    // connection: the descriptor stays readable either way, so a backlog
-                    // is drained one per pass with the PTY served in between, where a
-                    // loop refusing as fast as somebody could connect would not be. And
-                    // no [`ACCEPT_BACKOFF`] — what was refused is the connection, the
+                    // is not this uid's never becomes the session's business. And no
+                    // [`ACCEPT_BACKOFF`] — what was refused is the connection, the
                     // listener being in perfect health.
                     if !crate::usock::peer_is_ours(stream.as_fd(), self.paths.id()) {
                         return;
@@ -896,30 +925,27 @@ impl Daemon {
             self.reject_pending(ErrorCode::Protocol, "unparseable Hello");
             return;
         };
-        // Before the eviction below, not after (§ 6.4). `on_hello` keeps its own copy of
-        // the check, for the client that greets again on an established connection.
+        // Before the eviction below, not after (§ 6.4): a `Hello` this daemon cannot
+        // answer must not cost the incumbent its session on the way to being refused.
         if hello.protocol != PROTOCOL_VERSION {
             self.reject_pending(ErrorCode::Version, "protocol version mismatch");
             return;
         }
 
-        // Final drain of the outgoing connection: input it delivered between the poll
-        // and this moment must not be lost to the takeover ([`ACCEPT_BEFORE_READ`]).
-        if !ACCEPT_BEFORE_READ && self.client.is_some() {
+        // Final drain of the outgoing connection: input it delivered between the poll and
+        // this moment must not be lost to the takeover, for the reason [`Daemon::poll_once`]
+        // gives about the same rule one step earlier.
+        if self.client.is_some() {
             self.read_client(read_buf, scratch);
         }
         // Hands the session over (`IMPLEMENTATION.md` § 6.4), by the same door as any
         // other refusal — which also drops the agent connection the arriving client
         // knows nothing of. With nobody attached this does nothing at all.
         self.reject(ErrorCode::Takeover, "another client attached");
-        // Only `repaint_due` is meant: `on_hello` runs next and resolves the other three.
-        self.client = self.pending.take().map(|(conn, _)| Attached {
-            conn,
-            exit_sent: false,
-            sent_through: 0,
-            repaint_ctrl_l: false,
-            repaint_due: false,
-        });
+        self.client = self
+            .pending
+            .take()
+            .map(|(conn, _)| Attached::greeting(conn));
         self.on_hello(&hello);
         // Clients pipeline: input riding behind the `Hello` in the same read is
         // already buffered in the connection that was just promoted.
@@ -927,11 +953,9 @@ impl Daemon {
     }
 
     /// Turns away a connection that cannot have the session, leaving the session alone.
-    /// The `code` is a parameter because the client acts on a version mismatch and a
-    /// protocol error differently (`DESIGN.md` § 6.4).
     fn reject_pending(&mut self, code: ErrorCode, message: &'static str) {
         if let Some((pending, _)) = self.pending.take() {
-            pending.close_with(Some(&Frame::Error { code, message }));
+            refuse(pending, code, message);
         }
     }
 
@@ -943,9 +967,9 @@ impl Daemon {
         // it, for the reason [`Daemon::write_pty`] gives about the other half.
         match nbio::read_or_eof(pty.master(), buf) {
             // Always drain, attached or not: an unread PTY blocks the child on write (§ 4).
-            nbio::Read::Data(n) => self.ring.push(buf.get(..n).unwrap_or(&[])),
-            nbio::Read::Eof => self.on_child_exit(),
-            nbio::Read::WouldBlock => {}
+            nbio::ReadOutcome::Data(n) => self.ring.push(buf.get(..n).unwrap_or(&[])),
+            nbio::ReadOutcome::Eof => self.on_child_exit(),
+            nbio::ReadOutcome::WouldBlock => {}
         }
     }
 
@@ -992,15 +1016,16 @@ impl Daemon {
     /// out, and why nothing may read the missing status as a child still running (§ 6.5).
     ///
     /// Every pass, not only past end of file: the child can exit while something it
-    /// started still holds the slave — `sleep 3600 &` then `exit` — and nothing else would
-    /// reap it. Whether the client is *told* is [`Daemon::pump_output`]'s decision; what
-    /// this costs is the pid, which makes [`Pty::pid_reissued`] load-bearing.
+    /// started still holds the slave — `sleep 3600 &` then `exit` — and nothing else
+    /// would reap it, `SIGCHLD` being at its default disposition. Whether the client is
+    /// *told* is [`Daemon::pump_output`]'s decision; what this costs is the pid, which
+    /// makes [`Pty::pid_reissued`] load-bearing.
     ///
-    /// The `waitpid` runs ahead of the settled-status exit, that call being the reaping
+    /// The `waitpid` runs ahead of the `self.exited` test, that call being the reaping
     /// itself: § 6.5's synthesised status names a child that may still be running, so
-    /// leaving on `self.exited` alone held its zombie for the rest of the session. What
-    /// comes back is discarded there rather than allowed to revise a status a client has
-    /// already been told, and `try_wait` caches, so a collected child costs no syscall.
+    /// leaving on a status alone held its zombie for the rest of the session. What comes
+    /// back is discarded there rather than allowed to revise a status a client has
+    /// already been told.
     fn collect_status(&mut self) {
         let reaped = self
             .pty
@@ -1046,7 +1071,7 @@ impl Daemon {
             if self.input_is_saturated() {
                 // Returning rather than breaking, so the end-of-file test below is
                 // skipped: `attach` shuts its write half down on stdin EOF and goes on
-                // draining output (§ 7). `poll_once`'s `has_buffered_input` test re-arms
+                // draining output (§ 7). `poll_once`'s [`Conn::buffered`] test re-arms
                 // this loop once `write_pty` has taken some of the queue.
                 return;
             }
@@ -1056,22 +1081,37 @@ impl Daemon {
             let ty = match client.conn.take_frame(scratch) {
                 Ok(Some(ty)) => ty,
                 Ok(None) => break,
-                Err(_) => {
+                // The wire says only "unparseable": [`ErrorCode`] is a small closed set
+                // and the message is a `&'static str`, so the taxonomy `ProtoError`
+                // carries has nowhere to go on the connection being closed. Logged, or a
+                // client that cannot attach over one bad byte is diagnosed nowhere.
+                Err(err) => {
+                    crate::sanitize::error(self.paths.id(), &format!("client frame: {err}"));
                     self.reject(ErrorCode::Protocol, "unparseable frame header");
                     return;
                 }
             };
-            let Ok(frame) = Frame::decode(ty, scratch) else {
-                self.reject(ErrorCode::Protocol, "unparseable frame payload");
-                return;
+            let frame = match Frame::decode(ty, scratch) {
+                Ok(frame) => frame,
+                Err(err) => {
+                    crate::sanitize::error(self.paths.id(), &format!("client {ty:?}: {err}"));
+                    self.reject(ErrorCode::Protocol, "unparseable frame payload");
+                    return;
+                }
             };
             self.handle_frame(&frame);
         }
     }
 
+    /// Services one decoded frame from the attached client.
+    ///
+    /// A second `Hello` is not among them: greeting is what *makes* a connection the
+    /// client (§ 6.4), so one arriving on a connection that already is rewinds both
+    /// streams under a session that has been running against them. It gets a refusal of
+    /// its own rather than the catch-all's, which would tell a client that had greeted
+    /// perfectly well that `Hello` is a frame it may not send.
     fn handle_frame(&mut self, frame: &Frame<'_>) {
         match *frame {
-            Frame::Hello(hello) => self.on_hello(&hello),
             Frame::Input { offset, data } => self.on_input(offset, data),
             // Recorded rather than applied: [`Daemon::apply_win`] runs once a pass.
             Frame::Resize(win) => self.win = win,
@@ -1089,6 +1129,9 @@ impl Daemon {
                     agent.close_from_client(generation);
                 }
             }
+            Frame::Hello(_) => {
+                self.reject(ErrorCode::Protocol, "this connection has already greeted");
+            }
             _ => self.reject(ErrorCode::Protocol, "frame is not valid from a client"),
         }
     }
@@ -1105,7 +1148,7 @@ impl Daemon {
                 // A session without an agent is worth having; one that refuses to start is
                 // not. `HelloOk` says only `agent: false`, so the reason goes to syslog.
                 Err(err) => {
-                    crate::syslog::error(self.paths.id(), &format!("agent socket: {err}"));
+                    crate::sanitize::error(self.paths.id(), &format!("agent socket: {err}"));
                 }
             }
         }
@@ -1124,8 +1167,8 @@ impl Daemon {
             // left to do with it is name it to syslog and stop the loop.
             Err(err) => {
                 self.reject(ErrorCode::Internal, "failed to start the session shell");
-                crate::syslog::error(self.paths.id(), &format!("session shell: {err}"));
-                self.fatal = Some("the session shell could not be started");
+                crate::sanitize::error(self.paths.id(), &format!("session shell: {err}"));
+                self.stop = Some("the session shell could not be started");
             }
         }
     }
@@ -1150,11 +1193,14 @@ impl Daemon {
         }
     }
 
+    /// Settles the arriving client onto the session, creating it if there is none yet.
+    ///
+    /// Checks no version, deliberately, though it is handed the field.
+    /// [`Daemon::read_pending`] makes that check *before* the eviction because § 6.4
+    /// requires it, so by the time this runs the incumbent is already gone — a second copy
+    /// could only refuse a client the session has just been handed to, leaving nobody
+    /// attached, which is the state the first check exists to prevent.
     fn on_hello(&mut self, hello: &Hello<'_>) {
-        if hello.protocol != PROTOCOL_VERSION {
-            self.reject(ErrorCode::Version, "protocol version mismatch");
-            return;
-        }
         self.win = hello.win;
         // Restated to the terminal rather than assumed, which is § 2.2's rule and not an
         // optimisation to be had back: the arriving `Hello`'s winsize is authoritative,
@@ -1180,24 +1226,22 @@ impl Daemon {
             // panics on unordered bounds — a bare trap with no message in a shipping build.
             hello.out_offset.min(self.ring.end()).max(base)
         };
-        // Not a field on the wire: both ends compute it — `HelloOk::gap` (§ 4.2).
-        let gap = resume_from > hello.out_offset;
-        if let Some(client) = self.client.as_mut() {
-            client.sent_through = resume_from;
-            client.repaint_ctrl_l = hello.repaint_ctrl_l;
-            // Re-armed, because a second `Hello` on an established connection rewinds the
-            // stream and would wait for ever for an `Exit` sent against old offsets.
-            client.exit_sent = false;
-            // Owed rather than issued here, so an attach-time gap and a mid-stream one
-            // share one repaint policy; never cleared by a greeting that reports none.
-            client.repaint_due |= gap;
-        }
-        self.tell_client(&Frame::HelloOk(HelloOk {
+        let ok = HelloOk {
             resume_from,
             in_applied: self.in_applied,
             linger: self.logind_linger,
             agent: self.agent.is_some(),
-        }));
+        };
+        // Not a field on the wire: both ends compute it, through the one helper (§ 4.2).
+        let gap = ok.gap(hello.out_offset);
+        if let Some(client) = self.client.as_mut() {
+            client.sent_through = resume_from;
+            client.repaint_ctrl_l = hello.repaint_ctrl_l;
+            // Owed rather than issued here, so an attach-time gap and a mid-stream one
+            // share one repaint policy.
+            client.repaint_due = gap;
+        }
+        self.tell_client(&Frame::HelloOk(ok));
     }
 
     /// Asks the child to redraw after a gap, by whichever means this client chose;
@@ -1255,7 +1299,7 @@ impl Daemon {
         let Some(client) = self.client.as_mut() else {
             return;
         };
-        if !client.conn.is_write_saturated() && client.sent_through < end {
+        if client.conn.queued() < MAX_PENDING_WRITE && client.sent_through < end {
             if client.sent_through < base {
                 // Overflowed while this client was slow or away: the stream is
                 // discontinuous and the client must reset its emulator.
@@ -1297,11 +1341,7 @@ impl Daemon {
         // Coalesced onto the moment this client holds the whole ring rather than issued
         // per gap (§ 4.3).
         let repainting = client.repaint_due && client.sent_through >= end;
-        if repainting {
-            client.repaint_due = false;
-        }
-        // Outside the borrow above, the repaint writing to the PTY queue rather than to
-        // the client.
+        client.repaint_due &= !repainting;
         if repainting {
             self.repaint();
         }
@@ -1353,14 +1393,14 @@ impl Daemon {
         };
         let generation = agent.generation();
         match agent.read(buf) {
-            nbio::Read::Data(n) => {
+            nbio::ReadOutcome::Data(n) => {
                 let data = buf.get(..n).unwrap_or(&[]);
                 if let Some((generation, client)) = generation.zip(self.client.as_mut()) {
                     client.conn.send_agent_data(generation, data);
                 }
             }
-            nbio::Read::Eof => self.close_agent_channel(),
-            nbio::Read::WouldBlock => {}
+            nbio::ReadOutcome::Eof => self.close_agent_channel(),
+            nbio::ReadOutcome::WouldBlock => {}
         }
     }
 
@@ -1373,9 +1413,7 @@ impl Daemon {
         }
     }
 
-    /// Pushes out what is queued, and is three of the six endings § 6.4 lists: a socket
-    /// that has failed, a peer past `ABANDON_PENDING_WRITE` (§ 4.1), and the half-closed
-    /// one owed nothing further — the only one of the three that is not a failure.
+    /// Pushes out what is queued, and is three of the six endings § 6.4 lists.
     ///
     /// Out through [`Daemon::drop_client`] like every other departure — the flush inside
     /// it costs one refused write on a socket that has just refused one, against two
@@ -1387,19 +1425,17 @@ impl Daemon {
         // Read after the flush, an unfinished queue being exactly what the `Exit` has
         // not been delivered through yet.
         let finished = client.conn.flush_some().is_err()
-            || client.conn.is_write_hopeless()
-            || (client.exit_sent && client.conn.is_eof() && !client.conn.wants_write());
+            || client.conn.queued() >= ABANDON_PENDING_WRITE
+            || (client.exit_sent && client.conn.is_eof() && client.conn.queued() == 0);
         if finished {
             self.drop_client();
         }
     }
 
-    /// Sends a final `Error` and closes the connection.
+    /// The same for the attached client, which also leaves the session clientless.
     fn reject(&mut self, code: ErrorCode, message: &'static str) {
         if let Some(client) = self.client.take() {
-            client
-                .conn
-                .close_with(Some(&Frame::Error { code, message }));
+            refuse(client.conn, code, message);
             self.on_detached();
         }
     }
@@ -1424,10 +1460,16 @@ impl Daemon {
     /// exited changes nothing — the stamp is what reaps either way (§ 6.5).
     fn on_detached(&mut self) {
         self.last_detach = Instant::now();
-        // Nothing can answer a signature request with the client gone, so the
-        // waiting process should fail now rather than at reattach (§ 6.7).
-        if let Some(agent) = self.agent.as_mut() {
-            let _ = agent.forget();
+        // Nothing can answer a signature request with the client gone, so the waiting
+        // process should fail now rather than at reattach (§ 6.7). Through the client's
+        // own door rather than by dropping the channel: one poll pass can carry both the
+        // reply to a signature request and the `Detach` behind it, and `forget` here threw
+        // that reply away — a `git push` down a session detached cleanly, failing on an
+        // agent that hung up mid-answer. With nothing queued this is `forget` exactly.
+        if let Some(agent) = self.agent.as_mut()
+            && let Some(generation) = agent.generation()
+        {
+            agent.close_from_client(generation);
         }
     }
 
@@ -1508,23 +1550,25 @@ mod tests {
         drop(bound.expect("a stale socket somebody else removed first is not a failure"));
     }
 
-    /// A daemon with an agent socket and nothing else, for the poll-set questions.
+    /// A daemon with a listening socket and nothing else — no terminal, no client, no
+    /// agent — for the questions that are about the event loop rather than a session.
     ///
-    /// Both sockets are bound inside `root`, and the resolved [`SessionPaths`] is never
-    /// used, so nothing is created in the run directory of whoever runs the suite.
-    fn with_agent(root: &Scratch) -> Daemon {
+    /// Every socket is bound inside `root`, and the resolved [`SessionPaths`] is never
+    /// used, so nothing is created in the run directory of whoever runs the suite. `name`
+    /// only has to differ between the daemons one test builds.
+    fn blank(root: &Scratch, name: &str) -> Daemon {
         Daemon {
-            paths: SessionPaths::new(&format!("pollset_{}", std::process::id()))
+            paths: SessionPaths::new(&format!("{name}_{}", std::process::id()))
                 .expect("resolve the run directory"),
-            listener: UnixListener::bind(root.join("session.sock")).expect("bind a session socket"),
+            listener: UnixListener::bind(root.join(&format!("{name}.sock")))
+                .expect("bind a session socket"),
             stop_pipe: None,
-            stopping: false,
-            fatal: None,
+            stop: None,
             ring: crate::ring::Ring::new(1024),
             pty: None,
             client: None,
             pending: None,
-            agent: Some(Agent::bind(&root.join("session.agent")).expect("bind an agent socket")),
+            agent: None,
             child_dir: PathBuf::from("/"),
             logind_linger: Linger::Unknown,
             in_applied: 0,
@@ -1537,6 +1581,157 @@ mod tests {
             agent_accept_retry: None,
             last_detach: Instant::now(),
         }
+    }
+
+    /// [`blank`] with an agent socket, for the poll-set questions about one.
+    fn with_agent(root: &Scratch) -> Daemon {
+        let mut daemon = blank(root, "pollset");
+        daemon.agent =
+            Some(Agent::bind(&root.join("session.agent")).expect("bind an agent socket"));
+        daemon
+    }
+
+    /// Hands `daemon` a connection in `slot`, and gives back the peer end a test writes
+    /// frames into. Blocking, where the daemon's own half is not: a frame this small
+    /// reaches the kernel's buffer in one write and the daemon reads it from there.
+    fn attach_peer(conn: impl FnOnce(Conn)) -> UnixStream {
+        let (peer, ours) = UnixStream::pair().expect("a socketpair");
+        conn(Conn::new(ours).expect("a connection"));
+        peer
+    }
+
+    /// Writes `frame` down `peer` as a client would.
+    fn deliver(peer: &mut UnixStream, frame: &Frame<'_>) {
+        use std::io::Write as _;
+
+        let mut wire = Vec::new();
+        frame.encode(&mut wire).expect("a valid frame");
+        peer.write_all(&wire)
+            .expect("deliver a frame to the daemon");
+    }
+
+    /// Reads whatever `peer` has been sent, giving up rather than parking the run.
+    fn collect(peer: &mut UnixStream) -> Vec<u8> {
+        use std::io::Read as _;
+
+        peer.set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("bound the read");
+        let mut got = vec![0u8; 4096];
+        let n = peer.read(&mut got).unwrap_or(0);
+        got.truncate(n);
+        got
+    }
+
+    /// A terminal with a shell on it, so an arriving `Hello` resumes a session rather
+    /// than starting one — `pty.rs`'s own tests spawn the same way.
+    fn shell(session_id: &str) -> Pty {
+        Pty::spawn(&pty::Spawn {
+            term: "dumb",
+            win: WinSize::default(),
+            session_id,
+            cwd: Path::new("/tmp"),
+            agent_sock: None,
+        })
+        .expect("spawn a shell on a pty")
+    }
+
+    /// Regression: a takeover keeps what the client it evicts had already delivered
+    /// (`IMPLEMENTATION.md` § 6.4).
+    ///
+    /// One `poll` can report both a readable client and, from the connection replacing
+    /// it, the `Hello` that evicts it. The eviction ends the first connection for good —
+    /// nothing resends what was left in its receive buffer, the peer that would have is
+    /// gone, and the arriving client resumes from an `in_applied` those keystrokes never
+    /// reached — so the last thing typed before a reattach was dropped whenever the two
+    /// landed in the same wakeup.
+    ///
+    /// Two things hold the rule up, and this pins the rule rather than either of them:
+    /// [`Daemon::poll_once`] decodes before it services the greeting, and
+    /// [`Daemon::read_pending`] drains again before the eviction, for the bytes that
+    /// arrived while this pass was running. They are deliberately redundant.
+    ///
+    /// The readiness array is handed straight to `poll_once`, which is what makes "the
+    /// same wakeup" a fact of the test rather than a race it has to win — no sleep can
+    /// promise the interleaving this states outright.
+    #[test]
+    fn a_takeover_keeps_the_input_the_client_it_evicts_had_delivered() {
+        /// No newline, so this reaches the shell's line buffer and never its command
+        /// line: what is under test is the daemon's accounting, not the child.
+        const TYPED: &[u8] = b"the last keystrokes";
+
+        let root = Scratch::new("takeover-order");
+        let mut daemon = blank(&root, "takeover");
+        daemon.pty = Some(shell("takeover-order"));
+
+        let mut leaving = attach_peer(|conn| daemon.client = Some(Attached::greeting(conn)));
+        // Delivered and never `fill`ed: these bytes are in the kernel's buffer, exactly
+        // where a keystroke that arrived between the `poll` and this moment sits.
+        deliver(
+            &mut leaving,
+            &Frame::Input {
+                offset: 0,
+                data: TYPED,
+            },
+        );
+
+        let mut arriving = attach_peer(|conn| {
+            daemon.pending = Some((conn, Instant::now() + PENDING_HELLO_TIMEOUT));
+        });
+        deliver(
+            &mut arriving,
+            &Frame::Hello(Hello {
+                protocol: PROTOCOL_VERSION,
+                agent_forward: false,
+                repaint_ctrl_l: false,
+                out_offset: RESUME_FROM_START,
+                win: WinSize::default(),
+                term: "dumb",
+            }),
+        );
+
+        let mut ready = [PollFlags::empty(); POLL_SLOTS];
+        ready[Source::Client as usize] = PollFlags::IN;
+        ready[Source::Pending as usize] = PollFlags::IN;
+        let mut read_buf = vec![0u8; 64 * 1024];
+        let mut scratch = Vec::new();
+        daemon.poll_once(&ready, &mut read_buf, &mut scratch);
+
+        // Read out before the shell is collected, so a failing assertion below still
+        // leaves no `dash` behind: `Pty` has no `Drop` of its own, deliberately.
+        let applied = daemon.in_applied;
+        let promoted = daemon.pending.is_none() && daemon.client.is_some();
+        let evicted = collect(&mut leaving);
+        if let Some(mut pty) = daemon.pty.take() {
+            pty.terminate();
+        }
+
+        assert!(
+            promoted,
+            "the arriving connection never took the session, so nothing here was a \
+             takeover"
+        );
+        assert_eq!(
+            evicted,
+            {
+                let mut wire = Vec::new();
+                Frame::Error {
+                    code: ErrorCode::Takeover,
+                    message: "another client attached",
+                }
+                .encode(&mut wire)
+                .expect("a valid frame");
+                wire
+            },
+            "the evicted connection was told something other than why it was evicted"
+        );
+        assert_eq!(
+            applied,
+            TYPED.len() as u64,
+            "the {} bytes this client delivered before the takeover went with the \
+             connection: the arriving one resumes from {applied}, so they are typed into \
+             nothing and nobody will resend them",
+            TYPED.len()
+        );
     }
 
     /// Regression: the agent listener had the error *tolerance* of the session
@@ -1592,13 +1787,7 @@ mod tests {
         // Attached, so the deadline under test is not shadowed by the session's own:
         // a clientless daemon already wakes for `FIRST_ATTACH_TIMEOUT`, well before it.
         let (_peer, ours) = UnixStream::pair().expect("a socketpair");
-        daemon.client = Some(Attached {
-            conn: Conn::new(ours).expect("a connection"),
-            exit_sent: false,
-            sent_through: 0,
-            repaint_ctrl_l: false,
-            repaint_due: false,
-        });
+        daemon.client = Some(Attached::greeting(Conn::new(ours).expect("a connection")));
 
         let agent = daemon.agent.as_mut().expect("an agent socket");
         let _served = UnixStream::connect(agent.path()).expect("connect to the agent socket");

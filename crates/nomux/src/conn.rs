@@ -3,29 +3,18 @@
 //! Reads accumulate until a whole frame is available; writes accumulate until the
 //! socket accepts them. Decoding copies each payload into caller-owned scratch so the
 //! borrow of the receive buffer ends before the frame is handled — cheap, because that
-//! direction only ever carries keystrokes and control frames. The output direction,
-//! where volume lives, is encoded straight from the ring.
+//! direction only ever carries keystrokes and control frames.
+//!
+//! What the two buffers are *allowed* to reach is not decided here: § 4.1's caps live
+//! together in `daemon.rs`, and [`Conn::queued`] and [`Conn::buffered`] are what the
+//! daemon measures them with.
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 
 use nomux::{Frame, FrameType, HEADER_LEN, Header, MAX_PAYLOAD, decode_header};
 
-/// Stop queueing output once this much is already waiting for a slow client
-/// (`IMPLEMENTATION.md` § 4.1).
-const MAX_PENDING_WRITE: usize = 1 << 20;
-
-/// Queue size at which a client is treated as gone rather than slow (§ 4.1).
-const ABANDON_PENDING_WRITE: usize = 8 << 20;
-
-/// Stop reading from the socket once this much undecoded input is already buffered.
-///
-/// [`Conn::fill`] loops until `EAGAIN`, and against a peer that keeps writing that
-/// loop has no natural end: every chunk it takes frees exactly that much room in the
-/// kernel's buffer for the peer to refill. The cap is what leaves the bytes where the
-/// peer blocks on them instead — load-bearing rather than defensive, because nothing
-/// empties this buffer while the daemon has stopped *decoding* (§ 4.1).
-const MAX_PENDING_READ: usize = 1 << 20;
+use crate::daemon::{MAX_PENDING_READ, MAX_PENDING_WRITE};
 
 const _: () = assert!(
     MAX_PENDING_READ > HEADER_LEN + MAX_PAYLOAD as usize,
@@ -104,22 +93,23 @@ impl Conn {
         self.eof
     }
 
-    /// Whether there is buffered output waiting for the socket.
+    /// Output queued for the socket and not yet accepted by it: zero is "nothing to
+    /// write", and § 4.1's `MAX_PENDING_WRITE` and `ABANDON_PENDING_WRITE` are what the
+    /// daemon reads it against.
     #[must_use]
-    pub(crate) const fn wants_write(&self) -> bool {
-        self.tx_pos < self.tx.len()
+    pub(crate) const fn queued(&self) -> usize {
+        self.tx.len() - self.tx_pos
     }
 
-    /// Whether enough output is already queued that more should not be added.
+    /// Input read off the socket and not yet decoded, against § 4.1's
+    /// `MAX_PENDING_READ`.
+    ///
+    /// Non-zero is also what sends the event loop back for frames no second `POLLIN`
+    /// will ever announce: the daemon stops decoding while the PTY queue is full
+    /// (`IMPLEMENTATION.md` § 4.1), which can leave whole frames sitting here.
     #[must_use]
-    pub(crate) const fn is_write_saturated(&self) -> bool {
-        self.tx.len() - self.tx_pos >= MAX_PENDING_WRITE
-    }
-
-    /// Whether this peer has stopped reading altogether ([`ABANDON_PENDING_WRITE`]).
-    #[must_use]
-    pub(crate) const fn is_write_hopeless(&self) -> bool {
-        self.tx.len() - self.tx_pos >= ABANDON_PENDING_WRITE
+    pub(crate) const fn buffered(&self) -> usize {
+        self.rx.len() - self.rx_pos
     }
 
     /// Queues a frame, and reports whether anything was queued.
@@ -146,7 +136,7 @@ impl Conn {
             // larger than the queue budget, and a single pump would otherwise queue
             // the whole of it for a client that has stopped reading. The caller
             // resumes from the returned offset.
-            if self.is_write_saturated() {
+            if self.queued() >= MAX_PENDING_WRITE {
                 break;
             }
             // Ahead of the offset rather than beside it. A frame that was not queued
@@ -174,21 +164,6 @@ impl Conn {
         }
     }
 
-    /// Whether enough undecoded input is buffered that no more should be read.
-    const fn is_read_saturated(&self) -> bool {
-        self.rx.len() - self.rx_pos >= MAX_PENDING_READ
-    }
-
-    /// Whether undecoded bytes are still sitting in the receive buffer.
-    ///
-    /// The daemon stops decoding while the PTY queue is full (`IMPLEMENTATION.md`
-    /// § 4.1), which can leave whole frames here that no second `POLLIN` will ever
-    /// announce: this is what sends the event loop back for them.
-    #[must_use]
-    pub(crate) const fn has_buffered_input(&self) -> bool {
-        self.rx_pos < self.rx.len()
-    }
-
     /// Reads whatever the socket has available into the receive buffer, up to
     /// [`MAX_PENDING_READ`] still undecoded.
     ///
@@ -200,7 +175,7 @@ impl Conn {
     ///
     /// Propagates read failures other than `EWOULDBLOCK` and `EINTR`.
     pub(crate) fn fill(&mut self, chunk: &mut [u8]) -> io::Result<()> {
-        while !self.is_read_saturated() {
+        while self.buffered() < MAX_PENDING_READ {
             match self.stream.read(chunk) {
                 Ok(0) => {
                     self.eof = true;
@@ -392,11 +367,6 @@ mod tests {
         wire
     }
 
-    /// Undecoded bytes waiting in the receive buffer.
-    fn buffered(conn: &Conn) -> usize {
-        conn.rx.len() - conn.rx_pos
-    }
-
     /// Fills through a buffer of the caller's, as the daemon's event loop does with the
     /// one it carries for the whole pass.
     fn fill(conn: &mut Conn) -> io::Result<()> {
@@ -419,7 +389,7 @@ mod tests {
                     assert!(
                         conn.rx.len() > before,
                         "neither side can move: {} bytes buffered, {} of {} sent",
-                        buffered(conn),
+                        conn.buffered(),
                         sent,
                         bytes.len()
                     );
@@ -487,7 +457,7 @@ mod tests {
                     "{frame:?} completed on {split} of {} bytes",
                     wire.len()
                 );
-                assert_eq!(buffered(&conn), split, "every byte given must be kept");
+                assert_eq!(conn.buffered(), split, "every byte given must be kept");
 
                 feed(&mut peer, &mut conn, &wire[split..]);
                 assert_eq!(
@@ -526,8 +496,11 @@ mod tests {
         let mut scratch = Vec::new();
         let (mut peer, mut conn) = pair();
         feed(&mut peer, &mut conn, &wire);
-        assert_eq!(buffered(&conn), wire.len());
-        assert!(!conn.is_read_saturated(), "a whole frame must not saturate");
+        assert_eq!(conn.buffered(), wire.len());
+        assert!(
+            conn.buffered() < MAX_PENDING_READ,
+            "a whole frame must not saturate"
+        );
         assert_eq!(take(&mut conn, &mut scratch), Some(frame));
         assert_eq!(&scratch[..], &wire[HEADER_LEN..]);
     }
@@ -550,8 +523,8 @@ mod tests {
         let mut lens = Vec::new();
         let mut got = Vec::new();
         let mut next = 7;
-        while sender.wants_write() || reader.has_buffered_input() {
-            let before = (sender.tx.len() - sender.tx_pos, buffered(&reader));
+        while sender.queued() > 0 || reader.buffered() > 0 {
+            let before = (sender.queued(), reader.buffered());
             sender.flush_some().expect("a flush");
             fill(&mut reader).expect("a fill");
             while let Some(frame) = take(&mut reader, &mut scratch) {
@@ -565,7 +538,7 @@ mod tests {
             }
             assert_ne!(
                 before,
-                (sender.tx.len() - sender.tx_pos, buffered(&reader)),
+                (sender.queued(), reader.buffered()),
                 "neither side moved"
             );
         }
@@ -602,11 +575,11 @@ mod tests {
             matches!(conn.take_frame(&mut scratch), Ok(None)),
             "three bytes of a header are not a frame"
         );
-        assert!(conn.has_buffered_input(), "the stump must be kept");
+        assert!(conn.buffered() > 0, "the stump must be kept");
 
         feed(&mut peer, &mut conn, &wire[tail_at + 3..]);
         assert_eq!(take(&mut conn, &mut scratch), Some(tail));
-        assert!(!conn.has_buffered_input());
+        assert_eq!(conn.buffered(), 0);
     }
 
     /// A header this build cannot parse is reported without being consumed, so the
@@ -621,7 +594,7 @@ mod tests {
             conn.take_frame(&mut scratch),
             Err(ProtoError::UnknownFrameType(0x00))
         );
-        assert_eq!(buffered(&conn), HEADER_LEN, "the bad header must stay put");
+        assert_eq!(conn.buffered(), HEADER_LEN, "the bad header must stay put");
     }
 
     /// A stream of frames read in chunks that never end on a frame boundary: the
@@ -652,7 +625,7 @@ mod tests {
                     compacted(conn.rx.len(), conn.rx_pos),
                     "{} dead bytes under {} live ones",
                     conn.rx_pos,
-                    buffered(&conn)
+                    conn.buffered()
                 );
                 if conn.rx_pos == 0 && !conn.rx.is_empty() {
                     halvings += 1;
@@ -685,7 +658,7 @@ mod tests {
         for _ in 0..rounds {
             // Topped back up after every write, which is what the replay path does
             // and what makes the dead prefix a cost rather than a curiosity.
-            while !conn.is_write_saturated() {
+            while conn.queued() < MAX_PENDING_WRITE {
                 let frame = Frame::Output {
                     offset,
                     data: &payload,
@@ -699,12 +672,12 @@ mod tests {
                 compacted(conn.tx.len(), conn.tx_pos),
                 "{} dead bytes under {} live ones",
                 conn.tx_pos,
-                conn.tx.len() - conn.tx_pos
+                conn.queued()
             );
             if conn.tx_pos == 0 && !conn.tx.is_empty() {
                 halvings += 1;
             }
-            if conn.wants_write() {
+            if conn.queued() > 0 {
                 short_writes += 1;
             }
             high_water = high_water.max(conn.tx.len());
@@ -714,10 +687,10 @@ mod tests {
             assert!(sip(&mut peer, &mut got) > 0, "the peer read nothing");
         }
 
-        while conn.wants_write() {
+        while conn.queued() > 0 {
             conn.flush_some().expect("a flush");
             assert!(
-                drain(&mut peer, &mut got) > 0 || !conn.wants_write(),
+                drain(&mut peer, &mut got) > 0 || conn.queued() == 0,
                 "nothing moved"
             );
         }
@@ -750,7 +723,7 @@ mod tests {
                 offset: round * payload.len() as u64,
                 data: &payload,
             });
-            while conn.wants_write() {
+            while conn.queued() > 0 {
                 conn.flush_some().expect("a flush");
                 drain(&mut peer, &mut got);
             }
@@ -789,7 +762,7 @@ mod tests {
                     matches!(conn.take_frame(&mut scratch), Ok(None)),
                     "a frame whose payload never arrived must not be handed over"
                 );
-                assert_eq!(buffered(&conn), split, "the stump is neither used nor lost");
+                assert_eq!(conn.buffered(), split, "the stump is neither used nor lost");
             }
         }
     }
@@ -807,7 +780,7 @@ mod tests {
                 data: &payload,
             });
         }
-        assert!(conn.wants_write(), "there is something to throw away");
+        assert!(conn.queued() > 0, "there is something to throw away");
 
         let last = Frame::Error {
             code: ErrorCode::Takeover,
@@ -830,7 +803,7 @@ mod tests {
     fn flush_final_gives_up_on_a_peer_that_has_stopped_reading() {
         let payload = bulk(4096);
         let (_peer, mut conn) = pair();
-        while !conn.is_write_saturated() {
+        while conn.queued() < MAX_PENDING_WRITE {
             conn.send(&Frame::Output {
                 offset: 0,
                 data: &payload,
@@ -839,7 +812,7 @@ mod tests {
         // Fill the kernel's buffer first, so it is the deadline that ends the call.
         conn.flush_some().expect("a flush");
         assert!(
-            conn.wants_write(),
+            conn.queued() > 0,
             "the socket must be full to test anything"
         );
 
@@ -858,7 +831,7 @@ mod tests {
             "the deadline is what should have ended this, after {elapsed:?}"
         );
         assert!(
-            conn.wants_write(),
+            conn.queued() > 0,
             "the queue is left for the caller to drop"
         );
     }

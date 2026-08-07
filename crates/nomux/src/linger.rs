@@ -10,8 +10,6 @@ use std::path::Path;
 
 use nomux::Linger;
 
-use crate::passwd;
-
 /// Present exactly when `systemd` is the running init.
 const SYSTEMD_MARKER: &str = "/run/systemd/system";
 
@@ -48,21 +46,22 @@ fn state_of(dir: &Path, user: &str) -> Linger {
 
 /// The login name, used as a filename component under [`LINGER_DIR`].
 ///
-/// `IMPLEMENTATION.md` § 6.2 has the source order and the refusals. The environment is a
-/// fallback rather than a peer: directory-backed accounts have no line in `/etc/passwd`.
+/// `$USER`, then `$LOGNAME`, and nothing else. The password database used to sit in front
+/// of them and could never decide anything: [`detect`] answers `Unknown` without asking
+/// unless [`SYSTEMD_MARKER`] is there, and a host running `logind` is one where PAM has
+/// set both variables — so it bought a second parse of `/etc/passwd` per session and no
+/// answer that these two did not already give.
 ///
 /// Empty, `/`, NUL, `.` and `..` are refused because this name is joined onto a system
 /// directory and `$USER` is the environment's to set: anything but a single component
-/// asks about a path other than the one [`LINGER_DIR`] holds.
+/// asks about a path other than the one [`LINGER_DIR`] holds. Asked of each source in
+/// turn rather than of the answer, so a `$USER` that fails it falls through to `$LOGNAME`
+/// as the stated order implies, rather than ending the lookup.
 fn username() -> Option<String> {
-    passwd::current()
-        .map(|entry| entry.name)
-        .or_else(|| {
-            std::env::var("USER")
-                .or_else(|_| std::env::var("LOGNAME"))
-                .ok()
-        })
-        .filter(|name| {
+    ["USER", "LOGNAME"]
+        .into_iter()
+        .filter_map(|variable| std::env::var(variable).ok())
+        .find(|name| {
             !name.is_empty()
                 && !name.contains('/')
                 && !name.contains('\0')

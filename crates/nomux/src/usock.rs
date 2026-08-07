@@ -180,7 +180,7 @@ pub(crate) fn peer_is_ours(peer: BorrowedFd<'_>, id: &str) -> bool {
     if uid_is_ours(&uid, rustix::process::getuid().as_raw()) {
         return true;
     }
-    crate::syslog::error(
+    crate::sanitize::error(
         id,
         &match uid {
             Ok(uid) => format!("refused a connection from uid {uid}"),
@@ -206,11 +206,6 @@ mod widths {
 }
 
 /// The uid `SO_PEERCRED` reports for the process at the other end of `fd`.
-///
-/// Through `libc` because rustix's socket options sit behind its `net` feature, which
-/// this crate does not enable: § 8's 400 KiB budget is why the feature list is as short as
-/// it is, and it is the same reason `daemon::publish`'s second `listen` is spelled this
-/// way.
 fn peer_uid(fd: BorrowedFd<'_>) -> io::Result<u32> {
     let mut cred = libc::ucred {
         pid: 0,

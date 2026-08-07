@@ -22,11 +22,19 @@ repos:
       # comment pointing at a section that has gone reads exactly like one that has not,
       # so the reference rots in a file nobody reopens. Cheapest hook, and the only one
       # that can fail on a commit touching no Rust at all.
+      #
+      # `ya?ml` and `^scripts/`, which is what it takes to reach every tracked file. `yml`
+      # alone matched neither this file — the gate itself, and a `.yaml` — nor anything a
+      # future workflow adds under that spelling; and `scripts/nightly-version` and
+      # `scripts/size-baseline`, both read by scripts/build-release.sh, carry no extension at
+      # all, so a nightly bump or a baseline refresh used to be a commit that fired no hook
+      # whatsoever. This pattern decides only when the hook runs; what it then reads is the
+      # file list inside scripts/check-references.sh, and the two are kept in step.
       - id: section-references-resolve
         name: every § names a section that exists
         entry: sh scripts/check-references.sh
         language: system
-        files: '\.(rs|md|sh|toml|yml)$'
+        files: '\.(rs|md|sh|toml|ya?ml)$|^scripts/'
         pass_filenames: false
 
       # ci.yml carries ~60 lines of embedded shell that the hook below never sees —

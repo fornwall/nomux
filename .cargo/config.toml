@@ -6,12 +6,11 @@
 # and binutils the host happens to have, and their version then lands in the bytes we
 # ask the client to pin a SHA-256 of.
 #
-# Only `linker` belongs in this file. A `rustflags` key here would be silently
-# discarded the moment anything sets $CARGO_ENCODED_RUSTFLAGS or $RUSTFLAGS — either
-# environment variable replaces these tables rather than appending to them — and both
-# scripts do: scripts/build-release.sh sets the encoded form, so that a space in a
-# remapped path cannot split a flag, and both fault-injection guards under scripts/ set
-# the plain one. Link flags that must not go missing are passed from there instead.
+# Only `linker` belongs in this file. A `rustflags` key here would be silently discarded
+# the moment anything sets $CARGO_ENCODED_RUSTFLAGS or $RUSTFLAGS — either environment
+# variable replaces these tables rather than appending to them — and scripts/build-release.sh
+# sets the encoded form, so that a space in a remapped path cannot split a flag. Link flags
+# that must not go missing are passed from there instead.
 
 [target.x86_64-unknown-linux-musl]
 linker = "rust-lld"

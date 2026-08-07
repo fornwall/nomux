@@ -11,27 +11,30 @@
 //!
 //! A library target beside the binary rather than a module inside it, because an
 //! integration test cannot import from a binary and most of the suite speaks this
-//! codec. That also keeps `forbid(unsafe_code)` over a whole target: `pre_exec` and the
-//! signal handlers are the binary's, as is the seccomp filter the binary's *tests* trap
-//! a reach with — the shipped daemon installs none.
+//! codec. That also keeps `forbid(unsafe_code)` over a whole target: the signal
+//! handlers, the `fork` and the raw `AF_UNIX` calls are the binary's, and a codec that
+//! only reads and writes byte slices needs none of them.
 
 #![forbid(unsafe_code)]
+// The one place a doctest's warnings become errors. Neither `RUSTFLAGS` nor
+// `RUSTDOCFLAGS` reaches the doctest compile, so without this the crate's gates deny
+// warnings everywhere except the examples in these docs.
+#![doc(test(attr(deny(warnings))))]
 
 mod frame;
 
-pub use frame::{
-    ErrorCode, ExitKind, Frame, HELLO_AGENT_FORWARD, HELLO_REPAINT_CTRL_L, Hello, HelloOk, Linger,
-    RESUME_FROM_START, WinSize,
-};
+pub use frame::{ErrorCode, ExitKind, Frame, Hello, HelloOk, Linger, RESUME_FROM_START, WinSize};
 
 /// Protocol revision. Bumped on any wire change, including compatible ones.
 ///
 /// There is no history to consult but `git log`: `IMPLEMENTATION.md` § 2.2 states the
-/// revision in force and nothing before it. `tests/wire.rs` holds the constant, the
-/// vectors and the document to each other, so a bump has to move all three.
+/// revision in force and nothing before it. `tests/codec.rs`'s `vectors` module holds the
+/// constant, the byte vectors and the document to each other, so a bump has to move all
+/// three.
 pub const PROTOCOL_VERSION: u16 = 8;
 
-/// Fixed frame header size, so reads are a two-stage `read_exact`.
+/// Fixed frame header size: a reader sizes the payload from the first four bytes it has,
+/// and never has to scan for a boundary.
 pub const HEADER_LEN: usize = 4;
 
 /// Largest permitted payload. Bounds the peer's ability to force an allocation.
@@ -39,15 +42,14 @@ pub const MAX_PAYLOAD: u32 = 256 * 1024;
 
 // A discriminant list is written down once, and everything derived from it — the
 // enum, both directions of the conversion, and the `ALL` the suites sweep — is
-// generated, so the four cannot drift apart. A hand-written `from_byte` ending in a
+// generated, so the four cannot drift apart. A hand-written `from_wire` ending in a
 // catch-all `_ => None` leaves an end that can *send* a new frame but never
 // *receives* one. `IMPLEMENTATION.md` § 2.3 applies the same closed-set rule to
-// `Error.code`, `Exit.kind` and the linger field, hence the parameters: those sets
-// differ in their repr and in what the accessors are called.
+// `Error.code`, `Exit.kind` and the linger field.
 macro_rules! wire_enum {
     (
         $(#[$enum_meta:meta])*
-        $name:ident: $repr:ident, $as_fn:ident / $from_fn:ident,
+        $name:ident: $repr:ident,
         $($(#[$variant_meta:meta])* $variant:ident = $value:literal,)+
     ) => {
         $(#[$enum_meta])*
@@ -64,13 +66,13 @@ macro_rules! wire_enum {
 
             /// Returns the wire discriminant.
             #[must_use]
-            pub const fn $as_fn(self) -> $repr {
+            pub const fn as_wire(self) -> $repr {
                 self as $repr
             }
 
             /// Parses a wire discriminant, returning `None` if unrecognised.
             #[must_use]
-            pub const fn $from_fn(value: $repr) -> Option<Self> {
+            pub const fn from_wire(value: $repr) -> Option<Self> {
                 match value {
                     $($value => Some(Self::$variant),)+
                     _ => None,
@@ -87,7 +89,7 @@ wire_enum! {
     /// Exhaustive on purpose: both endpoints are built from this repository, so an
     /// unrecognised variant is a bug rather than a forward-compatibility case.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    FrameType: u8, as_byte / from_byte,
+    FrameType: u8,
     /// Client opens a session, carrying its resume offsets and window size.
     Hello = 0x01,
     /// Daemon accepts, reporting where output will resume from.
@@ -125,7 +127,12 @@ wire_enum! {
 pub struct Header {
     /// Frame discriminant.
     pub ty: FrameType,
-    /// Payload length in bytes, guaranteed `<= MAX_PAYLOAD`.
+    /// Payload length in bytes.
+    ///
+    /// `<= MAX_PAYLOAD` in every header [`decode_header`] returns, which is the only
+    /// thing that builds one outside the tests. The promise is that function's and not
+    /// this type's: both fields are `pub`, so a `Header` written out by hand carries
+    /// whatever it was given.
     pub len: u32,
 }
 
@@ -170,7 +177,7 @@ pub(crate) const fn encode_header(ty: FrameType, len: u32) -> Result<[u8; HEADER
     }
     // `len <= MAX_PAYLOAD` fits in 24 bits, so the high byte is always zero.
     let [_, a, b, c] = len.to_be_bytes();
-    Ok([ty.as_byte(), a, b, c])
+    Ok([ty.as_wire(), a, b, c])
 }
 
 /// Decodes a frame header.
@@ -196,7 +203,7 @@ pub(crate) const fn encode_header(ty: FrameType, len: u32) -> Result<[u8; HEADER
 /// ```
 pub fn decode_header(bytes: &[u8; HEADER_LEN]) -> Result<Header, ProtoError> {
     let [ty, a, b, c] = *bytes;
-    let ty = FrameType::from_byte(ty).ok_or(ProtoError::UnknownFrameType(ty))?;
+    let ty = FrameType::from_wire(ty).ok_or(ProtoError::UnknownFrameType(ty))?;
     let len = u32::from_be_bytes([0, a, b, c]);
     if len > MAX_PAYLOAD {
         return Err(ProtoError::PayloadTooLarge(len));
@@ -226,7 +233,7 @@ mod tests {
         );
         // 0x00_04_00_01 == MAX_PAYLOAD + 1, encoded by hand since the encoder refuses.
         assert_eq!(
-            decode_header(&[FrameType::Output.as_byte(), 0x04, 0x00, 0x01]),
+            decode_header(&[FrameType::Output.as_wire(), 0x04, 0x00, 0x01]),
             Err(ProtoError::PayloadTooLarge(MAX_PAYLOAD + 1))
         );
     }

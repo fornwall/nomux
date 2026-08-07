@@ -364,17 +364,18 @@ fn a_daemon_that_cannot_bind_says_so_even_when_it_has_to_fork() {
     );
 }
 
-/// A spawn lock nobody can open does not take the control surface with it: the dead
-/// session behind it is still collected.
+/// A spawn lock at a mode no later process would have chosen is still a lock, and the
+/// dead session behind it is still collected.
 ///
 /// The mode a lock is *created* at is
 /// [`the_lock_and_the_pidfile_are_created_at_0600_whatever_the_umask`]'s business.
-/// This is what one already at `0400` costs — a file left by an older release, or by
-/// a login under `umask 0200`. `list` opens `<id>.lock` `O_RDWR` to serialise against
-/// a spawn, and a caller that skipped every entry whose lock it could not open
-/// would leave that session on disk for good, which is the one outcome § 6.6 exists
-/// to rule out. So the entry is collected anyway: what the lock stands between is a
-/// spawn and a collection, and there is no spawn here to lose a race with.
+/// This is what one already at `0400` costs — a file left by an older release, by a
+/// login under `umask 0200`, or by the second implementation of `list` and `kill` that
+/// § 6.6 invites. It costs nothing, and deliberately: `rundir::SessionPaths::acquire`
+/// opens `<id>.lock` `O_RDONLY`, `flock(2)` needing no particular access mode, so a
+/// read-only file is locked exactly as any other. Asking for write would make this the
+/// one thing § 6.6 exists to rule out — a session on disk for good, its lock refused
+/// and so its entry never collectable.
 #[test]
 fn an_unopenable_spawn_lock_does_not_take_the_control_surface_with_it() {
     let session = StaleSession::create("lk4");
@@ -747,6 +748,11 @@ fn unidentified_pidfiles() -> [Unidentified; 5] {
 /// daemon must still be taken, or § 6.2's fork leaves a healthy session unidentifiable.
 #[test]
 fn a_live_session_its_pidfile_cannot_identify_is_refused_and_left_alone() {
+    // Five rows, each spawning a session and running `kill` twice and `list` twice, and
+    // every one of those waits on a `kill` that may sit out two graces. One figure for the
+    // table rather than none at all, per [`PATIENCE`]: the rows are independent, so a table
+    // that runs past the runner's kill reports nothing about which row was slow.
+    let deadline = Instant::now() + PATIENCE;
     for case in unidentified_pidfiles() {
         if case.needs_modes
             && skip_as_root(
@@ -816,6 +822,11 @@ fn a_live_session_its_pidfile_cannot_identify_is_refused_and_left_alone() {
         assert!(
             entries(&session.run.dir).is_empty(),
             "{id}: kill must unlink every one of the session's files"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "{id} left the table past its deadline, so the rest of it would be decided by \
+             nextest's kill rather than by an assertion"
         );
     }
 }
@@ -993,19 +1004,21 @@ fn kill_reports_an_unprobeable_socket_over_a_pidfile_that_names_no_daemon() {
 /// Regression: a daemon is still recognised when its command line is long *behind*
 /// the id.
 ///
-/// `argv[0]` is bounded — the kernel resolves it and will not hand back more than
-/// `PATH_MAX`, which is what `MAX_CMDLINE_LEN` is sized from — but `--label` is not:
-/// `spawn` passes what it was given straight through (`attach::spawn_daemon`), and the
-/// 256-byte cap in `sanitize_label` applies to the file the daemon *writes*, not to its
-/// own `argv`. So a command line has no length a buffer can be sized against, and a
-/// rule that needed to see the end of one would strand a session over a label.
+/// `MAX_CMDLINE_LEN` is sized for a well-formed `nomux daemon <id>` and nothing else:
+/// `--label` is unbounded, `spawn` passing what it was given straight through
+/// (`attach::spawn_daemon`), and the 256-byte cap in `sanitize_label` applies to the file
+/// the daemon *writes* rather than to its own `argv`. So a command line has no length a
+/// buffer can be sized against, and a rule that needed to see the end of one would strand
+/// a session over a label.
 ///
 /// Nothing behind the id is read as anything but padding: the pair is looked for among
 /// the arguments the read saw the end of, and finding it is an answer whether or not
 /// the rest arrived. The label here is an order of magnitude past what the layout
 /// stores and past the whole buffer. What both modes then have to do is the same
 /// thing — `list` must print the pid the file names rather than `?`, and `kill` must
-/// signal it and say so.
+/// signal it and say so. The other direction, where the pair is *not* found in a read
+/// that filled the buffer, is
+/// `control::tests::a_long_command_line_that_is_not_a_daemon_is_answered_rather_than_left_unknown`.
 #[test]
 fn a_daemon_started_with_an_over_long_label_is_still_recognised_as_one() {
     let root = run_root("lk20");
@@ -1521,67 +1534,83 @@ fn a_listing_whose_reader_has_gone_ends_cleanly_and_still_collects() {
 /// Every mode that resolves a run directory establishes that it is this user's alone
 /// *before* it trusts a name in it — including the two that only read.
 ///
-/// The directory here is a symlink into one anybody can write to, with a socket, a
-/// pidfile and a label planted in it. That is the whole attack: `attach` connecting
-/// first and checking afterwards relays the user's keystrokes into a socket somebody
-/// else is listening on, `list` prints their label to the user's terminal, `kill`
-/// reads their number out of the pidfile and signals it, and `spawn` and `daemon`
-/// `chmod` whatever the link points at and bind inside it. `rundir`'s unit tests own
-/// the decision; this is the consequence, which is the half a user sees.
+/// The directory holds a socket, a pidfile and a label somebody else planted, and it is
+/// one this user does not have to itself in each of the two ways § 6.3 rules out
+/// ([`Planted`]). That is the whole attack: `attach` connecting first and checking
+/// afterwards relays the user's keystrokes into a socket somebody else is listening on,
+/// `list` prints their label to the user's terminal, `kill` reads their number out of the
+/// pidfile and signals it, and `spawn` and `daemon` `chmod` the directory and bind inside
+/// it. `rundir`'s unit tests own the decision; this is the consequence, which is the half
+/// a user sees — and it is the same consequence whether the way in took an attacker or a
+/// umask.
 ///
 /// The owed code is § 10's, and the tables differ: `spawn` and `attach` report 126,
 /// which `DESIGN.md` § 7 has the client cache the whole host as unattachable on, so
 /// 127 would have it retry a host that can never work and 1 would have it give up on
-/// none. On the other table everything that is not a malformed command line is 1.
+/// none. On the other table everything that is not a malformed command line is 1. Both
+/// rows owe the same numbers, the refusal happening before any mode has done anything
+/// that could tell them apart.
 #[test]
-fn a_symlinked_run_directory_is_refused_by_every_mode_that_resolves_one() {
-    let planted = PlantedRunDir::create("lk7");
-    let before = entries(&planted.dir);
+fn a_run_directory_this_user_does_not_own_is_refused_by_every_mode_that_resolves_one() {
+    // One deadline for the whole table, per [`PATIENCE`]: ten runs of a binary that must
+    // refuse before it starts anything, and a bound per run would be ten times it.
+    let deadline = Instant::now() + PATIENCE;
+    for (name, how) in [("lk7", Planted::Symlink), ("lk34", Planted::WorldWritable)] {
+        let planted = PlantedRunDir::create(name, how);
+        let before = entries(&planted.dir);
 
-    for (mode, owed) in [
-        (vec!["spawn", "imp"], 126),
-        (vec!["attach", "imp"], 126),
-        (vec!["daemon", "imp"], 1),
-        (vec!["list"], 1),
-        (vec!["kill", "imp"], 1),
-    ] {
-        let out = planted.run(&mode);
+        for (mode, owed) in [
+            (vec!["spawn", "imp"], 126),
+            (vec!["attach", "imp"], 126),
+            (vec!["daemon", "imp"], 1),
+            (vec!["list"], 1),
+            (vec!["kill", "imp"], 1),
+        ] {
+            let out = planted.run(&mode, deadline);
+            assert_eq!(
+                out.status.code(),
+                Some(owed),
+                "{name}: {mode:?} must refuse this run directory with {owed}: {:?}",
+                stderr(&out)
+            );
+            assert!(
+                stderr(&out).contains("run directory") && stderr(&out).contains(how.says()),
+                "{name}: {mode:?} must say what it refused and why, naming {:?}: {:?}",
+                how.says(),
+                stderr(&out)
+            );
+            assert!(
+                out.stdout.is_empty(),
+                "{name}: {mode:?} printed a planted entry: {:?}",
+                stdout(&out)
+            );
+        }
+
+        assert!(
+            planted.nothing_connected(),
+            "{name}: the relay handed the session over to a socket somebody else planted"
+        );
         assert_eq!(
-            out.status.code(),
-            Some(owed),
-            "{mode:?} must refuse a symlinked run directory with {owed}: {:?}",
-            stderr(&out)
+            entries(&planted.dir),
+            before,
+            "{name}: nothing may be created in a directory this refused"
+        );
+        assert_eq!(
+            fs::symlink_metadata(&planted.dir)
+                .expect("stat the planted directory")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o777,
+            "{name}: a mode nomux refused is not a mode nomux may repair — tightening it \
+             now would leave whatever is already planted inside exactly where it is"
         );
         assert!(
-            stderr(&out).contains("run directory") && stderr(&out).contains("it is a symlink"),
-            "{mode:?} must say what it refused and why: {:?}",
-            stderr(&out)
-        );
-        assert!(
-            out.stdout.is_empty(),
-            "{mode:?} printed a planted entry: {:?}",
-            stdout(&out)
+            Instant::now() < deadline,
+            "{name} left the table past its deadline, so the rest of it would be decided \
+             by nextest's kill rather than by an assertion"
         );
     }
-
-    assert!(
-        planted.nothing_connected(),
-        "the relay handed the session over to a socket somebody else planted"
-    );
-    assert_eq!(
-        entries(&planted.dir),
-        before,
-        "nothing may be created through the link"
-    );
-    assert_eq!(
-        fs::symlink_metadata(&planted.dir)
-            .expect("stat the planted directory")
-            .permissions()
-            .mode()
-            & 0o7777,
-        0o777,
-        "the mode of a directory nomux does not own is not nomux's to change"
-    );
 }
 
 /// Being asked what sessions exist must not be what creates the place they would
@@ -1626,7 +1655,7 @@ fn the_control_surface_neither_creates_nor_complains_about_a_missing_run_directo
 /// arriving as one of those numbers would be wrong and uncaught.
 ///
 /// Through `spawn`, which is the mode with something to lose by getting the order
-/// wrong: it is the one that goes on to `ensure_dir`, so a refusal that came after
+/// wrong: it is the one that goes on to `ensure_run_dir`, so a refusal that came after
 /// the directory was created would be a bad id bringing a run directory into
 /// existence — and `../escape` would bring it into existence somewhere the caller
 /// did not name. `attach` reaches the same refusal through the same
@@ -1879,28 +1908,69 @@ impl LiveSession {
     }
 }
 
-/// A run directory that is a symlink into one anybody can write to, with a
-/// session's files already planted in it.
+/// How a run directory comes to be one this user does not have to itself.
+///
+/// Two ways in, and `rundir::check_run_dir` answers them from opposite ends — the
+/// `open` that will not resolve the name, and the `fstat` of the directory it did
+/// open. The consequence is one thing either way, which is why they share the table
+/// below: a stranger's label printed to the user's terminal, a stranger's number
+/// signalled out of the pidfile, and a stranger's socket handed the user's keystrokes.
+#[derive(Clone, Copy)]
+enum Planted {
+    /// A symlink into a directory anybody can write to. The pointed-at mode is
+    /// nothing `nomux` may repair, and following the link would `chmod` and bind
+    /// inside somebody else's directory.
+    Symlink,
+    /// The run directory itself, world-writable. No attacker and no symlink needed:
+    /// one login under a lax umask leaves `~/.local/state/nomux/run` at `0777`, after
+    /// which anybody on the host can create names in it. Tightening it now would not
+    /// un-plant what is already there, so § 6.3 refuses rather than repairs.
+    WorldWritable,
+}
+
+impl Planted {
+    /// What the refusal has to say, which is also what says which row fired.
+    const fn says(self) -> &'static str {
+        match self {
+            Self::Symlink => "it is a symlink",
+            Self::WorldWritable => "lets other users create files in it",
+        }
+    }
+}
+
+/// A run directory that is not this user's alone ([`Planted`]), with a session's files
+/// already planted in it.
 ///
 /// The socket is bound by this process and stays bound, so anything that connects
 /// to it reaches the test rather than a refused connection — which is the whole
 /// point: a refusal would look like the same "stale socket" every other test uses.
 struct PlantedRunDir {
     root: PathBuf,
-    /// What the link points at, so a test can ask what was done to it.
+    /// The directory the planted files are in — what the link points at, or the run
+    /// directory itself — so a test can ask what was done to it.
     dir: PathBuf,
     listener: UnixListener,
 }
 
 impl PlantedRunDir {
-    fn create(name: &str) -> Self {
+    fn create(name: &str, how: Planted) -> Self {
         let root = run_root(name);
-        let dir = root.join("theirs");
+        fs::create_dir_all(root.join("xdg")).expect("create the runtime directory");
+        // `XDG_RUNTIME_DIR` is `<root>/xdg`, so `<root>/xdg/nomux` is the name every
+        // mode resolves. What is at it is the whole of the difference between the rows.
+        let dir = match how {
+            Planted::Symlink => {
+                let theirs = root.join("theirs");
+                fs::create_dir_all(&theirs).expect("create the planted directory");
+                std::os::unix::fs::symlink(&theirs, root.join("xdg/nomux"))
+                    .expect("plant the symlink");
+                theirs
+            }
+            Planted::WorldWritable => root.join("xdg/nomux"),
+        };
         fs::create_dir_all(&dir).expect("create the planted directory");
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o777))
             .expect("make it world-writable");
-        fs::create_dir_all(root.join("xdg")).expect("create the runtime directory");
-        std::os::unix::fs::symlink(&dir, root.join("xdg/nomux")).expect("plant the symlink");
 
         let listener = UnixListener::bind(dir.join("imp.sock")).expect("plant a socket");
         listener
@@ -1927,15 +1997,19 @@ impl PlantedRunDir {
     /// this with are the ones that must not reach one — and if any ever does, it
     /// should find a predictable `/bin/sh` rather than whatever the developer logs in
     /// with.
-    fn run(&self, args: &[&str]) -> Output {
+    ///
+    /// The deadline is the caller's, per [`ran_by`] and [`PATIENCE`]: the caller below
+    /// makes five of these calls, and a fresh bound each would let one test spend five
+    /// times it — past the runner's own kill, which reports no assertion at all.
+    fn run(&self, args: &[&str], deadline: Instant) -> Output {
         ran_by(
             &mut nomux_with_shell(&self.root.join("xdg"), args),
-            Instant::now() + Duration::from_secs(10),
+            deadline,
         )
         .unwrap_or_else(|| {
             panic!(
                 "`nomux {args:?}` never returned, so it is still relaying to a \
-                 socket somebody else planted"
+                     socket somebody else planted"
             )
         })
     }

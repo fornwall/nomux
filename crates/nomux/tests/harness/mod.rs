@@ -34,8 +34,8 @@ use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use nomux::{
-    ErrorCode, Frame, FrameType, HEADER_LEN, HELLO_AGENT_FORWARD, HELLO_REPAINT_CTRL_L, Hello,
-    PROTOCOL_VERSION, RESUME_FROM_START, WinSize, decode_header,
+    ErrorCode, Frame, FrameType, HEADER_LEN, Hello, PROTOCOL_VERSION, RESUME_FROM_START, WinSize,
+    decode_header,
 };
 
 pub(crate) const WIN: WinSize = WinSize {
@@ -301,14 +301,19 @@ impl Session {
     /// used — `let (_session, ..)`, never `let (_, ..)`, which would end the session
     /// on the spot.
     pub(crate) fn attached(name: &str) -> (Self, Client, nomux::HelloOk) {
-        Self::attached_with(name, 0)
+        Self::attached_with(name, false, false)
     }
 
-    /// [`Session::attached`], with `flags` in the greeting.
-    pub(crate) fn attached_with(name: &str, flags: u8) -> (Self, Client, nomux::HelloOk) {
+    /// [`Session::attached`], with `agent_forward` and `repaint_ctrl_l` asked for in
+    /// that order — the order they sit in on the wire, and in [`Client::hello_with`].
+    pub(crate) fn attached_with(
+        name: &str,
+        agent_forward: bool,
+        repaint_ctrl_l: bool,
+    ) -> (Self, Client, nomux::HelloOk) {
         let session = Self::start(name);
         let mut client = session.connect();
-        let ok = client.hello_with(flags, RESUME_FROM_START);
+        let ok = client.hello_with(agent_forward, repaint_ctrl_l, RESUME_FROM_START);
         (session, client, ok)
     }
 
@@ -397,16 +402,19 @@ impl Cue {
 /// `deadline` is the caller's, spent here rather than renewed: a fresh [`Client`] per
 /// round would otherwise mint a fresh frame budget every time round, which is the case
 /// [`poll_by`] is written against.
+///
+/// Only the repaint flag, since every greeting here resumes a session that is already
+/// there and `agent_forward` is honoured on the one that creates it.
 pub(crate) fn reconnect_until_gap(
     session: &Session,
     deadline: Instant,
-    flags: u8,
+    repaint_ctrl_l: bool,
     out_offset: u64,
 ) -> (Client, nomux::HelloOk) {
     loop {
         let mut client = session.connect();
         client.waits_by(deadline);
-        let resumed = client.hello_with(flags, out_offset);
+        let resumed = client.hello_with(false, repaint_ctrl_l, out_offset);
         if resumed.gap(out_offset) {
             return (client, resumed);
         }
@@ -434,6 +442,13 @@ impl Drop for Session {
 /// Every test that needs one comes through here, so the naming argument in this
 /// module's header holds for all of them rather than for the ones that remembered.
 pub(crate) fn run_root(name: &str) -> PathBuf {
+    /// Room a run root must leave for the session id inside it. Not
+    /// `rundir::MAX_SESSION_ID_LEN`, which is 64: no test mints an id near that, and
+    /// demanding the protocol's maximum would refuse working directories. Double the
+    /// longest id the suite actually uses, which leaves the check about the environment
+    /// rather than about the names.
+    const ID_HEADROOM: usize = 32;
+
     sweep_finished_runs();
     let owned = format!("{}-{}", intern(name), std::process::id());
     let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(owned);
@@ -441,6 +456,22 @@ pub(crate) fn run_root(name: &str) -> PathBuf {
     // behind, so the wipe stays even though the name is this process's own.
     drop(fs::remove_dir_all(&root));
     fs::create_dir_all(&root).expect("create run root");
+    // Checked here rather than at the bind, because the bind's failure is 10 s of a
+    // daemon that never answers, repeated once per session test — fifty timeouts none of
+    // which names the cause. `sun_path` is 108 bytes with room for the NUL, and the
+    // longest name a session can put under this root is a maximum-length id plus the
+    // longest extension the run directory uses.
+    // `<root>/nomux/<id>.agent` is the longest name a session puts here.
+    let fixed = root.join("nomux").join(".agent").as_os_str().len();
+    assert!(
+        fixed + ID_HEADROOM <= 107,
+        "this run root leaves {} bytes for a session id, and the suite needs {ID_HEADROOM}: \
+         {}\nset a shorter CARGO_TARGET_DIR — `sockaddr_un` carries 107, and past it every \
+         session test fails alike on a daemon that never answers, for a reason that is the \
+         environment rather than the change under test",
+        107_usize.saturating_sub(fixed),
+        root.display()
+    );
     root
 }
 
@@ -882,11 +913,16 @@ impl Client {
     }
 
     pub(crate) fn hello(&mut self, out_offset: u64) -> nomux::HelloOk {
-        self.hello_with(0, out_offset)
+        self.hello_with(false, false, out_offset)
     }
 
-    pub(crate) fn hello_with(&mut self, flags: u8, out_offset: u64) -> nomux::HelloOk {
-        self.send(&hello_frame(flags, out_offset));
+    pub(crate) fn hello_with(
+        &mut self,
+        agent_forward: bool,
+        repaint_ctrl_l: bool,
+        out_offset: u64,
+    ) -> nomux::HelloOk {
+        self.send(&hello_frame(agent_forward, repaint_ctrl_l, out_offset));
         let greeting = self.frame_owed("a HelloOk from the daemon");
         self.take_hello_ok(greeting)
     }
@@ -895,7 +931,7 @@ impl Client {
     /// greetings, per [`poll_by`]. What is lost without it is the failure the test was
     /// going to report, the chaos seed § 9 promises included.
     pub(crate) fn hello_before(&mut self, deadline: Instant, out_offset: u64) -> nomux::HelloOk {
-        self.send(&hello_frame(0, out_offset));
+        self.send(&hello_frame(false, false, out_offset));
         let awaiting = "a HelloOk from the daemon";
         let greeting = self
             .frame_before(deadline, awaiting)
@@ -1315,13 +1351,21 @@ pub(crate) fn shrink_send_buffer(socket: &UnixStream, bytes: libc::c_int) {
 ///
 /// One literal rather than four, since the three sites that write it straight at a
 /// socket are exactly the ones that would be missed if it ever changed.
-/// Still taken as a flags byte, because the wire bits are what the tests that write
-/// straight at a socket are pinning; [`Hello`] itself carries them apart.
-pub(crate) const fn hello_frame(flags: u8, out_offset: u64) -> Frame<'static> {
+///
+/// Two bools rather than the flags byte, all the way up through [`Client::hello_with`]
+/// and [`Session::attached_with`]: nothing in the suite writes a bit, it builds a
+/// [`Hello`] and lets `encode` emit the byte. What pins the bit *values* is the fixed
+/// vector table in `tests/codec.rs`, which is why the wire constants need not be
+/// exported at all.
+pub(crate) const fn hello_frame(
+    agent_forward: bool,
+    repaint_ctrl_l: bool,
+    out_offset: u64,
+) -> Frame<'static> {
     Frame::Hello(Hello {
         protocol: PROTOCOL_VERSION,
-        agent_forward: flags & HELLO_AGENT_FORWARD != 0,
-        repaint_ctrl_l: flags & HELLO_REPAINT_CTRL_L != 0,
+        agent_forward,
+        repaint_ctrl_l,
         out_offset,
         win: WIN,
         term: "xterm-256color",
