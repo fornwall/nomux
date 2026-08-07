@@ -123,7 +123,12 @@ impl Pty {
             //
             // `SIGINT` and `SIGTERM` are absent because they are *handled* by the time
             // this runs (`startup::arm_stop_signals`), and exec resets a handler — the
-            // half § 6.2 describes, and the reading of it that hid the rest.
+            // half § 6.2 describes, and the reading of it that hid the rest. `SIGCHLD`
+            // is absent on the same ground and matters most of the five that are not
+            // here: `startup::arm_child_signal` handles it, and had it been *ignored*
+            // instead the shell would carry that through exec into a session where the
+            // kernel reaps its children out from under it and every `wait` it makes
+            // fails `ECHILD` — job control with it.
             //
             // A fixed array walked in place, so this stays what a `pre_exec` has to be:
             // allocation-free.

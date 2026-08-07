@@ -26,7 +26,9 @@ use crate::linger;
 use crate::nbio;
 use crate::pty::{self, Pty};
 use crate::rundir::{SessionPaths, ensure_run_dir, session_ids};
-use crate::startup::{arm_stop_signals, leave_login_session, release_startup_state};
+use crate::startup::{
+    arm_child_signal, arm_stop_signals, leave_login_session, release_startup_state,
+};
 
 /// Default ring capacity: how long a disconnect can last before scrollback is lost,
 /// times the per-host session count `MAX_SESSIONS` backstops (`IMPLEMENTATION.md` § 4).
@@ -175,6 +177,11 @@ struct Daemon {
     /// Read end of the self-pipe [`crate::startup::arm_stop_signals`] armed, or
     /// `None` on a host where it could not be armed at all.
     stop_pipe: Option<OwnedFd>,
+    /// The same for `SIGCHLD` ([`crate::startup::arm_child_signal`]), which is a
+    /// descriptor of its own for the reason that function gives. `None` is a worse
+    /// daemon rather than a broken one: [`Daemon::worth_a_waitpid`] then asks on every
+    /// pass, which is what the whole loop used to do.
+    child_pipe: Option<OwnedFd>,
     /// Why this session is ending, once anything has decided it should: a stop signal,
     /// or something it could not do without having failed. The loop leaves on its next
     /// pass (§ 6.5), and until then nothing new is accepted.
@@ -208,6 +215,11 @@ struct Daemon {
     /// what keeps § 2.2's "the arriving `Hello`'s winsize is authoritative" true of a
     /// reattach at an unchanged size.
     applied_win: Option<WinSize>,
+    /// Whether a `SIGCHLD` has arrived that no `waitpid` has been spent on yet. Set by
+    /// the pass that empties [`Daemon::child_pipe`] and cleared by the ask it pays for,
+    /// in that order — so a signal landing between the two leaves its byte in an emptied
+    /// pipe, which is the next wakeup rather than a reap nobody makes.
+    child_signalled: bool,
     /// When the PTY master reported end of file. Distinct from `exited`: the status is
     /// usually not readable yet at that moment.
     child_gone: Option<Instant>,
@@ -299,8 +311,8 @@ fn start(session_id: &str, label: Option<&str>) -> io::Result<()> {
 
     // One fallible region rather than a cleanup per call site: nothing past the bind can
     // be reported, so whatever fails inside `publish`, what it published goes.
-    let stop_pipe = match publish(&paths, label) {
-        Ok(stop_pipe) => stop_pipe,
+    let (stop_pipe, child_pipe) = match publish(&paths, label) {
+        Ok(pipes) => pipes,
         Err(err) => {
             // Released first: `unlink_all` takes this same lock, and `flock` conflicts
             // between two open descriptions of one file even within a process (§ 6.6).
@@ -323,6 +335,7 @@ fn start(session_id: &str, label: Option<&str>) -> io::Result<()> {
         paths,
         listener,
         stop_pipe,
+        child_pipe,
         stop: None,
         ring: crate::ring::Ring::new(ring_capacity(std::env::var(RING_BYTES_ENV).ok().as_deref())),
         pty: None,
@@ -334,6 +347,7 @@ fn start(session_id: &str, label: Option<&str>) -> io::Result<()> {
         pending_input: VecDeque::new(),
         win: WinSize::default(),
         applied_win: None,
+        child_signalled: false,
         child_gone: None,
         exited: None,
         accept_retry: None,
@@ -353,14 +367,18 @@ fn start(session_id: &str, label: Option<&str>) -> io::Result<()> {
 }
 
 /// Hands the id to the process that will actually serve it: § 6.2's detachment, the
-/// stop signals, and the two files `list` and `kill` read.
+/// signals, and the two files `list` and `kill` read. Answers with the read ends of the
+/// two self-pipes, stop first.
 ///
 /// # Errors
 ///
 /// Propagates the failure to write `<id>.pid`, and only that: a daemon sharing a login
-/// session, one without a stop pipe and one without a label in `list` are worse daemons
-/// rather than reasons to have no session.
-fn publish(paths: &SessionPaths, label: Option<&str>) -> io::Result<Option<OwnedFd>> {
+/// session, one without a stop pipe, one without a child pipe and one without a label in
+/// `list` are worse daemons rather than reasons to have no session.
+fn publish(
+    paths: &SessionPaths,
+    label: Option<&str>,
+) -> io::Result<(Option<OwnedFd>, Option<OwnedFd>)> {
     // Before the pidfile, so the pid `nomux kill` reads belongs to the process that
     // survives.
     leave_login_session();
@@ -368,9 +386,19 @@ fn publish(paths: &SessionPaths, label: Option<&str>) -> io::Result<Option<Owned
     // depth on Linux, and a backlog belongs to the socket's open file description, so
     // `leave_login_session`'s fork shares it rather than resetting it.
 
-    // Between the fork and the pidfile: arming after the pidfile `nomux kill` reads
-    // (§ 6.6) leaves a window where its signal lands on the default disposition, and
-    // arming before the fork lets the parent's `_exit` answer a signal into the pipe.
+    // Both here, between the fork and the pidfile: arming after the pidfile `nomux kill`
+    // reads (§ 6.6) leaves a window where its signal lands on the default disposition,
+    // and arming before the fork lets the parent's `_exit` answer a signal into the pipe.
+    // `SIGCHLD` too, rather than at `Pty::spawn` where the child it is about is created:
+    // a disposition belongs to the process, and the pipe has to exist before the first
+    // `poll` builds its set.
+    //
+    // `SIGCHLD` first, by `arm_stop_signals`'s own rule — it is the call that clears the
+    // inherited mask, and a signal blocked *and pending* is delivered the instant it
+    // does, so a handler installed afterwards is one that misses it. The consequence is
+    // the milder one here, `SIGCHLD`'s default being to ignore: what a late install would
+    // lose is the first notification, silently, rather than the daemon.
+    let child_pipe = arm_child_signal().ok();
     let stop_pipe = arm_stop_signals().ok();
 
     paths.write_pid()?;
@@ -378,7 +406,7 @@ fn publish(paths: &SessionPaths, label: Option<&str>) -> io::Result<Option<Owned
         // Advisory: a session is worth more than its name in a listing.
         drop(paths.write_label(label));
     }
-    Ok(stop_pipe)
+    Ok((stop_pipe, child_pipe))
 }
 
 /// Binds the session socket, replacing a stale one: a socket whose `connect` is refused
@@ -459,7 +487,10 @@ enum Source {
     /// The session socket, where clients arrive.
     Listener,
     /// Read end of the self-pipe a stop signal writes to.
-    Signal,
+    Stop,
+    /// Read end of the self-pipe `SIGCHLD` writes to, which is a second one for the
+    /// reason [`crate::startup::arm_child_signal`] gives.
+    Child,
     /// The PTY master.
     Pty,
     /// The attached client.
@@ -475,9 +506,10 @@ enum Source {
 /// Every source that appears in the poll set at most once, in the order
 /// [`Daemon::watches`] registers them. This list is what registers them, so a source
 /// added here is one [`POLL_SLOTS`] has already accounted for.
-const SINGLE_SOURCES: [Source; 7] = [
+const SINGLE_SOURCES: [Source; 8] = [
     Source::Listener,
-    Source::Signal,
+    Source::Stop,
+    Source::Child,
     Source::Pty,
     Source::Client,
     Source::Pending,
@@ -497,6 +529,18 @@ const READABLE: PollFlags = PollFlags::IN
     .union(PollFlags::HUP)
     .union(PollFlags::ERR)
     .union(PollFlags::NVAL);
+
+/// Takes back out of a self-pipe whatever its handler put there.
+///
+/// A short read is an empty pipe, so the ordinary one byte costs one syscall rather than
+/// one and the `EAGAIN` behind it, and a burst of them costs one more. `nbio::read`
+/// retries `EINTR`; any other error ends the loop and leaves the descriptor readable,
+/// which is a wasted pass rather than a lost wakeup — the opposite way round from
+/// reading on and hoping, which on a descriptor that has genuinely failed is the spin.
+fn drain_signals(pipe: BorrowedFd<'_>) {
+    let mut sink = [0u8; 64];
+    while nbio::read(pipe, &mut sink).is_ok_and(|read| read == sink.len()) {}
+}
 
 impl Daemon {
     fn event_loop(&mut self) -> io::Result<()> {
@@ -569,7 +613,8 @@ impl Daemon {
             // when the slot frees, where one accepted on top of the incumbent goes unheard.
             Source::Listener => (self.accept_retry.is_none() && self.pending.is_none())
                 .then(|| (self.listener.as_fd(), PollFlags::IN)),
-            Source::Signal => Some((self.stop_pipe.as_ref()?.as_fd(), PollFlags::IN)),
+            Source::Stop => Some((self.stop_pipe.as_ref()?.as_fd(), PollFlags::IN)),
+            Source::Child => Some((self.child_pipe.as_ref()?.as_fd(), PollFlags::IN)),
             // Dropped once the child is gone: the master reports `HUP` from then on, which
             // would spin the loop for the rest of the session (§ 6.5) with nothing to read.
             Source::Pty => {
@@ -739,11 +784,23 @@ impl Daemon {
 
         // Nothing is read from the pipe: the byte says only that a signal arrived, and
         // the loop leaves on its next pass, too soon to spin on a readable descriptor.
-        if revents(Source::Signal).intersects(READABLE) {
+        if revents(Source::Stop).intersects(READABLE) {
             // Never over a reason already recorded: a session that has just lost its
             // shell says so, and the signal is what it was going to do anyway.
             if self.stop.is_none() {
                 self.stop = Some("signalled");
+            }
+        }
+        // Emptied, where the pipe just above deliberately is not: this session goes on,
+        // and a byte left in a descriptor the poll set holds is a `poll` that returns at
+        // once on every pass for the rest of its life. Before the `waitpid`
+        // [`Daemon::collect_status`] spends at the end of this pass and never after it,
+        // which is the whole of the self-pipe discipline — a signal landing between the
+        // two leaves its byte in an emptied pipe, so the next `poll` returns for it.
+        if revents(Source::Child).intersects(READABLE) {
+            self.child_signalled = true;
+            if let Some(pipe) = self.child_pipe.as_ref() {
+                drain_signals(pipe.as_fd());
             }
         }
 
@@ -1009,11 +1066,15 @@ impl Daemon {
     /// ahead of `waitpid` for about a third of exits. That is what [`STATUS_GRACE`] waits
     /// out, and why nothing may read the missing status as a child still running (§ 6.5).
     ///
-    /// Every pass, not only past end of file: the child can exit while something it
-    /// started still holds the slave — `sleep 3600 &` then `exit` — and nothing else
-    /// would reap it, `SIGCHLD` being at its default disposition. Whether the client is
-    /// *told* is [`Daemon::pump_output`]'s decision; what this costs is the pid, which
-    /// makes [`Pty::pid_reissued`] load-bearing.
+    /// Not only past end of file: the child can exit while something it started still
+    /// holds the slave — `sleep 3600 &` then `exit` — and nothing else would reap it.
+    /// This was once answered by asking on every pass, which paid a `waitpid` for a
+    /// running child's whole life *and* still collected that one only whenever the loop
+    /// next happened to wake, up to [`IDLE_TICK`] away. `SIGCHLD` is handled now
+    /// ([`crate::startup::arm_child_signal`]), so the exit is itself the wakeup and
+    /// [`Daemon::worth_a_waitpid`] is the gate the syscall is spent behind. Whether the
+    /// client is *told* is [`Daemon::pump_output`]'s decision; what this costs is the
+    /// pid, which makes [`Pty::pid_reissued`] load-bearing.
     ///
     /// The `waitpid` runs ahead of the `self.exited` test, that call being the reaping
     /// itself: § 6.5's synthesised status names a child that may still be running, so
@@ -1021,10 +1082,17 @@ impl Daemon {
     /// back is discarded there rather than allowed to revise a status a client has
     /// already been told.
     fn collect_status(&mut self) {
-        let reaped = self
-            .pty
-            .as_mut()
-            .and_then(|pty| pty.try_wait().ok().flatten());
+        let reaped = if self.worth_a_waitpid() {
+            self.pty
+                .as_mut()
+                .and_then(|pty| pty.try_wait().ok().flatten())
+        } else {
+            None
+        };
+        // Spent whether or not anything came back, and after the ask rather than before
+        // it: a `SIGCHLD` that arrives from here on has left a byte in the pipe
+        // [`Daemon::poll_once`] emptied, and that byte is the next wakeup.
+        self.child_signalled = false;
         if self.exited.is_some() {
             return;
         }
@@ -1038,6 +1106,30 @@ impl Daemon {
             // itself — so no status is coming and the client is still owed an `Exit`.
             self.exited = Some((0, ExitKind::Exited));
         }
+    }
+
+    /// Whether this pass has any reason to ask `waitpid` — the gate
+    /// [`Daemon::collect_status`] spends its syscall behind, and the whole of what makes
+    /// a gate safe here.
+    ///
+    /// A `SIGCHLD` is the reason there can be one at all, and it is the strong condition
+    /// rather than a hint: `exit_notify` sets the dying task `EXIT_ZOMBIE` before it
+    /// queues the signal, so a byte in the child pipe is a `waitpid` that will not come
+    /// back empty. Nothing else has to be believed for the ordinary exit either — the
+    /// second clause is the retry regime `poll_timeout` clamps to, stated the same way
+    /// in both places so the rule and the wakeup enforcing it cannot drift apart, and
+    /// [`STATUS_GRACE`] is served by it whether the signal arrived or not. The third is a
+    /// host where the pipe could not be armed: there the answer is always yes, which is
+    /// what every pass used to do.
+    ///
+    /// Deliberately *not* `child_gone.is_some()` on its own. Past § 6.5's synthesised
+    /// status that is true for the rest of the session, over a child that daemonised
+    /// itself and may run for days — the every-pass `waitpid` this exists to delete,
+    /// reintroduced in the one session most likely to be long.
+    const fn worth_a_waitpid(&self) -> bool {
+        self.child_signalled
+            || (self.child_gone.is_some() && self.exited.is_none())
+            || self.child_pipe.is_none()
     }
 
     fn read_client(&mut self, read_buf: &mut [u8], scratch: &mut Vec<u8>) {
@@ -1559,6 +1651,7 @@ mod tests {
             listener: UnixListener::bind(root.join(&format!("{name}.sock")))
                 .expect("bind a session socket"),
             stop_pipe: None,
+            child_pipe: None,
             stop: None,
             ring: crate::ring::Ring::new(1024),
             pty: None,
@@ -1570,6 +1663,7 @@ mod tests {
             pending_input: VecDeque::new(),
             win: WinSize::default(),
             applied_win: None,
+            child_signalled: false,
             child_gone: None,
             exited: None,
             accept_retry: None,
@@ -1726,6 +1820,119 @@ mod tests {
              connection: the arriving one resumes from {applied}, so they are typed into \
              nothing and nobody will resend them",
             TYPED.len()
+        );
+    }
+
+    /// Whether the child pipe `daemon` is holding has anything to read, without reading
+    /// it: a zero timeout, so this answers rather than waits.
+    fn child_pipe_is_readable(daemon: &Daemon) -> bool {
+        let pipe = daemon
+            .child_pipe
+            .as_ref()
+            .expect("the pipe this test put there");
+        let mut fds = [PollFd::from_borrowed_fd(pipe.as_fd(), PollFlags::IN)];
+        let now = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        rustix::event::poll(&mut fds, Some(&now)).is_ok_and(|ready| ready > 0)
+    }
+
+    /// The pass that reads the child pipe empties it, which is the one thing a second
+    /// self-pipe must do that the stop pipe does not.
+    ///
+    /// A byte left in a descriptor the poll set holds is a `poll` that returns at once on
+    /// every pass for the rest of the session — the spin [`ACCEPT_BACKOFF`] exists to
+    /// rule out, reached here with nothing wrong at all. The stop pipe is licensed never
+    /// to be read because its byte is the last thing that loop ever wants; `SIGCHLD`
+    /// shares neither the pipe nor the licence, the session going on afterwards, and
+    /// [`crate::startup::arm_child_signal`] has why the two are separate descriptors.
+    ///
+    /// Two bytes, as two signals close together leave — the handler writes one apiece and
+    /// a pipe coalesces nothing — so a drain that took a byte a pass would be the same
+    /// spin one wakeup slower and pass this on one byte.
+    ///
+    /// The readiness array is handed straight to `poll_once`, so what is under test is
+    /// this daemon's answer to a source being ready rather than a signal a unit test
+    /// would have to install a process-wide handler to raise.
+    #[test]
+    fn a_child_signal_is_taken_back_out_of_the_pipe_that_carried_it() {
+        let root = Scratch::new("child-signal");
+        let mut daemon = blank(&root, "childsig");
+        let (read, write) = rustix::pipe::pipe_with(
+            rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
+        )
+        .expect("a self-pipe");
+        daemon.child_pipe = Some(read);
+
+        assert!(
+            daemon.watch_for(Source::Child).is_some(),
+            "a pipe nothing is wrong with belongs in the poll set"
+        );
+        rustix::io::write(&write, b"\0\0").expect("what two handlers would have left");
+        assert!(
+            child_pipe_is_readable(&daemon),
+            "the pipe must be readable, or nothing below is measuring anything"
+        );
+
+        let mut ready = [PollFlags::empty(); POLL_SLOTS];
+        ready[Source::Child as usize] = PollFlags::IN;
+        daemon.poll_once(&ready, &mut vec![0u8; 1024], &mut Vec::new());
+
+        assert!(
+            !child_pipe_is_readable(&daemon),
+            "the pass that read the child pipe left something in it, so every later \
+             `poll` returns at once with nothing to serve"
+        );
+    }
+
+    /// The four states of the gate the `waitpid` is spent behind, and the one that used
+    /// to be the whole rule.
+    ///
+    /// Asked directly because the syscall it elides is not observable from out here: what
+    /// a test can pin is the decision, and the decision is the change. The third state is
+    /// the one with a defect behind it — `child_gone` alone stays true for the rest of a
+    /// session whose child daemonised itself, so a gate written on it would put the
+    /// every-pass `waitpid` back in exactly the sessions most likely to last days.
+    #[test]
+    fn a_waitpid_is_asked_for_only_where_something_says_it_may_be_ready() {
+        let root = Scratch::new("waitpid-gate");
+        let mut daemon = blank(&root, "gate");
+        assert!(
+            daemon.worth_a_waitpid(),
+            "a host with no child pipe has nothing else to go on, and must ask as every \
+             pass used to"
+        );
+
+        let (read, _write) = rustix::pipe::pipe_with(
+            rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
+        )
+        .expect("a self-pipe");
+        daemon.child_pipe = Some(read);
+        assert!(
+            !daemon.worth_a_waitpid(),
+            "a running child answers `None` to every one of these, which is the syscall \
+             this exists to delete"
+        );
+
+        daemon.child_signalled = true;
+        assert!(
+            daemon.worth_a_waitpid(),
+            "the kernel sets the task `EXIT_ZOMBIE` before it queues the signal, so this \
+             is a `waitpid` that will not come back empty"
+        );
+
+        // End of file ahead of the exit, which is [`STATUS_GRACE`]'s whole subject: asked
+        // every pass of the retry regime whether the signal arrived or not.
+        daemon.child_signalled = false;
+        daemon.child_gone = Some(Instant::now());
+        assert!(daemon.worth_a_waitpid());
+
+        daemon.exited = Some((0, ExitKind::Exited));
+        assert!(
+            !daemon.worth_a_waitpid(),
+            "§ 6.5's synthesised status leaves `child_gone` set over a child that may run \
+             for days, so the end of file cannot be the condition on its own"
         );
     }
 

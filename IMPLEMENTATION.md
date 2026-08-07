@@ -325,8 +325,11 @@ would be shrugged off by the child § 6.5 sends it to, and an ignore this daemon
 arrives the same way: POSIX has a non-interactive shell set `SIGINT` and `SIGQUIT` to
 `SIG_IGN` around a background job, so without the other four `nomux spawn work &` in a
 script hands the user a shell — and everything that shell runs — ignoring `Ctrl-\` and
-`Ctrl-Z` for the session's life. `SIGINT` and `SIGTERM` are absent: § 6.2 *handles* them by
-then, and `exec` resets a handler.
+`Ctrl-Z` for the session's life. `SIGINT`, `SIGTERM` and `SIGCHLD` are absent: § 6.2
+*handles* all three by then, and `exec` resets a handler. `SIGCHLD` is the one where the
+distinction is the child's rather than the daemon's — ignoring it would have the kernel
+reap the shell's own children out from under it, and every `wait` it makes fail `ECHILD`,
+for the life of the session.
 
 **Both ends are opened `O_CLOEXEC`**, so the only descriptors that cross the `exec` are the
 three the child is handed deliberately. What that keeps out is the master: a copy of it in
@@ -383,8 +386,17 @@ Signal dispositions: `SIGHUP` ignored, and restored in the child with four other
 `exec` (§ 6.1). `SIGTERM` and `SIGINT` handled, not ignored (§ 6.5), armed before the
 pidfile so the pid `kill` reads does not name a process on the default disposition —
 best-effort, the arming resting on a `pipe2` whose failure the daemon swallows rather than
-refuse a session over. `SIGPIPE` ignored by the Rust runtime and reset for spawned
-children. `SIGQUIT`'s own disposition is § 6.5's; it is in § 6.1's list all the same.
+refuse a session over. `SIGCHLD` handled too, down a **second** self-pipe (§ 6.5), and
+handled rather than ignored for a reason of the child's: `SIG_IGN` survives `exec` and
+takes with it the kernel's own reaping, so the login shell would inherit a session in which
+every `wait` fails `ECHILD`. A handler needs no entry in § 6.1's reset list, `exec` clearing
+it. `SIGPIPE` ignored by the Rust runtime and reset for spawned children. `SIGQUIT`'s own
+disposition is § 6.5's; it is in § 6.1's list all the same.
+
+All three handlers are installed **before** the inherited signal mask is cleared, never
+after: `exec` preserves a pending signal as well as a blocked one, so a signal blocked and
+pending arrives the instant the mask clears, and a handler armed behind that is one it
+missed.
 
 `systemd-logind` with `KillUserProcesses=yes` kills the daemon at logout; the only fix is
 `loginctl enable-linger $USER`. The daemon reports the state in `HelloOk.linger` (§ 2.3),
@@ -524,6 +536,18 @@ for up to 2 s (`STATUS_GRACE`). **Past that the daemon synthesises one, and a cl
 has to know which:** `Exit{status: 0, kind: Exited}`, indistinguishable on the wire from a
 real exit 0 and a *fabrication*. Only a child that closed its terminal without exiting
 reaches it, and that process may still be running.
+
+**End of file is not the only way an exit is heard about, and cannot be.** A shell that
+exits behind a job still holding the slave — `sleep 3600 &` then `exit` — never brings the
+master to one, so what tells the daemon is `SIGCHLD`, on a self-pipe of its own in the poll
+set (§ 6.2). That pipe is drained on the pass that reads it, where the stop pipe is
+deliberately never read at all: this session goes on, and a byte left in a watched
+descriptor is a `poll` that returns at once for the rest of its life. Two pipes rather than
+one carrying two kinds of byte, so no drain can mistake a stop for a child. The `waitpid`
+is then spent only where something says it may be ready — a `SIGCHLD`, the `STATUS_GRACE`
+retry, or a host where the pipe could not be armed — rather than on every pass of a running
+child's whole life. Reporting is unchanged: the client hears nothing until the transcript
+is complete, which is still end of file.
 
 **The order is load-bearing**: `Exit` is queued only once *that* client's `sent_through` has
 reached the end of the ring, and a greeting rewinds `sent_through` to where the client

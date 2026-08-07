@@ -238,16 +238,18 @@ fn a_synthesised_exit_status_is_sent_on_the_pass_that_collects_it() {
 /// shell was therefore left a zombie for the whole life of the session, which is up
 /// to the seven-day idle timeout.
 ///
-/// Collecting is not reporting, and the two are asserted together: `next_of` refuses
-/// anything but the session's own chatter, so an `Exit` frame arriving here would
-/// fail this test. It must not, because the transcript is plainly not finished —
-/// the job that outlived the shell still has the terminal.
+/// Nothing is sent to provoke the pass the reap happens on, and that is the other
+/// half of what this pins. With the client idle and the master silent — the job says
+/// nothing for five minutes — a daemon whose child exited behind a held slave has no
+/// wakeup left short of `IDLE_TICK`, an hour away, so a reap that depended on one
+/// would be a reap the user waits an hour for. What supplies it is the `SIGCHLD`
+/// handler `startup::arm_child_signal` installs: the exit is itself the event.
 ///
-/// The reap happens on an event-loop pass, and with the client idle there are none:
-/// nothing wakes a daemon whose child exits behind a held slave, `SIGCHLD` being at
-/// its default disposition and so discarded. The `Ping` is what supplies one, on a
-/// condition rather than a sleep — the `Pong` answering it is queued by the same
-/// pass that collects.
+/// Collecting is not reporting, which is what the `Ping` below asks about, once the
+/// reap it is not responsible for has already happened: `next_of` refuses anything
+/// but the session's own chatter, so an `Exit` frame arriving here would fail this
+/// test. It must not, because the transcript is plainly not finished — the job that
+/// outlived the shell still has the terminal.
 #[test]
 fn a_shell_that_exits_behind_a_background_job_is_still_reaped() {
     let (session, mut client, ok) = Session::attached("zombie_shell");
@@ -262,15 +264,14 @@ fn a_shell_that_exits_behind_a_background_job_is_still_reaped() {
         "the shell never exited"
     );
 
+    assert!(
+        poll_until(SETTLE, || process_state(shell) != Some('Z')),
+        "the shell exited behind a job that still holds the slave and was left a \
+         zombie as pid {shell}, nothing having woken the daemon to collect it"
+    );
+
     client.send(&Frame::Ping);
     drop(client.next_of(FrameType::Pong));
-
-    assert_ne!(
-        process_state(shell),
-        Some('Z'),
-        "the shell exited behind a job that still holds the slave and was left a \
-         zombie as pid {shell}"
-    );
 
     // The job still has the terminal, and `Session` drops its daemon with `SIGKILL`,
     // which runs none of § 6.5's collection — so the `sleep` would outlive this test
@@ -308,9 +309,11 @@ fn a_shell_that_exits_behind_a_background_job_is_still_reaped() {
 /// non-interactive shell that blocks on the cue rather than a `sleep`, so when the child
 /// goes is the test's to say rather than a wall clock's.
 ///
-/// The `Ping` supplies the pass the reap happens on, as in the sibling — and here
+/// Nothing supplies the pass the reap happens on, as in the sibling — and here
 /// nothing else could: `poll_timeout` stops clamping to `STATUS_RETRY` the moment
-/// `exited` is set, so a session left holding a zombie sleeps on to `IDLE_TICK`.
+/// `exited` is set, so a session left holding a zombie sleeps on to `IDLE_TICK`. The
+/// `SIGCHLD` the real exit delivers is the whole of the wakeup, and the wait below is
+/// for what it sets off.
 #[test]
 fn a_child_that_exits_after_its_status_was_synthesised_is_still_reaped() {
     let (session, mut client, ok) = Session::attached("zombie_synth");
@@ -333,12 +336,8 @@ fn a_child_that_exits_after_its_status_was_synthesised_is_still_reaped() {
          that outlived its process"
     );
 
-    client.send(&Frame::Ping);
-    drop(client.next_of(FrameType::Pong));
-
-    assert_ne!(
-        process_state(child),
-        Some('Z'),
+    assert!(
+        poll_until(SETTLE, || process_state(child) != Some('Z')),
         "the daemon answered for pid {child} at the grace and then stopped reaping, so \
          the child it spoke for is a zombie it holds until the session ends"
     );

@@ -17,21 +17,36 @@ const STOP_SIGNALS: [libc::c_int; 2] = [libc::SIGTERM, libc::SIGINT];
 /// neither allocate nor take a lock. `-1` until [`arm_stop_signals`] publishes it.
 static STOP_PIPE: AtomicI32 = AtomicI32::new(-1);
 
+/// The same for `SIGCHLD`, and deliberately not the same pipe. [`arm_child_signal`]
+/// publishes it and has the argument.
+static CHILD_PIPE: AtomicI32 = AtomicI32::new(-1);
+
 /// The entirety of what happens in a signal handler: one byte down the self-pipe.
 ///
 /// Non-blocking, so a full pipe cannot park the daemon inside a handler — and a write
 /// it refuses is the message already waiting rather than a message lost. `errno` is
 /// not perturbed either: rustix issues the syscall directly on the `linux_raw` backend
 /// every shipped target selects.
-extern "C" fn note_stop_signal(_signum: libc::c_int) {
-    let raw = STOP_PIPE.load(Ordering::Relaxed);
+///
+/// Taken as an argument rather than written out twice, so the safety argument below is
+/// made once and both handlers are plainly the same three lines.
+fn note_signal(pipe: &AtomicI32) {
+    let raw = pipe.load(Ordering::Relaxed);
     if raw >= 0 {
-        // SAFETY: the write end is published once, before any handler can run, and
-        // then deliberately never closed, so this descriptor number is valid for
-        // the rest of the process's life and cannot have been reused.
+        // SAFETY: a write end is published once, before any handler can run, and then
+        // deliberately never closed, so this descriptor number is valid for the rest of
+        // the process's life and cannot have been reused.
         let fd = unsafe { BorrowedFd::borrow_raw(raw) };
         let _ = rustix::io::write(fd, b"\0");
     }
+}
+
+extern "C" fn note_stop_signal(_signum: libc::c_int) {
+    note_signal(&STOP_PIPE);
+}
+
+extern "C" fn note_child_signal(_signum: libc::c_int) {
+    note_signal(&CHILD_PIPE);
 }
 
 /// Routes [`STOP_SIGNALS`] into a descriptor the poll set can watch, and hands back
@@ -97,6 +112,64 @@ pub(crate) fn arm_stop_signals() -> io::Result<OwnedFd> {
         libc::sigprocmask(libc::SIG_SETMASK, empty.as_ptr(), std::ptr::null_mut());
     }
 
+    Ok(read)
+}
+
+/// Routes `SIGCHLD` into a descriptor of its own for the poll set, and hands back its
+/// read end. What the daemon then does with it is `daemon.rs`'s `collect_status`.
+///
+/// **A second pipe rather than a second byte down [`arm_stop_signals`]'s.** Telling the
+/// two apart would have worked — one byte is one byte, and a pipe write of one is
+/// atomic, so no handler could ever tear another's message. What sharing costs is the
+/// stop pipe's licence never to be *read*: its byte is the last thing the loop will ever
+/// want from that descriptor, where this one arrives afresh for every child that exits,
+/// stops or continues, and a byte left in a pipe is a descriptor that stays readable and
+/// a `poll` that returns at once on every pass for the rest of the session. So a shared
+/// pipe would have to be drained every pass, and that drain would be handing the
+/// shutdown decision bytes to classify — on the one path with no second chance, where a
+/// stop misread as a child costs `nomux kill` its whole grace and the user's shell its
+/// exit trap. Two descriptors and one more poll slot buy a `SIGCHLD` that cannot be read
+/// as a stop by construction rather than by convention.
+///
+/// **Handled, never ignored, and that is what keeps the child clean.** `exec` resets a
+/// handled disposition and preserves `SIG_IGN`, so `SIG_IGN` here — which on Linux also
+/// means the kernel reaps children itself — would follow the login shell through `exec`
+/// and leave every `wait` it ever makes failing `ECHILD`, job control included
+/// (`IMPLEMENTATION.md` § 6.1, and `pty.rs` for the five that do need putting back). A
+/// handler needs no reset in `pre_exec` for the same reason, and the window between the
+/// `fork` and the `exec` is not one either: the copy has no children of its own to be
+/// told about.
+///
+/// Called *before* [`arm_stop_signals`], which is the call that clears an inherited
+/// signal mask — and which installs its own handlers ahead of doing so for the reason it
+/// gives. The reason holds here as well as there: a blocked `SIGCHLD` is a handler that
+/// never runs, and one blocked *and pending* is delivered the instant that mask clears,
+/// so arming afterwards would miss it. What it costs is the milder half, `SIGCHLD`'s
+/// default being to ignore — not a daemon that dies but a notification silently dropped,
+/// and a dropped one is a reap nobody makes now that `collect_status` has stopped asking
+/// on every pass.
+///
+/// # Errors
+///
+/// Fails only if the pipe cannot be created.
+pub(crate) fn arm_child_signal() -> io::Result<OwnedFd> {
+    // `CLOEXEC` and the leaked write end are [`arm_stop_signals`]'s, for its reasons.
+    let (read, write) = rustix::pipe::pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK)?;
+    CHILD_PIPE.store(write.into_raw_fd(), Ordering::Relaxed);
+
+    // `SA_NOCLDSTOP` would keep a `Ctrl-Z`'d shell from delivering one of these, and is
+    // not worth `sigaction` and a second spelling of this install: what it saves is a
+    // wakeup that reads one byte and asks `waitpid` a question it answers `None` to.
+    //
+    // SAFETY: `signal` on a single-threaded process with an async-signal-safe handler,
+    // installed before the session's child exists. The result is not checked for
+    // [`arm_stop_signals`]'s reason — `SIGCHLD` is neither invalid nor uncatchable.
+    unsafe {
+        libc::signal(
+            libc::SIGCHLD,
+            note_child_signal as *const () as libc::sighandler_t,
+        );
+    }
     Ok(read)
 }
 
