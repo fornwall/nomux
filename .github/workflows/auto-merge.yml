@@ -1,9 +1,12 @@
 name: Auto-merge trusted pull requests
 
-# `pull_request_target` is required for a token that can enable auto-merge on a Dependabot PR.
-# Nothing here checks out or executes the pull request: every step runs from the protected base
-# branch, and the CI workflow remains the authority on the proposed tree.
+# Owner PRs use `pull_request_target`, so this trusted path always runs from the protected base
+# branch. Dependabot is deliberately handled on `pull_request` instead: GitHub forces the token
+# for a Dependabot-authored `pull_request_target` run to read-only even when a job requests write
+# permission. Nothing here checks out the pull request; CI remains the authority on its tree.
 on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
   pull_request_target:
     types: [opened, reopened, synchronize, ready_for_review]
 
@@ -17,6 +20,7 @@ jobs:
   owner:
     name: enable for owner PR
     if: >-
+      github.event_name == 'pull_request_target' &&
       github.event.pull_request.user.login == github.repository_owner &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       !github.event.pull_request.draft &&
@@ -38,6 +42,7 @@ jobs:
   verify_dependabot:
     name: verify compatible dependency update
     if: >-
+      github.event_name == 'pull_request' &&
       github.event.pull_request.user.login == 'dependabot[bot]' &&
       !github.event.pull_request.draft &&
       github.event.pull_request.auto_merge == null
