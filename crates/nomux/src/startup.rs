@@ -53,24 +53,6 @@ pub(crate) fn arm_stop_signals() -> io::Result<OwnedFd> {
     // holding a closed descriptor would write its byte into whatever was opened next.
     STOP_PIPE.store(write.into_raw_fd(), Ordering::Relaxed);
 
-    // A disposition is nothing without delivery, and the mask is the half that survives
-    // `exec`: a daemon started from a parent holding `SIGTERM` blocked — § 6.2's
-    // `nomux daemon x 0<&- 1>&- 2>&-` typed into such a shell, a systemd unit, a test
-    // harness — would install the handlers below and never hear from them. `nomux kill`
-    // would then wait out its two-second grace and `SIGKILL`, so the shell would run no
-    // exit trap and § 6.5's shutdown would not run at all. Nothing in this crate blocks
-    // a signal, so there is nothing here to preserve.
-    //
-    // SAFETY: `sigemptyset` initialises the set this frame owns, and `sigprocmask` is
-    // then handed that same initialised set and a null pointer for the old mask it is
-    // not being asked for. Single-threaded, so no other thread has a mask to disagree
-    // about.
-    unsafe {
-        let mut empty = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
-        libc::sigemptyset(empty.as_mut_ptr());
-        libc::sigprocmask(libc::SIG_SETMASK, empty.as_ptr(), std::ptr::null_mut());
-    }
-
     // `sighandler_t` is an integer wide enough for a pointer, and a function item
     // has to be laundered through one to reach it.
     let handler = note_stop_signal as *const () as libc::sighandler_t;
@@ -84,6 +66,37 @@ pub(crate) fn arm_stop_signals() -> io::Result<OwnedFd> {
         // [`STOP_SIGNALS`] is a compile-time constant that is neither.
         unsafe { libc::signal(signum, handler) };
     }
+
+    // Strictly after the loop above: `exec` preserves pending signals as well as the
+    // mask, so a parent holding `SIGTERM` blocked *and pending* delivers it the
+    // instant this returns. Unblocking first would deliver it at `SIG_DFL` — the
+    // daemon dying with `<id>.sock` bound, `<id>.pid` unwritten and § 6.5's shutdown
+    // unrun, which is the failure this whole function exists to prevent.
+    //
+    // A disposition is nothing without delivery, and the mask is the half that survives
+    // `exec`: a daemon started from a parent holding `SIGTERM` blocked — § 6.2's
+    // `nomux daemon x 0<&- 1>&- 2>&-` typed into such a shell, a systemd unit, a test
+    // harness — would install the handlers above and never hear from them. `nomux kill`
+    // would then wait out its two-second grace and `SIGKILL`, so the shell would run no
+    // exit trap and § 6.5's shutdown would not run at all.
+    //
+    // Cleared whole rather than unblocking [`STOP_SIGNALS`] alone, because the mask is
+    // inherited twice over: `std` documents that it does *not* reset one across
+    // `Command::spawn`, so whatever is blocked here is blocked in the session's login
+    // shell for its whole life. Leaving a parent's blocked `SIGTSTP` in place would cost
+    // the child `Ctrl-Z` exactly as an inherited `SIG_IGN` would (`pty.rs`), and that is
+    // the larger of the two harms.
+    //
+    // SAFETY: `sigemptyset` initialises the set this frame owns, and `sigprocmask` is
+    // then handed that same initialised set and a null pointer for the old mask it is
+    // not being asked for. Single-threaded, so no other thread has a mask to disagree
+    // about.
+    unsafe {
+        let mut empty = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+        libc::sigemptyset(empty.as_mut_ptr());
+        libc::sigprocmask(libc::SIG_SETMASK, empty.as_ptr(), std::ptr::null_mut());
+    }
+
     Ok(read)
 }
 

@@ -36,8 +36,8 @@ pub(crate) struct Spawn<'a> {
 
 /// How long the child's group has to act on `SIGHUP` before `SIGKILL` follows.
 ///
-/// Named for the signal actually sent: `control.rs` has a `TERM_GRACE` of its own for
-/// the different two seconds a *daemon* gets after `SIGTERM`.
+/// Named for the signal actually sent: `control.rs` has a `GRACE` of its own for the
+/// different two seconds a *daemon* gets after `SIGTERM`.
 const HANGUP_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Interval between liveness checks while waiting out [`HANGUP_GRACE`].

@@ -582,9 +582,21 @@ impl SessionPaths {
             // refused for the flag rather than for itself. Asked again without it, second
             // rather than first because creating is the ordinary case and this costs a
             // syscall only on the way to failing.
+            //
+            // The retry's own `ENOENT` is mapped back to `EROFS`: it means the name is
+            // absent *and* the mount will not create it, which is a fact about the
+            // filesystem and is what the arm below reports. Left as `ENOENT` it would fall
+            // to the catch-all and a read-only run directory would be blamed on descriptor
+            // limits by `spawn` and on another process by `kill`.
             .or_else(|err| {
                 if err == rustix::io::Errno::ROFS {
-                    rustix::fs::open(&path, reading, Mode::empty())
+                    rustix::fs::open(&path, reading, Mode::empty()).map_err(|retry| {
+                        if retry == rustix::io::Errno::NOENT {
+                            rustix::io::Errno::ROFS
+                        } else {
+                            retry
+                        }
+                    })
                 } else {
                     Err(err)
                 }

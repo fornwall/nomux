@@ -8,14 +8,14 @@
 use std::collections::VecDeque;
 use std::fs;
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use nomux::{
-    ErrorCode, ExitKind, Frame, FrameType, Hello, HelloOk, Linger, PROTOCOL_VERSION,
-    RESUME_FROM_START, WinSize,
+    ErrorCode, ExitKind, Frame, FrameType, Hello, HelloOk, PROTOCOL_VERSION, RESUME_FROM_START,
+    WinSize,
 };
 use rustix::event::{PollFd, PollFlags, Timespec};
 
@@ -90,9 +90,6 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 /// set is the only way to stand back from that.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
-/// Backlog for the session socket: as deep as this host allows (§ 6.3).
-const SOCKET_BACKLOG: libc::c_int = -1;
-
 /// How long a connection that has not said `Hello` keeps the one pending slot: a peer
 /// that connects and then says nothing would otherwise hold every later attach off for
 /// the life of the session. Generous against a relayed `Hello`'s round trip (§ 7).
@@ -126,6 +123,14 @@ pub(crate) const MAX_PENDING_READ: usize = 1 << 20;
 
 /// Capacity the decode scratch keeps between passes rather than hand back.
 const SCRATCH_RETAINED: usize = 64 * 1024;
+
+/// Capacity the PTY input queue keeps once drained, for [`SCRATCH_RETAINED`]'s reason at
+/// the other end of the same pass.
+///
+/// Small because this holds keystrokes: a queue that has just gone empty is overwhelmingly
+/// one that carried a handful of bytes, and the paste the shrink exists for is four orders
+/// of magnitude above this floor.
+const PENDING_INPUT_RETAINED: usize = 4096;
 
 /// The attached client, and the state that means nothing without one.
 ///
@@ -185,9 +190,6 @@ struct Daemon {
     agent: Option<Agent>,
     /// Where the child starts, captured before the daemon moved to `/`.
     child_dir: PathBuf,
-    /// Whether `logind` will let this session outlive the user's logout, for `HelloOk`.
-    /// Named for what it is: § 6.5 could read the wire's bare "linger" as a grace period.
-    logind_linger: Linger,
     /// Authoritative input offset: everything below this has been accepted for the
     /// PTY and must never be applied twice.
     in_applied: u64,
@@ -297,7 +299,7 @@ fn start(session_id: &str, label: Option<&str>) -> io::Result<()> {
 
     // One fallible region rather than a cleanup per call site: nothing past the bind can
     // be reported, so whatever fails inside `publish`, what it published goes.
-    let stop_pipe = match publish(&paths, &listener, label) {
+    let stop_pipe = match publish(&paths, label) {
         Ok(stop_pipe) => stop_pipe,
         Err(err) => {
             // Released first: `unlink_all` takes this same lock, and `flock` conflicts
@@ -328,7 +330,6 @@ fn start(session_id: &str, label: Option<&str>) -> io::Result<()> {
         pending: None,
         agent: None,
         child_dir,
-        logind_linger: linger::detect(),
         in_applied: 0,
         pending_input: VecDeque::new(),
         win: WinSize::default(),
@@ -359,22 +360,13 @@ fn start(session_id: &str, label: Option<&str>) -> io::Result<()> {
 /// Propagates the failure to write `<id>.pid`, and only that: a daemon sharing a login
 /// session, one without a stop pipe and one without a label in `list` are worse daemons
 /// rather than reasons to have no session.
-fn publish(
-    paths: &SessionPaths,
-    listener: &UnixListener,
-    label: Option<&str>,
-) -> io::Result<Option<OwnedFd>> {
+fn publish(paths: &SessionPaths, label: Option<&str>) -> io::Result<Option<OwnedFd>> {
     // Before the pidfile, so the pid `nomux kill` reads belongs to the process that
     // survives.
     leave_login_session();
-    // A second `listen` for the backlog: it installs one rather than keeping the one in
-    // force, so the fork would otherwise leave the queue at the parent's depth (§ 6.2,
-    // § 6.3). A wrong depth is no reason to refuse a session, so failure is discarded.
-    //
-    // SAFETY: `listen` is passed a descriptor `listener` owns and keeps open across
-    // the call, and a backlog. `UnixListener` has no safe spelling of a second
-    // `listen`, and rustix's would mean adding its `net` feature to the whole crate.
-    let _ = unsafe { libc::listen(listener.as_raw_fd(), SOCKET_BACKLOG) };
+    // No second `listen` here. `UnixListener::bind` already issues one at the maximum
+    // depth on Linux, and a backlog belongs to the socket's open file description, so
+    // `leave_login_session`'s fork shares it rather than resetting it.
 
     // Between the fork and the pidfile: arming after the pidfile `nomux kill` reads
     // (§ 6.6) leaves a window where its signal lands on the default disposition, and
@@ -985,10 +977,12 @@ impl Daemon {
             self.pending_input.clear();
         }
         // Given back on the way through empty, or one paste into a child that stopped
-        // reading holds 1.25 MiB for the rest of the session. The master asks for
-        // `POLLOUT` only while this is non-empty, so the pass that empties it is the last.
-        if self.pending_input.is_empty() {
-            self.pending_input.shrink_to(0);
+        // reading holds 1.25 MiB for the rest of the session. Down to a floor rather than
+        // to nothing: `shrink_to(0)` on an empty `VecDeque` *frees*, and this runs on every
+        // pass that drains, so the interactive path would pay a free and a malloc for every
+        // keystroke — the cost `event_loop` refuses on `scratch` for the same reason.
+        if self.pending_input.is_empty() && self.pending_input.capacity() > PENDING_INPUT_RETAINED {
+            self.pending_input.shrink_to(PENDING_INPUT_RETAINED);
         }
     }
 
@@ -1229,7 +1223,9 @@ impl Daemon {
         let ok = HelloOk {
             resume_from,
             in_applied: self.in_applied,
-            linger: self.logind_linger,
+            // Read here rather than held from startup: a session outlives the answer,
+            // and a user who enables lingering on being warned must stop being warned.
+            linger: linger::detect(),
             agent: self.agent.is_some(),
         };
         // Not a field on the wire: both ends compute it, through the one helper (§ 4.2).
@@ -1570,7 +1566,6 @@ mod tests {
             pending: None,
             agent: None,
             child_dir: PathBuf::from("/"),
-            logind_linger: Linger::Unknown,
             in_applied: 0,
             pending_input: VecDeque::new(),
             win: WinSize::default(),

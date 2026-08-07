@@ -20,7 +20,11 @@ const LINGER_DIR: &str = "/var/lib/systemd/linger";
 ///
 /// Two file lookups rather than `loginctl show-user -p Linger`, which is a D-Bus round
 /// trip: on a bus that is wedged it blocks for its full 25-second timeout, and this runs
-/// on the daemon's startup path, with the client that asked for the session waiting.
+/// with the client that asked for the session waiting on the answer.
+///
+/// Called per greeting rather than once at startup, and cheap enough to be: a session can
+/// outlive the answer by a week, and a user who runs `loginctl enable-linger` on being
+/// warned would otherwise be warned again on every attach for the rest of its life.
 pub(crate) fn detect() -> Linger {
     if !Path::new(SYSTEMD_MARKER).is_dir() {
         // No `logind`, so nothing kills the daemon at logout and nothing to warn about.
