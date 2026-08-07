@@ -265,12 +265,22 @@ weighs the `libvterm` snapshot).
 
 ```sh
 p=${XDG_DATA_HOME:-$HOME/.local/share}/nomux
-exec "$p/nomux-$VER" "$MODE" "$ID" 2>/dev/null
+r=; case ${XDG_RUNTIME_DIR-} in /*) r=${XDG_RUNTIME_DIR%/}/nomux ;; *)
+case ${XDG_STATE_HOME-} in /*) r=${XDG_STATE_HOME%/}/nomux/run ;; *)
+case ${HOME-} in /*) r=${HOME%/}/.local/state/nomux/run ;; esac ;; esac ;; esac
+case $r in /*) printf 'NOMUX-RUNDIR %s\n' "$r" >&2 ;; esac
+[ -x "$p/nomux-$VER" ] && exec "$p/nomux-$VER" "$MODE" "$ID" 2>/dev/null
 echo "NOMUX-BOOTSTRAP $(uname -s) $(uname -m) $p"
 ```
 
-`exec` replaces the shell on success, so the `echo` is unreachable unless the binary is
-missing or unrunnable. Warm cost: zero extra round trips. `$MODE` is `spawn` or `attach`
+`exec` replaces the shell on success, so the `echo` is what a host with no usable binary
+answers with — but only behind the `[ -x ]`. A bare `exec` whose argument cannot be executed
+exits a non-interactive shell where it stands, and the line after it never runs at all: dash,
+bash and BusyBox `ash` all leave 127 and an empty stream, and `2>/dev/null` swallows even the
+shell's own diagnostic. The test is the whole of why the fallback is reachable. What it does
+not cover is `ENOEXEC` — a binary present, executable, and built for another architecture —
+which still exits 126 saying nothing, and is §5.3's one retry rather than something this line
+reports. Warm cost: zero extra round trips. `$MODE` is `spawn` or `attach`
 ([DESIGN.md § 4](DESIGN.md#4-architecture)), a substitution rather than a second command,
 the client knowing which because it knows whether it holds a session for this tab. The
 fields are `uname`'s — `Linux`, `x86_64` — because `sh` emits the line before any binary
@@ -278,14 +288,59 @@ exists; confirming that an *uploaded* artifact runs is `--version`'s job, one li
 stdout and exit 0: `nomux <version> (protocol <revision>)`, the crate's version and the
 `PROTOCOL_VERSION` of §2.2.
 
+`NOMUX-RUNDIR` is the run directory §6.3 resolves, and it is the field §5.3's warm branch
+opens its `direct-streamlocal` at — the one thing that path needs and cannot ask for,
+running no process on the server. **Ahead of the `exec` and on stderr**, and neither half
+is a preference. Ahead, because a field appended to `NOMUX-BOOTSTRAP` would arrive only
+where the binary is missing or unrunnable, which is the one host with no session to open a
+channel to; the point of the line is the host that is *already* serving. Stderr, because on
+success the `exec`ed binary owns stdout and speaks §2.2's frames on it from its first byte
+— a line in front of those makes every client read a line before switching to frame mode,
+which is a wire change for something that needs none. An SSH exec channel carries stderr as
+separate extended data, so the two never interleave, and ~100 bytes cannot fill a window
+sshd opens at 2 MiB.
+
+§5.2's `exec` carries no `2>/dev/null`, so on that path the binary's own stderr reaches the
+channel as well, and it still does not collide: everything nomux writes there is §11's
+`nomux: `, this line is written before any binary exists as a process, and it is therefore
+first on the stream whichever of the two commands ran. The prefix is what the client scans
+for rather than reading the stream as one field, because a login shell sourcing an rc file
+gets there first on plenty of hosts — the same chatter that would corrupt the frames on
+stdout, which is the other half of why the field is not there.
+
+The value is §6.3's precedence restated in `sh`, and it has to be that precedence exactly.
+Each source counts **only where it names an absolute path**, `rundir::absolute_env` testing
+nothing else — so unset, empty and relative are one answer and not three, and a `~/run` no
+shell expanded is relative like the rest, which is why `${VAR-}` and a `case` do the work
+where a `${VAR:-default}` would silently promote the relative ones. `$HOME` substitutes for
+`$XDG_STATE_HOME` and then takes the *same* `nomux/run`, under `.local/state`: a branch of
+one precedence, not a third directory. `${VAR%/}/` is the join — `PathBuf::push` adds a
+separator only where the last byte is not one, and stripping one to put one back is that
+rule to the byte, down to `XDG_RUNTIME_DIR=/` giving `/nomux` and not the `//nomux` POSIX
+leaves implementation-defined. What the shell reads is what the `exec` inherits, so a login
+shell that *materialises* one of these — `zsh` supplies and exports `$HOME` where the
+environment carried none, `dash`, `bash` and BusyBox `ash` do not — moves both answers or
+neither. Where no source qualifies, nothing is printed, which is the daemon's own answer
+(§6.3, §10) rather than a silence: a client that reads no line has learnt that there is no
+warm path here.
+
+`printf` and not `echo`: `NOMUX-BOOTSTRAP`'s fields are `uname`'s and cannot hold a
+backslash, a path can, and `echo`'s treatment of one is unspecified — in `dash` it is an
+escape.
+
 ### 5.2 Upload and attach in one round trip
 
 ```sh
 p=${XDG_DATA_HOME:-$HOME/.local/share}/nomux
+r=; case ${XDG_RUNTIME_DIR-} in /*) r=${XDG_RUNTIME_DIR%/}/nomux ;; *)
+case ${XDG_STATE_HOME-} in /*) r=${XDG_STATE_HOME%/}/nomux/run ;; *)
+case ${HOME-} in /*) r=${HOME%/}/.local/state/nomux/run ;; esac ;; esac ;; esac
+case $r in /*) printf 'NOMUX-RUNDIR %s\n' "$r" >&2 ;; esac
 mkdir -p -m 700 "$p" && set -C && cat > "$p/.up.$$" && chmod 755 "$p/.up.$$" \
   && mv -f "$p/.up.$$" "$p/nomux-$VER" && exec "$p/nomux-$VER" "$MODE" "$ID"
 ```
 
+- **`NOMUX-RUNDIR` is repeated verbatim from §5.1 rather than inherited from it.** The two commands do not always both run — a version bump reaches this one with a host profile already cached — and the answer can move on a host that has not: `$XDG_RUNTIME_DIR` lives as long as a login session and is gone at last logout without linger (§6.3), so the same host resolves the tmpfs directory while somebody is logged in and the `$HOME` fallback when nobody is. A field re-established on every cold command cannot quietly name last week's directory. It sits before the `cat`, so the client has it without waiting out the upload, and before the `mkdir`, so a host that refuses the install still says where its sessions would be.
 - Temp-then-`mv` is atomic within one filesystem and avoids `ETXTBSY` — you cannot write over a running binary.
 - Version in the filename: an upgraded client cannot break sessions an older daemon still holds.
 - Transfer over an **exec channel with `cat`**, not SFTP. `Subsystem sftp` gets disabled on hardened hosts, and modern `scp` is SFTP underneath. SSH channels are 8-bit clean, so no base64 tax.
@@ -299,7 +354,7 @@ mkdir -p -m 700 "$p" && set -C && cat > "$p/.up.$$" && chmod 755 "$p/.up.$$" \
 
 ```mermaid
 flowchart TD
-  A["Cached host profile?"] -- yes --> W["direct-streamlocal to socket"]
+  A["Cached host profile with a run directory?"] -- yes --> W["direct-streamlocal to socket"]
   W -- refused --> X["exec: attach relay"]
   W -- ok --> DONE["session"]
   A -- no --> P["probe + attach (5.1)"]
@@ -315,6 +370,13 @@ flowchart TD
   U -- "EACCES / noexec / EROFS" --> F
   X -- fail --> F
 ```
+
+The run directory is a *field of the profile*, which is why the first node asks for it and
+not merely for a profile: the socket the warm branch opens is `$RUNDIR/<id>.sock` and that
+branch runs no process to resolve it (§6.3). Both cold commands emit it (§5.1, §5.2), so
+the cold path is what establishes the warm one, and a profile without the field has no warm
+branch to take — the client goes straight to the exec relay, which resolves the path in the
+daemon's own code and so needs none of this.
 
 `uname -m` lies on a 32-bit userland over a 64-bit kernel, hence the one ENOEXEC retry. A
 `noexec` or read-only home is detected by exec failing, never by parsing mounts, and every
@@ -442,21 +504,29 @@ Path precedence, first **absolute** one winning:
 A source naming a relative or empty path is skipped; where none names an absolute one,
 every mode fails with that — 126 from the relay, 1 from the rest (§ 10).
 
-**Which of the three won is something no document hands a client, and that is a gap.** Every
-source above is *server-side* environment, unreadable without an exec, and nothing gives the
-answer back: § 5.1's `NOMUX-BOOTSTRAP` line echoes `$p`, the **install** directory off
-`$XDG_DATA_HOME` — another variable on another precedence — while `list` prints three
-columns and no path (§ 6.6) and `--version` prints none. So § 5.3's warm branch, a
-`direct-streamlocal` opened straight at `$RUNDIR/<id>.sock`, has no way to acquire its
-central field. The repair the existing bootstrap can carry, and the only one costing no wire
-change, is a fourth field on that line: the resolved directory, computed in `sh` from the
-same environment the daemon will resolve it in, and emitted *ahead* of the `exec` — behind
-it, it fires only where the binary is missing or unrunnable. Teaching a mode to print it
-instead is a new output and so outside what the bootstrap already has. That field restates
-this precedence in a shell the daemon never runs, which is affordable only because a wrong
-one degrades to a refused `direct-streamlocal` and § 5.3's exec relay. **§ 5.1 does not carry
-it today**, so until it does the warm path is reachable only where a client was told the
-directory by hand.
+**Which of the three won is something the bootstrap hands back, because nothing else can.**
+Every source above is *server-side* environment, unreadable without an exec, and no output
+of this binary returns it: `list` prints three columns and no path (§ 6.6), `--version`
+prints none, and § 5.1's `NOMUX-BOOTSTRAP` line echoes `$p`, the **install** directory off
+`$XDG_DATA_HOME` — another variable on another precedence. So § 5.1 and § 5.2 both restate
+this precedence in four lines of POSIX `sh` and print the result as `NOMUX-RUNDIR <dir>` on
+stderr, ahead of their `exec` in both. Ahead, and on its own line rather than a fourth field
+on `NOMUX-BOOTSTRAP`: that line is echoed *behind* the `exec`, so a field on it reaches only
+a host with no binary, and the host that needs the directory is the one already serving a
+session. That is what gives § 5.3's warm branch its central field — a `direct-streamlocal`
+opened straight at `$RUNDIR/<id>.sock` needs the directory and runs no process to learn it.
+Teaching a mode to print it instead would be a new output on the surface § 6.6 freezes, and
+would still need the exec the warm path exists to avoid.
+
+The precedence is therefore written twice: here, in Rust, and in a shell the daemon never
+runs. The shell mirrors `absolute_env` and not the three-item list above — a source counts
+**only where it names an absolute path**, so unset, empty and relative are one answer;
+`$HOME` is a substitute for `$XDG_STATE_HOME` that takes the *same* `nomux/run` under
+`.local/state` rather than a directory of its own; and where nothing qualifies it prints
+nothing, which is this section's refusal rather than a silence. Two copies can still drift,
+and that is affordable for one reason only: a wrong directory is a `direct-streamlocal` sshd
+refuses, and § 5.3 answers a refusal with the exec relay, which resolves the path in the
+daemon's own code.
 
 A `sun_path` is 108 bytes including its terminator, so the directory, a `/`, the id and a
 six-byte suffix — `.label` and `.agent`, the joint longest of the five — have to fit in
