@@ -837,7 +837,7 @@ impl Daemon {
                     // loop refusing as fast as somebody could connect would not be. And
                     // no [`ACCEPT_BACKOFF`] — what was refused is the connection, the
                     // listener being in perfect health.
-                    if !crate::rundir::peer_is_ours(stream.as_fd(), self.paths.id()) {
+                    if !crate::usock::peer_is_ours(stream.as_fd(), self.paths.id()) {
                         return;
                     }
                     self.pending = Conn::new(stream)

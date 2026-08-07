@@ -18,10 +18,12 @@ mod passwd;
 mod pty;
 mod ring;
 mod rundir;
+mod sanitize;
 #[cfg(test)]
 mod scratch;
 mod startup;
 mod syslog;
+mod usock;
 
 use std::env;
 use std::ffi::OsString;

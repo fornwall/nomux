@@ -570,11 +570,12 @@ the same reason: a match inside a truncated read is authoritative, and only a *f
 match leaves truncation deciding.
 
 **What is signalled is a process, not a number.** A descriptor onto the pid is opened
-**before** question 2 is put, and both signals go through it. Only a host with no
-`pidfd_open` signals the number itself, and there the reuse is unclosable — nothing else
-can pin a process, and the pidfile is frozen as a bare number carrying no baseline to
-compare against. Every other failure of that open signals nothing at all; `control.rs` has
-which errnos fall where.
+**before** question 2 is put, and both signals go through it. A failure of that open — of
+any kind, including a host with no `pidfd_open` at all — signals nothing: `kill` refuses,
+naming the errno. There is no falling back on the bare number, because the errno that most
+invites one, `ESRCH`, is exactly the case where the number is already free to be somebody
+else's. The refusal is recoverable, `list` still printing the pid; a signal delivered to a
+stranger's process is not.
 
 | `<id>.pid` | `/proc` | Result |
 | --- | --- | --- |

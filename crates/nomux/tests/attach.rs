@@ -180,7 +180,7 @@ fn spawn_refuses_an_id_something_is_already_serving() {
 /// A daemon that has stopped calling `accept` is alive in every sense the layout cares
 /// about: it holds the socket, it holds the user's shell, and a client already attached
 /// is still being served. What it does not do is answer a probe — an `AF_UNIX` `connect`
-/// to a full backlog blocks rather than being refused, so `rundir::connect_within` gives
+/// to a full backlog blocks rather than being refused, so `usock::connect_within` gives
 /// up after two seconds and reports `TimedOut`, which is evidence that somebody bound
 /// this socket and is therefore evidence of *life*.
 ///

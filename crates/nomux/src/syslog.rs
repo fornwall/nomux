@@ -8,6 +8,8 @@
 
 use std::os::unix::net::UnixDatagram;
 
+use crate::sanitize::sanitize_text;
+
 const SOCKET: &str = "/dev/log";
 
 /// Sends one line, and never reports whether it arrived.
@@ -28,7 +30,7 @@ fn send(priority: u8, session_id: &str, message: &str) {
     // directory somebody else chose, and the id is not always validated either —
     // `daemon::run` reports a startup failure before anything has looked at its
     // argument. A newline in a datagram is how one log line becomes two.
-    let line = crate::rundir::sanitize_text(&format!(
+    let line = sanitize_text(&format!(
         "<{priority}>nomux[{pid}]: session {session_id}: {message}",
         pid = std::process::id(),
     ));
@@ -52,7 +54,7 @@ pub(crate) fn info(session_id: &str, message: &str) {
 
 #[cfg(test)]
 mod tests {
-    use crate::rundir::{sanitize_label, sanitize_text};
+    use crate::sanitize::{sanitize_label, sanitize_text};
 
     #[test]
     fn control_characters_cannot_forge_a_second_line() {

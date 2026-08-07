@@ -19,7 +19,7 @@
 //! | neither           | [`unattachable`], 126       | [`may_be_running`], 126    |
 //!
 //! The last row is the wedged daemon: an `AF_UNIX` `connect` to a full backlog blocks
-//! rather than being refused, so [`crate::rundir::connect_within`] gives up with `TimedOut`
+//! rather than being refused, so [`crate::usock::connect_within`] gives up with `TimedOut`
 //! over a socket somebody bound and stopped accepting on — evidence *of* a session, and
 //! § 10's "no such session" had `DESIGN.md` § 7's client cache a live one as an id it had
 //! got wrong. The two 126s keep separate kinds all the same: `AlreadyExists` answers a
@@ -51,7 +51,7 @@ const SPAWN_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// How long any one `connect` to the session socket waits out a full backlog.
 ///
-/// [`crate::rundir::connect_within`] has why every `connect` here is bounded and this
+/// [`crate::usock::connect_within`] has why every `connect` here is bounded and this
 /// one is not a plain `UnixStream::connect` (§ 6.3). Short, because the state it waits
 /// out clears in one `accept` and this is on the path of every attach.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -257,7 +257,7 @@ fn spawn_and_join(paths: &SessionPaths, label: Option<&str>) -> io::Result<UnixS
 /// § 6.6 forbidding an exit that established neither death nor life to unlink over a live
 /// session. Which exit it is cannot be read off the error, which is why this is a call
 /// rather than a wrapper on every failure: the deadline above and
-/// [`crate::rundir::connect_within`] both report `TimedOut`, one over a socket nothing ever
+/// [`crate::usock::connect_within`] both report `TimedOut`, one over a socket nothing ever
 /// bound and one over a socket somebody bound and stopped accepting on.
 fn released(paths: &SessionPaths, err: io::Error) -> io::Error {
     drop(fs::remove_file(paths.lock()));

@@ -229,7 +229,7 @@ impl Agent {
         // Before the slot is taken and before a byte is read, and on the same terms as
         // the session listener's (§ 6.3): what a connection here reaches is the client's
         // key store, so this is the socket that check is worth most on.
-        if !crate::rundir::peer_is_ours(stream.as_fd(), id)
+        if !crate::usock::peer_is_ours(stream.as_fd(), id)
             || !serving
             || stream.set_nonblocking(true).is_err()
         {

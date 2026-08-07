@@ -1,0 +1,317 @@
+//! What § 6.3 wants from `AF_UNIX` that `std` will not do.
+//!
+//! A `connect` that gives up rather than parking in a full backlog, and the
+//! `SO_PEERCRED` behind "one uid may have the session". Its own module because the run
+//! directory's business is names and modes: `<id>.sock` is bound over there, at the one
+//! mode that has to be exact ([`crate::rundir::bind_socket_private`]), and everything
+//! anyone does with a session socket afterwards is here.
+//!
+//! Through `libc` rather than rustix, whose sockets sit behind a `net` feature § 8's
+//! budget is why this crate does not enable.
+
+use std::io;
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::unix::net::UnixStream;
+use std::path::Path;
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// Longest path a unix socket can be bound to: `sun_path` is 108 bytes and holds a
+/// terminator, so 107 is what is left — the figure std checks before it builds an address.
+///
+/// `pub(crate)` because `rundir::SessionPaths::new` refuses an id whose run files would
+/// overrun it, rather than letting the `bind` discover that (§ 6.3).
+pub(crate) const SUN_PATH_MAX: usize = 107;
+
+/// Whether a failed `connect` to a session socket means nothing is listening there.
+///
+/// The one predicate behind every such decision in this binary, since § 6.3 requires the
+/// daemon's probe, its bind, `list` and `kill` to agree. A socket file outlives the process
+/// that bound it, so `ECONNREFUSED` is a dead daemon, and an absent name is that answer one
+/// syscall sooner. Anything else — `EACCES`, a descriptor limit — is not evidence of death
+/// and must never license an unlink: § 6.3's "`EACCES` is not staleness".
+pub(crate) fn nothing_is_listening(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+    )
+}
+
+/// How long to wait between attempts at a `connect` refused for room rather than for want
+/// of a listener. Short, because the state it waits out clears in one `accept`.
+const PROBE_RETRY: Duration = Duration::from_millis(10);
+
+/// Connects to the unix socket at `path`, giving up after `within` rather than parking in
+/// the kernel.
+///
+/// Bounded because an `AF_UNIX` `connect` to a *full* backlog blocks rather than being
+/// refused (§ 6.3), so a daemon that has stopped calling `accept` would park `list`, `kill`
+/// and every attach on that id with nothing to end the wait — and § 6.6's escape hatch has
+/// to answer on any host.
+///
+/// A sleep loop rather than a `poll`, which is what `AF_UNIX` requires: a stream socket
+/// refused for room answers `EAGAIN` at once and registers nothing to wait on, staying in
+/// `TCP_CLOSE`, where `poll` reports `POLLOUT | POLLHUP` immediately and for ever.
+/// `SO_SNDTIMEO`, which the kernel *does* honour here, is a bound a kernel could stop
+/// enforcing, and this is the surface that may not hang.
+///
+/// # Errors
+///
+/// Propagates the `connect`, so [`nothing_is_listening`] still divides a dead daemon from
+/// everything else, and reports [`io::ErrorKind::TimedOut`] for a backlog that never
+/// drained — neither death nor an answer, and licence for no unlink.
+pub(crate) fn connect_within(path: &Path, within: Duration) -> io::Result<UnixStream> {
+    let addr = unix_address(path)?;
+    let deadline = Instant::now() + within;
+    loop {
+        match connect_once(&addr) {
+            // `EAGAIN` is the full backlog and `EINTR` a call that has not happened yet:
+            // the two outcomes that say nothing about the listener.
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) => {}
+            outcome => return outcome,
+        }
+        if Instant::now() >= deadline {
+            // Narrowed before formatting: this would be the crate's only `u128` `Display`,
+            // some 700 bytes of the § 8 budget for a message on a cold path.
+            let ms = u64::try_from(within.as_millis()).unwrap_or(u64::MAX);
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "{} did not accept a connection within {ms}ms: its backlog is full, \
+                     so whoever bound it has stopped accepting",
+                    path.display(),
+                ),
+            ));
+        }
+        thread::sleep(PROBE_RETRY);
+    }
+}
+
+/// One non-blocking `connect` to `addr`, and the stream if it took.
+fn connect_once(addr: &libc::sockaddr_un) -> io::Result<UnixStream> {
+    // SAFETY: `socket` takes three integers and returns a descriptor or -1. Nothing is
+    // passed by reference, and the descriptor is owned from the next statement on.
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is the descriptor the call above just returned and nothing else
+    // holds, so this is its sole owner and the only thing that will close it.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: `connect` is given the address and length of a `sockaddr_un` that outlives
+    // the call — [`widths::SOCKADDR_UN`] is that type's own size — on a descriptor `fd`
+    // keeps open across it, and it writes nothing back through either.
+    let connected = unsafe {
+        libc::connect(
+            fd.as_raw_fd(),
+            std::ptr::from_ref(addr).cast::<libc::sockaddr>(),
+            widths::SOCKADDR_UN,
+        )
+    };
+    if connected < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stream = UnixStream::from(fd);
+    // The non-blocking flag belonged to the `connect` and not to the caller, every one
+    // of which wants the ordinary blocking socket it asked for.
+    stream.set_nonblocking(false)?;
+    Ok(stream)
+}
+
+/// The `sockaddr_un` naming `path`.
+///
+/// By hand because std creates the socket inside its own `connect` and offers no way to set
+/// a flag on one first, and rustix's would mean adding its `net` feature.
+fn unix_address(path: &Path) -> io::Result<libc::sockaddr_un> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = path.as_os_str().as_bytes();
+    // Unreachable — `SessionPaths::new` refuses an id this would overrun (§ 6.3) — and
+    // kept because the copy below is what it makes sound.
+    if bytes.len() > SUN_PATH_MAX {
+        return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
+    }
+    let mut addr = libc::sockaddr_un {
+        sun_family: widths::AF_UNIX,
+        // One byte past [`SUN_PATH_MAX`], which is the terminator that bound is stated
+        // against, and left zero so every shorter path is terminated by construction.
+        sun_path: [0; SUN_PATH_MAX + 1],
+    };
+    // SAFETY: `bytes` is at most `SUN_PATH_MAX` long, checked just above, and
+    // `sun_path` is one byte longer than that — so the copy stays inside the array and
+    // cannot reach its last byte. The two regions belong to different objects.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            addr.sun_path.as_mut_ptr().cast::<u8>(),
+            bytes.len(),
+        );
+    }
+    Ok(addr)
+}
+
+/// Whether a connection just off one of the session's two listeners is this user's, and
+/// so may be heard at all (§ 6.3); a refusal is reported against `id`.
+///
+/// Defence in depth rather than the lock itself: the `0700` run directory and `0600`
+/// sockets already exclude every other uid where modes hold, and this costs one
+/// `getsockopt` where they do not — a run directory somebody widened, a filesystem that
+/// carries no modes. Both listeners, the agent socket (§ 6.7) handing out signatures.
+///
+/// Nothing is sent back: an `Error` frame would spend `Conn::close_with`'s blocking flush
+/// (§ 6.5) on a peer with every reason not to read it, and would confirm to whoever it is
+/// what is listening here. Syslog hears it instead, being the only place this process can
+/// still write (§ 11).
+pub(crate) fn peer_is_ours(peer: BorrowedFd<'_>, id: &str) -> bool {
+    let uid = peer_uid(peer);
+    // The `getuid` § 6.3's run-directory check is written against, so that "this uid"
+    // means one thing across the tree; nothing here is ever setuid, so the real uid it
+    // answers with is also the one that owns the socket.
+    if uid_is_ours(&uid, rustix::process::getuid().as_raw()) {
+        return true;
+    }
+    crate::syslog::error(
+        id,
+        &match uid {
+            Ok(uid) => format!("refused a connection from uid {uid}"),
+            Err(err) => format!("refused a connection whose uid could not be read: {err}"),
+        },
+    );
+    false
+}
+
+/// The three fixed widths the socket calls here are handed: `AF_UNIX` in the field that
+/// carries it, and the lengths of a `sockaddr_un` and a `ucred`. Constants because 1, 110
+/// and 12 each fit the field they are written into, so the conversions these replace could
+/// not fail and cost a branch and an error string apiece against § 8's budget.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "1, 110 and 12 each fit the field the cast writes them into"
+)]
+mod widths {
+    pub(super) const AF_UNIX: libc::sa_family_t = libc::AF_UNIX as libc::sa_family_t;
+    pub(super) const SOCKADDR_UN: libc::socklen_t =
+        size_of::<libc::sockaddr_un>() as libc::socklen_t;
+    pub(super) const UCRED: libc::socklen_t = size_of::<libc::ucred>() as libc::socklen_t;
+}
+
+/// The uid `SO_PEERCRED` reports for the process at the other end of `fd`.
+///
+/// Through `libc` because rustix's socket options sit behind its `net` feature, which
+/// this crate does not enable: § 8's 400 KiB budget is why the feature list is as short as
+/// it is, and it is the same reason `daemon::publish`'s second `listen` is spelled this
+/// way.
+fn peer_uid(fd: BorrowedFd<'_>) -> io::Result<u32> {
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = widths::UCRED;
+    // SAFETY: `getsockopt` is given a `ucred` to fill and a `socklen_t` holding that
+    // type's own size, both owned by this frame and unaliased across the call, on a
+    // descriptor the borrow keeps open for it.
+    let asked = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            std::ptr::from_mut(&mut cred).cast::<libc::c_void>(),
+            std::ptr::from_mut(&mut len),
+        )
+    };
+    if asked != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // What comes back in `len` is how much of the struct was written, and it is what makes
+    // the read below mean anything: short of the whole of it, the uid is still the zero
+    // seeded above, which is root's.
+    if len != widths::UCRED {
+        return Err(io::Error::other(
+            "SO_PEERCRED answered with a partial ucred",
+        ));
+    }
+    Ok(cred.uid)
+}
+
+/// Whether the credentials `peer` came back with are `ours`, which is the one uid a session
+/// belongs to (§ 6.3). uid 0 is turned away with everyone else — root has `/proc`, `setuid`
+/// and `ptrace` whatever this answers — and so is a peer the kernel would not describe, a
+/// `getsockopt` that failed being evidence of nothing.
+const fn uid_is_ours(peer: &io::Result<u32>, ours: u32) -> bool {
+    matches!(peer, Ok(uid) if *uid == ours)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::AsFd as _;
+
+    /// § 6.3's peer-credential rule at the three edges a suite running as one uid
+    /// cannot put in front of a live daemon: another user, root, and an answer the
+    /// kernel never gave. Against [`uid_is_ours`], which both listeners reach through
+    /// [`peer_is_ours`].
+    ///
+    /// The refusal is here rather than end to end because a real mismatched peer needs
+    /// a second uid, which the suite has no way to become. What a daemon *can* be shown
+    /// is the other direction, in `tests/session.rs`:
+    /// `a_connection_from_this_uid_is_admitted_and_reports_its_credentials`, and every
+    /// other test in the suite, since a check that refused everybody would take no
+    /// clients at all.
+    #[test]
+    fn only_this_uid_may_have_the_session() {
+        let ours = rustix::process::getuid().as_raw();
+        assert!(
+            uid_is_ours(&Ok(ours), ours),
+            "the uid that started the session is the one it is for"
+        );
+        assert!(
+            !uid_is_ours(&Ok(ours.wrapping_add(1)), ours),
+            "another user's connection is refused however it reached the socket"
+        );
+        // Stated as a consequence rather than a case, so the assertion says the same
+        // thing under a suite run as root: uid 0 is refused by the general rule and
+        // admitted only where it is itself the uid that owns the session.
+        assert_eq!(
+            uid_is_ours(&Ok(0), ours),
+            ours == 0,
+            "root gets no exemption; it has `/proc` and `setuid` and needs none"
+        );
+        for unanswered in [
+            io::Error::from_raw_os_error(libc::ENOPROTOOPT),
+            io::Error::other("SO_PEERCRED answered with a partial ucred"),
+        ] {
+            assert!(
+                !uid_is_ours(&Err(unanswered), ours),
+                "a uid the kernel would not report is not a uid that matches"
+            );
+        }
+    }
+
+    /// [`peer_uid`] against the only peer this process can produce on its own, where
+    /// the answer is known: itself.
+    ///
+    /// It pins the call rather than the policy, and that is the half worth pinning. A
+    /// wrong level, option or struct answers `Err` for every connection, which
+    /// [`uid_is_ours`] then refuses — a session socket that admits nobody, which is
+    /// the realistic way this goes wrong.
+    #[test]
+    fn the_kernel_reports_the_uid_of_a_peer_this_process_owns() {
+        let (ours, _theirs) = UnixStream::pair().expect("a socketpair");
+        assert_eq!(
+            peer_uid(ours.as_fd()).expect("SO_PEERCRED on a socketpair"),
+            rustix::process::getuid().as_raw(),
+            "both ends of a socketpair belong to the process that made it"
+        );
+    }
+}
