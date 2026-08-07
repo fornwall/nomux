@@ -23,7 +23,10 @@
 
 mod frame;
 
-pub use frame::{ErrorCode, ExitKind, Frame, Hello, HelloOk, Linger, RESUME_FROM_START, WinSize};
+pub use frame::{
+    ErrorCode, ExitKind, Frame, Hello, HelloOk, Linger, MAX_AGENT_DATA, MAX_OUTPUT_DATA,
+    RESUME_FROM_START, WinSize,
+};
 
 /// Protocol revision. Bumped on any wire change, including compatible ones.
 ///
