@@ -42,9 +42,9 @@ const RING_BYTES_ENV: &str = "NOMUX_RING_BYTES";
 const MAX_RING_CAPACITY: usize = 1 << 30;
 
 /// Resolves the ring capacity from what [`RING_BYTES_ENV`] asked for; nothing here
-/// refuses (`IMPLEMENTATION.md` § 4). Zero is filtered rather than passed on, since
-/// `Ring::try_new` clamps it to one byte and a ring that makes every write a gap is no
-/// tuning choice.
+/// refuses (`IMPLEMENTATION.md` § 4). Zero is filtered rather than passed to
+/// `Ring::try_new`'s one-byte clamp — a ring that makes every write a gap is no tuning
+/// choice.
 fn ring_capacity(requested: Option<&str>) -> usize {
     requested
         .and_then(|value| value.trim().parse::<usize>().ok())
@@ -96,9 +96,8 @@ const FIRST_ATTACH_TIMEOUT: Duration = Duration::from_secs(30);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// How long the listener stays out of the poll set after an `accept` that failed for
-/// something other than a signal: a descriptor shortage leaves the connection queued, so
-/// the descriptor stays readable and `poll` returns at once on every pass. Leaving the
-/// set is the only way to stand back from that.
+/// something other than a signal: a descriptor shortage leaves the connection queued and
+/// the descriptor readable, and leaving the set is the only way to stand back from that.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// How long a connection that has not said `Hello` keeps the one pending slot: a peer
@@ -108,13 +107,10 @@ const PENDING_HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Stop accepting client input once this much is queued for a PTY not taking it (§ 4.1).
 ///
-/// The first of the four caps § 4.1 presents as one table, and they are here together
-/// because the figures are chosen against each other rather than one at a time: the two
-/// receive-side megabytes bound a connection's undecoded buffer against the queue it
-/// feeds, and the gap between the two output bounds is clear of the first plus a whole
-/// output chunk, so only the frames that *answer* a client can reach the second. Two of
-/// them are enforced in [`Conn`] rather than measured for the daemon: [`Conn::fill`]
-/// stops at [`MAX_PENDING_READ`], [`Conn::send_output`] at [`MAX_PENDING_WRITE`].
+/// § 4.1's four caps live here together because the figures are chosen against each
+/// other. Two are enforced in [`Conn`] rather than measured for the daemon:
+/// [`Conn::fill`] stops at [`MAX_PENDING_READ`], [`Conn::send_output`] at
+/// [`MAX_PENDING_WRITE`].
 const MAX_PENDING_INPUT: usize = 1 << 20;
 
 /// Stop queueing output once this much is already waiting for a slow client (§ 4.1).
@@ -123,22 +119,17 @@ pub(crate) const MAX_PENDING_WRITE: usize = 1 << 20;
 /// Queue size at which a client is treated as gone rather than slow (§ 4.1).
 const ABANDON_PENDING_WRITE: usize = 8 << 20;
 
-/// Stop reading from a connection once this much undecoded input is already buffered.
-///
-/// [`Conn::fill`] loops until `EAGAIN`, which against a peer that keeps writing has no
-/// natural end: every chunk it takes frees exactly that much room for the peer to refill.
-/// The cap leaves the bytes where the peer blocks on them instead — load-bearing rather
-/// than defensive, nothing emptying that buffer while the daemon has stopped *decoding*
-/// (§ 4.1).
+/// Stop reading from a connection once this much undecoded input is already buffered:
+/// nothing empties that buffer while the daemon has stopped *decoding* (§ 4.1), so the
+/// cap leaves the bytes in the kernel, where the peer blocks on them.
 pub(crate) const MAX_PENDING_READ: usize = 1 << 20;
 
 /// Capacity the decode scratch keeps between passes rather than hand back.
 const SCRATCH_RETAINED: usize = 64 * 1024;
 
-/// Capacity the PTY input queue keeps once drained, for [`SCRATCH_RETAINED`]'s reason at
-/// the other end of the same pass. Small because this holds keystrokes: a queue that has
-/// just gone empty overwhelmingly carried a handful of bytes, and the paste the shrink
-/// exists for is four orders of magnitude above this floor.
+/// Capacity the PTY input queue keeps once drained, for [`SCRATCH_RETAINED`]'s reason.
+/// Small because this holds keystrokes; the paste the shrink exists for is four orders
+/// of magnitude above this floor.
 const PENDING_INPUT_RETAINED: usize = 4096;
 
 /// The attached client, and the state that means nothing without one.
@@ -162,10 +153,8 @@ struct Attached {
 
 impl Attached {
     /// The connection promoted by a `Hello` that has not been answered yet.
-    ///
-    /// Three of the four are what [`Daemon::on_hello`] decides next, off that same
-    /// greeting. `terminal_end_sent` is the one it does not touch: a connection hears
-    /// the end once, and this is the only place a fresh one starts owed it.
+    /// [`Daemon::on_hello`] decides all but `terminal_end_sent` off that same greeting:
+    /// a connection hears the end once, and only a fresh one starts owed it.
     const fn greeting(conn: Conn) -> Self {
         Self {
             conn,
@@ -181,13 +170,11 @@ impl Attached {
 struct Daemon {
     paths: SessionPaths,
     listener: UnixListener,
-    /// Read end of the self-pipe [`crate::startup::arm_stop_signals`] armed. `None`
-    /// exists only for event-loop unit fixtures; startup refuses a session without it.
-    stop_pipe: Option<OwnedFd>,
-    /// The same for `SIGCHLD` ([`crate::startup::arm_child_signal`]), which is a
-    /// descriptor of its own for the reason that function gives. As above, `None` is
-    /// only a unit-fixture fallback; startup refuses a session without the wakeup.
-    child_pipe: Option<OwnedFd>,
+    /// Read end of the self-pipe [`crate::startup::arm_stop_signals`] armed.
+    stop_pipe: OwnedFd,
+    /// The same for `SIGCHLD` ([`crate::startup::arm_child_signal`]), a descriptor of
+    /// its own for the reason that function gives.
+    child_pipe: OwnedFd,
     /// Why this session is ending, once anything has decided it should: a stop signal,
     /// or something it could not do without having failed. The loop leaves on its next
     /// pass (§ 6.5), and until then nothing new is accepted.
@@ -212,10 +199,9 @@ struct Daemon {
     /// [`Daemon::apply_win`] closes the difference once a pass.
     win: WinSize,
     /// The size this daemon last *successfully* gave the PTY, so a pass that decoded a
-    /// hundred `Resize` frames still issues at most one `TIOCSWINSZ`. `None` is "no longer
-    /// known": the daemon is not the only thing that can call it — `stty rows` in the
-    /// session is the everyday spelling — so this records what was sent and never what the
-    /// terminal is. Every `Hello` clears it, which is what keeps § 2.2's authoritative
+    /// hundred `Resize` frames still issues at most one `TIOCSWINSZ`. What was sent,
+    /// never what the terminal is — `stty rows` in the session needs no permission from
+    /// this daemon — and every `Hello` clears it, which keeps § 2.2's authoritative
     /// winsize true of a reattach at an unchanged size.
     applied_win: Option<WinSize>,
     /// Whether a `SIGCHLD` has arrived that no `waitpid` has been spent on yet. Set by the
@@ -284,54 +270,13 @@ fn start(session_id: &str, label: Option<&str>, inherited_lock_fd: Option<i32>) 
             )
         })?,
     };
-    // Only an acquisition that atomically created the directory entry may scrub it on
-    // a refusal. For an inherited authority the parent owns failed-handoff cleanup.
-    let scrub_lock = publishing.created_name();
-
-    // Inside that locked region and before the bind, per § 6.3: taking the lock created
-    // `<id>.lock`, which `session_id_of` counts as a session, so a refusal that left it
-    // behind would ratchet this backstop against itself.
-    let dir = paths.dir();
-    let at_ceiling = match at_session_ceiling(dir, paths.id()) {
-        Ok(at_ceiling) => at_ceiling,
-        Err(err) => {
-            if scrub_lock {
-                drop(fs::remove_file(paths.lock()));
-            }
-            return Err(io::Error::new(
-                err.kind(),
-                format!(
-                    "{} could not be enumerated before starting session {}: {err}",
-                    dir.display(),
-                    paths.id()
-                ),
-            ));
-        }
-    };
-    if at_ceiling {
-        if scrub_lock {
-            drop(fs::remove_file(paths.lock()));
-        }
-        return Err(io::Error::new(
-            io::ErrorKind::QuotaExceeded,
-            format!(
-                "{} already holds {MAX_SESSIONS} sessions, which is as many as one host \
-                 will run: `nomux list` collects the ones that have stopped, and \
-                 `nomux kill <id>` ends one that has not",
-                dir.display()
-            ),
-        ));
-    }
-
-    // The whole of the bind before the fork: past § 6.2's fork the process a caller is
-    // waiting on has already `_exit`ed with a status of its own, so every errno after it
-    // reads as success — a session that never started, reported as started. Matched rather
-    // than `?`d for the reason the ceiling above scrubs: this is the *next* way out of the
-    // locked region, and a `?` here left `<id>.lock` behind on every full disk.
-    let listener = match bind_socket(&paths) {
+    let listener = match ceiling_checked_bind(&paths) {
         Ok(listener) => listener,
         Err(err) => {
-            if scrub_lock {
+            // Only an acquisition that atomically created the directory entry may scrub
+            // it on a refusal; for an inherited authority the parent owns failed-handoff
+            // cleanup.
+            if publishing.created_name() {
                 drop(fs::remove_file(paths.lock()));
             }
             return Err(err);
@@ -343,10 +288,8 @@ fn start(session_id: &str, label: Option<&str>, inherited_lock_fd: Option<i32>) 
     let (stop_pipe, child_pipe) = match publish(&paths, label) {
         Ok(pipes) => pipes,
         Err(err) => {
-            // This is still the publication authority, including when `spawn` retains
-            // another reference to the same inherited open-file description. Cleaning
-            // through it avoids releasing and then parking behind the parent that is
-            // waiting for this startup to finish.
+            // Still the publication authority: cleaning through it avoids releasing the
+            // lock and then parking behind the parent waiting for this startup to finish.
             drop(paths.unlink_all_locked(&publishing));
             return Err(err);
         }
@@ -404,10 +347,7 @@ fn start(session_id: &str, label: Option<&str>, inherited_lock_fd: Option<i32>) 
 ///
 /// Propagates failures to arm either required signal path or write `<id>.pid`. Detachment
 /// and the advisory label remain best effort: neither can make the event loop unsafe.
-fn publish(
-    paths: &SessionPaths,
-    label: Option<&str>,
-) -> io::Result<(Option<OwnedFd>, Option<OwnedFd>)> {
+fn publish(paths: &SessionPaths, label: Option<&str>) -> io::Result<(OwnedFd, OwnedFd)> {
     // Before the pidfile, so the pid `nomux kill` reads belongs to the process that
     // survives.
     detach_from_controlling_terminal();
@@ -416,15 +356,13 @@ fn publish(
     // `detach_from_controlling_terminal`'s fork shares it rather than resetting it.
 
     // Both between the fork and the pidfile: arming after the pidfile `nomux kill` reads
-    // (§ 6.6) leaves a window where its signal lands on the default disposition, and arming
-    // before the fork lets the parent's `_exit` answer a signal into the pipe. `SIGCHLD`
-    // here rather than at `Pty::spawn`, a disposition belonging to the process and the pipe
-    // having to exist before the first `poll` builds its set — and *first*, because
-    // `arm_stop_signals` is the call that clears the inherited mask and a signal blocked
-    // and pending is delivered the instant it does, so a handler installed afterwards
-    // silently misses the first notification.
-    let child_pipe = Some(arm_child_signal()?);
-    let stop_pipe = Some(arm_stop_signals()?);
+    // (§ 6.6) leaves a window where its signal lands on the default disposition, and
+    // arming before the fork lets the parent's `_exit` answer a signal into the pipe.
+    // `arm_stop_signals` second: it is the call that clears the inherited mask, a signal
+    // blocked and pending is delivered the instant it does, and a handler installed
+    // afterwards would silently miss that first notification.
+    let child_pipe = arm_child_signal()?;
+    let stop_pipe = arm_stop_signals()?;
 
     paths.write_pid()?;
     if let Some(label) = label {
@@ -432,6 +370,38 @@ fn publish(
         drop(paths.write_label(label));
     }
     Ok((stop_pipe, child_pipe))
+}
+
+/// Everything refusable inside [`start`]'s locked region, one `Err` exit so `<id>.lock`
+/// is scrubbed in a single place: the § 6.3 ceiling, counted before the bind because
+/// taking the lock created `<id>.lock` — which `session_id_of` counts as a session, so a
+/// refusal that left it behind would ratchet the backstop against itself — and then the
+/// bind, whole, before § 6.2's fork: past it the caller has already been answered, so
+/// every errno after it reads as success.
+fn ceiling_checked_bind(paths: &SessionPaths) -> io::Result<UnixListener> {
+    let dir = paths.dir();
+    let at_ceiling = at_session_ceiling(dir, paths.id()).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!(
+                "{} could not be enumerated before starting session {}: {err}",
+                dir.display(),
+                paths.id()
+            ),
+        )
+    })?;
+    if at_ceiling {
+        return Err(io::Error::new(
+            io::ErrorKind::QuotaExceeded,
+            format!(
+                "{} already holds {MAX_SESSIONS} sessions, which is as many as one host \
+                 will run: `nomux list` collects the ones that have stopped, and \
+                 `nomux kill <id>` ends one that has not",
+                dir.display()
+            ),
+        ));
+    }
+    bind_socket(paths)
 }
 
 /// Binds the session socket, replacing a stale one: a socket whose `connect` is refused
@@ -465,15 +435,12 @@ fn bind_socket(paths: &SessionPaths) -> io::Result<UnixListener> {
         Liveness::Unknown(err) => return Err(err),
     }
 
-    // A `<id>.pid` outliving its socket lets `attach`'s wait for that path to *exist* be
-    // satisfied by a dead daemon's number, after which `kill` signals an unrelated
-    // process. Before the `bind` so there is no window: past the match above, both names
-    // are a dead daemon's by the evidence that licensed removing the socket.
+    // Both names are a dead daemon's by the evidence that licensed removing the socket,
+    // and both are cleared before the `bind` so there is no window: a `<id>.pid`
+    // outliving its socket satisfies `attach`'s wait for the path to *exist* and sends
+    // `kill` after an unrelated process, and until `write_pid`'s own clear — the far
+    // side of § 6.2's fork — the label would answer for the id this daemon took over.
     paths.clear_pid();
-    // The same for the name `list` prints, and here rather than left to `write_pid`'s own
-    // clear for the timing: between the bind and that call this daemon has forked (§ 6.2),
-    // and for the whole of it the socket answers as a live session under the display name
-    // of the one whose id it took.
     paths.clear_label();
 
     let listener = crate::rundir::bind_socket_private(&path)?;
@@ -547,12 +514,10 @@ const READABLE: PollFlags = PollFlags::IN
     .union(PollFlags::ERR)
     .union(PollFlags::NVAL);
 
-/// Takes back out of a self-pipe whatever its handler put there.
-///
-/// A short read is an empty pipe, so the ordinary one byte costs one syscall rather than
-/// one and the `EAGAIN` behind it. `nbio::read` retries `EINTR`; any other error ends the
-/// loop and leaves the descriptor readable, a wasted pass rather than a lost wakeup —
-/// reading on and hoping is the spin, on a descriptor that has genuinely failed.
+/// Takes back out of a self-pipe whatever its handler put there. A short read is an
+/// empty pipe, so the ordinary one byte costs one syscall rather than one and the
+/// `EAGAIN` behind it; any error ends the loop — a wasted pass rather than a spin on a
+/// descriptor that has genuinely failed.
 fn drain_signals(pipe: BorrowedFd<'_>) {
     let mut sink = [0u8; 64];
     while nbio::read(pipe, &mut sink).is_ok_and(|read| read == sink.len()) {}
@@ -640,8 +605,8 @@ impl Daemon {
             // when the slot frees, where one accepted on top of the incumbent goes unheard.
             Source::Listener => (self.accept_retry.is_none() && self.pending.is_none())
                 .then(|| (self.listener.as_fd(), PollFlags::IN)),
-            Source::Stop => Some((self.stop_pipe.as_ref()?.as_fd(), PollFlags::IN)),
-            Source::Child => Some((self.child_pipe.as_ref()?.as_fd(), PollFlags::IN)),
+            Source::Stop => Some((self.stop_pipe.as_fd(), PollFlags::IN)),
+            Source::Child => Some((self.child_pipe.as_fd(), PollFlags::IN)),
             // Dropped once the child is gone: the master reports `HUP` from then on, which
             // would spin the loop for the rest of the session (§ 6.5) with nothing to read.
             Source::Pty => {
@@ -822,17 +787,11 @@ impl Daemon {
         // of this pass, in [`Daemon::child_signalled`]'s order.
         if revents(Source::Child).intersects(READABLE) {
             self.child_signalled = true;
-            if let Some(pipe) = self.child_pipe.as_ref() {
-                drain_signals(pipe.as_fd());
-            }
+            drain_signals(self.child_pipe.as_fd());
         }
 
-        let pty_events = revents(Source::Pty);
         let client_events = revents(Source::Client);
-        if pty_events.intersects(PollFlags::OUT) {
-            self.write_pty();
-        }
-        if pty_events.intersects(READABLE) {
+        if revents(Source::Pty).intersects(READABLE) {
             self.read_pty(read_buf);
         }
         let client_ready = client_events.intersects(READABLE) || self.input_backlog();
@@ -904,11 +863,7 @@ impl Daemon {
         });
         // A listener out of the poll set, a pending connection that says nothing, an agent
         // connection gone quiet, and an unknown outcome § 6.5 is about to report have no
-        // other wakeup behind them. The grace itself rather than a retry regime: an
-        // ordinary exit arrives as a `SIGCHLD` byte within microseconds, and a host with no
-        // child pipe —
-        // where [`Daemon::worth_a_waitpid`] already asks every pass — hears about one up to
-        // [`OUTCOME_GRACE`] late rather than within 5 ms.
+        // other wakeup behind them.
         if let Some(at) = [
             self.accept_retry,
             self.agent_accept_retry,
@@ -1068,9 +1023,8 @@ impl Daemon {
             self.pending_input.clear();
         }
         // Given back on the way through empty, or one paste into a child that stopped
-        // reading holds 1.25 MiB for the rest of the session. Down to a floor rather than to
-        // nothing: `shrink_to(0)` on an empty `VecDeque` *frees*, so an interactive path
-        // through here would pay a free and a malloc for every keystroke.
+        // reading holds 1.25 MiB for the rest of the session. Down to a floor:
+        // `shrink_to(0)` on an empty `VecDeque` *frees*, a free and a malloc a keystroke.
         if self.pending_input.is_empty() && self.pending_input.capacity() > PENDING_INPUT_RETAINED {
             self.pending_input.shrink_to(PENDING_INPUT_RETAINED);
         }
@@ -1091,20 +1045,15 @@ impl Daemon {
         self.pending_input.shrink_to(0);
     }
 
-    /// Collects the child's status once `waitpid` will give it up; § 6.5 has when that is
-    /// and [`Daemon::worth_a_waitpid`] is the gate the syscall is spent behind.
-    ///
-    /// End of file is not the exit and does not even follow it: `do_exit` closes the dying
-    /// process's descriptors — the PTY slave among them — well before it makes the process
-    /// reapable, so on this kernel the master reports end of file ahead of `waitpid` for
-    /// about a third of exits. What the ask costs is the pid, which makes
+    /// Collects the child's status once `waitpid` will give it up (§ 6.5), behind
+    /// [`Daemon::worth_a_waitpid`]'s gate. End of file is not the exit and usually
+    /// precedes it — the kernel closes the dying child's descriptors before making it
+    /// reapable. The ask costs the pid, which makes
     /// [`Pty::pid_reissued`] load-bearing; whether the client is *told* is
-    /// [`Daemon::pump_output`]'s decision.
-    ///
-    /// The `waitpid` runs ahead of the `self.outcome` test, that call being the reaping
-    /// itself: § 6.5's unknown outcome names a child that may still be running, so
-    /// stopping these asks after reporting it held the later zombie for the rest of the
-    /// session.
+    /// [`Daemon::pump_output`]'s decision. The `waitpid` runs ahead of the
+    /// `self.outcome` test: § 6.5's unknown outcome names a child that may still be
+    /// running, so stopping the asks after reporting it would hold the later zombie for
+    /// the rest of the session.
     fn collect_outcome(&mut self) {
         let reaped = if self.worth_a_waitpid() {
             self.pty
@@ -1132,38 +1081,30 @@ impl Daemon {
         }
     }
 
-    /// Whether this pass has any reason to ask `waitpid` — § 6.5's three, and the whole of
-    /// what makes a gate safe here.
+    /// Whether this pass has any reason to ask `waitpid` (§ 6.5).
     ///
-    /// A `SIGCHLD` is the strong condition rather than a hint: `exit_notify` sets the dying
+    /// A `SIGCHLD` is the strong condition rather than a hint: the kernel sets the dying
     /// task `EXIT_ZOMBIE` before it queues the signal, so a byte in the child pipe is a
-    /// `waitpid` that will not come back empty. The second clause serves [`OUTCOME_GRACE`]
-    /// whether the signal arrived or not; the third is the pipe-free unit fixture, where
-    /// the safe conservative answer is always yes as every pass used to be.
-    ///
-    /// Deliberately *not* `terminal_closed_at.is_some()` on its own: past § 6.5's
-    /// unknown outcome that stays true over a child that daemonised itself and may run
-    /// for days — the every-pass `waitpid` this exists to delete, back in the longest
-    /// sessions.
+    /// `waitpid` that will not come back empty. The second clause serves
+    /// [`OUTCOME_GRACE`] whether the signal arrived or not, and is deliberately *not*
+    /// `terminal_closed_at.is_some()` alone: past § 6.5's unknown outcome that stays
+    /// true over a child that daemonised itself and may run for days.
     const fn worth_a_waitpid(&self) -> bool {
-        self.child_signalled
-            || (self.terminal_closed_at.is_some() && self.outcome.is_none())
-            || self.child_pipe.is_none()
+        self.child_signalled || (self.terminal_closed_at.is_some() && self.outcome.is_none())
     }
 
     fn read_client(&mut self, read_buf: &mut [u8], scratch: &mut Vec<u8>) {
         let Some(client) = self.client.as_mut() else {
             return;
         };
-        // Nothing is asked of a socket whose peer has closed its write half, and what it
-        // delivered before it is already in the buffer the loop below reads. Such a peer is
-        // not gone — `attach` half-closes on stdin EOF and goes on draining output (§ 7) —
-        // so what ends this connection is the *write* side, in [`Daemon::write_client`].
+        // Nothing is asked of a socket whose peer has closed its write half: such a peer
+        // is not gone — `attach` half-closes on stdin EOF and goes on draining output
+        // (§ 7) — so what ends this connection is the *write* side, in
+        // [`Daemon::write_client`].
         if !client.conn.is_eof() && client.conn.fill(read_buf).is_err() {
             // The rule for every client I/O failure, in either direction and on either
-            // socket: a connection failing is the normal case and never the daemon's, so
-            // nothing here is propagated out of the event loop. What `fill` had buffered
-            // goes undecoded, and the client resends from `in_applied` (§ 3).
+            // socket: a connection failing is never the daemon's, so nothing is
+            // propagated out of the event loop. The client resends from `in_applied` (§ 3).
             self.drop_client();
             return;
         }
@@ -1206,11 +1147,9 @@ impl Daemon {
         }
 
         // A clean half-close is how `attach` says it has no more input while it keeps
-        // reading output (§ 7), but a half-close behind part of a frame can never become
-        // clean: no byte will arrive to complete it. Leaving that connection attached
-        // disables idle reaping indefinitely and keeps an invalid stream as the current
-        // client until a takeover. Complete frames have all been consumed above, so any
-        // remainder at EOF is necessarily a truncated header or payload.
+        // reading output (§ 7), but one behind part of a frame can never become clean,
+        // and left attached it disables idle reaping for good. Complete frames were all
+        // consumed above, so any remainder at EOF is a truncated header or payload.
         if self
             .client
             .as_ref()
@@ -1220,12 +1159,10 @@ impl Daemon {
         }
     }
 
-    /// Services one decoded frame from the attached client.
-    ///
-    /// A second `Hello` is not among them: greeting is what *makes* a connection the client
-    /// (§ 6.4), so one arriving on a connection that already is rewinds both streams under
-    /// a running session. Its refusal is worded apart from the catch-all's, which would
-    /// tell a client that greeted perfectly well that `Hello` is a frame it may not send.
+    /// Services one decoded frame from the attached client. A second `Hello` is refused
+    /// apart from the catch-all: greeting is what *makes* a connection the client
+    /// (§ 6.4), and one arriving on a connection that already is rewinds both streams
+    /// under a running session.
     fn handle_frame(&mut self, frame: &Frame<'_>) {
         match *frame {
             Frame::Input { offset, data } => self.on_input(offset, data),
@@ -1288,13 +1225,11 @@ impl Daemon {
         }
     }
 
-    /// Gives the PTY the size the client last asked for, at most once per pass.
-    ///
-    /// `Resize` touches no queue, so it never breaks [`Daemon::read_client`]'s decode loop:
-    /// a peer sending nothing else fills `MAX_PENDING_READ` with 12-byte frames and would,
-    /// applied per frame, spend one wakeup on ~87 000 `TIOCSWINSZ` calls and as many
-    /// `SIGWINCH`s — with the PTY undrained throughout, which is the one thing § 4.1 does
-    /// not allow a client to cause. Only the last size was ever real.
+    /// Gives the PTY the size the client last asked for, at most once per pass:
+    /// `Resize` never breaks [`Daemon::read_client`]'s decode loop, so applied per frame
+    /// a peer could spend one wakeup on ~87 000 `TIOCSWINSZ` calls with the PTY
+    /// undrained throughout — the one thing § 4.1 does not allow a client to cause.
+    /// Only the last size was ever real.
     fn apply_win(&mut self) {
         if self.applied_win == Some(self.win) {
             return;
@@ -1308,11 +1243,9 @@ impl Daemon {
     }
 
     /// Settles the arriving client onto the session, creating it if there is none yet.
-    ///
-    /// Checks no version, deliberately, though it is handed the field.
-    /// [`Daemon::read_pending`] makes that check *before* the eviction because § 6.4
-    /// requires it, so a second copy here could only refuse a client the session has just
-    /// been handed to — leaving nobody attached, which is what the first check prevents.
+    /// Deliberately checks no version: [`Daemon::read_pending`] did, *before* the
+    /// eviction (§ 6.4), so a second copy here could only refuse a client the session
+    /// has just been handed to.
     fn on_hello(&mut self, hello: &Hello<'_>) {
         self.win = hello.win;
         // Restated to the terminal rather than assumed (§ 2.2): the child may have moved
@@ -1530,11 +1463,8 @@ impl Daemon {
         }
     }
 
-    /// Pushes out what is queued, and is three of the six endings § 6.4 lists.
-    ///
-    /// Out through [`Daemon::drop_client`] like every other departure — the flush inside
-    /// it costs one refused write on a socket that has just refused one, against two
-    /// paths that would otherwise have to be kept saying the same thing.
+    /// Pushes out what is queued, and is three of the six endings § 6.4 lists — out
+    /// through [`Daemon::drop_client`] like every other departure.
     fn write_client(&mut self) {
         let Some(client) = self.client.as_mut() else {
             return;
@@ -1578,11 +1508,10 @@ impl Daemon {
     fn on_detached(&mut self) {
         self.last_detach = Instant::now();
         // Nothing can answer a signature request with the client gone, so the waiting
-        // process should fail now rather than at reattach (§ 6.7). Through the client's own
-        // door rather than by dropping the channel: one poll pass can carry both the reply
-        // to a signature request and the `Detach` behind it, and `forget` here threw that
-        // reply away — a `git push` failing on an agent that hung up mid-answer. With
-        // nothing queued this is `forget` exactly.
+        // process should fail now rather than at reattach (§ 6.7). Through the client's
+        // own door rather than `forget`: one poll pass can carry both the reply to a
+        // signature request and the `Detach` behind it, and `forget` throws that reply
+        // away. With nothing queued this is `forget` exactly.
         if let Some(agent) = self.agent.as_mut()
             && let Some(generation) = agent.generation()
         {
@@ -1633,14 +1562,10 @@ mod tests {
     }
 
     /// Regression: losing the race to remove a stale socket must not turn a session
-    /// that is perfectly startable into one that refuses to start.
-    ///
-    /// A `list` collects a dead session on exactly the evidence `bind_socket`
-    /// acts on — a `connect` that was refused — so the two reach for the same file
-    /// and the collection can get there first. What is left then is the state
-    /// `bind_socket` was trying to reach, and it used to answer it with the
-    /// `ENOENT` from its own `remove_file`, which `daemon::start` propagates: no
-    /// session, because somebody else had already tidied up.
+    /// that is perfectly startable into one that refuses to start. A `list` collects a
+    /// dead session on exactly the evidence `bind_socket` acts on — a `connect` that was
+    /// refused — so the two reach for the same file and the collection can get there
+    /// first, leaving exactly the state `bind_socket` was trying to reach.
     #[test]
     fn a_stale_socket_collected_from_under_the_bind_still_starts_the_session() {
         // The real run directory of whoever is running the suite, since `run_dir` is
@@ -1678,8 +1603,8 @@ mod tests {
                 .expect("resolve the run directory"),
             listener: UnixListener::bind(root.join(&format!("{name}.sock")))
                 .expect("bind a session socket"),
-            stop_pipe: None,
-            child_pipe: None,
+            stop_pipe: pipe(),
+            child_pipe: pipe(),
             stop: None,
             ring: crate::ring::Ring::new(1024),
             pty: None,
@@ -1698,6 +1623,15 @@ mod tests {
             agent_accept_retry: None,
             last_detach: Instant::now(),
         }
+    }
+
+    /// The read end of a fresh self-pipe, as [`blank`] holds in place of the armed ones.
+    fn pipe() -> OwnedFd {
+        rustix::pipe::pipe_with(
+            rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
+        )
+        .expect("a self-pipe")
+        .0
     }
 
     /// [`blank`] with an agent socket, for the poll-set questions about one.
@@ -1753,19 +1687,13 @@ mod tests {
     }
 
     /// Regression: a takeover keeps what the client it evicts had already delivered
-    /// (`IMPLEMENTATION.md` § 6.4).
-    ///
-    /// One `poll` can report both a readable client and, from the connection replacing it,
-    /// the `Hello` that evicts it, and the last thing typed before a reattach was dropped
-    /// whenever the two landed in the same wakeup — [`Daemon::poll_once`] has why.
-    ///
-    /// Two things hold the rule up, and this pins the rule rather than either of them:
+    /// (`IMPLEMENTATION.md` § 6.4) — one `poll` can report both a readable client and,
+    /// from the connection replacing it, the `Hello` that evicts it. Two deliberately
+    /// redundant things hold the rule up, and this pins the rule rather than either:
     /// `poll_once` decodes before it services the greeting, and [`Daemon::read_pending`]
-    /// drains again before the eviction. They are deliberately redundant.
-    ///
-    /// The readiness array is handed straight to `poll_once`, which is what makes "the
-    /// same wakeup" a fact of the test rather than a race it has to win — no sleep can
-    /// promise the interleaving this states outright.
+    /// drains again before the eviction. The readiness array is handed straight to
+    /// `poll_once`, which makes "the same wakeup" a fact of the test rather than a race
+    /// it has to win.
     #[test]
     fn a_takeover_keeps_the_input_the_client_it_evicts_had_delivered() {
         /// No newline, so this reaches the shell's line buffer and never its command
@@ -1903,11 +1831,10 @@ mod tests {
     /// Whether the child pipe `daemon` is holding has anything to read, without reading
     /// it: a zero timeout, so this answers rather than waits.
     fn child_pipe_is_readable(daemon: &Daemon) -> bool {
-        let pipe = daemon
-            .child_pipe
-            .as_ref()
-            .expect("the pipe this test put there");
-        let mut fds = [PollFd::from_borrowed_fd(pipe.as_fd(), PollFlags::IN)];
+        let mut fds = [PollFd::from_borrowed_fd(
+            daemon.child_pipe.as_fd(),
+            PollFlags::IN,
+        )];
         let now = Timespec {
             tv_sec: 0,
             tv_nsec: 0,
@@ -1916,20 +1843,13 @@ mod tests {
     }
 
     /// The pass that reads the child pipe empties it, which is the one thing a second
-    /// self-pipe must do that the stop pipe does not.
-    ///
-    /// A byte left in a watched descriptor is [`ACCEPT_BACKOFF`]'s spin reached with nothing
-    /// wrong at all. The stop pipe is licensed never to be read because its byte is the last
-    /// thing that loop ever wants; `SIGCHLD` shares neither the pipe nor the licence, the
-    /// session going on afterwards.
-    ///
-    /// Two bytes, as two signals close together leave — the handler writes one apiece and
-    /// a pipe coalesces nothing — so a drain that took a byte a pass would be the same
-    /// spin one wakeup slower and pass this on one byte.
-    ///
-    /// The readiness array is handed straight to `poll_once`, so what is under test is
-    /// this daemon's answer to a source being ready rather than a signal a unit test
-    /// would have to install a process-wide handler to raise.
+    /// self-pipe must do that the stop pipe does not: the stop pipe's byte is the last
+    /// thing that loop ever wants, where a byte left after `SIGCHLD` is
+    /// [`ACCEPT_BACKOFF`]'s spin with nothing wrong at all. Two bytes, as two signals
+    /// close together leave — a pipe coalesces nothing — so a drain that took a byte a
+    /// pass would pass this on one. The readiness array is handed straight to
+    /// `poll_once`, so what is under test is the answer to a ready source rather than a
+    /// signal a unit test would need a process-wide handler to raise.
     #[test]
     fn a_child_signal_is_taken_back_out_of_the_pipe_that_carried_it() {
         let root = Scratch::new("child-signal");
@@ -1938,7 +1858,7 @@ mod tests {
             rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
         )
         .expect("a self-pipe");
-        daemon.child_pipe = Some(read);
+        daemon.child_pipe = read;
 
         assert!(
             daemon.watch_for(Source::Child).is_some(),
@@ -1961,29 +1881,15 @@ mod tests {
         );
     }
 
-    /// The four states of the gate the `waitpid` is spent behind, and the one that used
-    /// to be the whole rule.
-    ///
-    /// Asked directly because the syscall it elides is not observable from out here: what
-    /// a test can pin is the decision, and the decision is the change. The third state is
-    /// the one with a defect behind it — `terminal_closed_at` alone stays true for the
-    /// rest of a session whose child daemonised itself, so a gate written on it would
-    /// put the every-pass `waitpid` back in exactly the sessions most likely to last days.
+    /// The states of the gate the `waitpid` is spent behind, asked directly: the syscall
+    /// it elides is not observable from out here, so what a test can pin is the
+    /// decision. The last state is the one with a defect behind it — `terminal_closed_at`
+    /// alone stays true for the rest of a session whose child daemonised itself, putting
+    /// an every-pass `waitpid` in exactly the sessions most likely to last days.
     #[test]
     fn a_waitpid_is_asked_for_only_where_something_says_it_may_be_ready() {
         let root = Scratch::new("waitpid-gate");
         let mut daemon = blank(&root, "gate");
-        assert!(
-            daemon.worth_a_waitpid(),
-            "a pipe-free fixture has nothing else to go on, and must ask as every \
-             pass used to"
-        );
-
-        let (read, _write) = rustix::pipe::pipe_with(
-            rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
-        )
-        .expect("a self-pipe");
-        daemon.child_pipe = Some(read);
         assert!(
             !daemon.worth_a_waitpid(),
             "a running child answers `None` to every one of these, which is the syscall \
@@ -2049,14 +1955,10 @@ mod tests {
     }
 
     /// A served agent connection takes the listener out of the poll set and puts its own
-    /// deadline into the timeout — the two halves of § 6.7's one-at-a-time rule that live
-    /// out here rather than inside `Agent`.
-    ///
-    /// `Agent::accept` declines a second connection whatever the poll set says, so a
-    /// listener left in it costs no correctness and a whole core: the waiting connection
-    /// keeps that descriptor readable, which is [`ACCEPT_BACKOFF`]'s shape arrived at by
-    /// a taken slot rather than by an error. And nothing but the clock ends a connection
-    /// that says nothing, so a loop that slept past the deadline would never reach it.
+    /// deadline into the timeout — the two halves of § 6.7's one-at-a-time rule that
+    /// live out here rather than inside `Agent`. A listener left in the set costs no
+    /// correctness and a whole core, and nothing but the clock ends a connection that
+    /// says nothing.
     #[test]
     fn a_served_agent_connection_holds_the_listener_out_and_sets_the_next_wakeup() {
         let root = Scratch::new("agent-serving");

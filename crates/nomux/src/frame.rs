@@ -267,6 +267,13 @@ pub enum Frame<'a> {
     },
 }
 
+/// Largest `data` one [`Frame::Input`] or [`Frame::Output`] can carry: the 8-byte
+/// offset encoded ahead of it shares [`crate::MAX_PAYLOAD`].
+pub const MAX_OUTPUT_DATA: usize = crate::MAX_PAYLOAD as usize - 8;
+
+/// The same for [`Frame::AgentData`], whose 4-byte generation shares the payload.
+pub const MAX_AGENT_DATA: usize = crate::MAX_PAYLOAD as usize - 4;
+
 impl<'a> Frame<'a> {
     /// Returns this frame's discriminant.
     #[must_use]
