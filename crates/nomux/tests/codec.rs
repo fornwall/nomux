@@ -347,18 +347,11 @@ mod generated {
             6 => OwnedFrame::copied(Frame::Gap {
                 new_base_offset: rng.u64(),
             }),
-            7 => {
-                let kind = rng.pick(&ExitKind::ALL, ExitKind::Exited);
-                OwnedFrame::copied(Frame::Exit {
-                    status: if kind == ExitKind::Unknown {
-                        0
-                    } else {
-                        rng.i32()
-                    },
-                    kind,
-                    since_terminal_closed_secs: rng.u32(),
-                })
-            }
+            7 => OwnedFrame::copied(Frame::Exit {
+                status: rng.i32(),
+                kind: rng.pick(&ExitKind::ALL, ExitKind::Exited),
+                since_terminal_closed_secs: rng.u32(),
+            }),
             8 => OwnedFrame::copied(Frame::Detach),
             9 => OwnedFrame::copied(Frame::Ping),
             10 => OwnedFrame::copied(Frame::Pong),
@@ -1011,7 +1004,7 @@ mod vectors {
                 ],
             },
             // A closed terminal does not prove the child chose status zero. `Unknown`
-            // carries the one canonical sentinel status and preserves the elapsed time.
+            // carries the sentinel status 0 the daemon sends, and the elapsed time.
             Vector {
                 frame: Frame::Exit {
                     status: 0,
@@ -1020,7 +1013,7 @@ mod vectors {
                 },
                 bytes: &[
                     0x08, 0x00, 0x00, 0x09, //
-                    0x00, 0x00, 0x00, 0x00, // canonical unknown status
+                    0x00, 0x00, 0x00, 0x00, // sentinel unknown status
                     0x02, // unknown
                     0x10, 0x20, 0x30, 0x40, // since_terminal_closed_secs
                 ],

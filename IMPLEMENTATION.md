@@ -118,8 +118,8 @@ channel would not do.
 
 `Exit` closes the terminal transcript; it does not claim the process has terminated. A
 known outcome carries its exit status or signal. If the terminal has closed but `waitpid`
-still has no outcome at the reporting deadline, kind 2 (`unknown`) carries the canonical
-status 0. `Exit.since_terminal_closed_secs` counts whole seconds since the child let go
+still has no outcome at the reporting deadline, kind 2 (`unknown`) carries the sentinel
+status 0, which transports no process outcome. `Exit.since_terminal_closed_secs` counts whole seconds since the child let go
 of the terminal, elapsed against a monotonic clock and saturating at `u32::MAX`.
 
 `Ping` is the client's alone: the daemon never sends one, answers every one it decodes with
@@ -985,7 +985,7 @@ of these each can produce. It reports the fate of *the relay*, never of the chil
 
 The child's own status, when known, arrives in the `Exit` frame (§ 2.2) the relay cannot
 read (§ 7); `128+n` is the client's convention for a known signal. Kind `Unknown` carries
-no shell status and must not be interpreted as the canonical sentinel zero it transports.
+no shell status and must not be interpreted as the sentinel zero it transports.
 
 Only 64 is `sysexits.h`'s. 126 and 127 are the *shell's* exec codes applied to a session,
 and the collision is deliberate: a client runs these over an SSH exec channel where a

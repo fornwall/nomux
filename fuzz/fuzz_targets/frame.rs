@@ -39,10 +39,10 @@
 //! which libFuzzer tries first regardless.
 //!
 //! Note the bound this does not reach: `MAX_PAYLOAD` is 256 KiB and libFuzzer's default
-//! `-max_len` is 4096, so the oversize refusal at the top of `decode` stays covered by
-//! `a_payload_over_the_maximum_is_refused_by_decode` alone. Raising `-max_len` to 262145
-//! would buy that one branch at the cost of every exec, which is the wrong trade for a
-//! search.
+//! `-max_len` is 4096. The bound lives in `decode_header`, whose four-byte domain
+//! `header_decode_is_total` closes exhaustively on stable; `decode` itself carries no
+//! length check to search for. Raising `-max_len` to 262145 would slow every exec for
+//! nothing, which is the wrong trade for a search.
 //!
 //! The lint wall in `../Cargo.toml` — `unwrap_used`, `panic`, `indexing_slicing` — does not
 //! reach this workspace, and would be backwards here if it did. It stands because a daemon

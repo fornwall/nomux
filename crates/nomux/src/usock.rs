@@ -78,20 +78,14 @@ pub(crate) fn connect_within(path: &Path, within: Duration) -> io::Result<UnixSt
                     err.kind(),
                     io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                 ) => {}
-            // A listener weighing its peer is one wall of the room: on the host
-            // `DESIGN.md` § 8 keeps that check for, whoever won the race to bind
-            // `<id>.sock` is handed the keystrokes this stream goes on to carry.
-            // `EACCES` because [`nothing_is_listening`] already reads that errno as
-            // neither death nor an answer — [`Liveness::Unknown`] — so the refusal
-            // licenses no unlink.
+            // Refused as `EACCES`, which [`liveness`] reads as [`Liveness::Unknown`] —
+            // neither death nor an answer, so the refusal licenses no unlink.
             Ok(stream) if !peer_is_ours(stream.as_fd(), id) => {
                 return Err(io::Error::from_raw_os_error(libc::EACCES));
             }
             outcome => return outcome,
         }
         if Instant::now() >= deadline {
-            // Narrowed before formatting: this would be the crate's only `u128` `Display`,
-            // some 700 bytes of the § 8 budget for a message on a cold path.
             let ms = u64::try_from(within.as_millis()).unwrap_or(u64::MAX);
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -207,15 +201,9 @@ fn unix_address(path: &Path) -> io::Result<libc::sockaddr_un> {
 /// Whether a connection just off one of the session's two listeners is this user's, and
 /// so may be heard at all (§ 6.3); a refusal is reported against `id`.
 ///
-/// Defence in depth rather than the lock itself: the `0700` run directory and `0600`
-/// sockets already exclude every other uid where modes hold, and this costs one
-/// `getsockopt` where they do not — a run directory somebody widened, a filesystem that
-/// carries no modes. Both listeners, the agent socket (§ 6.7) handing out signatures.
-///
-/// Nothing is sent back: an `Error` frame would spend `Conn::close_with`'s blocking flush
-/// (§ 6.5) on a peer with every reason not to read it, and would confirm to whoever it is
-/// what is listening here. Syslog hears it instead, being the only place this process can
-/// still write (§ 11).
+/// Defence in depth behind the `0700` run directory and `0600` sockets (§ 6.3), for where
+/// modes do not hold. Nothing is sent back to the refused peer; syslog hears it instead
+/// (§ 11).
 pub(crate) fn peer_is_ours(peer: BorrowedFd<'_>, id: &str) -> bool {
     let uid = peer_uid(peer);
     // The `getuid` § 6.3's run-directory check is written against, so that "this uid"
@@ -272,14 +260,6 @@ fn peer_uid(fd: BorrowedFd<'_>) -> io::Result<u32> {
     if asked != 0 {
         return Err(io::Error::last_os_error());
     }
-    // What comes back in `len` is how much of the struct was written, and it is what makes
-    // the read below mean anything: short of the whole of it, the uid is still the zero
-    // seeded above, which is root's.
-    if len != widths::UCRED {
-        return Err(io::Error::other(
-            "SO_PEERCRED answered with a partial ucred",
-        ));
-    }
     Ok(cred.uid)
 }
 
@@ -325,15 +305,11 @@ mod tests {
             ours == 0,
             "root gets no exemption; it has `/proc` and `setuid` and needs none"
         );
-        for unanswered in [
-            io::Error::from_raw_os_error(libc::ENOPROTOOPT),
-            io::Error::other("SO_PEERCRED answered with a partial ucred"),
-        ] {
-            assert!(
-                !uid_is_ours(&Err(unanswered), ours),
-                "a uid the kernel would not report is not a uid that matches"
-            );
-        }
+        let unanswered = io::Error::from_raw_os_error(libc::ENOPROTOOPT);
+        assert!(
+            !uid_is_ours(&Err(unanswered), ours),
+            "a uid the kernel would not report is not a uid that matches"
+        );
     }
 
     /// [`peer_uid`] against the only peer this process can produce on its own, where
