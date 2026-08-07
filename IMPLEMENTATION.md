@@ -37,7 +37,6 @@ it, and what nomux *sets* is §6.1.1's. `NOMUX_UPDATE_BASELINE` is tested for ex
 | `HOME` | every mode | Second choice (§6.3), and the child's working directory (§6.1.1) |
 | `XDG_RUNTIME_DIR` | every mode | Login-scoped fallback run directory (§6.3) |
 | `SHELL` | daemon | The child's login shell (§6.1.1) |
-| `USER`, `LOGNAME` | daemon | Login name for the linger check (§6.2) |
 | `NOMUX_RING_BYTES` | daemon | Ring capacity in bytes (§4) |
 | `NOMUX_CHAOS_SEED` | the chaos suite | Disconnect-point seed; unset is a fixed default, so a failure reproduces (§9) |
 | `NOMUX_UPDATE_BASELINE` | `scripts/build-release.sh` | Rewrite `scripts/size-baseline` from this build (§8) |
@@ -79,7 +78,7 @@ and never has to scan for a boundary. *winsize* is four `u16`s — cols, rows, x
 | Type | Dir | Name | Payload |
 | --- | --- | --- | --- |
 | `0x01` | C→D | `Hello` | `u16` protocol, `u8` flags, `u64` out_offset, winsize, `u16` term_len, UTF-8 term bytes |
-| `0x02` | D→C | `HelloOk` | `u64` resume_from, `u64` in_applied, `u8` linger (0 unknown, 1 disabled, 2 enabled), `u8` flags |
+| `0x02` | D→C | `HelloOk` | `u64` resume_from, `u64` in_applied, `u8` flags |
 | `0x03` | C→D | `Input` | `u64` offset, bytes |
 | `0x04` | D→C | `InputAck` | `u64` applied_through |
 | `0x05` | D→C | `Output` | `u64` offset, bytes |
@@ -94,7 +93,7 @@ and never has to scan for a boundary. *winsize* is four `u16`s — cols, rows, x
 | `0x0e` | ↔ | `AgentData` | `u32` generation, opaque `ssh-agent` bytes |
 | `0x0f` | ↔ | `AgentClose` | `u32` generation |
 
-`Hello` carries the current revision, **9** — `PROTOCOL_VERSION` in
+`Hello` carries the current revision, **10** — `PROTOCOL_VERSION` in
 `crates/nomux/src/lib.rs`, bumped on any wire change, compatible ones included.
 
 The session id is *not* in `Hello`: the socket path fixes it warm, and the id handed to
@@ -134,7 +133,7 @@ unmeasured.
 
 Both flag fields are exhaustive: an undefined bit is a protocol error, not a
 forward-compatibility case ([DESIGN.md § 2](DESIGN.md#2-scope)), and the same holds for
-every other closed set on the wire — `Error.code`, `Exit.kind`, `HelloOk.linger`.
+every other closed set on the wire — `Error.code`, `Exit.kind`.
 
 `Hello.flags`:
 
@@ -483,16 +482,9 @@ and `fork` leave the process in the SSH `session-*.scope`; with `KillUserProcess
 logout stops that scope and the daemon with it. `loginctl enable-linger` keeps the user's
 manager alive but does not move an already-running session process into a manager unit, so
 it is not a workaround for this release. Reliable survival under that policy requires a
-user-manager-backed scope or service and remains a release gate in [PLAN.md](PLAN.md).
-
-`HelloOk.linger` (§ 2.3) therefore reports only the advisory marker that a future launch
-path can use, reading `/run/systemd/system` and then `/var/lib/systemd/linger/<user>`. It is
-never a survival guarantee. A missing marker is definite *disabled*; only a lookup that
-fails otherwise is *unknown*. The login name is `$USER`, then `$LOGNAME`, and nothing else.
-**The test is applied to each source in turn, not to the answer**: a name that is empty or
-holds `/`, NUL, `.` or `..` is not a single filename component, and one that fails is
-skipped rather than fatal — a malformed `$USER` falls through to `$LOGNAME`, which is what
-"in that order" has to mean. Only both failing is *unknown*.
+user-manager-backed scope or service and remains a release gate in [PLAN.md](PLAN.md);
+whatever linger detection such a launcher needs is that work's to add. Nothing on the wire
+reports logout policy, which the daemon could not turn into a survival statement anyway.
 
 ### 6.3 Socket
 
@@ -574,14 +566,8 @@ second implementation of `list` or `kill` must obey, in the order the rules bind
   - `EROFS` opening `<id>.lock` (kind `ReadOnlyFilesystem`): **the run directory is read-only, so there is no session here to start and none to remove.** A fact about the mount and not about locking.
 - **A caller with nobody to report to gives up the standing rather than the work only where no new session can be exposed**: daemon exit and `list`'s sweep skip cleanup they cannot serialise. Startup has no such arm; a daemon that does not own the lock refuses the id before probing or binding. Whoever the user is actually waiting on — `spawn`, `attach`, `kill` — turns that refusal into a message and an exit code (§ 10).
 
-The daemon refuses to start where the run directory already holds **64** other session ids
-(`MAX_SESSIONS`), a backstop under the client-side cap
-[DESIGN.md § 5.1](DESIGN.md#51-identity) argues for. Each start atomically creates and locks
-its `<id>.lock` reservation before counting, and excludes only its own id. The locks are
-per-id, but their names are global counting tokens: of two contenders for the final slot,
-whichever creates its reservation second necessarily counts the first. A collector cannot
-remove a reservation while its start holds the lock. The count is therefore a ceiling, not
-a check-then-act race, without another directory-wide mutex.
+The daemon holds no session-count limit: how many sessions a host runs is wholly the
+client's ([DESIGN.md § 5.1](DESIGN.md#51-identity)).
 
 ### 6.4 Multiple clients
 

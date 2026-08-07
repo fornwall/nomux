@@ -48,11 +48,11 @@ emit_header() {
     emit_byte $((payload_length % 256))
 }
 
-# Protocol 9, no agent, replay from the ring's beginning, 80x24, TERM=dumb.
+# Protocol 10, no agent, replay from the ring's beginning, 80x24, TERM=dumb.
 emit_hello() {
     emit_header 1 25
     for byte in \
-        0 9 0 \
+        0 10 0 \
         255 255 255 255 255 255 255 255 \
         0 80 0 24 0 0 0 0 \
         0 4 100 117 109 98
@@ -98,7 +98,7 @@ inspect_transcript() {
             if (matched == marker_count) found_marker = 1
         }
         function finish_frame() {
-            if (type == 2 && frame_len == 18) saw_hello_ok = 1
+            if (type == 2 && frame_len == 17) saw_hello_ok = 1
             if (type == 8) {
                 saw_exit = 1
                 if (frame_len == 9 && first[0] == 0 && first[1] == 0 &&

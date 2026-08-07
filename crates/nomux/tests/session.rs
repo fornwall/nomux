@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use nomux::{
-    ErrorCode, Frame, FrameType, HEADER_LEN, Hello, Linger, PROTOCOL_VERSION, RESUME_FROM_START,
-    WinSize, decode_header,
+    ErrorCode, Frame, FrameType, HEADER_LEN, Hello, PROTOCOL_VERSION, RESUME_FROM_START, WinSize,
+    decode_header,
 };
 
 use harness::{
@@ -604,7 +604,6 @@ fn refusals_a_connection_can_earn() -> [Refused; 9] {
                 client.send(&Frame::HelloOk(nomux::HelloOk {
                     resume_from: 0,
                     in_applied: 0,
-                    linger: Linger::Unknown,
                     agent: false,
                 }));
             },

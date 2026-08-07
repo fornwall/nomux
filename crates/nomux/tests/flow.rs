@@ -909,9 +909,9 @@ fn a_daemon_that_cannot_accept_stands_back_rather_than_spinning() {
     let session = Session::start("emfile");
     let daemon = session.child.id();
     // Not merely answering. `Session::start` waits for the socket, and the daemon
-    // binds that before it writes its pidfile, opens `/dev/null` over its stdio and
-    // asks `logind` about lingering — all of which need a descriptor, and the first
-    // of which is a `?` that ends the process. Starving it there is starving a
+    // binds that before it writes its pidfile and opens `/dev/null` over its stdio
+    // — both of which need a descriptor, and the first of which is a `?` that ends
+    // the process. Starving it there is starving a
     // *startup*, which is a different thing from the event loop this measures and
     // fails it about one run in four on a loaded machine. The pidfile is the last of
     // those that can refuse to start, so waiting for it is waiting for the state the

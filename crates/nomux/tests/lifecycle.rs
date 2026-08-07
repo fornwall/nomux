@@ -28,8 +28,8 @@ use std::time::{Duration, Instant};
 use nomux::{Frame, FrameType, RESUME_FROM_START};
 
 use harness::{
-    Client, Cue, FRAME_PATIENCE, Flock, HeldLock, MAX_SESSIONS, Reaper, Rng, SETTLE, SPIN_WINDOW,
-    Session, Spawned, StatField, control, control_with_shell, cpu_ticks, daemon_reaper, entries,
+    Client, Cue, FRAME_PATIENCE, Flock, HeldLock, Reaper, Rng, SETTLE, SPIN_WINDOW, Session,
+    Spawned, StatField, control, control_with_shell, cpu_ticks, daemon_reaper, entries,
     leads_a_process_group, nomux_with_shell, poll_by, poll_until, process_alive, process_state,
     run_root, stat_field, still_serving, succeeded, wait_for, wait_until_flock, wedge_socket,
 };
@@ -606,117 +606,13 @@ fn a_daemon_that_leads_a_process_group_detaches_by_forking() {
     assert_detached(&detachment, recorded);
 }
 
-/// Turns each id in `ids` away at the ceiling through `mode`, and asserts that no
-/// refusal left anything in the run directory.
+/// Regression: a spawn whose socket cannot be bound leaves nothing behind.
 ///
-/// The sessions are planted as `<id>.sock` files rather than started: 64 daemons is 64
-/// shells and 64 rings, and what is being counted is names on disk (§ 6.3).
-///
-/// Asserted twice over, because either half alone is satisfiable by the bug. That no
-/// `<id>.*` is left is the property; that the *count* has not moved is what it was for,
-/// and it is the one a reader can check against [`MAX_SESSIONS`]. Whether that ratchet
-/// needs a second, differently named id to be falsifiable is the caller's to say — a
-/// lock left behind by one refusal would be excluded from a repeat of the *same* id's
-/// count as its own.
-fn refusals_at_the_session_ceiling_leave_nothing_behind(
-    name: &str,
-    mode: &str,
-    refusal: i32,
-    ids: &[&str],
-) {
-    let root = run_root(name);
-    let dir = root.join("nomux/run");
-    fs::create_dir_all(&dir).expect("create the run directory");
-    for n in 0..MAX_SESSIONS {
-        fs::write(dir.join(format!("full{n}.sock")), b"").expect("plant a session");
-    }
-
-    for &id in ids {
-        let refused = control_with_shell(&root, &[mode, id]);
-        let complaint = harness::stderr(&refused);
-        assert_eq!(
-            refused.status.code(),
-            Some(refusal),
-            "a run directory holding {MAX_SESSIONS} sessions took another one through \
-             `{mode}`: {complaint:?}"
-        );
-        assert!(
-            complaint.contains(&MAX_SESSIONS.to_string()),
-            "the refusal must name the ceiling it is enforcing, or this test is \
-             measuring a different failure: {complaint:?}"
-        );
-        assert_eq!(
-            session_files(&dir, id),
-            Vec::<String>::new(),
-            "the refused `{mode}` left files behind, which `list` and the next daemon \
-             both read as a session that is there"
-        );
-    }
-
-    // What the leak actually cost, and the half that says why it mattered: the
-    // directory holds exactly what it held before either spawn was refused, so the
-    // ceiling the *next* one meets is still the ceiling.
-    assert_eq!(
-        session_ids(&dir).len(),
-        MAX_SESSIONS,
-        "the refusals added ids to a directory that was already full, so the backstop \
-         now refuses at {MAX_SESSIONS} minus however many spawns have been turned away"
-    );
-}
-
-/// Regression: a spawn refused at the session ceiling leaves nothing behind, so the
-/// backstop cannot ratchet against itself.
-///
-/// The daemon takes `<id>.lock` before it counts the ids in the run directory, which is
-/// what § 6.3 asks of it — the count has to happen where nothing else is publishing.
-/// Taking that lock *creates* the file, and `rundir::session_id_of` reads a bare
-/// `<id>.lock` as a session, so a refusal that returned without removing it added a
-/// counted id to the directory. Every rejected spawn of a new id then made the next one
-/// count one higher, and a run directory that started one over the ceiling walked away
-/// from it: 64, 65, 66, with only `nomux list` able to bring it back.
-#[test]
-fn a_spawn_refused_at_the_session_ceiling_leaves_no_lock_behind() {
-    // Two ids, because the count ratchet is this test's to prove: a lock left behind
-    // by the first refusal would be excluded from a repeat of the same id's count as
-    // its own, so the second refusal has to name a different id.
-    refusals_at_the_session_ceiling_leave_nothing_behind(
-        "ceiling_lock",
-        "daemon",
-        1,
-        &["over1", "over2"],
-    );
-}
-
-/// The same property through the mode a user actually runs, where a different process
-/// owns the file.
-///
-/// [`a_spawn_refused_at_the_session_ceiling_leaves_no_lock_behind`] drives `nomux
-/// daemon` directly, so the process that meets the ceiling is the one holding
-/// `<id>.lock` and can unlink what it created. Under `nomux spawn` the relay creates the
-/// name and hands the daemon a duplicate of the locked descriptor across `exec`; the
-/// relay therefore remains responsible for removing that name when publication fails.
-/// That ownership boundary is the half of the ratchet the test above cannot reach.
-///
-/// Costs one `attach::SPAWN_TIMEOUT`. The daemon refuses at once, but nothing on the
-/// socket distinguishes a daemon that refused from one that is slow to bind, so the
-/// relay waits out its deadline and reports § 10's 127 with the daemon's complaint
-/// attached — which is also why one id is all this variant is run with: the ownership
-/// boundary needs only one refusal, and the count ratchet is the sibling's to prove
-/// with two.
-#[test]
-fn a_relay_refused_at_the_session_ceiling_leaves_no_lock_behind() {
-    refusals_at_the_session_ceiling_leave_nothing_behind("ceiling_relay", "spawn", 127, &["over1"]);
-}
-
-/// Regression: a spawn whose socket cannot be bound leaves nothing behind either.
-///
-/// The scrub the two tests above pin covers the ceiling and stops there, and the bind is
-/// the very next way out of the locked region — a full disk, a descriptor shortage, a
-/// quota, a name planted where `<id>.sock` goes. It returned through `?`, past the
-/// removal, leaving the 0-byte `<id>.lock` `try_lock_spawn` had just created: one more
-/// counted id, and § 6.3's ratchet open again by a quieter route. Quieter because it
-/// needs no full directory to show up in — every refused bind on a fresh id adds a
-/// session `nomux list` reports and the next daemon counts, until something collects it.
+/// The bind is the first way out of the locked region — a full disk, a descriptor
+/// shortage, a quota, a name planted where `<id>.sock` goes. It returned through `?`,
+/// past the removal, leaving the 0-byte `<id>.lock` `try_lock_spawn` had just created:
+/// a session `nomux list` reports and the next daemon reads as one that is there, until
+/// something collects it.
 ///
 /// The lever is a directory where the socket goes, which needs no fault injection and
 /// fails the daemon on its own path: `connect` to a name that is not a socket is refused,
@@ -1029,28 +925,6 @@ fn a_direct_daemon_refuses_an_id_whose_spawn_lock_is_held() {
         lock_before,
         "the refused daemon replaced somebody else's lock name"
     );
-}
-
-/// Every file in `dir` belonging to session `id`, by name.
-fn session_files(dir: &Path, id: &str) -> Vec<String> {
-    entries(dir)
-        .into_iter()
-        .filter(|name| name.split_once('.').is_some_and(|(found, _)| found == id))
-        .collect()
-}
-
-/// The distinct session ids `dir` holds, by the rule `rundir::session_id_of` counts
-/// them with: whatever precedes the first `.`.
-///
-/// [`entries`] comes back sorted, so the run of names belonging to one id is
-/// contiguous and `dedup` is all a distinct count needs.
-fn session_ids(dir: &Path) -> Vec<String> {
-    let mut ids: Vec<String> = entries(dir)
-        .iter()
-        .filter_map(|name| name.split_once('.').map(|(id, _)| id.to_owned()))
-        .collect();
-    ids.dedup();
-    ids
 }
 
 /// Whether `pid` has finished detaching itself (§ 6.2): a session of its own, and
