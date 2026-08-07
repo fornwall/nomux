@@ -94,7 +94,7 @@ pub(crate) fn list() -> io::Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
     let mut listening = true;
-    for id in session_ids(&dir) {
+    for id in session_ids(&dir)? {
         // Against the directory already resolved above rather than one per entry: it is the
         // directory these names came out of, so re-reading the environment could only
         // disagree with the `read_dir` this is iterating.
@@ -186,8 +186,8 @@ pub(crate) fn kill(session_id: &str) -> io::Result<()> {
         }
     }
     // Probed once more under the lock (§ 6.6), where [`collect`] also decides and the two
-    // must agree. What it closes is the daemon somebody started by hand, which § 6.3 lets
-    // bind *without* the spawn lock when it cannot take one, and so inside this locked region.
+    // must agree. A daemon can no longer bind inside this region: direct starts must take
+    // this lock, and spawned daemons inherit the relay's locked descriptor (§ 6.3).
     match liveness(&paths.socket(), PROBE_TIMEOUT) {
         // The one *successful* exit from the locked region, and so the one place the files
         // go: already gone, stopped on `SIGTERM` and killed outright all end up here.
@@ -416,10 +416,14 @@ fn names_daemon_for(whole: &[u8], id: &str) -> bool {
     }
     let mut session = None;
     while let Some(arg) = args.next() {
-        if arg == b"--label" {
-            // The value is the next argument, and must not be read as the id.
+        if arg == b"--label" || arg == b"--lock-fd" {
+            // Option values are never session ids. `--lock-fd` is the private
+            // descriptor capability a relay hands its daemon at `exec`.
             args.next();
-        } else if !arg.starts_with(b"-") {
+        } else if !arg.starts_with(b"--label=")
+            && !arg.starts_with(b"--lock-fd=")
+            && !arg.starts_with(b"-")
+        {
             session.get_or_insert(arg);
         }
     }
@@ -846,6 +850,18 @@ mod tests {
             &cmdline(&["/opt/nomux-0.2.0", "daemon", "one"]),
             "one"
         ));
+        assert!(names_daemon_for(
+            &cmdline(&["nomux", "daemon", "--lock-fd", "7", "one"]),
+            "one"
+        ));
+        assert!(names_daemon_for(
+            &cmdline(&["nomux", "daemon", "--lock-fd=7", "one"]),
+            "one"
+        ));
+        assert!(
+            !names_daemon_for(&cmdline(&["nomux", "daemon", "--lock-fd", "7", "one"]), "7"),
+            "the inherited descriptor number is not the session id"
+        );
         // Whole arguments, so one id is never a prefix of another.
         assert!(!names_daemon_for(
             &cmdline(&["nomux", "daemon", "one0"]),

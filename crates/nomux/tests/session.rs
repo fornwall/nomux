@@ -1304,7 +1304,7 @@ fn a_daemon_whose_standard_descriptors_are_closed_still_serves_its_session() {
     // reason to fork — it is not a process-group leader, so `setsid` takes.
     let _daemon = Spawned::spawn(&mut command);
 
-    let socket = root.join("nomux").join("nsd.sock");
+    let socket = root.join("nomux/run").join("nsd.sock");
     assert!(
         poll_by(Instant::now() + FRAME_PATIENCE, || greeted(&socket)),
         "the daemon never answered a Hello on {}, so it is holding the id with nothing \

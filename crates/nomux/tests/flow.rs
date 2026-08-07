@@ -489,7 +489,7 @@ fn a_half_closed_client_is_served_to_the_end_and_let_go_there() {
 /// answers.
 ///
 /// The queue only ever drains in `write_pty`, and `Daemon::watches` keeps the master in
-/// the poll set only while `child_gone` is `None` — so from the exit onwards there is
+/// the poll set only while `terminal_closed_at` is `None` — so from the exit onwards there is
 /// no `write_pty` to come. A queue standing at the § 4.1 cap at that moment stayed
 /// there for good, and `input_is_saturated` with it: the client is polled with an empty
 /// mask and `read_client` returns before it decodes anything, so no `Ping` is answered,
@@ -701,7 +701,8 @@ fn a_client_that_never_reads_its_answers_is_dropped_rather_than_queued_for() {
 /// the PTY is not read, and the child is stopped inside `write` for as long as it lasts
 /// (`CHUNK` below is why one write is enough to stop it).
 ///
-/// Nothing in that queue was worth the wait. `sent_through`, `in_applied` and `exit_sent`
+/// Nothing in that queue was worth the wait. `sent_through`, `in_applied` and
+/// `terminal_end_sent`
 /// are per connection, so a client that comes back is served the ring from where it
 /// *consumed* to and handed the exit behind it again (§ 4.2, § 6.5): what is queued is a
 /// copy of state the session still holds, which is `Conn::close_with`'s argument for

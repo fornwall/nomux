@@ -4,31 +4,43 @@
 //! (`IMPLEMENTATION.md` § 4.1). Losing scrollback is recoverable; a wedged shell
 //! is not.
 
-use std::collections::VecDeque;
+use std::collections::{TryReserveError, VecDeque};
 
 /// A rolling window over the tail of the output stream.
 #[derive(Debug)]
 pub(crate) struct Ring {
     buf: VecDeque<u8>,
-    /// Not `buf.capacity()`: `VecDeque::with_capacity` allocates *at least* what was
-    /// asked for, so reading the window back off the allocation would silently enlarge
-    /// it to whatever the allocator rounded up to.
+    /// Not `buf.capacity()`: the allocation may hold more than was asked for, so reading
+    /// the window back off it would silently enlarge the protocol-visible retention.
     capacity: usize,
     base: u64,
 }
 
 impl Ring {
-    /// Creates a ring retaining at most `capacity` bytes, and never fewer than one.
+    /// Tries to create a ring retaining at most `capacity` bytes, and never fewer than one.
     ///
     /// The clamp is unreachable — `daemon::ring_capacity` filters zero — but clamping
     /// rather than asserting keeps an abort site out of a `panic = "abort"` binary.
-    pub(crate) fn new(capacity: usize) -> Self {
+    pub(crate) fn try_new(capacity: usize) -> Result<Self, TryReserveError> {
         let capacity = capacity.max(1);
-        Self {
-            buf: VecDeque::with_capacity(capacity),
+        let mut buf = VecDeque::new();
+        // Unlike `with_capacity`, this reports allocator refusal. The daemon performs
+        // this reservation before publishing a socket or pidfile, so an aggressive
+        // `NOMUX_RING_BYTES` under a tight address-space limit is a normal startup error
+        // rather than an abort that strands run files.
+        buf.try_reserve_exact(capacity)?;
+        Ok(Self {
+            buf,
             capacity,
             base: 0,
-        }
+        })
+    }
+
+    /// Infallible spelling kept inside tests, whose tiny capacities are fixtures rather
+    /// than hostile configuration.
+    #[cfg(test)]
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self::try_new(capacity).expect("reserve the test ring")
     }
 
     /// Offset of the oldest retained byte.
@@ -95,6 +107,14 @@ mod tests {
         ring.push(b"ab");
         assert_eq!((ring.base(), ring.end()), (1, 2));
         assert_eq!(read_from(&ring, ring.base()), b"b");
+    }
+
+    #[test]
+    fn an_impossible_allocation_is_reported_instead_of_aborting() {
+        assert!(
+            Ring::try_new(usize::MAX).is_err(),
+            "capacity overflow must remain a recoverable construction error"
+        );
     }
 
     #[test]

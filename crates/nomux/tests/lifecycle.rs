@@ -4,7 +4,7 @@
 //! (`IMPLEMENTATION.md` § 6.3), the detachment from whoever launched it (§ 6.2), and
 //! a child that inherits nothing but its stdio. Ending: the exit status the client is
 //! owed and when it arrives (§ 6.5, § 10), the reaping of everything the session
-//! leaves behind it — including the child a synthesised status has already spoken
+//! leaves behind it — including the child an unknown outcome has already spoken
 //! for — and the shutdown a signal or an idle deadline sets off.
 
 #![allow(
@@ -19,7 +19,7 @@ mod harness;
 
 use std::fs;
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -54,7 +54,7 @@ const PATIENCE: Duration = Duration::from_secs(30);
 /// This client stays attached, unlike
 /// [`a_session_whose_child_has_exited_keeps_its_files_and_its_status_with_nobody_attached`],
 /// so what it pins is the frame the daemon builds on the pass that collects the
-/// status — which is what makes it the place to pin `since_exit_secs` at zero. That
+/// status — which makes it the place to pin `since_terminal_closed_secs` at zero. That
 /// field is how a client tells a shell that has just finished from one that finished
 /// while the laptop was shut (§ 6.5), and only a client that watched the exit happen
 /// can say what the answer must be. A daemon that stamped the frame when it *built*
@@ -72,7 +72,7 @@ fn a_child_killed_by_a_signal_is_reported_as_signalled_rather_than_as_a_status()
 
     let deadline = Instant::now() + FRAME_PATIENCE;
     let awaiting = "the fate of a child that killed itself with SIGKILL";
-    let (status, kind, since_exit_secs) = loop {
+    let (status, kind, since_terminal_closed_secs) = loop {
         let (ty, payload) = client
             .frame_before(deadline, awaiting)
             .unwrap_or_else(|| panic!("timed out waiting for {awaiting}"));
@@ -80,8 +80,8 @@ fn a_child_killed_by_a_signal_is_reported_as_signalled_rather_than_as_a_status()
             Frame::Exit {
                 status,
                 kind,
-                since_exit_secs,
-            } => break (status, kind, since_exit_secs),
+                since_terminal_closed_secs,
+            } => break (status, kind, since_terminal_closed_secs),
             Frame::Output { .. } | Frame::InputAck { .. } | Frame::Pong => {}
             other => panic!("unexpected {other:?} while waiting for the exit"),
         }
@@ -98,9 +98,9 @@ fn a_child_killed_by_a_signal_is_reported_as_signalled_rather_than_as_a_status()
     // the end of file it measures from, and a whole second would have to pass before
     // this could read as anything but zero.
     assert_eq!(
-        since_exit_secs, 0,
+        since_terminal_closed_secs, 0,
         "the client that watched the exit happen was told the shell had been gone \
-         for {since_exit_secs} s, so the field measures something other than the end \
+         for {since_terminal_closed_secs} s, so the field measures something other than the end \
          of file"
     );
 }
@@ -108,9 +108,9 @@ fn a_child_killed_by_a_signal_is_reported_as_signalled_rather_than_as_a_status()
 /// Regression: the status is turned into a frame on the pass that collects it, not
 /// on whatever pass happens to wake up next.
 ///
-/// `pump_output` is the only place the `Exit` frame is built, and `collect_status`
+/// `pump_output` is the only place the `Exit` frame is built, and `collect_outcome`
 /// used to run at the top of `event_loop` — one whole iteration earlier.
-/// `poll_timeout` carries a wakeup at `STATUS_GRACE` only while the status is still
+/// `poll_timeout` carries a wakeup at `OUTCOME_GRACE` only while the outcome is still
 /// outstanding, so the pass that finally collected one no longer qualified for it,
 /// and by then the master had already left the poll set with the child.
 ///
@@ -120,12 +120,12 @@ fn a_child_killed_by_a_signal_is_reported_as_signalled_rather_than_as_a_status()
 /// `IDLE_TICK` — an hour away. The user is left holding a session whose shell has
 /// finished, with no status and no reason given, until they type something at it.
 ///
-/// Driven down the `STATUS_GRACE` path rather than through an ordinary `exit`, which
+/// Driven down the `OUTCOME_GRACE` path rather than through an ordinary `exit`, which
 /// reaches the same bug only when `waitpid` is not ready at PTY end of file — a coin
 /// toss rather than a test. A child that closes the terminal *without* exiting reaches
 /// it every time: the master reports end of file at once, and `waitpid` has nothing to
 /// give up because the process is still there, so the status can only come from the
-/// two-second synthesis in `collect_status`.
+/// two-second unknown-outcome deadline in `collect_outcome`.
 ///
 /// `exec <command>` rather than bare redirections, because redirecting 0, 1 and 2 away
 /// from the slave does not take the last descriptor onto it: an interactive shell
@@ -133,19 +133,19 @@ fn a_child_killed_by_a_signal_is_reported_as_signalled_rather_than_as_a_status()
 /// pins as `SHELL` — and the master goes on waiting. Replacing the process closes that
 /// one, since it is close-on-exec.
 #[test]
-fn a_synthesised_exit_status_is_sent_on_the_pass_that_collects_it() {
-    /// Comfortably above the two-second `STATUS_GRACE`, and nowhere near the hour the
+fn an_unknown_outcome_is_sent_on_the_pass_that_decides_it() {
+    /// Comfortably above the two-second `OUTCOME_GRACE`, and nowhere near the hour the
     /// regression misses this by: large enough not to fail a fork, an exec and a poll
     /// pass under nextest's full-core parallelism, and small enough to be a bound.
     const BOUND: Duration = Duration::from_secs(10);
 
-    let (_session, mut client, ok) = Session::attached("exit_synthesised");
+    let (_session, mut client, ok) = Session::attached("outcome_unknown");
 
     // The marker is the last thing the child writes, and the `exec` on its heels is
     // what closes the terminal — so the clock below starts within one shell statement
     // of the end of file the daemon reacts to. The process it leaves behind is alive
     // for far longer than this test runs, which is what leaves `waitpid` with nothing
-    // to report and forces the synthesis.
+    // to report and forces the explicit unknown outcome.
     client.make_ready(
         "-echo",
         Some("exec sleep 300 0</dev/null 1>/dev/null 2>/dev/null"),
@@ -165,7 +165,7 @@ fn a_synthesised_exit_status_is_sent_on_the_pass_that_collects_it() {
             Frame::Exit {
                 status,
                 kind,
-                since_exit_secs: _,
+                since_terminal_closed_secs: _,
             } => break (began.elapsed(), status, kind),
             Frame::Output { .. } | Frame::InputAck { .. } | Frame::Pong => {}
             other => panic!("unexpected {other:?} while waiting for the exit"),
@@ -176,7 +176,11 @@ fn a_synthesised_exit_status_is_sent_on_the_pass_that_collects_it() {
         status, 0,
         "a child that closed the terminal without exiting has no status of its own"
     );
-    assert_eq!(kind, nomux::ExitKind::Exited);
+    assert_eq!(
+        kind,
+        nomux::ExitKind::Unknown,
+        "closing the terminal is not evidence that the child exited successfully"
+    );
     assert!(
         elapsed < BOUND,
         "the Exit frame took {elapsed:?}: the status was collected at the two-second \
@@ -190,7 +194,7 @@ fn a_synthesised_exit_status_is_sent_on_the_pass_that_collects_it() {
 ///
 /// A shell that exits behind a job still holding the slave — `sleep 300 &` and then
 /// `exit`, which is what a `nohup ... &` leaves — never brings the master to end of
-/// file, so nothing stamps `child_gone` and a collection gated on it never runs.
+/// file, so nothing stamps `terminal_closed_at` and a collection gated on it never runs.
 /// Nothing else reaps: `Pty::try_wait` has no other caller until `terminate`. The
 /// shell was therefore left a zombie for the whole life of the session, which is up
 /// to the seven-day idle timeout.
@@ -247,32 +251,32 @@ fn a_shell_that_exits_behind_a_background_job_is_still_reaped() {
 /// Regression: the child is still reaped after the daemon has answered for it.
 ///
 /// The other half of [`a_shell_that_exits_behind_a_background_job_is_still_reaped`],
-/// where `child_gone` never arrives: here it arrives too early. A child that closes the
-/// terminal without exiting — § 6.5's "anything that daemonises itself" — brings the
-/// master to end of file with `waitpid` empty, so at `STATUS_GRACE` the daemon
-/// *fabricates* an `exit 0` over a process that is still running. `collect_status` then
-/// opened with `if self.exited.is_some() { return; }` and was the only caller of
-/// `Pty::try_wait` before `terminate`, which made that guess the last word: the child,
+/// where `terminal_closed_at` never arrives: here it arrives too early. A child that
+/// closes the terminal without exiting — § 6.5's "anything that daemonises itself" — brings the
+/// master to end of file with `waitpid` empty, so at `OUTCOME_GRACE` the daemon
+/// reports its outcome as unknown over a process that is still running. The old
+/// `collect_status` then opened with `if self.exited.is_some() { return; }` and was the
+/// only caller of `Pty::try_wait` before `terminate`, which made that report the last word: the child,
 /// when it really exited, stayed a zombie the daemon held for the life of the session —
 /// up to the seven-day idle timeout.
 ///
 /// The `Exit` frame is what orders the two halves. Releasing the cue only once it has
-/// arrived is what puts the synthesis *before* the exit; the other way round `waitpid`
+/// arrived is what puts the unknown outcome *before* the real exit; the other way round `waitpid`
 /// is ready at end of file, the ordinary arm collects, and the test is green against the
 /// defect it was written for.
 ///
 /// `exec` for the reason
-/// [`a_synthesised_exit_status_is_sent_on_the_pass_that_collects_it`] gives, over a
+/// [`an_unknown_outcome_is_sent_on_the_pass_that_decides_it`] gives, over a
 /// non-interactive shell that blocks on the cue rather than a `sleep`, so when the child
 /// goes is the test's to say rather than a wall clock's.
 ///
 /// Nothing supplies the pass the reap happens on, as in the sibling — and here
-/// nothing else could: `poll_timeout` drops its `STATUS_GRACE` wakeup the moment
-/// `exited` is set, so a session left holding a zombie sleeps on to `IDLE_TICK`. The
+/// nothing else could: `poll_timeout` drops its `OUTCOME_GRACE` wakeup the moment
+/// `outcome` is set, so a session left holding a zombie sleeps on to `IDLE_TICK`. The
 /// `SIGCHLD` the real exit delivers is the whole of the wakeup, and the wait below is
 /// for what it sets off.
 #[test]
-fn a_child_that_exits_after_its_status_was_synthesised_is_still_reaped() {
+fn a_child_that_exits_after_an_unknown_outcome_is_still_reaped() {
     let (session, mut client, ok) = Session::attached("zombie_synth");
     let child = shell_of(&session);
     let cue = Cue::new(&session.root);
@@ -282,8 +286,8 @@ fn a_child_that_exits_after_its_status_was_synthesised_is_still_reaped() {
         Some("exec sh -c 'read go < cue' 0</dev/null 1>/dev/null 2>/dev/null"),
         ok.resume_from,
     );
-    // Two seconds of `STATUS_GRACE` later, and the daemon has now told this client how a
-    // child that is still sitting on the cue below turned out.
+    // Two seconds of `OUTCOME_GRACE` later, and the daemon has told this client that the
+    // transcript ended without a known outcome while the child still waits below.
     drop(client.next_of(FrameType::Exit));
 
     cue.release();
@@ -399,7 +403,7 @@ fn child_of(parent: u32) -> Option<u32> {
 /// Guards the consequence rather than one line of the cause. `write_pty` used to
 /// answer an `EIO` from the master by recording the exit, and recording the exit is
 /// what takes the master out of the poll set, since `Daemon::watches` keeps it only
-/// while `child_gone` is `None`. From that moment the master is never read again, so
+/// while `terminal_closed_at` is `None`. From that moment the master is never read again, so
 /// everything the child wrote on its way out past the one read of that same pass was
 /// dropped with no `Gap` to say so, which is the one thing § 9 forbids outright. The
 /// exit belongs to `read_pty`, which reaches `Read::Eof` only once the master is dry.
@@ -512,7 +516,7 @@ fn a_child_that_exits_with_input_still_queued_delivers_its_last_output_in_full()
             Frame::Exit {
                 status,
                 kind,
-                since_exit_secs: _,
+                since_terminal_closed_secs: _,
             } => break (status, kind),
             Frame::InputAck { .. } | Frame::Pong => {}
             other => panic!("unexpected {other:?} while collecting the child's last output"),
@@ -577,8 +581,8 @@ fn a_daemon_that_leads_a_process_group_detaches_by_forking() {
     let mut starter = Spawned::spawn(&mut command);
     let original_pid = starter.id();
 
-    let pid_file = root.join("nomux").join("grouped.pid");
-    wait_for(&root.join("nomux").join("grouped.sock"));
+    let pid_file = root.join("nomux/run").join("grouped.pid");
+    wait_for(&root.join("nomux/run").join("grouped.sock"));
     wait_for(&pid_file);
 
     // Bounded rather than a bare `wait`: if the fork never happened then the process
@@ -643,7 +647,7 @@ fn a_daemon_that_leads_a_process_group_detaches_by_forking() {
 /// first would be excluded from the second's count as its own.
 fn refusals_at_the_session_ceiling_leave_nothing_behind(name: &str, mode: &str, refusal: i32) {
     let root = run_root(name);
-    let dir = root.join("nomux");
+    let dir = root.join("nomux/run");
     fs::create_dir_all(&dir).expect("create the run directory");
     for n in 0..MAX_SESSIONS {
         fs::write(dir.join(format!("full{n}.sock")), b"").expect("plant a session");
@@ -707,11 +711,10 @@ fn a_spawn_refused_at_the_session_ceiling_leaves_no_lock_behind() {
 ///
 /// [`a_spawn_refused_at_the_session_ceiling_leaves_no_lock_behind`] drives `nomux
 /// daemon` directly, so the process that meets the ceiling is the one holding
-/// `<id>.lock` and can unlink what it created. Under `nomux spawn` the lock belongs to
-/// the relay: the daemon it starts finds `try_lock_spawn` refused, and § 6.3 forbids it
-/// to unlink a name another process is holding, so it exits leaving the file there.
-/// Only `attach::create` can take it back, which is the half of the ratchet the test
-/// above cannot reach.
+/// `<id>.lock` and can unlink what it created. Under `nomux spawn` the relay creates the
+/// name and hands the daemon a duplicate of the locked descriptor across `exec`; the
+/// relay therefore remains responsible for removing that name when publication fails.
+/// That ownership boundary is the half of the ratchet the test above cannot reach.
 ///
 /// Costs two `attach::SPAWN_TIMEOUT`s. The daemon refuses at once, but nothing on the
 /// socket distinguishes a daemon that refused from one that is slow to bind, so the
@@ -740,7 +743,7 @@ fn a_relay_refused_at_the_session_ceiling_leaves_no_lock_behind() {
 #[test]
 fn a_spawn_whose_socket_cannot_be_bound_leaves_no_lock_behind() {
     let root = run_root("bind_lock");
-    let dir = root.join("nomux");
+    let dir = root.join("nomux/run");
     fs::create_dir_all(&dir).expect("create the run directory");
     fs::create_dir(dir.join("wedged.sock")).expect("plant a name no bind can take");
     let before = entries(&dir);
@@ -781,7 +784,7 @@ fn a_spawn_whose_socket_cannot_be_bound_leaves_no_lock_behind() {
 #[test]
 fn a_daemon_that_inherits_a_pending_stop_signal_still_runs_its_shutdown() {
     let root = run_root("pending_term");
-    let dir = root.join("nomux");
+    let dir = root.join("nomux/run");
     fs::create_dir_all(&dir).expect("create the run directory");
     let before = entries(&dir);
 
@@ -851,7 +854,7 @@ fn a_daemon_refused_by_a_live_session_leaves_that_session_its_lock() {
     let session = Session::start("dup_id");
     let lock = session
         .root
-        .join("nomux")
+        .join("nomux/run")
         .join(format!("{}.lock", session.id));
     assert!(
         lock.exists(),
@@ -906,7 +909,7 @@ fn a_daemon_refused_by_a_live_session_leaves_that_session_its_lock() {
 fn a_spawn_re_takes_a_spawn_lock_that_was_collected() {
     let deadline = Instant::now() + PATIENCE;
     let root = run_root("collected_lock");
-    let dir = root.join("nomux");
+    let dir = root.join("nomux/run");
     fs::create_dir_all(&dir).expect("create the run directory");
     let lock_path = dir.join("collected.lock");
     let lock = HeldLock::take(&lock_path);
@@ -967,7 +970,7 @@ fn a_spawn_re_takes_a_spawn_lock_that_was_collected() {
 fn a_daemon_holds_the_spawn_lock_while_it_claims_the_id() {
     let deadline = Instant::now() + PATIENCE;
     let root = run_root("claimed_lock");
-    let dir = root.join("nomux");
+    let dir = root.join("nomux/run");
     fs::create_dir_all(&dir).expect("create the run directory");
     // Created here so the wait below has an inode to name; the daemon opens this same
     // path, and `SpawnLock` checks that what it locked is still the file at it.
@@ -989,6 +992,69 @@ fn a_daemon_holds_the_spawn_lock_while_it_claims_the_id() {
         lock.ino(),
         "the daemon took the spawn lock before it went near the socket",
         deadline,
+    );
+}
+
+/// A direct daemon start cannot turn somebody else's locked, stale id into a live
+/// session.
+///
+/// The lock is the authority to replace a stale socket, not merely a courtesy around
+/// publication. Proceeding after a nonblocking lock attempt failed let two daemons both
+/// believe they could claim one id: the second could unlink the first one's socket in
+/// the narrow interval before its listener began answering. A stale socket forces the
+/// replacement arm here without needing that timing window; the held lock must stop the
+/// daemon before it changes any name.
+#[test]
+fn a_direct_daemon_refuses_an_id_whose_spawn_lock_is_held() {
+    let deadline = Instant::now() + PATIENCE;
+    let root = run_root("contended_direct_lock");
+    let dir = root.join("nomux/run");
+    fs::create_dir_all(&dir).expect("create the run directory");
+    let socket = dir.join("contended.sock");
+    drop(UnixListener::bind(&socket).expect("plant a stale session socket"));
+    let socket_before = fs::metadata(&socket).expect("stat the stale socket").ino();
+    let held = HeldLock::take(&dir.join("contended.lock"));
+    let lock_before = held.metadata().expect("stat the held lock").ino();
+
+    let mut daemon = Spawned::spawn(
+        nomux_with_shell(&root, &["daemon", "contended"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
+    assert!(
+        poll_by(deadline, || !daemon.is_running()),
+        "a direct daemon waited for, or proceeded without, somebody else's spawn lock"
+    );
+    let refused = daemon
+        .into_exited()
+        .wait_with_output()
+        .expect("collect the refused daemon");
+
+    assert_eq!(
+        refused.status.code(),
+        Some(1),
+        "a daemon claimed an id without the spawn lock: {:?}",
+        harness::stderr(&refused)
+    );
+    assert!(
+        harness::stderr(&refused).contains("being started or removed"),
+        "the refusal did not identify the held startup authority: {:?}",
+        harness::stderr(&refused)
+    );
+    assert_eq!(
+        fs::metadata(&socket)
+            .expect("the stale socket survived")
+            .ino(),
+        socket_before,
+        "the refused daemon replaced a socket without owning the spawn lock"
+    );
+    assert_eq!(
+        fs::metadata(dir.join("contended.lock"))
+            .expect("the held lock survived")
+            .ino(),
+        lock_before,
+        "the refused daemon replaced somebody else's lock name"
     );
 }
 
@@ -1138,13 +1204,13 @@ fn a_daemon_nobody_ever_attaches_to_reaps_itself() {
 /// anybody leaves one running.
 ///
 /// The status is distinctive because the alternative is not: `exit 0` is what the
-/// daemon synthesises for a child it never got a status for (`collect_status`), so a
+/// daemon reports as unknown for a child it never got a status for (`collect_outcome`), so a
 /// session that had lost the real one would still answer plausibly.
 ///
 /// The order the two halves arrive in is pinned here as well, for the client that has
 /// no way to ask again: `pump_output` sends the `Exit` only once `sent_through` has
 /// reached the end of the ring, and it is decided afresh for every connection —
-/// `on_hello` rewinds `sent_through` to where this client resumes and `exit_sent`
+/// `on_hello` rewinds `sent_through` to where this client resumes and `terminal_end_sent`
 /// starts false on every takeover. A client that was handed the status first closes
 /// the tab on it and loses the whole transcript, including whatever the shell said on
 /// its way out; [`replay_to_the_exit`] stops at the `Exit`, so output queued behind it
@@ -1227,17 +1293,17 @@ fn a_session_whose_child_has_exited_keeps_its_files_and_its_status_with_nobody_a
         replay.output,
         resumed.resume_from
     );
-    // The other half of what `since_exit_secs` is for, and the half only a delay can
+    // The other half of what `since_terminal_closed_secs` is for, and the half only a delay can
     // establish: a client arriving late is told *how* late, so a shell that finished
     // days ago is not presented as one that just did. Compared against one less than
     // the wait, since the field counts whole seconds from an end of file that
     // preceded it.
     assert!(
-        u64::from(replay.since_exit_secs) + 1 >= UNATTENDED.as_secs(),
+        u64::from(replay.since_terminal_closed_secs) + 1 >= UNATTENDED.as_secs(),
         "a client reattaching {UNATTENDED:?} after the exit was told the child had \
          been gone for {} s, so the field is stamped when the frame is built rather \
          than measured from the end of file",
-        replay.since_exit_secs
+        replay.since_terminal_closed_secs
     );
 }
 
@@ -1252,7 +1318,7 @@ struct Replay {
     kind: nomux::ExitKind,
     /// Whole seconds the daemon says have passed since the child let go of the
     /// terminal.
-    since_exit_secs: u32,
+    since_terminal_closed_secs: u32,
 }
 
 /// Reads a reattached client's replay up to and including the exit.
@@ -1279,13 +1345,13 @@ fn replay_to_the_exit(client: &mut Client) -> Replay {
             Frame::Exit {
                 status,
                 kind,
-                since_exit_secs,
+                since_terminal_closed_secs,
             } => {
                 return Replay {
                     output: String::from_utf8_lossy(&seen).into_owned(),
                     status,
                     kind,
-                    since_exit_secs,
+                    since_terminal_closed_secs,
                 };
             }
             Frame::InputAck { .. } | Frame::Gap { .. } | Frame::Pong => {}

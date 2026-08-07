@@ -6,7 +6,7 @@
 //! never change.
 
 use std::io::{self, Write as _};
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -124,23 +124,28 @@ fn absolute_env(key: &str) -> Option<std::ffi::OsString> {
     env::var_os(key).filter(|value| Path::new(value).is_absolute())
 }
 
-/// Resolves the run directory, preferring `XDG_RUNTIME_DIR`.
+/// Resolves the run directory, preferring persistent per-user state.
 ///
 /// The precedence and the reason for each half are § 6.3's, as is the rule
 /// [`absolute_env`] applies to every source.
 pub(crate) fn run_dir() -> io::Result<PathBuf> {
-    if let Some(dir) = absolute_env("XDG_RUNTIME_DIR") {
-        return Ok(PathBuf::from(dir).join("nomux"));
-    }
     let state = absolute_env("XDG_STATE_HOME")
         .map(PathBuf::from)
-        .or_else(|| absolute_env("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+        .or_else(|| absolute_env("HOME").map(|home| PathBuf::from(home).join(".local/state")));
+    if let Some(state) = state {
+        return Ok(state.join("nomux/run"));
+    }
+    // Last resort only. `pam_systemd` removes `$XDG_RUNTIME_DIR` after the final logout,
+    // including every socket below it, so choosing it while a persistent home is available
+    // makes an otherwise surviving daemon unreachable at exactly the reconnect nomux exists
+    // to serve.
+    absolute_env("XDG_RUNTIME_DIR")
+        .map(|dir| PathBuf::from(dir).join("nomux"))
         .ok_or_else(|| {
             io::Error::other(
-                "none of XDG_RUNTIME_DIR, XDG_STATE_HOME or HOME names an absolute path",
+                "none of XDG_STATE_HOME, HOME or XDG_RUNTIME_DIR names an absolute path",
             )
-        })?;
-    Ok(state.join("nomux/run"))
+        })
 }
 
 /// Creates `dir` if it is absent, and refuses it if it is not this user's alone.
@@ -168,6 +173,8 @@ pub(crate) fn ensure_run_dir(dir: &Path) -> io::Result<()> {
     // somebody else can write to, what they left there between the two checks. Absent
     // even now is the one place where that is a failure rather than an answer: this
     // function owes its caller a directory, and there is none.
+    // Revalidate after recursive creation: some ancestors may not have existed on the
+    // first pass, and `create_dir_all` is willing to walk whatever appeared there.
     if check_run_dir(dir)? {
         return Ok(());
     }
@@ -176,6 +183,69 @@ pub(crate) fn ensure_run_dir(dir: &Path) -> io::Result<()> {
         io::ErrorKind::NotFound,
         "it was removed as it was created",
     ))
+}
+
+/// Refuses a run-directory path an untrusted user can redirect after it is checked.
+///
+/// The later socket and file operations are path-based; Linux has no `bindat(2)`. A final
+/// directory at 0700 is therefore insufficient when another uid can rename an ancestor or
+/// replace one with a symlink between validation and use. Every existing ancestor must be
+/// a real directory, owned by this uid or root, and not writable by group or other. A sticky
+/// shared parent is safe for a child owned by this uid or root, as the kernel forbids another
+/// uid from renaming that entry. Missing components are allowed here because
+/// [`ensure_run_dir`] creates them and then runs this check again before returning.
+fn check_trusted_ancestors(dir: &Path) -> io::Result<()> {
+    let us = rustix::process::getuid().as_raw();
+    let mut child_owner = fs::symlink_metadata(dir)
+        .ok()
+        .map(|metadata| metadata.uid());
+    let mut ancestor = dir.parent();
+    while let Some(path) = ancestor {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_dir() {
+                    return Err(refuse(
+                        path,
+                        io::ErrorKind::NotADirectory,
+                        "an ancestor is not a real directory",
+                    ));
+                }
+                let owner = metadata.uid();
+                if owner != us && owner != 0 {
+                    return Err(refuse(
+                        path,
+                        io::ErrorKind::PermissionDenied,
+                        &format!("ancestor owner uid {owner} is neither this user nor root"),
+                    ));
+                }
+                let mode = metadata.mode();
+                // The sticky bit is the one safe shared-directory exception: only the
+                // child owner, directory owner or root may rename the protected entry.
+                let sticky_protects_child = mode & 0o1000 != 0
+                    && child_owner.is_some_and(|owner| owner == us || owner == 0);
+                if mode & 0o022 != 0 && !sticky_protects_child {
+                    return Err(refuse(
+                        path,
+                        io::ErrorKind::PermissionDenied,
+                        &format!(
+                            "ancestor mode {:o} lets other users redirect the run directory",
+                            mode & 0o7777
+                        ),
+                    ));
+                }
+                child_owner = Some(owner);
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(io::Error::new(
+                    err.kind(),
+                    format!("{}: ancestor could not be examined: {err}", path.display()),
+                ));
+            }
+        }
+        ancestor = path.parent();
+    }
+    Ok(())
 }
 
 /// Answers whether `dir` is a run directory of this user's alone, opening it to find out.
@@ -188,15 +258,16 @@ pub(crate) fn ensure_run_dir(dir: &Path) -> io::Result<()> {
 /// second `fstat` of ours, which could disagree with the descriptor it describes.
 ///
 /// The descriptor is dropped at the end and the run files go on being opened by name
-/// (§ 6.3), deliberately: holding it would pin the filesystem § 6.2 lets go of. What is
-/// established is one link — nobody but this uid can put a name in *this* directory — and
-/// every component above it is trusted, a gap `DESIGN.md` § 8 states rather than closes.
+/// (§ 6.3), deliberately: holding it would pin the filesystem § 6.2 lets go of. That is
+/// safe only because [`check_trusted_ancestors`] first proves another uid cannot redirect
+/// the path between this check and those operations.
 ///
 /// # Errors
 ///
 /// Anything that is not a directory of this user's alone, at a mode its owner can open and
 /// nobody else can create in — the arms below are the distinctions.
 pub(crate) fn check_run_dir(dir: &Path) -> io::Result<bool> {
+    check_trusted_ancestors(dir)?;
     let fd = match rustix::fs::open(
         dir,
         OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -347,22 +418,22 @@ pub(crate) fn session_id_of(path: &Path) -> Option<&str> {
         .filter(|id| is_valid_session_id(id))
 }
 
-/// Every distinct session id `dir` holds — one entry per session, not per file (§ 6.6) —
-/// and none at all where it cannot be read.
-pub(crate) fn session_ids(dir: &Path) -> Vec<String> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut ids: Vec<String> = entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let path = entry.path();
-            session_id_of(&path).map(str::to_owned)
-        })
-        .collect();
+/// Every distinct session id `dir` holds — one entry per session, not per file (§ 6.6).
+///
+/// Enumeration failures are propagated rather than turned into an empty or partial list.
+/// An empty answer licenses `list` to report success and startup to admit another session;
+/// either claim is false when the directory was not actually read to its end.
+pub(crate) fn session_ids(dir: &Path) -> io::Result<Vec<String>> {
+    let mut ids = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if let Some(id) = session_id_of(&path) {
+            ids.push(id.to_owned());
+        }
+    }
     ids.sort_unstable();
     ids.dedup();
-    ids
+    Ok(ids)
 }
 
 /// The five names § 6.6 freezes for one session, and the id that finds whatever else it has.
@@ -537,10 +608,10 @@ impl SessionPaths {
         self.acquire(FlockOperation::NonBlockingLockExclusive)
     }
 
-    /// [`Self::try_lock_spawn_or_refuse`] for a caller with nobody to report to: the two
-    /// opportunistic collections and a daemon publishing its own id, each of which answers
-    /// "somebody else holds it" and "nothing here can hold it" the same way, by touching
-    /// nothing. Whoever the user is actually waiting on says which it was.
+    /// [`Self::try_lock_spawn_or_refuse`] for the two opportunistic collections, which
+    /// have nobody to report a refusal to and answer every failure by touching nothing.
+    /// Daemon startup deliberately does not use this lossy spelling: it must either own
+    /// the lock or refuse the id.
     pub(crate) fn try_lock_spawn(&self) -> Option<SpawnLock> {
         self.try_lock_spawn_or_refuse().ok().flatten()
     }
@@ -572,16 +643,28 @@ impl SessionPaths {
             // leaving the mutex on an inode nothing else resolves to. `ELOOP` is not one of
             // the two refusals below, so that reads as "not this time" — a name somebody is
             // in the middle of replacing — rather than as a verdict on the host.
-            let reading = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+            // `NONBLOCK` is inert for regular files and load-bearing for a FIFO planted
+            // at this name: opening its read end without a writer otherwise sleeps before
+            // any caller's lock deadline can begin to help.
+            let reading = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK;
             let opened = with_umask(FILE_MODE, || {
-                rustix::fs::open(
+                match rustix::fs::open(
                     &path,
-                    OFlags::CREATE | reading,
+                    OFlags::CREATE | OFlags::EXCL | reading,
                     Mode::from_bits_truncate(FILE_MODE),
-                )
+                ) {
+                    Ok(fd) => Ok((fd, true)),
+                    // Open the inode that won the create race. Keeping this as a second
+                    // lookup is intentional: [`SpawnLock::locks_the_file_at`] below
+                    // rejects it if a collector replaces the name between the two.
+                    Err(rustix::io::Errno::EXIST) => {
+                        rustix::fs::open(&path, reading, Mode::empty()).map(|fd| (fd, false))
+                    }
+                    Err(err) => Err(err),
+                }
             });
-            let fd = match opened {
-                Ok(fd) => fd,
+            let (fd, created_name) = match opened {
+                Ok(opened) => opened,
                 // `EROFS` here means the name is *absent* and the mount will not create it,
                 // never that a `<id>.lock` already sitting there was refused for the flag:
                 // the kernel drops `O_CREAT` when it cannot take the write and reports the
@@ -598,6 +681,12 @@ impl SessionPaths {
                 // replacing — is about this attempt rather than about the file.
                 Err(_) => return Ok(None),
             };
+            let stat = rustix::fs::fstat(&fd).map_err(io::Error::from)?;
+            if rustix::fs::FileType::from_raw_mode(stat.st_mode)
+                != rustix::fs::FileType::RegularFile
+            {
+                return Err(self.not_a_lock_file(&path));
+            }
             loop {
                 match rustix::fs::flock(&fd, operation) {
                     // A signal landing on a blocking `flock` is not an answer; ask again.
@@ -618,7 +707,7 @@ impl SessionPaths {
                     Err(_) => return Ok(None),
                 }
             }
-            let lock = SpawnLock { fd };
+            let lock = SpawnLock { fd, created_name };
             if lock.locks_the_file_at(&path) {
                 return Ok(Some(lock));
             }
@@ -663,6 +752,79 @@ impl SessionPaths {
                 path = path.display(),
             ),
         )
+    }
+
+    /// Refuses a directory node that cannot serve as the spawn mutex.
+    ///
+    /// Opened non-blocking before this check, so a FIFO, device or socket cannot turn
+    /// `spawn` and the `kill` escape hatch into an unbounded syscall.
+    fn not_a_lock_file(&self, path: &Path) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "session {id}: spawn lock {path} is not a regular file",
+                id = self.id,
+                path = path.display(),
+            ),
+        )
+    }
+
+    /// Adopts the locked descriptor `spawn` inherited across its daemon exec.
+    ///
+    /// The descriptor is the capability proving startup authority. It is re-locked
+    /// non-blocking (which succeeds on the inherited open-file description), checked
+    /// against the current `<id>.lock` name, and put back under `CLOEXEC` before the
+    /// login shell can be spawned.
+    pub(crate) fn inherit_spawn_lock(&self, raw: i32) -> io::Result<SpawnLock> {
+        if raw <= libc::STDERR_FILENO {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "inherited spawn-lock descriptor is not usable",
+            ));
+        }
+        // This number came from argv, including on a direct `nomux daemon` invocation.
+        // Validate it before `OwnedFd::from_raw_fd`: constructing an `OwnedFd` for a
+        // closed number violates its safety contract, and its drop is an I/O-safety abort
+        // rather than the ordinary `EBADF` this malformed handoff earns. A raw `fcntl`
+        // is the only way to ask without first claiming the descriptor is valid. Nothing
+        // can close it between this check and the ownership transfer: startup is still
+        // single-threaded and neither signal handler has been armed yet.
+        //
+        // SAFETY: `F_GETFD` takes no third argument, treats `raw` as a number only, and
+        // mutates no memory. Failure is reported through errno below.
+        if unsafe { libc::fcntl(raw, libc::F_GETFD) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `spawn` cleared `CLOEXEC` on this owned descriptor in the forked
+        // child and passed its number as an argument. This process has not opened or
+        // closed anything since exec that could reuse it; the raw check above established
+        // that a direct caller did pass an open descriptor; and taking ownership here makes
+        // this the one value that closes the inherited copy.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)?;
+        let stat = rustix::fs::fstat(&fd).map_err(io::Error::from)?;
+        if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::RegularFile {
+            return Err(self.not_a_lock_file(&self.lock()));
+        }
+        rustix::fs::flock(&fd, FlockOperation::NonBlockingLockExclusive)
+            .map_err(io::Error::from)?;
+        let lock = SpawnLock {
+            fd,
+            // The parent owns cleanup on a failed handoff. The daemon needs only the
+            // authority, not a second and necessarily racy guess at who made the name.
+            created_name: false,
+        };
+        if !lock.locks_the_file_at(&self.lock()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "session {}: inherited lock does not name {}",
+                    self.id,
+                    self.lock().display()
+                ),
+            ));
+        }
+        Ok(lock)
     }
 
     /// Removes every file belonging to this session, ignoring absences.
@@ -780,9 +942,28 @@ fn remove_node(path: &Path) -> io::Result<()> {
 pub(crate) struct SpawnLock {
     /// The locked descriptor: `close(2)` on it releases the lock, so it is held for that.
     fd: OwnedFd,
+    /// Whether this acquisition created the directory entry it locked.
+    ///
+    /// Established atomically with `O_EXCL`, rather than by an `exists` check before
+    /// the open. A startup failure may remove the name only in this case; otherwise it
+    /// may be a stale mutex another process still has standing on.
+    created_name: bool,
 }
 
 impl SpawnLock {
+    /// The descriptor whose open-file description carries this lock.
+    ///
+    /// `spawn` inherits this exact description into the daemon, so authority crosses
+    /// the exec boundary without a release/reacquire window.
+    pub(crate) fn raw_fd(&self) -> i32 {
+        self.fd.as_raw_fd()
+    }
+
+    /// Whether taking this lock created its directory entry.
+    pub(crate) const fn created_name(&self) -> bool {
+        self.created_name
+    }
+
     /// Whether this holds a lock on the file that is at `path` now — `flock` attaches to
     /// the inode rather than to the name ([`SpawnLock`]), so nothing else can tell a lock
     /// on the spawn mutex from a lock on what used to be it.
@@ -926,6 +1107,31 @@ mod tests {
         // The second call is the one every attach after the first makes.
         ensure_run_dir(&dir).unwrap();
         assert_eq!(mode_of(&dir), DIR_MODE);
+    }
+
+    /// Checking only the final 0700 directory is a path race: another uid able to rename
+    /// its parent can replace the checked name before a later bind or unlink follows it.
+    #[test]
+    fn a_run_directory_below_a_shared_ancestor_is_refused() {
+        let root = Scratch::new("rundir-shared-parent");
+        let shared = root.dir("shared");
+        let dir = shared.join("private");
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+
+        let err = check_run_dir(&dir).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        assert!(
+            err.to_string().contains("redirect the run directory"),
+            "the refusal must explain why the final directory's mode is insufficient: {err}"
+        );
+        assert!(
+            ensure_run_dir(&dir).is_err(),
+            "creation and the read-only list/attach/kill check must share the refusal"
+        );
+
+        // Leave cleanup able to traverse the fixture even under a restrictive umask.
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     /// Neither a symlink nor a plain file is a run directory, and the symlink is the

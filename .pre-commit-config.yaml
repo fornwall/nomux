@@ -100,11 +100,21 @@ repos:
 
       # Bans, licences and sources, which are answered from the lockfile alone. The
       # advisories are CI's: they need the RustSec database fetched over the network, and a
-      # commit hook that reaches the network fails on a train. Only the three files that can
-      # change the answer trigger it.
+      # commit hook that reaches the network fails on a train. Every manifest can change
+      # the root dependency graph through workspace membership or path dependencies, so
+      # nested `Cargo.toml` files trigger it too.
       - id: cargo-deny
         name: cargo deny check bans licenses sources
         entry: cargo deny --locked check bans licenses sources
         language: system
-        files: '^(Cargo\.(toml|lock)|deny\.toml)$'
+        files: '(^|/)Cargo\.toml$|^Cargo\.lock$|^deny\.toml$'
+        pass_filenames: false
+
+      # The fuzz workspace's build dependencies execute locally even though no harness
+      # artifact ships. Advisories stay in networked CI; provenance is cheap and offline.
+      - id: cargo-deny-fuzz
+        name: cargo deny fuzz sources
+        entry: cargo deny --locked --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check sources
+        language: system
+        files: '^fuzz/(Cargo\.toml|Cargo\.lock|deny\.toml)$|^crates/nomux/Cargo\.toml$'
         pass_filenames: false

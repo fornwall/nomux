@@ -100,9 +100,9 @@ stateDiagram-v2
   Spawning --> Attached: bind socket, fork, PTY on the first Hello
   Attached --> Detached: connection lost / explicit detach
   Detached --> Attached: attach, resume from offset
-  Attached --> Ended: child exits, Exit after the last output
-  Detached --> Ended: child exits, status held
-  Ended --> Ended: attach, replay then the status again
+  Attached --> Ended: terminal closes, Exit after the last output
+  Detached --> Ended: terminal closes, outcome held
+  Ended --> Ended: attach, replay then the outcome again
   Detached --> Reaping: idle timeout since the last detach
   Ended --> Reaping: idle timeout since the last detach
   Reaping --> [*]: signal whatever is left, unlink run files
@@ -204,7 +204,7 @@ session, cached per host so it is not re-probed, on the conditions in
 ## 8. Security model
 
 - **No new *network* attack surface** (§3). The local surface is what follows: a unix socket per session, an optional agent socket, and a process outliving the login. The uploaded binary is not part of it — anyone who can write `~/.local/share/nomux/` can already edit `.bashrc`.
-- **That equivalence holds for the same user only.** The run directory is opened `O_NOFOLLOW` and held to this uid at exactly `0700` — a wrong mode is `fchmod`ed back rather than refused, from `list` and `kill` too, which is the one thing they mutate; group- or other-writable is the loosening refused instead, tightening not un-planting whatever was left inside ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)). The install directory is only created ([§ 5.2](IMPLEMENTATION.md#52-upload-and-attach-in-one-round-trip)), so another user able to write there replaces the binary every connection on the exec path runs: code execution as the victim. The published command line holds `mkdir -p -m 700` and `set -C`, and the client must check a directory that already exists and refuse a parent that is not the user's.
+- **That equivalence holds for the same user only.** The run directory and every ancestor are held to this uid before use, since another uid able to write anywhere along the path can redirect path-based binds and unlinks after the final directory is checked; [IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket) has the rules. The install directory is only created ([§ 5.2](IMPLEMENTATION.md#52-upload-and-attach-in-one-round-trip)), so another user able to write there replaces the binary every connection on the exec path runs: code execution as the victim. The published command line holds `mkdir -p -m 700` and `set -C`, and the client must check a directory that already exists and refuse a parent that is not the user's.
 - **No new secrets** (§3). `SO_PEERCRED` is checked in both directions besides: the daemon refuses an accepted connection whose uid is not its own, and a `connect` refuses a socket bound by anybody else ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)) — defence in depth for a host whose modes do not hold, rather than a second authenticator.
 - **No abstract sockets.** They are namespace-scoped, not permission-scoped, and would be reachable by any local user.
 - **Agent forwarding is a real capability expansion — the only one here**, and the only item on this list that reaches past what the login already had (§5.4).

@@ -26,15 +26,15 @@ use std::env;
 use std::fs;
 use std::io;
 use std::net::Shutdown;
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::process::{ChildStderr, Command, Stdio};
+use std::process::{Child, ChildStderr, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags};
 
-use crate::rundir::{SessionPaths, check_run_dir, ensure_run_dir};
+use crate::rundir::{SessionPaths, SpawnLock, check_run_dir, ensure_run_dir};
 use crate::usock::{Liveness, liveness};
 
 /// How long to wait for a freshly spawned daemon to bind its socket.
@@ -209,7 +209,7 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> io::Result<UnixStream> {
     // A collector may unlink `<id>.lock` while this call is blocked on it, which
     // `rundir::SpawnLock` has: the lock that comes back is the one on the file now at
     // the path.
-    let _spawn_lock = paths.lock_spawn()?;
+    let spawn_lock = paths.lock_spawn()?;
 
     let socket = paths.socket();
     // Once, and under the lock: another spawn may have created the session while we
@@ -224,7 +224,7 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> io::Result<UnixStream> {
         Liveness::Unknown(err) => return Err(may_be_running(paths, &err)),
     }
 
-    let complaint = match spawn_daemon(paths.id(), label) {
+    let complaint = match spawn_daemon(paths.id(), label, &spawn_lock) {
         Ok(complaint) => complaint,
         // The one failure with nothing of anyone's behind it: no daemon was started, and
         // the probe above has just said nobody else is serving the id either, so the
@@ -298,7 +298,11 @@ fn await_publication(paths: &SessionPaths, deadline: Instant) {
 /// Both halves — `setsid` and `/dev/null` stdio — are the daemon's own job as of
 /// `IMPLEMENTATION.md` § 6.2, and both are still done here because it cannot reach
 /// either soon enough; that section has the two windows this closes.
-fn spawn_daemon(session_id: &str, label: Option<&str>) -> io::Result<Option<ChildStderr>> {
+fn spawn_daemon(
+    session_id: &str,
+    label: Option<&str>,
+    spawn_lock: &SpawnLock,
+) -> io::Result<Option<ChildStderr>> {
     // The inode this process was loaded from, not the path it was loaded under, for two
     // reasons. A name is resolved again at exec, and what it resolves to by then belongs to
     // any uid that can write the install directory (`SECURITY.md`) — only that second exec
@@ -308,6 +312,7 @@ fn spawn_daemon(session_id: &str, label: Option<&str>) -> io::Result<Option<Chil
     // spawn parked in that window would otherwise lose its daemon to a concurrent upgrade
     // *of its own version*.
     let mut command = Command::new("/proc/self/exe");
+    let lock_fd = spawn_lock.raw_fd();
     command
         // Keeps the real path in `ps`, off the very link named above, so a host with no
         // `/proc` still fails here rather than newly at the exec.
@@ -315,6 +320,11 @@ fn spawn_daemon(session_id: &str, label: Option<&str>) -> io::Result<Option<Chil
         .arg0(env::current_exe()?)
         .arg("daemon")
         .arg(session_id)
+        // Private startup capability, deliberately an argument rather than an
+        // environment variable the login shell could inherit. The descriptor names
+        // the already-locked open-file description; the number alone grants nothing.
+        .arg("--lock-fd")
+        .arg(lock_fd.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         // A pipe rather than `/dev/null`, which is the only reason a failure to start
@@ -328,12 +338,19 @@ fn spawn_daemon(session_id: &str, label: Option<&str>) -> io::Result<Option<Chil
 
     // Bound out here rather than written inside the `unsafe` block below, for the
     // reason `pty::Pty::spawn` gives at the same shape.
-    let pre_exec = || -> io::Result<()> {
+    let pre_exec = move || -> io::Result<()> {
         rustix::process::setsid()?;
+        // `SpawnLock` opens `CLOEXEC` by default. Clear it only in the forked child:
+        // descriptor flags are per descriptor table, so the parent's copy stays
+        // protected while this one crosses exactly this exec. The daemon restores it
+        // before it can spawn the login shell.
+        // SAFETY: `lock_fd` belongs to `spawn_lock`, which outlives `Command::spawn`.
+        let lock = unsafe { BorrowedFd::borrow_raw(lock_fd) };
+        rustix::io::fcntl_setfd(lock, rustix::io::FdFlags::empty())?;
         Ok(())
     };
     // SAFETY: runs in the forked child before exec and must be async-signal-safe.
-    // `setsid` is.
+    // `setsid` and `fcntl` are.
     unsafe {
         command.pre_exec(pre_exec);
     }
@@ -378,9 +395,13 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
     stream.set_nonblocking(true)?;
 
     let stdin = io::stdin();
-    let stdout = io::stdout();
+    // stdout is the one inherited descriptor this process cannot safely make
+    // non-blocking: its open-file description may be shared with the caller's shell.
+    // A bounded socketpair gives this loop a non-blocking destination while the one
+    // worker allowed to block owns the actual write (§ 7).
+    let stdout = StdoutWorker::spawn()?;
     let stdin_fd = stdin.as_fd();
-    let stdout_fd = stdout.as_fd();
+    let stdout_fd = stdout.fd();
     let sock_fd = stream.as_fd();
 
     let mut to_socket = Pump::default();
@@ -407,12 +428,15 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
         let mut fds: [PollFd<'_>; 3] =
             std::array::from_fn(|_| PollFd::from_borrowed_fd(sock_fd, PollFlags::empty()));
         let mut watched = 0;
-        for (fd, flags) in [
-            (stdin_fd, stdin_flags),
-            (sock_fd, socket_flags),
-            (stdout_fd, stdout_flags),
+        for (fd, flags, always_watch) in [
+            (stdin_fd, stdin_flags, false),
+            (sock_fd, socket_flags, false),
+            // Even while nothing is queued, the worker closing its channel is the
+            // notification that actual stdout failed. An fd with no requested events
+            // sleeps normally and still reports `HUP`/`ERR`.
+            (stdout_fd, stdout_flags, true),
         ] {
-            if !flags.is_empty()
+            if (always_watch || !flags.is_empty())
                 && let Some(slot) = fds.get_mut(watched)
             {
                 *slot = PollFd::from_borrowed_fd(fd, flags);
@@ -447,7 +471,7 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
         };
         let stdin_events = revents(!stdin_flags.is_empty());
         let socket_events = revents(!socket_flags.is_empty());
-        let stdout_events = revents(!stdout_flags.is_empty());
+        let stdout_events = revents(true);
 
         // `ERR` and `NVAL` alongside `HUP`, as `daemon::wait` has them: a source
         // reporting one of those alone would otherwise never be read, never be closed,
@@ -467,31 +491,132 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
         {
             socket_open = false;
         }
-        // Speculative on a non-empty buffer as well as on `POLLOUT`, which stdout below
-        // deliberately is not: this descriptor was made non-blocking at the top, so an
-        // optimistic write costs at worst one `EAGAIN`. The answer is dropped rather
-        // than read as an ending — an `EPIPE` towards the socket is a client that has
-        // gone, and that same departure arrives as EOF from its *read* side above.
+        // Speculative on a non-empty buffer as well as on `POLLOUT`: this descriptor was
+        // made non-blocking at the top, so an optimistic write costs at worst one
+        // `EAGAIN`. The answer is dropped rather than read as an ending — an `EPIPE`
+        // towards the socket is a client that has gone, and that same departure arrives
+        // as EOF from its *read* side above.
         if socket_events.contains(PollFlags::OUT) || to_socket.has_data() {
             let _ = to_socket.drain_to(sock_fd)?;
         }
-        // Before the write and not through it: a destination whose reader has gone never
-        // reports `POLLOUT` — a full pipe with no reader is not writable, it is broken —
-        // so this is the only way that ending arrives on a pipe.
+        // The destination here is the worker channel, not inherited stdout. It is
+        // non-blocking, and its peer closing is how a stdout failure wakes this loop
+        // even when the output pump happens to be empty.
         if stdout_events.intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL) {
             stdout_open = false;
         } else if stdout_events.contains(PollFlags::OUT) {
-            // Never speculatively, the way the socket above is drained: stdout is left
-            // in the blocking mode it was inherited in and cannot safely be taken out
-            // of it — it may be a terminal whose open file description the user's shell
-            // shares — so a write it is not ready for parks the whole relay with the
-            // other direction unserved. A socket-backed stdout reports itself writable
-            // and then refuses, so its `EPIPE` here is the only way its death arrives.
             stdout_open = to_stdout.drain_to(stdout_fd)?;
         }
     }
 
-    Ok(())
+    // Closing the channel hands the worker EOF behind every byte already queued. Join
+    // only on this normal path: if the relay itself failed, returning must not wait on
+    // a worker that may be blocked forever in the failed process's stdout.
+    stdout.finish()
+}
+
+/// The blocking half of the relay's stdout boundary.
+///
+/// The main loop owns one non-blocking endpoint and never writes inherited stdout.
+/// This worker owns the other endpoint and at most one [`RELAY_CHUNK`] in userspace;
+/// the socketpair's kernel buffer is the remaining fixed bound. A blocked terminal,
+/// pipe, socket or regular file therefore backpressures session output without
+/// preventing the main loop from forwarding input.
+struct StdoutWorker {
+    channel: UnixStream,
+    worker: Child,
+}
+
+impl StdoutWorker {
+    fn spawn() -> io::Result<Self> {
+        let (channel, worker_channel) = UnixStream::pair()?;
+        channel.set_nonblocking(true)?;
+        let parent = rustix::process::getpid();
+        let mut command = Command::new("/proc/self/exe");
+        command
+            .arg("__relay-stdout")
+            .stdin(Stdio::from(OwnedFd::from(worker_channel)))
+            .stdout(Stdio::inherit())
+            // The worker reports errno in its status; a second diagnostic racing the
+            // parent would duplicate and reorder the one the user is owed.
+            .stderr(Stdio::null());
+        let supervise = move || -> io::Result<()> {
+            // If the relay is killed while this worker is blocked in stdout, it must
+            // not survive as an orphan holding the caller's pipe or terminal. Set the
+            // signal before checking the parent to close the death-before-prctl race.
+            rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))?;
+            if rustix::process::getppid() != Some(parent) {
+                return Err(rustix::io::Errno::PIPE.into());
+            }
+            Ok(())
+        };
+        // SAFETY: the relay has created no threads. The closure runs between fork and
+        // exec and makes only `prctl` and `getppid` syscalls; neither allocates or takes
+        // a userspace lock.
+        unsafe {
+            command.pre_exec(supervise);
+        }
+        let worker = command.spawn()?;
+        Ok(Self { channel, worker })
+    }
+
+    fn fd(&self) -> BorrowedFd<'_> {
+        self.channel.as_fd()
+    }
+
+    /// Closes the producer end after its queued bytes, then proves the worker delivered
+    /// them or reports why it could not.
+    fn finish(self) -> io::Result<()> {
+        let Self {
+            channel,
+            mut worker,
+        } = self;
+        drop(channel.shutdown(Shutdown::Write));
+        drop(channel);
+        let status = worker.wait()?;
+        match status.code() {
+            Some(0) => Ok(()),
+            Some(code @ 1..=254) => Err(io::Error::from_raw_os_error(code)),
+            _ => Err(io::Error::other("relay stdout worker did not exit cleanly")),
+        }
+    }
+}
+
+/// Copies the bounded worker channel to actual stdout.
+///
+/// One chunk at a time and one write per readiness event. The write may still block
+/// after making partial progress — that is exactly why it lives in this worker — while
+/// an inherited non-blocking stdout remains correct because `EAGAIN` goes back through
+/// `poll`. `EPIPE` is the ordinary "stdout's reader left" ending [`Pump::drain_to`]
+/// already defines.
+pub(crate) fn copy_stdin_to_stdout() -> io::Result<()> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let stdout_fd = stdout.as_fd();
+    let channel_fd = stdin.as_fd();
+    let mut pump = Pump::default();
+    let mut chunk = [0u8; RELAY_CHUNK];
+
+    loop {
+        if !pump.has_data() && !pump.fill_from(channel_fd, &mut chunk)? {
+            return Ok(());
+        }
+        while pump.has_data() {
+            let mut ready = [PollFd::from_borrowed_fd(stdout_fd, PollFlags::OUT)];
+            match rustix::event::poll(&mut ready, None) {
+                Ok(_) => {}
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(err) => return Err(err.into()),
+            }
+            let events = ready.first().map_or_else(PollFlags::empty, PollFd::revents);
+            if events.intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL) {
+                return Ok(());
+            }
+            if events.contains(PollFlags::OUT) && !pump.drain_to(stdout_fd)? {
+                return Ok(());
+            }
+        }
+    }
 }
 
 /// One direction of the relay, whose whole state is whatever the destination would not

@@ -99,6 +99,11 @@ jobs:
       # and it shells out to `cargo metadata`, which rewrites a stale lock to make itself work.
       - run: cargo deny --locked check advisories
 
+      # fuzz/ is a separate workspace with deliberately different licence and path-dependency
+      # rules, but its build scripts execute here. Its narrow policy keeps advisories and source
+      # provenance in the publish-gating check job without weakening the shipping policy above.
+      - run: cargo deny --locked --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check advisories sources
+
       # The released binary, by checksum: from source it needs a Go toolchain, and the image's Go
       # is an unpinned input — a release raising its Go floor would break hook *installation* and
       # take clippy, doc and the tests below with it before any of them run.
@@ -135,12 +140,21 @@ jobs:
       # everything else, which is most of the value of a CI run over a local one.
       - run: cargo nextest run --locked --workspace --run-ignored all --no-fail-fast
 
+      # The suite above keeps the default chaos interleaving reproducible. Three more fixed
+      # seeds buy different disconnect boundaries without turning a failure into an
+      # unreproducible random draw; each run is only the four chaos cases.
+      - name: Replay additional chaos interleavings
+        run: |
+          for seed in 1 11400714819323198485 15111065706836454659; do
+            NOMUX_CHAOS_SEED="$seed" cargo nextest run --locked --workspace --test chaos
+          done
+
   # Sixty seconds is not a search and this job does not pretend to be one: it checks that fuzz/
   # still compiles and still passes over its committed seeds, which is what rots in a workspace
   # sitting outside the root one and so outside every hook but `cargo fmt`. No corpus is carried
   # between runs — a cache restored from the last green commit would make what this job covers a
-  # function of what happened to be cached. Deliberately absent from `publish`'s `needs`: a tag
-  # must not depend on how many execs a runner managed, and a crash still turns the run red.
+  # function of what happened to be cached. Release-gating: the time budget changes how much is
+  # explored, not whether a crash already found in this run is safe to publish alongside.
   fuzz:
     name: fuzz targets
     runs-on: ubuntu-latest
@@ -237,14 +251,17 @@ jobs:
       # The only place the shipping configuration runs on a commit that is not a tag: nothing in
       # the check job builds `-Zbuild-std` with `-Cpanic=immediate-abort`, so a binary that does
       # not start at all — a miscompiled std — would pass every pull request and first fail on the
-      # tag publishing it. Both, the tree having no `target_arch` cfg, so std and codegen are the
-      # whole divergence. Static, so the runner runs one and qemu-user the other.
+      # tag publishing it. Both architectures must execute; on native x86_64 the shipped binary
+      # also greets a real PTY, drives a shell, detaches, replays through a second relay, checks
+      # Exit, then lists and kills it. Release-only protocol, startup, signal and run-directory
+      # behavior is therefore exercised rather than inferred from `--version`.
       - name: Run the binaries that ship
         run: |
           sudo apt-get update -qq && sudo apt-get install -y qemu-user
           chmod +x target/dist/nomux-x86_64-unknown-linux-musl target/dist/nomux-aarch64-unknown-linux-musl
           target/dist/nomux-x86_64-unknown-linux-musl --version
           qemu-aarch64 target/dist/nomux-aarch64-unknown-linux-musl --version
+          sh scripts/smoke-release.sh target/dist/nomux-x86_64-unknown-linux-musl
 
       # The checksums are the point of this job — the client pins one per architecture — so they
       # have to outlive the log they were printed to. On a tag the release below is where they
@@ -260,7 +277,7 @@ jobs:
           if-no-files-found: ignore
 
   # The checksums need a permanent, public home; a workflow artifact expires after ninety days
-  # and sits behind a login. Its own job because it `needs` both jobs above — so a
+  # and sits behind a login. Its own job because it needs every test and artifact job — so a
   # tag cannot publish a release whose tests failed — and because it is the only one that wants a
   # write token, which is why the others keep the read-only one the header grants. Rehearsed by
   # nothing: no pull request reaches the download, the checksum check or `gh release create`. Nor
@@ -269,7 +286,7 @@ jobs:
   publish:
     name: publish the release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [check, release]
+    needs: [check, fuzz, release]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

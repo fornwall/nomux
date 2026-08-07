@@ -22,13 +22,15 @@ pub struct WinSize {
 }
 
 wire_enum! {
-    /// How the child process terminated.
+    /// What is known about the child when its terminal stream ends.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     ExitKind: u8,
     /// Returned a status from `main` or `exit`.
     Exited = 0,
     /// Killed by a signal.
     Signalled = 1,
+    /// The terminal closed but the child had not exited by the reporting deadline.
+    Unknown = 2,
 }
 
 wire_enum! {
@@ -77,6 +79,16 @@ fn checked_term(term: &str) -> Result<(), ProtoError> {
     Ok(())
 }
 
+/// Keeps the sentinel carried with [`ExitKind::Unknown`] canonical.
+fn checked_exit(status: i32, kind: ExitKind) -> Result<(), ProtoError> {
+    if kind == ExitKind::Unknown && status != 0 {
+        return Err(ProtoError::Malformed(
+            "unknown exit outcome carries a nonzero status",
+        ));
+    }
+    Ok(())
+}
+
 /// Opening frame: what the client already has, and how big its terminal is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Hello<'a> {
@@ -112,19 +124,18 @@ impl Hello<'_> {
 }
 
 wire_enum! {
-    /// Whether the daemon's session outlives the user's last logout.
+    /// The user's systemd linger-marker state.
     ///
-    /// Reported rather than worked around, and a byte of [`HelloOk`] in its own right
-    /// rather than bits inside its flags (`IMPLEMENTATION.md` § 6.2, § 2.3).
+    /// Advisory only: it says whether systemd keeps the user manager alive, not whether
+    /// this session-scoped daemon survives logout (`IMPLEMENTATION.md` § 6.2, § 2.3).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     Linger: u8,
-    /// Not determined: no `systemd`, or its state is unreadable. Do not warn —
-    /// on a host without `logind` there is nothing to warn about.
+    /// Not determined: no `systemd`, or its state is unreadable.
     Unknown = 0,
-    /// `logind` is running and lingering is off for this user. The session dies at
-    /// logout if the host also sets `KillUserProcesses=yes`.
+    /// `logind` is running and lingering is off for this user.
     Disabled = 1,
-    /// Lingering is on; the session survives logout.
+    /// Lingering is on, so systemd keeps the user's manager alive after logout. This
+    /// daemon still remains in the SSH session scope unless a manager-backed launch moves it.
     Enabled = 2,
 }
 
@@ -139,7 +150,7 @@ pub struct HelloOk {
     pub resume_from: u64,
     /// Authoritative input offset; the client fast-forwards to this.
     pub in_applied: u64,
-    /// Whether this session survives the user's logout.
+    /// Advisory systemd linger-marker state; not a survival guarantee.
     pub linger: Linger,
     /// Whether an agent socket is being served, so the client knows to expect
     /// [`Frame::AgentOpen`]. False when it was not asked for, and equally when the
@@ -205,18 +216,19 @@ pub enum Frame<'a> {
         /// New oldest retained offset.
         new_base_offset: u64,
     },
-    /// The child terminated.
+    /// The terminal stream ended and all preceding output has been sent.
     Exit {
-        /// Exit status, or signal number when `kind` is [`ExitKind::Signalled`].
+        /// Exit status, or signal number when `kind` is [`ExitKind::Signalled`]. Always
+        /// zero when `kind` is [`ExitKind::Unknown`].
         status: i32,
-        /// How it terminated.
+        /// What is known about how the child terminated.
         kind: ExitKind,
         /// Whole seconds since the child let go of the terminal, saturating
         /// (`IMPLEMENTATION.md` § 2.2). Elapsed against a monotonic clock rather than
         /// a wall-clock stamp the two ends would have to agree on, and carried here
         /// rather than on [`HelloOk`], which goes out on every attach of every session
-        /// while this means anything only once the child has gone.
-        since_exit_secs: u32,
+        /// while this means anything only once the terminal has closed.
+        since_terminal_closed_secs: u32,
     },
     /// Client is leaving without ending the session.
     Detach,
@@ -352,11 +364,12 @@ impl<'a> Frame<'a> {
             Self::Exit {
                 status,
                 kind,
-                since_exit_secs,
+                since_terminal_closed_secs,
             } => {
+                checked_exit(status, kind)?;
                 out.extend_from_slice(&status.to_be_bytes());
                 out.push(kind.as_wire());
-                out.extend_from_slice(&since_exit_secs.to_be_bytes());
+                out.extend_from_slice(&since_terminal_closed_secs.to_be_bytes());
             }
             Self::Detach | Self::Ping | Self::Pong => {}
             Self::Error { code, message } => {
@@ -446,12 +459,18 @@ impl<'a> Frame<'a> {
             FrameType::Gap => Self::Gap {
                 new_base_offset: r.u64()?,
             },
-            FrameType::Exit => Self::Exit {
-                status: r.i32()?,
-                kind: ExitKind::from_wire(r.u8()?)
-                    .ok_or(ProtoError::Malformed("unknown exit kind"))?,
-                since_exit_secs: r.u32()?,
-            },
+            FrameType::Exit => {
+                let status = r.i32()?;
+                let kind = ExitKind::from_wire(r.u8()?)
+                    .ok_or(ProtoError::Malformed("unknown exit kind"))?;
+                let since_terminal_closed_secs = r.u32()?;
+                checked_exit(status, kind)?;
+                Self::Exit {
+                    status,
+                    kind,
+                    since_terminal_closed_secs,
+                }
+            }
             FrameType::Detach => Self::Detach,
             FrameType::Ping => Self::Ping,
             FrameType::Pong => Self::Pong,
@@ -631,6 +650,37 @@ mod tests {
             Frame::decode(FrameType::Error, &[0xff, 0xff]),
             Err(ProtoError::Malformed("unknown error code"))
         );
+    }
+
+    #[test]
+    fn an_unknown_outcome_has_one_canonical_status() {
+        let frame = Frame::Exit {
+            status: 1,
+            kind: ExitKind::Unknown,
+            since_terminal_closed_secs: 0,
+        };
+        let mut encoded = b"earlier frame".to_vec();
+        let before = encoded.clone();
+        assert_eq!(
+            frame.encode(&mut encoded),
+            Err(ProtoError::Malformed(
+                "unknown exit outcome carries a nonzero status"
+            ))
+        );
+        assert_eq!(encoded, before, "a rejected frame changed the output queue");
+
+        let payload = [0, 0, 0, 1, 2, 0, 0, 0, 0];
+        assert_eq!(
+            Frame::decode(FrameType::Exit, &payload),
+            Err(ProtoError::Malformed(
+                "unknown exit outcome carries a nonzero status"
+            ))
+        );
+        round_trip(Frame::Exit {
+            status: 0,
+            kind: ExitKind::Unknown,
+            since_terminal_closed_secs: u32::MAX,
+        });
     }
 
     #[test]

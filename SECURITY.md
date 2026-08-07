@@ -1,7 +1,7 @@
 # Security policy
 
-nomux uploads a binary to other people's servers, leaves a daemon holding a shell
-there after the login session has gone, and — when switched on — proxies
+nomux uploads a binary to other people's servers, aims to leave a daemon holding a shell
+after an SSH connection has gone, and — when switched on — proxies
 `ssh-agent`. Each is something a user has to decide to trust.
 
 ## Reporting

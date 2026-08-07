@@ -991,6 +991,60 @@ fn kill_signals_what_the_pidfile_names_even_when_another_daemon_answers_on_the_s
 
 /// Regression: no run file can park the control surface in a syscall.
 ///
+/// The spawn lock is opened on every creation and collection path, so it needs the
+/// same nonblocking file-type boundary as the pidfile and label below. A FIFO at this
+/// name used to park before `flock` was even attempted: `open(O_RDONLY)` waits for a
+/// writer forever, outside every lock deadline. `list` may conservatively leave an
+/// entry it cannot serialise; `kill` and `spawn` must report the malformed lock.
+#[test]
+fn no_mode_parks_on_a_spawn_lock_that_is_a_fifo() {
+    let deadline = Instant::now() + PATIENCE;
+    let root = run_root("lock_fifo");
+    let dir = root.join("nomux/run");
+    fs::create_dir_all(&dir).expect("create the run directory");
+    let lock = dir.join("fifo_lock.lock");
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        &lock,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::from_bits_truncate(0o600),
+        0,
+    )
+    .expect("plant a FIFO where the spawn lock should be");
+
+    let run = |args: &[&str]| {
+        ran_by(&mut nomux(&root, args), deadline)
+            .unwrap_or_else(|| panic!("`nomux {args:?}` parked on a FIFO spawn lock"))
+    };
+    let listed = run(&["list"]);
+    let killed = run(&["kill", "fifo_lock"]);
+    let spawned = run(&["spawn", "fifo_lock"]);
+
+    succeeded(
+        &listed,
+        "list failed instead of conservatively skipping the entry",
+    );
+    for (mode, expected, output) in [("kill", 1, killed), ("spawn", 126, spawned)] {
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "{mode} accepted a FIFO as a spawn lock: {:?}",
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).contains("not a regular file"),
+            "{mode} did not identify the malformed lock: {:?}",
+            stderr(&output)
+        );
+    }
+    assert!(
+        lock.exists(),
+        "a mode unlinked the malformed lock without owning it"
+    );
+}
+
+/// Regression: no ordinary run file can park the control surface in a syscall.
+///
 /// A FIFO opened `O_RDONLY` without `O_NONBLOCK` blocks in `open(2)` until somebody
 /// opens it for writing, which for a file nobody is writing is for ever — so a FIFO
 /// at `<id>.pid` or `<id>.label` stopped the escape hatch dead. The 0700 directory
@@ -1056,6 +1110,38 @@ fn the_control_surface_does_not_park_on_a_run_file_that_is_a_fifo() {
     );
 }
 
+/// Runtime diagnostics cross the same terminal boundary as argv diagnostics.
+///
+/// The run-directory path comes from the environment and is repeated in refusals. A
+/// newline could forge a second diagnostic and an escape sequence could drive the
+/// terminal unless the final reporting boundary escapes the complete error, not just
+/// command-line parsing errors.
+#[test]
+fn a_runtime_error_cannot_drive_the_terminal_it_is_printed_to() {
+    let root = run_root("runtime_escape").join("line\n\u{1b}]0;forged-title\u{7}");
+    fs::create_dir_all(&root).expect("create the hostile runtime root");
+    fs::write(root.join("nomux"), b"not a directory").expect("plant a bad run directory");
+
+    let listed = control(&root, &["list"]);
+    assert_eq!(
+        listed.status.code(),
+        Some(1),
+        "a bad run directory was accepted"
+    );
+    let complaint = stderr(&listed);
+    let body = complaint
+        .strip_suffix('\n')
+        .expect("a diagnostic ends in exactly its own line break");
+    assert!(
+        !body.contains('\n') && !body.contains('\u{1b}') && !body.contains('\u{7}'),
+        "a runtime-controlled path emitted terminal controls verbatim: {complaint:?}"
+    );
+    assert!(
+        complaint.contains("line\\n\\u{1b}]0;forged-title\\u{7}"),
+        "the escaped refusal no longer identifies the failing path: {complaint:?}"
+    );
+}
+
 /// Runs `command` against a deadline, and hands back `None` if it never came back.
 ///
 /// For the defects that are a wait with no end: a test that simply waits for the
@@ -1096,7 +1182,7 @@ fn list_and_kill_operate_without_the_protocol() {
     let (mut session, _client, _) = Session::attached("control");
     // The two files the daemon does not publish unless it is asked to, so all five
     // names are on disk and the fold below has the most it will ever have to do.
-    let dir = session.root.join("nomux");
+    let dir = session.root.join("nomux/run");
     fs::write(dir.join(format!("{}.label", session.id)), "five files").expect("plant a label");
     fs::write(dir.join(format!("{}.agent", session.id)), "").expect("plant an agent name");
     assert_eq!(entries(&dir).len(), 5, "all five names on disk");
@@ -1153,10 +1239,10 @@ fn list_reports_an_id_this_run_directory_cannot_address() {
     // than anything about the id itself.
     let id = "a".repeat(64);
     let mut deep = run_root("unaddressable");
-    while deep.as_os_str().len() + "/nomux/".len() + id.len() + ".label".len() <= 107 {
+    while deep.as_os_str().len() + "/nomux/run/".len() + id.len() + ".label".len() <= 107 {
         deep.push("pad");
     }
-    let dir = deep.join("nomux");
+    let dir = deep.join("nomux/run");
     fs::create_dir_all(&dir).expect("create a deep run directory");
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("owner-only");
     let planted = dir.join(format!("{id}.pid"));
@@ -1227,7 +1313,7 @@ fn a_label_survives_into_list() {
     // label (§ 6.2), and the assertion below reads the last two — so waiting on the
     // first would let `list` run against a session that is answering and has not
     // said what it is called, which prints `labelled\t?\t` and fails on the label.
-    wait_for(&root.join("nomux").join("labelled.label"));
+    wait_for(&root.join("nomux/run").join("labelled.label"));
     // And the pidfile is already there, being one step earlier in that same order.
     let (_pid, _reaper) = daemon_reaper(&root, "labelled");
 
@@ -1444,7 +1530,7 @@ fn invalid_session_ids_are_refused() {
     // created along the way — the refusal precedes every syscall that would.
     let long = "a".repeat(64);
     let mut deep = root.clone();
-    while deep.as_os_str().len() + "/nomux/".len() + long.len() + ".label".len() <= 107 {
+    while deep.as_os_str().len() + "/nomux/run/".len() + long.len() + ".label".len() <= 107 {
         deep.push("pad");
     }
 
@@ -1476,6 +1562,31 @@ fn invalid_session_ids_are_refused() {
     }
 }
 
+/// The private startup descriptor is still argv and therefore hostile input on a direct
+/// invocation. Claiming a closed number as an `OwnedFd` makes Rust abort when it drops the
+/// value; it must instead be rejected as the ordinary bad descriptor that it is.
+#[test]
+fn a_closed_inherited_lock_descriptor_is_reported_without_aborting() {
+    let root = run_root("lk-invalid-fd");
+    let refused = control(
+        &root,
+        &["daemon", "lk-invalid-fd", "--lock-fd", "2147483647"],
+    );
+
+    assert_eq!(
+        refused.status.code(),
+        Some(1),
+        "an invalid inherited descriptor must be a reported runtime failure, not a signal or an \
+         I/O-safety abort: {:?}",
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("Bad file descriptor"),
+        "the refusal should preserve the kernel's actionable diagnosis: {:?}",
+        stderr(&refused)
+    );
+}
+
 /// The two answers a client gets out of this binary before it has a session: the
 /// protocol revision, and 64 for a command line that makes no sense.
 ///
@@ -1483,11 +1594,11 @@ fn invalid_session_ids_are_refused() {
 /// here: pinning the number would make bumping the protocol a two-file change and say
 /// nothing about whether the binary reports the one it speaks.
 ///
-/// All four ways of reaching `EX_USAGE` (§ 10) are here because they are different
+/// These ways of reaching `EX_USAGE` (§ 10) are here because they are different
 /// code: an argument a mode that takes none was given, a mode that does not exist, a
-/// `--label` offered to the one session mode that creates nothing — a caller that
-/// still believes `attach` might create the session, so silence would leave it
-/// believing that and lose the label besides — and an id beginning with `-`, which
+/// `--label` offered to either session mode that cannot record one — an attaching caller
+/// may still believe it creates the session, while a killing caller is otherwise silently
+/// ignored — and an id beginning with `-`, which
 /// `main` reads as an option before any mode sees it. None may put anything on stdout,
 /// where a client parses the bootstrap line, and each must name what it objected to,
 /// since the usage text behind it describes five modes and says nothing about which
@@ -1522,6 +1633,11 @@ fn version_and_usage_report_what_a_client_keys_off() {
         (
             vec!["attach", "lk10", "--label", "a tab title"],
             "a label offered to the mode that creates nothing",
+            "--label",
+        ),
+        (
+            vec!["kill", "lk10", "--label", "ignored intent"],
+            "a label offered to the mode that cannot record it",
             "--label",
         ),
         (
@@ -1562,7 +1678,7 @@ impl StaleSession {
     /// A directory with no session in it at all.
     fn empty(id: &str) -> Self {
         let root = run_root(id);
-        let dir = root.join("nomux");
+        let dir = root.join("nomux/run");
         fs::create_dir_all(&dir).expect("create run directory");
         Self {
             root,
@@ -1734,11 +1850,11 @@ impl PlantedRunDir {
     /// makes five of these calls, and a fresh bound each would let one test spend five
     /// times it — past the runner's own kill, which reports no assertion at all.
     fn run(&self, args: &[&str], deadline: Instant) -> Output {
-        ran_by(
-            &mut nomux_with_shell(&self.root.join("xdg"), args),
-            deadline,
-        )
-        .unwrap_or_else(|| {
+        let mut command = nomux_with_shell(&self.root.join("xdg"), args);
+        // This fixture specifically tests the runtime fallback; the general harness
+        // pins persistent XDG state so a later HOME for the child cannot move it.
+        command.env_remove("XDG_STATE_HOME").env_remove("HOME");
+        ran_by(&mut command, deadline).unwrap_or_else(|| {
             panic!(
                 "`nomux {args:?}` never returned, so it is still relaying to a \
                      socket somebody else planted"

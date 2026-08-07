@@ -1,0 +1,13 @@
+# The fuzz harness is a separate workspace because its vendored LLVM runtime has
+# different licensing and its path dependency is intentionally unversioned. Those are
+# shipping-policy questions; build scripts in this graph still execute on developer and
+# CI machines, so advisories and provenance remain mandatory here.
+
+[advisories]
+ignore = []
+yanked = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

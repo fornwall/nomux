@@ -1,13 +1,14 @@
 //! The transfers the PTY master, the agent channels and the relay are moved by.
 //!
-//! Every descriptor here is non-blocking bar one — the relay's stdout, which may be a
-//! terminal it cannot take out of blocking mode (`attach.rs`) — a single-threaded
-//! `poll` loop not being able to afford to be parked inside a `read` or a `write`, so
-//! `EINTR` and `EAGAIN` are part of the ordinary flow rather than failures.
+//! Every descriptor here is non-blocking bar the relay's stdout. The relay cannot
+//! safely change that inherited open-file description, so `attach.rs` isolates its
+//! writes in a bounded worker where blocking cannot park the event loop. `EINTR` and
+//! `EAGAIN` are ordinary flow rather than failures in either case.
 //!
 //! What an outcome *means* is mostly not here: [`drain_to`] hands `EPIPE` back rather than
-//! folded into a decision two of the three callers would get wrong; [`read_or_eof`] is the one
-//! fold the PTY and the agent agree on; the relay folds its own in `attach.rs`'s `fill_from`.
+//! folding it into a decision two of the three callers would get wrong; [`read_or_eof`]
+//! distinguishes a real ending from a failed descriptor; the relay folds its own in
+//! `attach.rs`'s `fill_from`.
 
 use std::collections::VecDeque;
 use std::io::IoSlice;
@@ -19,11 +20,13 @@ use rustix::io::Errno;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReadOutcome {
     Data(usize),
-    /// Peer gone or descriptor failed, folded: the payload is opaque, nothing worth telling apart.
+    /// Peer gone, including Linux's `EIO` spelling of PTY end of file.
     Eof,
     /// The whole reason this is an enum: this and [`ReadOutcome::Eof`] both arrive as an error
     /// return, and confusing the two would end the session on every spurious wakeup.
     WouldBlock,
+    /// The descriptor failed for a reason that is not an ending.
+    Failed(Errno),
 }
 
 /// Reads into `buf`, retrying a call a signal interrupted: `EINTR` says a signal
@@ -37,12 +40,12 @@ pub(crate) fn read(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<usize, Errno> {
     }
 }
 
-/// Reads from a descriptor whose only endings are bytes and gone: PTY master, agent channel.
+/// Reads from a PTY master or agent channel without conflating failure with EOF.
 ///
 /// Linux fails master reads with `EIO`, rather than returning 0, once the last process holding
-/// the slave exits — so the kernel's own EOF is folded in here too. Nothing is propagated,
-/// hence no `Result`, for the reason `daemon::Daemon::read_client` gives; both callers drop a
-/// descriptor answering [`ReadOutcome::Eof`] from the poll set, so an unknown errno never spins.
+/// the slave exits — so that specific errno is the kernel's own EOF and is folded in here.
+/// Every other errno is preserved: a failed PTY must not become a clean terminal ending and
+/// an invented process outcome.
 ///
 /// An empty `buf` answers [`ReadOutcome::WouldBlock`]: `read(fd, &mut [])` is `Ok(0)`, which
 /// every caller here reads as the peer having gone — `daemon.rs`'s `on_child_exit` would
@@ -54,7 +57,8 @@ pub(crate) fn read_or_eof(fd: BorrowedFd<'_>, buf: &mut [u8]) -> ReadOutcome {
     match read(fd, buf) {
         Ok(n) if n > 0 => ReadOutcome::Data(n),
         Err(Errno::AGAIN) => ReadOutcome::WouldBlock,
-        Ok(_) | Err(_) => ReadOutcome::Eof,
+        Ok(_) | Err(Errno::IO) => ReadOutcome::Eof,
+        Err(err) => ReadOutcome::Failed(err),
     }
 }
 
@@ -62,9 +66,9 @@ pub(crate) fn read_or_eof(fd: BorrowedFd<'_>, buf: &mut [u8]) -> ReadOutcome {
 ///
 /// A non-empty queue on return is normal, not a failure: come back on `POLLOUT` (§ 4.1).
 ///
-/// One write, not a loop until `EAGAIN`: on the blocking stdout above, `POLLOUT` promises only
-/// that *some* write will succeed, so even the first can park where a byte of room was
-/// reported, and a second would park on no promise at all — the other direction unserved.
+/// One write, not a loop until `EAGAIN`: an event-loop destination gets one fair share
+/// of a pass, and the stdout worker does not make a second unpromised blocking write
+/// after a short first one.
 ///
 /// One `writev` over both halves rather than a write apiece, load-bearing rather than
 /// an optimisation: a wrapped `VecDeque` served back-first delivers transposed
@@ -124,5 +128,22 @@ mod tests {
         let mut got = [0u8; 8];
         let n = read(read_end.as_fd(), &mut got).expect("read it back");
         assert_eq!(&got[..n], b"fghijklm", "the two halves arrived in order");
+    }
+
+    #[test]
+    fn a_read_failure_is_not_reported_as_end_of_file() {
+        let dir = rustix::fs::open(
+            "/",
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .expect("open a descriptor read(2) refuses");
+        assert_eq!(
+            read_or_eof(dir.as_fd(), &mut [0]),
+            ReadOutcome::Failed(Errno::ISDIR),
+            "a failed descriptor was mistaken for a peer that closed cleanly"
+        );
     }
 }
