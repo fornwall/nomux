@@ -1,0 +1,8 @@
+# What a fuzz run writes. `corpus/` is libFuzzer's working set and grows without bound;
+# the fixed inputs it starts from are `seeds/`, which is tracked. `artifacts/` holds the
+# reproducer for a crash — a finding worth keeping belongs in a test in
+# crates/nomux/tests/, not here.
+/target
+/corpus
+/artifacts
+/coverage

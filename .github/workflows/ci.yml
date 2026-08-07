@@ -159,6 +159,79 @@ jobs:
       # else, which is most of the value of a CI run over a local one.
       - run: cargo nextest run --locked --workspace --run-ignored all --no-fail-fast
 
+  # Sixty seconds a target is not a search, and this job does not pretend to be one. What it
+  # checks is that fuzz/ still compiles and still passes over its committed seeds — which is
+  # what rots between the days somebody actually fuzzes, that workspace sitting outside the
+  # root one and so outside every hook but `cargo fmt`. The search is `sh fuzz/run.sh frame`
+  # with no bound, on a machine that has the time.
+  #
+  # No corpus carried between runs. A cache restored from the last green commit would make
+  # what this job covers a function of what happened to be cached, which is not something a
+  # pull request can reason about, and a check whose coverage nobody can state is one this
+  # tree refuses elsewhere.
+  #
+  # Deliberately absent from `publish`'s `needs`: a tag must not depend on how many execs a
+  # runner managed. A crash still turns the run red, which is the part that matters.
+  fuzz:
+    name: fuzz targets
+    runs-on: ubuntu-latest
+    # Behind the gate rather than beside it, alone among the jobs here: this is the slowest
+    # thing in the workflow per unit of what it is likely to catch, and a tree that cannot
+    # pass clippy has nothing worth fuzzing.
+    needs: check
+    timeout-minutes: 20
+    steps:
+      # `persist-credentials: false`: the steps below execute fuzz/run.sh out of the pull
+      # request's own tree, which is the same hazard the check job names.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The stable pin from rust-toolchain.toml, which builds cargo-fuzz and lints the crate.
+      # No nightly step: fuzz/run.sh installs the one it names, as scripts/build-release.sh
+      # does for the release job and for the same reason — stated in two places the two can
+      # drift, and the cache key below follows the file that names it.
+      - name: Install the pinned toolchain
+        run: rustup toolchain install --profile minimal --no-self-update
+
+      # `workspaces: fuzz`, fuzz/ being a workspace of its own: its lock file and its target
+      # directory are both under there, and the default `.` would key this job's cache on a
+      # root workspace it never builds.
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: fuzz-${{ hashFiles('fuzz/run.sh') }}
+          workspaces: fuzz
+
+      # cargo-fuzz is in no install-action manifest, so `tool:` there falls through to
+      # cargo-binstall and ends up compiling it anyway, out of a store nothing pins. Compiled
+      # from crates.io at a version named here instead, on the same terms as the pins above.
+      # rust-cache keeps $CARGO_HOME/bin, so this is paid on a cold cache rather than per
+      # run, and cargo skips it outright when that version is already installed.
+      - run: cargo install --locked cargo-fuzz@0.13.2
+
+      # The only lint pass fuzz/ gets, the clippy hook reaching the root workspace alone. On
+      # stable and without a sanitizer, neither of which the crate needs to type-check, so
+      # this is the cheap build and the fuzz one below is not.
+      #
+      # The deny rides on the command rather than in a job-level RUSTFLAGS as the check job
+      # has it: cargo-fuzz composes its sanitizer flags on top of RUSTFLAGS, so a
+      # `-D warnings` set for the job would follow into the fuzz build and make a warning out
+      # of libfuzzer-sys or cc fail it.
+      - run: cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
+
+      - run: sh fuzz/run.sh frame -max_total_time=60
+      - run: sh fuzz/run.sh header -max_total_time=60
+
+      # The input that crashed, which the log holds only as a hexdump. `cargo fuzz run
+      # <target> <this file>` replays it. `ignore`, not `error`: this step also runs when the
+      # clippy above is what failed, and that leaves no artifact behind.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure()
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+
   # The 400 KiB budget is correctness-adjacent — the cold upload happens over
   # cellular — and is the one thing the local hooks cannot check.
   release:

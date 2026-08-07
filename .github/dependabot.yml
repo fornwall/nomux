@@ -2,9 +2,8 @@ version: 2
 
 # Two pins here are covered by no ecosystem below and by no gate anywhere:
 # `rust-toolchain.toml`'s stable channel and the dated release `scripts/build-release.sh`
-# names. That
-# is accepted rather than automated, and the reason is that neither is a version number a bot
-# could move on its own. The nightly decides the bytes of a binary whose SHA-256 a client
+# names. That is accepted rather than automated, and the reason is that neither is a version
+# number a bot could move on its own. The nightly decides the bytes of a binary whose SHA-256 a client
 # pins, so a bump is only correct alongside a `scripts/size-baseline` refresh someone has
 # looked at; and the stable bump lands a new wall of lints on a tree whose gates deny
 # warnings, which is a change with a diff rather than a one-line edit. Both are read by a
@@ -24,6 +23,10 @@ updates:
 
   # The dependency tree is small and the binary ships to servers, so take patches.
   # Grouped: separate PRs per crate is noise at this size.
+  #
+  # No second entry for `/fuzz`, which has a lockfile of its own: it is held outside the
+  # supply-chain gates on the argument deny.toml makes, and a harness that ships nothing is
+  # not worth a monthly PR against the tree that does.
   - package-ecosystem: cargo
     directory: /
     schedule:

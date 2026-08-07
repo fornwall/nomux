@@ -5,6 +5,15 @@
 # No `[graph] targets`, deliberately: every target is checked rather than the two that
 # ship, so the windows crates errno pulls in are in scope — an advisory that surfaces
 # only on someone else's platform is one this repository would rather hear about.
+#
+# Out of scope: fuzz/, a workspace of its own that no cargo run from here reaches. Two of
+# the rules below would have to be loosened tree-wide to take it in, which is the argument
+# against — `allow` would need NCSA, libfuzzer-sys being `(MIT OR Apache-2.0) AND NCSA` for
+# the LLVM libFuzzer sources it vendors, and `wildcards` would need `allow-wildcard-paths`,
+# a path dependency carrying no version being a wildcard to cargo-deny. Both statements are
+# about object code the binary ships; a fuzz harness ships nothing, runs on a developer's
+# machine and reads bytes it generated itself. Weakening either here to say something about
+# a crate that never leaves the tree is the wrong trade.
 
 [advisories]
 # Deny by default. `ignore` stays empty: with two direct dependencies, an advisory is

@@ -23,9 +23,12 @@
 /// panics on any input" — `indexing_slicing` is denied crate-wide, which makes an
 /// out-of-bounds panic unlikely rather than impossible.
 ///
-/// This is the fuzzing story for the parser, run on stable as part of the normal suite
-/// rather than as a `cargo-fuzz` target: the input space that matters is a 4-byte header
-/// and a length-prefixed payload, which a generator reaches by construction.
+/// This is the parser's coverage on stable, run as part of the normal suite: the input
+/// space that matters is a 4-byte header and a length-prefixed payload, which a generator
+/// reaches by construction. The coverage-guided half is `fuzz/`, which reaches the same
+/// two entry points under a sanitiser and off a corpus it keeps
+/// ([IMPLEMENTATION.md § 9](../../../IMPLEMENTATION.md#9-testing)); neither replaces the
+/// other, and only this one runs in a gate.
 ///
 /// The generator is a seeded [`generated::Rng`] rather than a property-testing crate. The
 /// cases here are already small — a payload is at most 40 bytes and a text field at most
@@ -446,7 +449,10 @@ mod generated {
         let len = u32::from_be_bytes([0, a, b, c]);
         match decode_header(&bytes) {
             Ok(header) => {
-                if FrameType::from_wire(ty) != Some(header.ty) {
+                // Through `as_wire`, not `from_wire`: `decode_header` is built out of the
+                // latter, so comparing against it asserts that a function agrees with
+                // itself. The byte it was handed is the only independent witness there is.
+                if header.ty.as_wire() != ty {
                     return Err(format!("{bytes:02x?}: invented the type {:?}", header.ty));
                 }
                 if header.len != len {
@@ -466,7 +472,7 @@ mod generated {
                 if reported != ty {
                     return Err(format!("{bytes:02x?}: reported a byte it did not read"));
                 }
-                if FrameType::from_wire(ty).is_some() {
+                if FrameType::ALL.iter().any(|known| known.as_wire() == ty) {
                     return Err(format!("{bytes:02x?}: refused a known type"));
                 }
             }

@@ -17,8 +17,5 @@ its work is tracked here; what this side owes it is fixed contract in
 
 ## P2 — test depth
 
-- A `cargo-fuzz` target for `decode_header` and `Frame::decode`. The codec's property
-  tests drive a seeded generator of their own, which covers the shapes the parser has but
-  not the ones it does not.
 - Chaos against a real full-screen program; the suite stays deterministic on sixel and
   CSI from `sh`, and driving an actual `vim` would test `vim`.
