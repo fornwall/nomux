@@ -33,9 +33,7 @@ yanked = "deny"
 #
 # `cargo deny list` re-derives this from the lockfile and is how to check the claim. It
 # was last checked against the eight crates the lock now holds, which between them declare
-# these two and nothing else — a list that only stayed true because the dev-dependency
-# that reached `unicode-ident`, and with it a `Unicode-3.0` term neither entry here can
-# satisfy, has since gone.
+# these two and nothing else.
 allow = ["Apache-2.0", "MIT"]
 
 [bans]
