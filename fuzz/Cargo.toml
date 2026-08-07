@@ -2,10 +2,10 @@
 # that carries two runtime dependencies and a note on each. The root manifest names its one
 # member, so `cargo build`, `cargo clippy --all-targets`, `cargo nextest run --workspace`
 # and `cargo deny` all stop there: libFuzzer's C++ runtime is absent from the shipped
-# binary, from ../Cargo.lock, and from every gate a commit has to pass — the `cargo fmt`
-# hook that reaches these sources being the one exception, and it compiles nothing. What
-# the separation costs is that ../Cargo.toml's lint wall does not reach here either; see
-# the note in fuzz_targets/frame.rs on why that wall is the wrong one for a fuzz target.
+# binary, from ../Cargo.lock, and from the root workspace's gates. CI reaches this workspace
+# explicitly with its own format, Clippy, advisory and seeded-fuzz passes. What the separation
+# costs is that ../Cargo.toml's lint wall does not reach here either; see the note in
+# fuzz_targets/frame.rs on why that wall is the wrong one for a fuzz target.
 #
 # It also settles the release profile, which is read from the workspace root and nowhere
 # else — so the root's is not in force here and the one below is. What that is worth is

@@ -51,6 +51,7 @@ jobs:
     permissions:
       pull-requests: read
     outputs:
+      dependency-names: ${{ steps.metadata.outputs.dependency-names }}
       update-type: ${{ steps.metadata.outputs.update-type }}
     steps:
       # Besides exposing the semantic update type, this rejects a PR whose author or commits do
@@ -65,17 +66,20 @@ jobs:
     name: enable for compatible dependency update
     needs: verify_dependabot
     if: >-
-      needs.verify_dependabot.outputs.update-type == 'version-update:semver-patch' ||
-      needs.verify_dependabot.outputs.update-type == 'version-update:semver-minor'
+      !contains(needs.verify_dependabot.outputs.dependency-names, 'actions/download-artifact') &&
+      !contains(needs.verify_dependabot.outputs.dependency-names, 'dependabot/fetch-metadata') &&
+      (needs.verify_dependabot.outputs.update-type == 'version-update:semver-patch' ||
+       needs.verify_dependabot.outputs.update-type == 'version-update:semver-minor')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: write
       pull-requests: write
     steps:
-      # A major upgrade can change an action's runtime contract or a crate's API even when today's
-      # tests pass, so it remains a reviewed PR. Patch and minor updates still wait for every
-      # branch rule and required check; this command merely records that pending decision.
+      # Major upgrades remain reviewed. So do the action that runs later with the release job's
+      # write token and the metadata action that decides this policy; neither executes its
+      # privileged path on its own update PR. Every other patch and minor update still waits for
+      # every branch rule and required check before this pending decision takes effect.
       - name: Enable auto-merge for patch and minor updates
         env:
           GH_TOKEN: ${{ github.token }}
