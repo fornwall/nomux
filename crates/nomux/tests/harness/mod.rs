@@ -1328,7 +1328,10 @@ impl Client {
     /// the last few the child writes, `yes` writes nothing but the needle, and the
     /// newest kilobyte is the one thing the ring never discards. What is *not* relaxed
     /// is contiguity — output between gaps is still asserted to be unbroken, so the
-    /// hole this tolerates is only ever one the daemon owned up to.
+    /// hole this tolerates is only ever one the daemon owned up to. Bytes collected
+    /// before a gap are discarded: otherwise the end of one retained range and the
+    /// beginning of the next could combine into a needle that never existed in the
+    /// child's stream.
     pub(crate) fn read_past_gaps(&mut self, needle: &str, from: u64) -> (String, u64) {
         self.read_until_inner(needle, from, true)
     }
@@ -1350,7 +1353,15 @@ impl Client {
                         return (String::from_utf8_lossy(&seen).into_owned(), offset);
                     }
                 }
-                Frame::Gap { new_base_offset } if follow_gaps => offset = new_base_offset,
+                Frame::Gap { new_base_offset } if follow_gaps => {
+                    assert!(
+                        new_base_offset > offset,
+                        "a Gap must move output forward: current offset {offset}, new base \
+                         {new_base_offset}"
+                    );
+                    offset = new_base_offset;
+                    seen.clear();
+                }
                 Frame::InputAck { .. } | Frame::Pong => {}
                 other => panic!("unexpected frame while awaiting {needle:?}: {other:?}"),
             }

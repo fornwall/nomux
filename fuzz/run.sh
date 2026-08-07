@@ -15,13 +15,26 @@
 # directory it was invoked from.
 set -eu
 
-# Nightly, because `-Zsanitizer=address` is. Named here as scripts/build-release.sh names
-# its own, and for a different reason: that one is dated so the bytes a client hashes cannot
-# drift, this one so a nightly regression cannot turn a green tree red with no commit behind
-# it — the argument ci.yml makes for pinning every tool it installs. Two lines rather than
-# one shared file, because they answer different questions and either can move without the
-# other; nothing compares them.
-nightly='nightly-2026-08-07'
+unset CDPATH
+repo=$(cd -- "$(dirname -- "$0")/.." && pwd -P)
+cd "$repo"
+
+# Nightly, because `-Zsanitizer=address` is. Dated so a nightly regression cannot turn a
+# green tree red with no commit behind it, and read from the release build's tracked pin so
+# the two workflows always exercise one compiler version.
+nightly_file="$repo/scripts/nightly-version"
+nightly=$(awk 'NF { if (++seen > 1 || NF != 1) exit 1; value = $1 }
+    END { if (seen != 1) exit 1; print value }' "$nightly_file") || {
+    echo "$nightly_file must contain exactly one toolchain name" >&2
+    exit 1
+}
+case "$nightly" in
+nightly-[0-9][0-9][0-9][0-9]-[01][0-9]-[0-3][0-9]) ;;
+*)
+    echo "$nightly_file must name a dated nightly toolchain" >&2
+    exit 1
+    ;;
+esac
 
 if [ "$#" -lt 1 ]; then
     echo "usage: sh fuzz/run.sh <target> [libfuzzer args...]" >&2
@@ -29,9 +42,6 @@ if [ "$#" -lt 1 ]; then
 fi
 target=$1
 shift
-
-unset CDPATH
-cd -- "$(dirname -- "$0")/.."
 
 # Installed rather than detected and complained about, as scripts/build-release.sh does it:
 # one idempotent command, so a runner and a laptop provision identically and ci.yml needs no

@@ -598,10 +598,12 @@ the takeover, a newer client's *failed* greeting threw the working client off an
 the newcomer too, leaving nobody attached and nobody permitted to reconnect
 ([DESIGN.md § 6.4](DESIGN.md#64-version-skew)).
 
-**A client's end of file is not a departure.** The relay half-closes on stdin EOF and goes
-on draining output (§ 7), so a peer that has stopped *sending* is still owed everything the
-child has yet to say. Six things end an *established* connection without a refusal: a
-queued write that fails; § 4.1's `ABANDON_PENDING_WRITE`; the `Exit` going out to a
+**A client's clean end of file is not a departure.** The relay half-closes on stdin EOF and
+goes on draining output (§ 7), so a peer that has stopped *sending* is still owed everything
+the child has yet to say. An end of file behind part of a frame is instead a protocol
+refusal: those bytes can never become a frame, and keeping their connection attached would
+disable idle reaping indefinitely. Six things end an *established* connection without a
+refusal: a queued write that fails; § 4.1's `ABANDON_PENDING_WRITE`; the `Exit` going out to a
 half-closed peer with nothing left owed; `POLLHUP` or `POLLERR`; a read that fails before
 end of file; and a `Detach` frame. The third is what ends `nomux attach <id> < script`: past
 the child's exit the master leaves the poll set, so a ring read to its end stays read to its
@@ -609,8 +611,8 @@ end. Read as a departure, that end of file cost the script every byte its child 
 after it ran out. A half-closed client holds the session as an attached silent one does,
 bounded by that same 8 MiB.
 
-Beside those stand seven kinds of refusal, each carrying a final `Error` — the takeover
-above, three malformations, a version this daemon cannot answer (refused on the *pending*
+Beside those stand eight kinds of refusal, each carrying a final `Error` — the takeover
+above, four malformations, a version this daemon cannot answer (refused on the *pending*
 connection, per the paragraph above), a shell that would not start, and § 3's input gap —
 and the session's own shutdown (§ 6.5), which closes whatever is attached whether or not it
 did anything wrong.
@@ -901,15 +903,14 @@ writes and the gate reads.
 
 `rustup target add` is the entire setup — no gcc, no zig, no sysroot — and the shipping
 build takes a nightly, without which both targets overrun the budget on panic machinery
-alone. It is pinned to a **dated** nightly, a floating one moving the bytes the published
-hash covers: `scripts/build-release.sh` names it, the only other nightly in the tree being
-§ 9's fuzzing pin — dated against a different hazard, free to move without this one, and
-compared to it by nothing. The compiler that measured a baseline is written down beside it
-and deliberately **not** checked against the one building — a bump moves the figures by
-tenths of a percent against a 3% threshold, so a stamp that disagrees never means a delta
-anyone would act on, and refusing on one only taught people to reach for the escape hatch.
-That script argues all of that — the release profile, the `-Z build-std` case and the
-reproducibility flags.
+alone. Release builds and § 9's fuzzing use one **dated** nightly named in
+`scripts/nightly-version`. A floating one would move both the bytes the published hash covers
+and CI's fuzzing compiler without a commit behind either change. One shared pin makes a bump
+exercise both uses together. The compiler that measured a baseline is written down beside it
+and deliberately **not** checked against the one building — a bump moves the figures by tenths
+of a percent against a 3% threshold, so a stamp that disagrees never means a delta anyone would
+act on, and refusing on one only taught people to reach for the escape hatch. The build script
+argues the rest — the release profile, the `-Z build-std` case and the reproducibility flags.
 
 That script is the producing half of a check whose consuming half does not exist: **the
 client is meant to pin a SHA-256 per architecture and verify it after upload, and nothing
@@ -941,9 +942,9 @@ wire vector's four literal header bytes already pin. `decode_header` has none of
 `header_decode_is_total` having closed that domain outright by sweeping all 256 type bytes
 against both sides of the cap — a target over it could only agree with a suite that had
 already finished. `sh fuzz/run.sh <target>` runs one and
-installs the nightly it names, as `scripts/build-release.sh` does for the release build
-(§ 8). CI gives it sixty seconds, which checks that it still builds and still passes over
-its seeds and is nowhere near a search.
+installs the shared nightly in `scripts/nightly-version`, as `scripts/build-release.sh` does
+for the release build (§ 8). CI gives it sixty seconds, which checks that it still builds and
+still passes over its seeds and is nowhere near a search.
 
 What the signal guards measure is the *decision* to signal, which is the only thing that
 can be measured: `pty::reach` is that module's one door to a `kill(2)` it aims at a pid of
@@ -1014,4 +1015,3 @@ as a listing is, and a newline is how one datagram becomes two log entries.
 
 One case stays silent whatever the sink: the shipping build compiles panics down to a bare
 trap (§ 8), so `SIGQUIT`'s core is what is left (§ 6.5).
-

@@ -11,6 +11,9 @@
 //!   [`overflow_during_disconnects_is_always_reported`].
 //! - Input is applied once whatever the disconnect pattern:
 //!   [`replayed_input_across_random_disconnects_is_applied_once`].
+//! - A `Ctrl-L` repaint sharing the PTY queue with overlapping resends does not move
+//!   the input position or cost the child a byte:
+//!   [`ctrl_l_repaints_interleaved_with_resends_do_not_change_input`].
 //! - The daemon's own boundaries — a `MAX_PAYLOAD` chunk, a send queue that filled
 //!   mid-slice, a ring that rolled — cut a full-screen program's escape sequences in
 //!   half without ever losing or repeating a byte; and a disconnect the seed placed in
@@ -36,7 +39,7 @@ use std::time::{Duration, Instant};
 
 use nomux::{Frame, MAX_PAYLOAD, RESUME_FROM_START};
 
-use harness::{Rng, Session, assert_same_stream, poll_by, socket_capacity};
+use harness::{Rng, Session, assert_same_stream, poll_by, reconnect_until_gap, socket_capacity};
 
 /// `conn::MAX_PENDING_WRITE`, private to the daemon: what § 4.1 has it queue for a slow
 /// client before it stops adding. Mirrored here as the harness mirrors its neighbours,
@@ -49,7 +52,7 @@ const MAX_PENDING_WRITE: usize = 1 << 20;
 /// Under the forty-second kill in `.config/nextest.toml`, since a deadline at or above
 /// that can never fire — and a stall killed from outside says nothing, losing § 9's
 /// promise that every chaos failure carries its seed. Spent once per test, per
-/// `harness::poll_by`. All three finish in under two seconds.
+/// `harness::poll_by`. All four finish in under two seconds.
 const PATIENCE: Duration = Duration::from_secs(20);
 
 /// Seed used when `NOMUX_CHAOS_SEED` is unset.
@@ -254,6 +257,179 @@ fn replayed_input_across_random_disconnects_is_applied_once() {
         marks, rounds,
         "each line must run exactly once; transcript: {seen:?} (seed {chaos_seed})"
     );
+}
+
+/// Client bytes bracketing every repaint; neither contains the byte being filtered.
+const REPAINT_PREFIX: &[u8] = b"client-begin|";
+const REPAINT_FENCE: &[u8] = b"|client-fence";
+
+/// Checks the recorded PTY input once [`REPAINT_FENCE`] has arrived.
+fn assert_repaints_preserved_input(
+    recorded: &[u8],
+    intended: &[u8],
+    rounds: usize,
+    chaos_seed: u64,
+) {
+    let fence = recorded
+        .windows(REPAINT_FENCE.len())
+        .position(|window| window == REPAINT_FENCE)
+        .expect("the fence the wait above returned for");
+    let through_fence = recorded
+        .get(..fence + REPAINT_FENCE.len())
+        .expect("the located fence fits in the record");
+    let repaint_positions: Vec<usize> = through_fence
+        .iter()
+        .enumerate()
+        .filter_map(|(at, byte)| (*byte == 0x0c).then_some(at))
+        .collect();
+    assert!(
+        repaint_positions
+            .iter()
+            .any(|at| (REPAINT_PREFIX.len()..fence).contains(at)),
+        "{rounds} overflow reconnects put no Ctrl-L between the client's prefix and \
+         fence, so repaint and resend never interleaved (seed {chaos_seed}); repaint \
+         positions: {repaint_positions:?}"
+    );
+
+    let client_bytes: Vec<u8> = through_fence
+        .iter()
+        .copied()
+        .filter(|byte| *byte != 0x0c)
+        .collect();
+    assert_eq!(
+        client_bytes,
+        intended,
+        "removing {} Ctrl-L repaint(s) must leave every client byte exactly once \
+         (seed {chaos_seed})",
+        repaint_positions.len()
+    );
+}
+
+/// A `Ctrl-L` repaint interleaved with overlapping input resends does not change the
+/// exactly-once stream (`IMPLEMENTATION.md` §§ 3, 4.3).
+///
+/// Each reconnect happens only once the output ring has overflowed again, so its
+/// greeting both reports a new output position and queues `0x0c` through the same PTY
+/// input queue as the bytes below. The client treats that greeting's `in_applied` as
+/// authoritative and deliberately resends from just before it. A repaint counted as
+/// client input trims a real byte from that resend, and any lost, duplicated or reordered
+/// client byte changes the final record. The position assertion also proves the repaint
+/// path actually ran while that client stream was under way, rather than letting the
+/// exactly-once half pass on its own.
+///
+/// The child is `cat`, not the marker-counting shell above: it records a stray form feed
+/// instead of interpreting it in the middle of a command. Removing exactly those form
+/// feeds must leave every byte the client intended, once and in order.
+#[test]
+fn ctrl_l_repaints_interleaved_with_resends_do_not_change_input() {
+    /// Small enough that an unpaced writer rolls it between reconnects, and that one
+    /// pass can queue the whole retained window and issue the repaint it owes.
+    const RING: usize = 32 * 1024;
+    /// Enough reconnects that this is sustained interaction rather than one lucky
+    /// ordering, while keeping the shared chaos deadline well clear.
+    const ROUNDS: usize = 12;
+    /// The flooder's last output, proving it has stopped before the input record is read.
+    const OVER: &str = "NOMUX-42-REPAINT-OVER";
+
+    let chaos_seed = chaos_seed();
+    let mut rng = Rng::new(chaos_seed);
+    let session = Session::start_with_ring("chaos_repaint_resend", RING);
+    let deadline = Instant::now() + PATIENCE;
+    let mut client = session.connect_by(deadline);
+    let ok = client.hello_with(false, true, RESUME_FROM_START);
+
+    // The foreground `cat` consumes raw bytes into a file rather than echoing them into
+    // the ring. A background process supplies the independently overflowing output,
+    // but waits until the prefix below is through: once the flood fills this client's
+    // output queue, § 4.1 deliberately stops polling its input, so racing the prefix
+    // against the flood can leave it unread forever.
+    // Non-canonical mode matters for the daemon's bare `0x0c`: otherwise the line
+    // discipline holds it until some later client byte happens to carry a newline.
+    let flood = "set +m; L=0123456789abcdef; L=$L$L$L$L; L=$L$L$L$L; L=$L$L$L$L; \
+                 (while [ ! -f start ]; do sleep 0.01; done; \
+                 while [ ! -f stop ]; do printf '%s\n' \"$L\"; done; \
+                 printf NOMUX-$((6*7))-REPAINT-OVER) & exec cat > record";
+    let ready = client.make_ready(
+        "-echo -onlcr -icanon min 1 time 0",
+        Some(flood),
+        ok.resume_from,
+    );
+    let record = session.root.join("record");
+    assert!(
+        poll_by(deadline, || record.exists()),
+        "the raw child never opened its input record (seed {chaos_seed})"
+    );
+
+    // Put known client input before the first repaint. Waiting on the record rather than
+    // an ack also proves the raw child, not the setup shell, consumed it.
+    let input_start = ready.in_offset;
+    let mut intended = REPAINT_PREFIX.to_vec();
+    client.input(input_start, REPAINT_PREFIX);
+    assert!(
+        poll_by(deadline, || fs::read(&record)
+            .is_ok_and(|seen| seen.starts_with(REPAINT_PREFIX))),
+        "the prefix never reached the raw child (seed {chaos_seed})"
+    );
+    fs::write(session.root.join("start"), []).expect("start the output flood");
+    drop(client);
+
+    // Every returned greeting is across a fresh overflow. Its repaint enters the PTY
+    // queue before this client sends the overlapping tail derived from `in_applied`.
+    let (mut client, mut resumed) = reconnect_until_gap(&session, deadline, true, ready.offset);
+    let mut output_offset = resumed.resume_from;
+    let mut confirmed = resumed.in_applied;
+    assert_eq!(
+        confirmed,
+        input_start + REPAINT_PREFIX.len() as u64,
+        "the first repaint changed the input position before any resend (seed {chaos_seed})"
+    );
+    let mut resend_from = confirmed.saturating_sub(1 + rng.below(6)).max(input_start);
+
+    for round in 0..ROUNDS {
+        intended.extend_from_slice(format!("round-{round:02}|").as_bytes());
+        let from = usize::try_from(resend_from - input_start).expect("input offset fits");
+        client.input(resend_from, &intended[from..]);
+
+        // Abrupt with unread flood output, so this Input may be applied, partly decoded,
+        // or lost with the socket. The next greeting is the only authority on which.
+        drop(client);
+        (client, resumed) = reconnect_until_gap(&session, deadline, true, output_offset);
+        assert!(
+            resumed.in_applied >= confirmed,
+            "round {round}: applied input went backwards across a repaint and reconnect \
+             (seed {chaos_seed})"
+        );
+        assert!(
+            resumed.in_applied <= input_start + intended.len() as u64,
+            "round {round}: a repaint was counted as client input (seed {chaos_seed})"
+        );
+        confirmed = resumed.in_applied;
+        output_offset = resumed.resume_from;
+        // Always overlap at least one byte, so trimming a resend is structural rather
+        // than dependent on what the disconnect happened to lose.
+        resend_from = confirmed.saturating_sub(1 + rng.below(6)).max(input_start);
+    }
+
+    // Stop output first. Reaching its final marker means the client has caught the ring
+    // and every repaint owed by the repeated gaps has entered the shared input queue.
+    fs::write(session.root.join("stop"), []).expect("ask the flooder to stop");
+    client.read_past_gaps(OVER, output_offset);
+
+    intended.extend_from_slice(REPAINT_FENCE);
+    let from = usize::try_from(resend_from - input_start).expect("input offset fits");
+    client.input(resend_from, &intended[from..]);
+    assert!(
+        poll_by(deadline, || {
+            fs::read(&record).is_ok_and(|seen| {
+                seen.windows(REPAINT_FENCE.len())
+                    .any(|window| window == REPAINT_FENCE)
+            })
+        }),
+        "the final resend never reached the raw child (seed {chaos_seed})"
+    );
+
+    let seen = fs::read(&record).expect("the raw child's input record");
+    assert_repaints_preserved_input(&seen, &intended, ROUNDS, chaos_seed);
 }
 
 /// Ring capacity for

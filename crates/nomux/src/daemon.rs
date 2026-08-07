@@ -1151,6 +1151,20 @@ impl Daemon {
             };
             self.handle_frame(&frame);
         }
+
+        // A clean half-close is how `attach` says it has no more input while it keeps
+        // reading output (§ 7), but a half-close behind part of a frame can never become
+        // clean: no byte will arrive to complete it. Leaving that connection attached
+        // disables idle reaping indefinitely and keeps an invalid stream as the current
+        // client until a takeover. Complete frames have all been consumed above, so any
+        // remainder at EOF is necessarily a truncated header or payload.
+        if self
+            .client
+            .as_ref()
+            .is_some_and(|client| client.conn.is_eof() && client.conn.buffered() != 0)
+        {
+            self.reject(ErrorCode::Protocol, "truncated frame at end of input");
+        }
     }
 
     /// Services one decoded frame from the attached client.
@@ -1774,6 +1788,59 @@ mod tests {
              connection: the arriving one resumes from {applied}, so they are typed into \
              nothing and nobody will resend them",
             TYPED.len()
+        );
+    }
+
+    /// A write half closed behind an incomplete frame cannot be the clean stdin EOF
+    /// `attach` uses: there is no future byte that can complete it, so it must release
+    /// the attached slot rather than keeping the session non-idle for ever.
+    #[test]
+    fn an_eof_mid_frame_releases_the_client() {
+        use std::io::Write as _;
+
+        let root = Scratch::new("truncated-client");
+        let mut daemon = blank(&root, "truncated");
+        let mut peer = attach_peer(|conn| {
+            daemon.client = Some(Attached::greeting(conn));
+        });
+        daemon.last_detach = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or(daemon.last_detach);
+        let detached_before = daemon.last_detach;
+
+        let mut wire = Vec::new();
+        Frame::Input {
+            offset: 0,
+            data: b"never complete",
+        }
+        .encode(&mut wire)
+        .expect("a valid frame");
+        peer.write_all(&wire[..=nomux::HEADER_LEN])
+            .expect("deliver an incomplete frame");
+        peer.shutdown(std::net::Shutdown::Write)
+            .expect("close only the input half");
+
+        let mut read_buf = vec![0u8; 64 * 1024];
+        daemon.read_client(&mut read_buf, &mut Vec::new());
+
+        assert!(daemon.client.is_none(), "the invalid client kept the slot");
+        assert!(
+            daemon.last_detach > detached_before,
+            "releasing the client must arm detached-session reaping"
+        );
+        assert_eq!(
+            collect(&mut peer),
+            {
+                let mut expected = Vec::new();
+                Frame::Error {
+                    code: ErrorCode::Protocol,
+                    message: "truncated frame at end of input",
+                }
+                .encode(&mut expected)
+                .expect("a valid frame");
+                expected
+            },
+            "the peer must learn that its half-close was not a clean input EOF"
         );
     }
 
