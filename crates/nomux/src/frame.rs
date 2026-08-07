@@ -1,10 +1,8 @@
 //! Frame payloads and their codec.
 //!
 //! Decoding borrows byte and string fields from the payload it is handed, so nothing
-//! here allocates. It is not copy-free, and the PTY path is the copying one: `encode`
-//! appends the payload to the caller's buffer, every output byte copied once, which is
-//! what lets a queued `Frame::Output` outlive the ring slot it was read from. `conn.rs`
-//! has the copy the other direction makes.
+//! here allocates; `encode` copies each output byte once into the caller's buffer, which
+//! is what lets a queued `Frame::Output` outlive the ring slot it was read from.
 
 use crate::{FrameType, HEADER_LEN, ProtoError, encode_header, wire_enum};
 
@@ -63,11 +61,6 @@ const HELLO_AGENT_FORWARD: u8 = 1 << 0;
 const HELLO_REPAINT_CTRL_L: u8 = 1 << 1;
 
 /// Bits defined in `Hello`'s flags byte. Anything else set is a protocol error.
-///
-/// The byte never leaves this module, which is why all three constants are private:
-/// [`Hello`] carries the two bits as bools, and packing and unpacking them is
-/// [`Hello::flags`] and `decode`'s work alone. `tests/codec.rs`'s vector table is what
-/// pins the values.
 const HELLO_FLAG_BITS: u8 = HELLO_AGENT_FORWARD | HELLO_REPAINT_CTRL_L;
 
 /// Refuses a [`Hello::term`] carrying an interior NUL, on the way *out* as well as in,
@@ -75,16 +68,6 @@ const HELLO_FLAG_BITS: u8 = HELLO_AGENT_FORWARD | HELLO_REPAINT_CTRL_L;
 fn checked_term(term: &str) -> Result<(), ProtoError> {
     if term.as_bytes().contains(&0) {
         return Err(ProtoError::Malformed("TERM contains a NUL byte"));
-    }
-    Ok(())
-}
-
-/// Keeps the sentinel carried with [`ExitKind::Unknown`] canonical.
-fn checked_exit(status: i32, kind: ExitKind) -> Result<(), ProtoError> {
-    if kind == ExitKind::Unknown && status != 0 {
-        return Err(ProtoError::Malformed(
-            "unknown exit outcome carries a nonzero status",
-        ));
     }
     Ok(())
 }
@@ -218,16 +201,14 @@ pub enum Frame<'a> {
     },
     /// The terminal stream ended and all preceding output has been sent.
     Exit {
-        /// Exit status, or signal number when `kind` is [`ExitKind::Signalled`]. Always
-        /// zero when `kind` is [`ExitKind::Unknown`].
+        /// Exit status, or signal number when `kind` is [`ExitKind::Signalled`]. Carries
+        /// no outcome when `kind` is [`ExitKind::Unknown`]; the daemon sends the sentinel
+        /// 0 there (`IMPLEMENTATION.md` § 2.2).
         status: i32,
         /// What is known about how the child terminated.
         kind: ExitKind,
-        /// Whole seconds since the child let go of the terminal, saturating
-        /// (`IMPLEMENTATION.md` § 2.2). Elapsed against a monotonic clock rather than
-        /// a wall-clock stamp the two ends would have to agree on, and carried here
-        /// rather than on [`HelloOk`], which goes out on every attach of every session
-        /// while this means anything only once the terminal has closed.
+        /// Whole seconds since the child let go of the terminal, elapsed against a
+        /// monotonic clock and saturating (`IMPLEMENTATION.md` § 2.2).
         since_terminal_closed_secs: u32,
     },
     /// Client is leaving without ending the session.
@@ -305,28 +286,24 @@ impl<'a> Frame<'a> {
     /// [`crate::MAX_PAYLOAD`], or [`ProtoError::Malformed`] for a field too long for
     /// its own length prefix. `out` is rewound to its original length in every case.
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), ProtoError> {
-        // The payload goes straight into the caller's buffer and the header is patched
-        // in behind it, so the rewind lives here, once, rather than on each error path
-        // inside: a caller appending frames back to back never ships half of one,
-        // whatever `encode_from` grows a new way to fail on.
+        // The rewind lives here, once: a caller appending frames back to back never
+        // ships half of one, whatever `encode_from` grows a new way to fail on.
         let start = out.len();
         self.encode_from(start, out)
             .inspect_err(|_| out.truncate(start))
     }
 
-    /// Appends the frame, `start` being `out`'s length on entry. Free to leave a partial
-    /// frame behind on failure: [`Frame::encode`] rewinds to `start`.
+    /// Appends the frame, `start` being `out`'s length on entry; free to leave a partial
+    /// frame behind on failure, [`Frame::encode`] rewinding to `start`.
     fn encode_from(&self, start: usize, out: &mut Vec<u8>) -> Result<(), ProtoError> {
         out.extend_from_slice(&[0; HEADER_LEN]);
         self.encode_payload(out)?;
 
         // The saturation is reachable only from a caller in this process handing over a
         // 4 GiB field — never a peer, whose frames `decode_header` has already bounded.
+        // `encode_header` refuses anything over `MAX_PAYLOAD`, saturated or not.
         let payload_len = out.len() - start - HEADER_LEN;
         let len = u32::try_from(payload_len).unwrap_or(u32::MAX);
-        if payload_len > crate::MAX_PAYLOAD as usize {
-            return Err(ProtoError::PayloadTooLarge(len));
-        }
         let header = encode_header(self.frame_type(), len)?;
         #[expect(
             clippy::indexing_slicing,
@@ -373,7 +350,6 @@ impl<'a> Frame<'a> {
                 kind,
                 since_terminal_closed_secs,
             } => {
-                checked_exit(status, kind)?;
                 out.extend_from_slice(&status.to_be_bytes());
                 out.push(kind.as_wire());
                 out.extend_from_slice(&since_terminal_closed_secs.to_be_bytes());
@@ -400,18 +376,9 @@ impl<'a> Frame<'a> {
     ///
     /// [`ProtoError::Truncated`] if the payload ends early,
     /// [`ProtoError::TrailingBytes`] if it is longer than the frame requires,
-    /// [`ProtoError::PayloadTooLarge`] if it is longer than [`crate::MAX_PAYLOAD`],
     /// and [`ProtoError::Malformed`] for invalid enum discriminants or non-UTF-8
     /// text.
     pub fn decode(ty: FrameType, payload: &'a [u8]) -> Result<Self, ProtoError> {
-        // The daemon reaches this only through `decode_header`, which has already
-        // applied the bound. Restated because `decode` is public and the suite calls
-        // it on its own: without it a frame could decode that `encode` would refuse.
-        let len = u32::try_from(payload.len()).unwrap_or(u32::MAX);
-        if len > crate::MAX_PAYLOAD {
-            return Err(ProtoError::PayloadTooLarge(len));
-        }
-
         let mut r = Reader::new(payload);
         let frame = match ty {
             FrameType::Hello => {
@@ -471,7 +438,6 @@ impl<'a> Frame<'a> {
                 let kind = ExitKind::from_wire(r.u8()?)
                     .ok_or(ProtoError::Malformed("unknown exit kind"))?;
                 let since_terminal_closed_secs = r.u32()?;
-                checked_exit(status, kind)?;
                 Self::Exit {
                     status,
                     kind,
@@ -660,37 +626,6 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_outcome_has_one_canonical_status() {
-        let frame = Frame::Exit {
-            status: 1,
-            kind: ExitKind::Unknown,
-            since_terminal_closed_secs: 0,
-        };
-        let mut encoded = b"earlier frame".to_vec();
-        let before = encoded.clone();
-        assert_eq!(
-            frame.encode(&mut encoded),
-            Err(ProtoError::Malformed(
-                "unknown exit outcome carries a nonzero status"
-            ))
-        );
-        assert_eq!(encoded, before, "a rejected frame changed the output queue");
-
-        let payload = [0, 0, 0, 1, 2, 0, 0, 0, 0];
-        assert_eq!(
-            Frame::decode(FrameType::Exit, &payload),
-            Err(ProtoError::Malformed(
-                "unknown exit outcome carries a nonzero status"
-            ))
-        );
-        round_trip(Frame::Exit {
-            status: 0,
-            kind: ExitKind::Unknown,
-            since_terminal_closed_secs: u32::MAX,
-        });
-    }
-
-    #[test]
     fn undefined_flag_bits_are_rejected() {
         let mut hello = Vec::new();
         Frame::Hello(Hello {
@@ -867,19 +802,5 @@ mod tests {
             Err(ProtoError::Malformed("TERM contains a NUL byte")),
             "a NUL that arrived on the socket is a protocol error, not a spawn failure"
         );
-    }
-
-    /// `decode` is public and usable without `decode_header`, so it applies the
-    /// same bound rather than trusting a caller to have done it.
-    #[test]
-    fn a_payload_over_the_maximum_is_refused_by_decode() {
-        let oversized = vec![0u8; MAX_PAYLOAD as usize + 1];
-        assert_eq!(
-            Frame::decode(FrameType::Output, &oversized),
-            Err(ProtoError::PayloadTooLarge(MAX_PAYLOAD + 1))
-        );
-        // One byte under the limit still decodes, so the bound is inclusive.
-        let largest = vec![0u8; MAX_PAYLOAD as usize];
-        assert!(Frame::decode(FrameType::Output, &largest).is_ok());
     }
 }
