@@ -1,6 +1,6 @@
-# cargo-deny, run by .github/workflows/ci.yml's check job as
-# `cargo deny check advisories bans licenses sources`, which is where the reason for
-# each of those four is written down.
+# cargo-deny, run in two halves: .pre-commit-config.yaml's hook checks bans, licences and
+# sources from the lockfile alone, and .github/workflows/ci.yml adds `advisories`, which
+# fetches a database over the network where a commit hook may not.
 #
 # No `[graph] targets`, deliberately: every target is checked rather than the two that
 # ship, so the windows crates errno pulls in are in scope — an advisory that surfaces
@@ -41,8 +41,11 @@ yanked = "deny"
 allow = ["Apache-2.0", "MIT"]
 
 [bans]
-# Unactionable in any real dependency tree, so duplicates are reported and not failed.
-multiple-versions = "warn"
+# `warn` is the usual answer, and `cargo deny check` exits zero on one — which would leave
+# `wildcards` below the only rule this section actually enforces. Affordable here because the
+# lockfile holds eight crates and no duplicate among them: the first one to arrive lands in a
+# diff someone reads rather than in a line that scrolls past in a green log.
+multiple-versions = "deny"
 # A `*` requirement resolves to whatever crates.io was holding on the day the lock was
 # written, which is the one thing this tree is arranged not to do: the compiler is pinned by
 # date, the actions by commit, and the binary is fetched against a checksum. Nothing declares

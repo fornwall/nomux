@@ -262,7 +262,8 @@ fn has_controlling_terminal() -> bool {
 /// a daemon nothing can ever reach. `tests/session.rs` starts one that way and greets it.
 pub(crate) fn release_startup_state() {
     let _ = rustix::process::chdir("/");
-    let Ok(null) = rustix::fs::open("/dev/null", OFlags::RDWR, Mode::empty()) else {
+    let Ok(null) = rustix::fs::open("/dev/null", OFlags::RDWR | OFlags::CLOEXEC, Mode::empty())
+    else {
         return;
     };
     let _ = rustix::stdio::dup2_stdin(&null);

@@ -10,16 +10,24 @@ version: 2
 # person, in a commit that carries whatever else the bump broke.
 #
 # What that leaves unattended is a compiler-side fix nobody notices. It is the dependency
-# tree — everybody else's code, which is the larger surface — that the weekly `advisories`
-# job in .github/workflows/ci.yml watches on a timer, precisely because those move without
-# this repository moving.
+# tree — everybody else's code, which is the larger surface — that the weekly `schedule:` in
+# .github/workflows/ci.yml watches on a timer, running the whole workflow and with it
+# `cargo deny check advisories`, precisely because those move without this repository moving.
 updates:
   # Action majors are tracked by a moving tag, minors are not; without this the
   # workflow silently ages.
+  #
+  # The two artifact actions are grouped because one hands its output to the other, and
+  # ungrouped they arrive as separate pull requests: the `download-artifact` half goes green
+  # on its own, `publish` being tag-gated, so a major that no longer reads what the other
+  # wrote is not discovered until the tag that needed it.
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: monthly
+    groups:
+      artifacts:
+        patterns: ["actions/upload-artifact", "actions/download-artifact"]
 
   # The dependency tree is small and the binary ships to servers, so take patches.
   # Grouped: separate PRs per crate is noise at this size.

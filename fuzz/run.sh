@@ -1,8 +1,8 @@
 #!/bin/sh
 # Runs one of fuzz/fuzz_targets/ under libFuzzer:
 #
-#   sh fuzz/run.sh frame                      until it crashes or you stop it
-#   sh fuzz/run.sh header -max_total_time=60  time-boxed, as .github/workflows/ci.yml does
+#   sh fuzz/run.sh frame                     until it crashes or you stop it
+#   sh fuzz/run.sh frame -max_total_time=60  time-boxed, as .github/workflows/ci.yml does
 #
 # Anything after the target name goes to libFuzzer. A finding lands in
 # fuzz/artifacts/<target>/ and is replayed with `cargo fuzz run <target> <that file>`.

@@ -301,11 +301,7 @@ impl<'a> Frame<'a> {
         out.extend_from_slice(&[0; HEADER_LEN]);
         self.encode_payload(out)?;
 
-        // The cap is compared in `usize`: narrowing *first* and testing the result reports
-        // every payload past 4 GiB as `PayloadTooLarge(u32::MAX)`, a length nothing
-        // counted, and `tests/codec.rs` holds the decode direction to reporting only what
-        // it read. The saturation below outlives that only because `PayloadTooLarge`
-        // carries a `u32`, and reaching it needs a caller in this process handing over a
+        // The saturation is reachable only from a caller in this process handing over a
         // 4 GiB field — never a peer, whose frames `decode_header` has already bounded.
         let payload_len = out.len() - start - HEADER_LEN;
         let len = u32::try_from(payload_len).unwrap_or(u32::MAX);
@@ -313,18 +309,11 @@ impl<'a> Frame<'a> {
             return Err(ProtoError::PayloadTooLarge(len));
         }
         let header = encode_header(self.frame_type(), len)?;
-        // Unreachable after the `extend_from_slice`; fallible for `indexing_slicing`. The
-        // complaint names the encoder rather than the peer: `Malformed` is what `Conn::send`
-        // would turn into a wire error, and nothing arriving on a socket can reach here.
-        let Some(slot) = out
-            .get_mut(start..)
-            .and_then(<[u8]>::first_chunk_mut::<HEADER_LEN>)
-        else {
-            return Err(ProtoError::Malformed(
-                "encoder invariant: the reserved header slot went missing",
-            ));
-        };
-        *slot = header;
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "`extend_from_slice` above reserved this slot; `encode_payload` only appends"
+        )]
+        out[start..start + HEADER_LEN].copy_from_slice(&header);
         Ok(())
     }
 

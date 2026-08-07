@@ -3,36 +3,23 @@ name: CI
 on:
   push:
     branches: [main]
-    # A `v*` tag publishes a release: the `publish` job promotes the exact bytes the release
-    # job built, so the published checksums are the ones the size gate computed over. A
+    # A `v*` tag publishes a release: `publish` promotes the exact bytes `release` built. A
     # rebuild would be byte-identical by § 8, but "would be" is a claim and this is not one.
     tags: ['v*']
-  # No `paths-ignore`. It used to carry `['**/*.md', 'LICENSE']`, which was wrong whichever
-  # way it was read. As spelled it matched nothing: `**` matches any run of characters and the
-  # `/` after it is literal, so `**/*.md` wants a markdown file in a subdirectory, and all five
-  # tracked ones are at the root — the documented spelling for "any markdown anywhere" is
-  # `**.md`. Spelled that way it would have worked, and working is the worse outcome: it skips
-  # every job on a documentation-only pull request, and a documentation-only change is exactly
-  # what `scripts/check-references.sh` is for — the one hook that can fail on a commit touching
-  # no Rust at all. Gone, no pull request skips a job, so a required check cannot sit
-  # "expected" for ever and branch protection can be turned on.
+  # No `paths-ignore`: a job a pull request skips leaves a required check sitting "expected" for
+  # ever, and a documentation-only commit is exactly what scripts/check-references.sh is for.
   pull_request:
-  # cargo-deny's advisory database moves while this tree stands still, and dependabot bumps
-  # monthly, so without a timer an advisory published on Tuesday waits for whoever pushes
-  # next. Weekly: two direct dependencies do not earn a daily run of anything. The whole
-  # workflow runs, rather than a cut-down advisories job beside it: `check` already runs
-  # `cargo deny check advisories`, and a second copy of a job's provisioning is two `if:`
-  # conditions that have to stay each other's complement. `publish` sits it out on its own
-  # `startsWith(github.ref, 'refs/tags/v')`.
+  # The advisory database moves while this tree stands still and dependabot bumps monthly, so
+  # without a timer an advisory published on Tuesday waits for whoever pushes next. Weekly, two
+  # direct dependencies not earning a daily run of anything.
   schedule:
     - cron: '17 4 * * 1'
-  # The release job's artifacts expire, and it is the only producer of the
-  # per-architecture binaries and their checksums. Without this, getting them back
-  # means an empty commit.
+  # The release job's artifacts expire and nothing else produces the per-architecture binaries or
+  # their checksums; without this, getting them back means an empty commit.
   workflow_dispatch:
 
-# Cancel superseded branch runs; let `main` finish, since each commit there is a
-# distinct set of musl artifacts that nothing else produces.
+# Cancel superseded branch runs; let `main` finish, since each commit there is a distinct set of
+# musl artifacts that nothing else produces.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -42,51 +29,39 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # A failure in the PTY suite is awkward to reproduce off the runner, so keep the
-  # backtrace in the log.
+  # A failure in the PTY suite is awkward to reproduce off the runner, so keep the backtrace.
   RUST_BACKTRACE: 1
 
-# Every action is pinned to a commit, not a tag: a tag is a mutable pointer in someone else's
-# repository, and the release job builds the binaries whose SHA-256 the client pins. The
-# version rides in the trailing comment. `actions/*` are pinned too — being GitHub's own puts
-# them inside the trust boundary but leaves the pointer just as mutable, and `download-artifact`
-# feeds the one job holding `contents: write`. Dependabot's `github-actions` ecosystem updates
-# a SHA pin and its comment together, so this costs nothing after the first commit.
+# Every action pinned to a commit, GitHub's own included: a tag is a mutable pointer in someone
+# else's repository, and `download-artifact` feeds the one job holding `contents: write`.
 jobs:
   # One job, so the workspace and its dependencies are compiled against a single cache.
   check:
     name: fmt, clippy, tests
     runs-on: ubuntu-latest
-    # The session tests spawn a real PTY, shells and unix sockets; a wedged child
-    # would otherwise hold the runner for the six-hour default.
+    # A wedged PTY child would otherwise hold the runner for the six-hour default.
     timeout-minutes: 20
-    # Job-level rather than per step, so every cargo below sees one value: RUSTFLAGS is part
-    # of cargo's fingerprint and of the rust-cache key, and a step that differed would
-    # rebuild from cold. Why the deny lives here rather than in [workspace.lints] is in
-    # Cargo.toml. Not on the release job, whose script sets CARGO_ENCODED_RUSTFLAGS — which
-    # makes cargo ignore RUSTFLAGS entirely, so a deny there would be silently absent.
-    #
-    # RUSTDOCFLAGS beside it rather than inline on the `cargo doc` step, because RUSTFLAGS
-    # does not reach rustdoc at all: the two steps below that run one — `cargo doc` and
-    # `cargo test --doc` — would otherwise disagree about whether a rustdoc warning is fatal,
-    # and only one of them would have been chosen deliberately. Measured, so the limit is
-    # written down rather than assumed: this does *not* make a warning inside a doctest fatal.
-    # Neither variable does. Denying those is `#![doc(test(attr(deny(warnings))))]` on the
-    # crate, and nothing here substitutes for it.
+    # Job-level rather than per step, so every cargo below sees one value: RUSTFLAGS is part of
+    # cargo's fingerprint and of the rust-cache key, and a step that differed would rebuild from
+    # cold. Why the deny lives here rather than in [workspace.lints] is in Cargo.toml. Not on the
+    # release job, whose script sets CARGO_ENCODED_RUSTFLAGS — which makes cargo ignore RUSTFLAGS
+    # entirely, so a deny there would be silently absent. RUSTDOCFLAGS beside it because RUSTFLAGS
+    # does not reach rustdoc at all. Measured: neither makes a warning *inside* a doctest fatal,
+    # which needs `#![doc(test(attr(deny(warnings))))]` on the crate.
     env:
       RUSTFLAGS: -D warnings
       RUSTDOCFLAGS: -D warnings
     steps:
-      # `persist-credentials: false`: nothing in this workflow pushes, and the default
-      # leaves the job token in .git/config while a step below executes `entry:` shell out
-      # of the pull request's own .pre-commit-config.yaml.
+      # `persist-credentials: false`: nothing in this workflow pushes, and the default leaves the
+      # job token in .git/config while a step below executes `entry:` shell out of the pull
+      # request's own .pre-commit-config.yaml.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # A tag naming a version nobody bumped otherwise burns every job in this workflow
-      # before failing on a one-line comparison. The `publish` job asks the built binary the
-      # same question and remains the authority; this only moves the answer an hour earlier.
+      # A tag naming a version nobody bumped otherwise burns every job in this workflow before
+      # failing on a one-line comparison. `publish` asks the built binary the same question and
+      # remains the authority.
       - name: Check the tag names the workspace version
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
@@ -104,26 +79,22 @@ jobs:
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-      # Prebuilt binaries; `cargo install` would build each from source on every
-      # cache miss. Every one pinned, so what fails a build is a version named here rather
-      # than whatever the tool released this week: a shellcheck or clippy-adjacent tool that
-      # lands a new check turns a green tree red with no commit behind it. Dependabot does
-      # not read these — the `github-actions` ecosystem updates the `uses:` SHA above and
-      # nothing inside `with:` — so they are bumped by hand, which is the point.
+      # Prebuilt; `cargo install` would build each from source on every cache miss. Pinned, so a
+      # tool that lands a new check cannot turn a green tree red with no commit behind it;
+      # dependabot does not read inside `with:`, so these move by hand.
       - uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9
         with:
           tool: cargo-nextest@0.9.143,cargo-deny@0.20.2,prek@0.4.12,shellcheck@0.11.0
 
-      # Advisories, because dependabot bumps monthly and a CVE does not wait; licences and
-      # sources, because the binary ships other people's object code. `--locked`, and before
-      # the subcommand where it is cargo-deny's own option: this is the job's first cargo and
-      # it shells out to `cargo metadata`, which rewrites a stale lock to make itself work.
-      - run: cargo deny --locked check advisories bans licenses sources
+      # Advisories alone — bans, licences and sources are the cargo-deny hook's, run by prek
+      # below; this one fetches a database over the network where a hook may not. `--locked`
+      # before the subcommand, where it is cargo-deny's own option: this is the job's first cargo
+      # and it shells out to `cargo metadata`, which rewrites a stale lock to make itself work.
+      - run: cargo deny --locked check advisories
 
-      # The released binary, by checksum. Built from source it would need a Go
-      # toolchain — the only one this tree has any use for — and the image's Go is an
-      # unpinned input, so a release raising its Go floor breaks hook *installation*
-      # and takes clippy, doc and the tests below with it before any of them run.
+      # The released binary, by checksum: from source it needs a Go toolchain, and the image's Go
+      # is an unpinned input — a release raising its Go floor would break hook *installation* and
+      # take clippy, doc and the tests below with it before any of them run.
       - name: install actionlint
         env:
           VERSION: 1.7.12
@@ -137,97 +108,76 @@ jobs:
           tar -xzf "$tarball" -C "$HOME/.local/bin" actionlint
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      # The gate itself, from .pre-commit-config.yaml, so a hook and the CI step
-      # enforcing it cannot say different things. `--skip cargo-nextest`: the step
-      # below runs a strict superset of that hook, and the session suite is too slow
-      # to run twice. shellcheck and actionlint are both on $PATH by here.
+      # The gate itself, from .pre-commit-config.yaml. `--skip cargo-nextest`: the step below runs
+      # a strict superset of that hook, and the session suite is too slow to run twice.
       - run: prek run --all-files --skip cargo-nextest
 
       # rustdoc's lints are a namespace of their own, reached by neither the clippy hook nor
       # RUSTFLAGS, and a renamed item turns a link into nothing rather than into an error.
-      # `--document-private-items` because the binary is almost entirely private; `--lib
-      # --bins` because a bare `cargo doc` documents only the lib when both share a name.
+      # `--document-private-items` because the binary is almost entirely private; `--lib --bins`
+      # because a bare `cargo doc` documents only the lib when both share a name.
       - run: cargo doc --locked --workspace --no-deps --document-private-items --lib --bins
 
-      # nextest cannot run doctests, so they need a pass of their own or doc examples go
-      # unexercised. Here rather than in a hook: the workspace has one, which is not worth a
-      # cargo front-end invocation on every commit that touches a `*.rs`.
+      # nextest cannot run doctests, so they need a pass of their own. Here rather than in a hook:
+      # the workspace's one is not worth a cargo front-end invocation on every commit.
       - run: cargo test --locked --doc --workspace
 
       # The cargo-nextest hook's command plus the two flags that only make sense here.
-      # `--run-ignored all`: the one ignored test sits out a real reaping timeout,
-      # the 30 s first-attach one. Too slow for a pre-commit hook, exactly what
-      # CI is for.
-      # `--no-fail-fast`: one failure should not hide the state of everything
-      # else, which is most of the value of a CI run over a local one.
+      # `--run-ignored all`: the one ignored test sits out a real 30 s first-attach reaping
+      # timeout, too slow for a hook. `--no-fail-fast`: one failure should not hide the state of
+      # everything else, which is most of the value of a CI run over a local one.
       - run: cargo nextest run --locked --workspace --run-ignored all --no-fail-fast
 
-  # Sixty seconds a target is not a search, and this job does not pretend to be one. What it
-  # checks is that fuzz/ still compiles and still passes over its committed seeds — which is
-  # what rots between the days somebody actually fuzzes, that workspace sitting outside the
-  # root one and so outside every hook but `cargo fmt`. The search is `sh fuzz/run.sh frame`
-  # with no bound, on a machine that has the time.
-  #
-  # No corpus carried between runs. A cache restored from the last green commit would make
-  # what this job covers a function of what happened to be cached, which is not something a
-  # pull request can reason about, and a check whose coverage nobody can state is one this
-  # tree refuses elsewhere.
-  #
-  # Deliberately absent from `publish`'s `needs`: a tag must not depend on how many execs a
-  # runner managed. A crash still turns the run red, which is the part that matters.
+  # Sixty seconds is not a search and this job does not pretend to be one: it checks that fuzz/
+  # still compiles and still passes over its committed seeds, which is what rots in a workspace
+  # sitting outside the root one and so outside every hook but `cargo fmt`. No corpus is carried
+  # between runs — a cache restored from the last green commit would make what this job covers a
+  # function of what happened to be cached. Deliberately absent from `publish`'s `needs`: a tag
+  # must not depend on how many execs a runner managed, and a crash still turns the run red.
   fuzz:
     name: fuzz targets
     runs-on: ubuntu-latest
-    # Behind the gate rather than beside it, alone among the jobs here: this is the slowest
-    # thing in the workflow per unit of what it is likely to catch, and a tree that cannot
-    # pass clippy has nothing worth fuzzing.
+    # Behind the gate rather than beside it, alone among the jobs here: the slowest thing in the
+    # workflow per unit of what it is likely to catch, and a tree that cannot pass clippy has
+    # nothing worth fuzzing.
     needs: check
     timeout-minutes: 20
     steps:
-      # `persist-credentials: false`: the steps below execute fuzz/run.sh out of the pull
-      # request's own tree, which is the same hazard the check job names.
+      # `persist-credentials: false`, for the reason the check job gives.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # The stable pin from rust-toolchain.toml, which builds cargo-fuzz and lints the crate.
-      # No nightly step: fuzz/run.sh installs the one it names, as scripts/build-release.sh
-      # does for the release job and for the same reason — stated in two places the two can
-      # drift, and the cache key below follows the file that names it.
+      # The stable pin from rust-toolchain.toml, which builds cargo-fuzz and lints the crate. No
+      # nightly step: fuzz/run.sh installs the one it names, and stated in two places the two can
+      # drift; the cache key below follows the file that names it.
       - name: Install the pinned toolchain
         run: rustup toolchain install --profile minimal --no-self-update
 
-      # `workspaces: fuzz`, fuzz/ being a workspace of its own: its lock file and its target
-      # directory are both under there, and the default `.` would key this job's cache on a
-      # root workspace it never builds.
+      # `workspaces: fuzz`, fuzz/ being a workspace of its own: its lock file and target directory
+      # are both under there, and the default `.` would key this cache on one it never builds.
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: fuzz-${{ hashFiles('fuzz/run.sh') }}
           workspaces: fuzz
 
       # cargo-fuzz is in no install-action manifest, so `tool:` there falls through to
-      # cargo-binstall and ends up compiling it anyway, out of a store nothing pins. Compiled
-      # from crates.io at a version named here instead, on the same terms as the pins above.
-      # rust-cache keeps $CARGO_HOME/bin, so this is paid on a cold cache rather than per
-      # run, and cargo skips it outright when that version is already installed.
+      # cargo-binstall and compiles it anyway, out of a store nothing pins. From crates.io at a
+      # version named here instead; rust-cache keeps $CARGO_HOME/bin, so it is a cold-cache cost.
       - run: cargo install --locked cargo-fuzz@0.13.2
 
       # The only lint pass fuzz/ gets, the clippy hook reaching the root workspace alone. On
-      # stable and without a sanitizer, neither of which the crate needs to type-check, so
-      # this is the cheap build and the fuzz one below is not.
-      #
-      # The deny rides on the command rather than in a job-level RUSTFLAGS as the check job
-      # has it: cargo-fuzz composes its sanitizer flags on top of RUSTFLAGS, so a
-      # `-D warnings` set for the job would follow into the fuzz build and make a warning out
-      # of libfuzzer-sys or cc fail it.
+      # stable and without a sanitizer, neither of which the crate needs to type-check. The deny
+      # rides on the command rather than in a job-level RUSTFLAGS: cargo-fuzz composes its
+      # sanitizer flags on top of RUSTFLAGS, so one set for the job would follow into the fuzz
+      # build and make a warning out of libfuzzer-sys or cc fail it.
       - run: cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
 
       - run: sh fuzz/run.sh frame -max_total_time=60
-      - run: sh fuzz/run.sh header -max_total_time=60
 
-      # The input that crashed, which the log holds only as a hexdump. `cargo fuzz run
-      # <target> <this file>` replays it. `ignore`, not `error`: this step also runs when the
-      # clippy above is what failed, and that leaves no artifact behind.
+      # The input that crashed, which the log holds only as a hexdump; `cargo fuzz run <target>
+      # <this file>` replays it. `ignore`, not `error`: this step also runs when the clippy above
+      # is what failed, and that leaves no artifact behind.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: failure()
         with:
@@ -235,44 +185,34 @@ jobs:
           path: fuzz/artifacts/
           if-no-files-found: ignore
 
-  # The 400 KiB budget is correctness-adjacent — the cold upload happens over
-  # cellular — and is the one thing the local hooks cannot check.
+  # The 400 KiB budget is correctness-adjacent — the cold upload happens over cellular — and is
+  # the one thing the local hooks cannot check.
   release:
     name: musl release builds
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      # `persist-credentials: false`: the step below executes scripts/build-release.sh out of
-      # the pull request's own tree, which is the same hazard the check job names.
+      # `persist-credentials: false`, for the reason the check job gives.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # No toolchain step here: scripts/build-release.sh installs the nightly it names, its
-      # sources, llvm-tools and both musl targets itself, in one idempotent `rustup toolchain
-      # install`. It used to be stated in both places and the two could drift — the script
-      # would detect what this step had failed to install and print the command this step had
-      # already run. The script owns the target list and the compiler, so it owns fetching
-      # them, and the cache key follows the file that names it.
+      # No toolchain step: scripts/build-release.sh installs the nightly it names, its sources,
+      # llvm-tools and both musl targets itself, in one idempotent `rustup toolchain install`. It
+      # owns the target list and the compiler, so it owns fetching them, and the cache key follows
+      # the file that names it.
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: musl-${{ hashFiles('scripts/build-release.sh') }}
 
-      # Owns the target list and the size budget; exits non-zero if a binary is over.
       - run: sh scripts/build-release.sh
 
-      # The reproducibility claim, tested rather than approximated. `check_leaks` inside the
-      # script proves no *builder-specific path this script derived* survives in an artifact,
-      # which is a proxy: it cannot see a path rustc spelled differently from the environment
-      # the needles came out of. This builds the same commit a second time from a different
-      # checkout path, a different $CARGO_HOME and a different target directory, and requires
-      # the two SHA256SUMS to agree — which is the property the client actually depends on,
-      # since it pins those sums and a second machine has to arrive at them.
-      #
-      # `git archive HEAD` rather than a copy of the worktree: it is exactly the committed
-      # tree, and it leaves target/ behind so the rebuild is genuinely cold. RUSTUP_HOME is
-      # deliberately shared — the toolchain is an input both builds are meant to agree on,
-      # and it is $CARGO_HOME and the two paths that have to differ.
+      # `check_leaks` in that script proves only that no path *it* derived survives in an artifact;
+      # it cannot see one rustc spelled differently. This rebuilds the same commit from another
+      # checkout path, $CARGO_HOME and target directory and requires the two SHA256SUMS to agree,
+      # which is the property a client pinning them depends on. `git archive HEAD` is exactly the
+      # committed tree and leaves target/ behind, so the rebuild is cold; RUSTUP_HOME is shared on
+      # purpose, the toolchain being an input both builds are meant to agree on.
       - name: Rebuild from another path and compare the checksums
         run: |
           rebuild="$RUNNER_TEMP/nomux-rebuild"
@@ -287,12 +227,11 @@ jobs:
               exit 1
           fi
 
-      # The only place the shipping configuration is ever executed on a commit that is not
-      # a tag. Nothing in the check job builds `-Zbuild-std` with `-Cpanic=immediate-abort`,
-      # so without this a binary that does not start at all — a miscompiled std — passes
-      # every pull request and first fails on the tag that publishes it. Both of them: the
-      # tree has no `target_arch` cfg, so std and codegen are the whole divergence between
-      # the two. Static, so the runner runs one and qemu-user the other.
+      # The only place the shipping configuration runs on a commit that is not a tag: nothing in
+      # the check job builds `-Zbuild-std` with `-Cpanic=immediate-abort`, so a binary that does
+      # not start at all — a miscompiled std — would pass every pull request and first fail on the
+      # tag publishing it. Both, the tree having no `target_arch` cfg, so std and codegen are the
+      # whole divergence. Static, so the runner runs one and qemu-user the other.
       - name: Run the binaries that ship
         run: |
           sudo apt-get update -qq && sudo apt-get install -y qemu-user
@@ -300,21 +239,19 @@ jobs:
           target/dist/nomux-x86_64-unknown-linux-musl --version
           qemu-aarch64 target/dist/nomux-aarch64-unknown-linux-musl --version
 
-      # The checksums are the point of this job — the client pins one per
-      # architecture — so they have to outlive the log they were printed to. On a tag
-      # the release below is where they actually land; this keeps every other commit's
-      # set reachable for the ninety days an artifact lasts.
+      # The checksums are the point of this job — the client pins one per architecture — so they
+      # have to outlive the log they were printed to. On a tag the release below is where they
+      # land; this keeps every other commit's set reachable for the ninety days an artifact lasts.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: musl-binaries
           path: target/dist/
           if-no-files-found: error
 
-  # What P3 asked for: the checksums somewhere a client can read them, an artifact expiring
-  # after ninety days and sitting behind a login. Its own job because it `needs` both jobs
-  # above — so a tag cannot publish a release whose tests failed, where parallel jobs with no
-  # dependency would have raced — and because it is the only one that wants a write token,
-  # which is why the others keep the read-only one the header grants.
+  # What P3 asked for: the checksums somewhere a client can read them, an artifact expiring after
+  # ninety days and sitting behind a login. Its own job because it `needs` both jobs above — so a
+  # tag cannot publish a release whose tests failed — and because it is the only one that wants a
+  # write token, which is why the others keep the read-only one the header grants.
   publish:
     name: publish the release
     if: startsWith(github.ref, 'refs/tags/v')
@@ -324,31 +261,27 @@ jobs:
     permissions:
       contents: write
     steps:
-      # No checkout: everything published is in the artifact, and the tag is named by
-      # the ref rather than read out of the tree.
+      # No checkout: everything published is in the artifact, and the tag is named by the ref.
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: musl-binaries
           path: dist
 
-      # The check every download page asks a user to run, run here first — against the
-      # artifact that came back out of the store rather than the one that went in. It
-      # also settles what is present: `sha256sum -c` fails on a file it cannot open, so
-      # a manifest naming something the build did not emit stops here.
+      # The check every download page asks a user to run, run here first — against the artifact
+      # that came back out of the store rather than the one that went in. It also settles what is
+      # present: `sha256sum -c` fails on a file it cannot open.
       - name: Verify the artifact against its own checksums
         working-directory: dist
         run: sha256sum -c SHA256SUMS
 
-      # Artifacts do not carry the executable bit, and the step below runs one to ask its
-      # version. No bearing on what is published — every install path chmods it anyway.
+      # Artifacts do not carry the executable bit and the step below runs one; no bearing on what
+      # is published, every install path chmods it anyway.
       - run: chmod +x dist/nomux-*
 
-      # Asked of the artifact rather than read out of Cargo.toml — the tag's whole job is to
-      # name what these binaries are, and the x86_64 musl binary is static-pie on an x86_64
-      # runner, so the one witness to the version that ships can simply be asked. The `check`
-      # job compares the same tag against Cargo.toml an hour earlier; this is the authority.
-      # Before anything is published, because a tag cannot be quietly corrected: the sums
-      # under `v0.1.0` are what a client pins.
+      # Asked of the artifact rather than read out of Cargo.toml: the tag's whole job is to name
+      # what these binaries are, and the x86_64 musl binary is static-pie on an x86_64 runner, so
+      # the one witness can simply be asked. Before anything is published, a tag not being quietly
+      # correctable — the sums under `v0.1.0` are what a client pins.
       - name: Check the tag names the version the binaries report
         run: |
           built=$(dist/nomux-x86_64-unknown-linux-musl --version)
@@ -362,12 +295,10 @@ jobs:
               ;;
           esac
 
-      # `SHA256SUMS` goes up beside the binaries it covers, in the format `sha256sum -c` reads,
-      # so verifying needs no API and no tooling. GitHub also computes an immutable SHA-256 per
-      # asset, exposed as `digest` on the releases API — worth both, the file being portable and
-      # signed by nothing while the digest is GitHub's and unrewritable. The body carries the
-      # sums inline so the number a human compares is on the page they are reading already.
-      # `--verify-tag`, so a ref naming no tag fails rather than creating one nobody tagged.
+      # `SHA256SUMS` goes up beside the binaries it covers, in the format `sha256sum -c` reads, so
+      # verifying needs no API and no tooling. GitHub also computes an immutable SHA-256 per asset
+      # — worth both, the file being portable and signed by nothing while the digest is GitHub's
+      # and unrewritable. `--verify-tag`, so a ref naming no tag fails rather than creating one.
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -385,9 +316,9 @@ jobs:
               cat dist/SHA256SUMS
               echo '```'
           } > "$notes"
-          # Exactly what the manifest names, rather than a `dist/nomux-*` glob. Counted,
-          # because `set -e` does not see into a process substitution — a failed awk would
-          # publish a manifest and no binaries, and a tag cannot be amended.
+          # Exactly what the manifest names, rather than a `dist/nomux-*` glob. Counted, because
+          # `set -e` does not see into a process substitution — a failed awk would publish a
+          # manifest and no binaries, and a tag cannot be amended.
           mapfile -t assets < <(awk '{print "dist/" $2}' dist/SHA256SUMS)
           if [ "${#assets[@]}" -ne 2 ]; then
               echo "the manifest names ${#assets[@]} files, not the expected 2:" >&2

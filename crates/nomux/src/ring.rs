@@ -61,16 +61,14 @@ impl Ring {
             .extend(data.get(overflow - from_buf..).unwrap_or_default());
     }
 
-    /// Returns the retained bytes at and after `from`, as the two halves of the
-    /// underlying deque.
+    /// Returns the retained bytes at and after `from`, as the two halves of the underlying
+    /// deque.
     ///
-    /// `from` is clamped to [`Ring::base`], so a caller that has fallen behind
-    /// resumes at the oldest retained byte — check [`Ring::base`] first if that needs
-    /// reporting as a gap.
-    ///
-    /// The two stay in stream order, and either may be empty — including the *first*,
-    /// once `from` is past the front half — so a caller walking them must skip an
-    /// empty part rather than stop at one.
+    /// `from` is clamped to [`Ring::base`], so a caller that has fallen behind resumes at
+    /// the oldest retained byte — check [`Ring::base`] first if that needs reporting as a
+    /// gap. The two stay in stream order, and either may be empty — including the *first*,
+    /// once `from` is past the front half — so a caller walking them must skip an empty
+    /// part rather than stop at one.
     pub(crate) fn slices_from(&self, from: u64) -> [&[u8]; 2] {
         let skip = usize::try_from(from.saturating_sub(self.base)).unwrap_or(usize::MAX);
         let (front, back) = self.buf.as_slices();

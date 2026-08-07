@@ -106,6 +106,15 @@ pub(crate) const MAX_PID_LEN: usize = 32;
 /// keeps the id out of.
 pub(crate) const MAX_SESSION_ID_LEN: usize = 64;
 
+/// The longer of the two extensions this layout binds a socket at, `.sock` being the other.
+///
+/// What [`SessionPaths::in_dir`] measures an id against, since only these two names are ever
+/// addresses: `<id>.pid`, `<id>.label` and `<id>.lock` are plain files under no
+/// [`SUN_PATH_MAX`] bound at all. Measuring against one of those would let the sixth name
+/// § 6.6 invites tighten the id ceiling for nothing — or, were that name a socket with a
+/// longer extension, silently overrun it.
+const LONGEST_SOCKET_EXT: &str = ".agent";
+
 /// The value of environment variable `key`, but only where it names an **absolute**
 /// path.
 ///
@@ -318,17 +327,27 @@ fn is_valid_session_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
-/// The session a name in the run directory belongs to, if it belongs to one.
+/// A name in the run directory split into the session it belongs to and the extension saying
+/// which of that session's files it is: the id is what precedes the **first** `.`, and a name
+/// with no `.` is nobody's.
 ///
-/// The inverse of [`SessionPaths::with_extension`], and the one rule by which anything here
-/// learns an id from a directory rather than from a caller — the glob § 6.6 rests growth on,
-/// so the id is what precedes the **first** `.` and a name with no `.` is nobody's.
+/// The one rule by which anything here reads a filename, and the glob § 6.6 rests growth on.
+/// Spelt twice it stops being one rule, which is how a sixth filename comes to be found by
+/// discovery and missed by collection — the two readers are [`session_id_of`] and
+/// [`SessionPaths::removal_order`], and only the second wants the extension.
+fn split_run_name(path: &Path) -> Option<(&str, &str)> {
+    path.file_name()?.to_str()?.split_once('.')
+}
+
+/// The session a name in the run directory belongs to, if it belongs to one — the inverse of
+/// [`SessionPaths::with_extension`], and [`split_run_name`] without the extension.
 ///
 /// Validated before it is handed back ([`is_valid_session_id`], § 6.3): every caller derives
 /// a path, a probe or a signal from it, and these bytes came out of a directory.
 pub(crate) fn session_id_of(path: &Path) -> Option<&str> {
-    let (id, _extension) = path.file_name()?.to_str()?.split_once('.')?;
-    is_valid_session_id(id).then_some(id)
+    split_run_name(path)
+        .map(|(id, _)| id)
+        .filter(|id| is_valid_session_id(id))
 }
 
 /// Every distinct session id `dir` holds — one entry per session, not per file (§ 6.6) —
@@ -389,9 +408,9 @@ impl SessionPaths {
         }
         // A valid id is not enough: a 64-byte one under a deep enough run directory
         // overruns `SUN_PATH_MAX`. Refused here rather than at the `bind`, and against the
-        // longest name rather than `.sock` (§ 6.3), so no `SessionPaths` that exists can
-        // fail to build its own address.
-        let longest = dir.as_os_str().len() + "/".len() + id.len() + ".label".len();
+        // longest *socket* rather than `.sock` alone (§ 6.3), so no `SessionPaths` that
+        // exists can fail to build either of its addresses ([`LONGEST_SOCKET_EXT`]).
+        let longest = dir.as_os_str().len() + "/".len() + id.len() + LONGEST_SOCKET_EXT.len();
         if longest > SUN_PATH_MAX {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -576,36 +595,15 @@ impl SessionPaths {
                     OFlags::CREATE | reading,
                     Mode::from_bits_truncate(FILE_MODE),
                 )
-            })
-            // A read-only filesystem answers `O_CREAT` with `EROFS` whether or not the file
-            // is already there, so a `<id>.lock` sitting on one, perfectly lockable, was
-            // refused for the flag rather than for itself. Asked again without it, second
-            // rather than first because creating is the ordinary case and this costs a
-            // syscall only on the way to failing.
-            //
-            // The retry's own `ENOENT` is mapped back to `EROFS`: it means the name is
-            // absent *and* the mount will not create it, which is a fact about the
-            // filesystem and is what the arm below reports. Left as `ENOENT` it would fall
-            // to the catch-all and a read-only run directory would be blamed on descriptor
-            // limits by `spawn` and on another process by `kill`.
-            .or_else(|err| {
-                if err == rustix::io::Errno::ROFS {
-                    rustix::fs::open(&path, reading, Mode::empty()).map_err(|retry| {
-                        if retry == rustix::io::Errno::NOENT {
-                            rustix::io::Errno::ROFS
-                        } else {
-                            retry
-                        }
-                    })
-                } else {
-                    Err(err)
-                }
             });
             let fd = match opened {
                 Ok(fd) => fd,
-                // Past the retry, so the name really is absent and the mount really will
-                // not create it: a fact about the filesystem, and a different sentence
-                // from the one below.
+                // `EROFS` here means the name is *absent* and the mount will not create it,
+                // never that a `<id>.lock` already sitting there was refused for the flag:
+                // the kernel drops `O_CREAT` when it cannot take the write and reports the
+                // refusal only once the lookup comes back negative, so a lock on a read-only
+                // mount still opens and locks. A fact about the filesystem, and a different
+                // sentence from the one below.
                 Err(rustix::io::Errno::ROFS) => return Err(self.read_only_lock(&path)),
                 // A file no process of this uid can open is one no process can lock, so
                 // there is no mutex at this name for anybody.
@@ -738,12 +736,10 @@ impl SessionPaths {
         if let Ok(entries) = fs::read_dir(&self.dir) {
             order.extend(entries.filter_map(Result::ok).filter_map(|entry| {
                 let path = entry.path();
-                // [`session_id_of`]'s rule — the id is what precedes the *first* `.` — asked
-                // against an id already known instead of learned.
-                let mine = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .and_then(|name| name.split_once('.'))
+                // [`session_id_of`] validates because it learns an id from the directory;
+                // this compares against one checked when the `SessionPaths` was built, so
+                // the rule alone is what it needs.
+                let mine = split_run_name(&path)
                     .is_some_and(|(id, extension)| id == self.id && !ALREADY.contains(&extension));
                 mine.then_some(path)
             }));

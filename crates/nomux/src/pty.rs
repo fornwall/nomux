@@ -49,9 +49,8 @@ pub(crate) struct Pty {
     master: OwnedFd,
     child: Child,
     /// The child's start time, read once at spawn — the other half of its identity, for
-    /// [`Pty::pid_reissued`], which has what a `None` costs: on a host where `/proc`
-    /// could not answer there is no identity to hold a pid against, ever, and the reaches
-    /// that rest on one are given up rather than made on the pid alone.
+    /// [`Pty::pid_reissued`], which has what a `None` costs and why it is not the whole of
+    /// the answer.
     started: Option<u64>,
 }
 
@@ -222,8 +221,8 @@ impl Pty {
 
     /// Terminates everything the session started, then the child itself.
     ///
-    /// Two reaches — the child's process group, then [`session`]'s `/proc` walk over its
-    /// session — because neither alone covers it, and in that order:
+    /// Two reaches — the child's process group, then [`signal_session`]'s `/proc` walk over
+    /// its session — because neither alone covers it, and in that order:
     /// `IMPLEMENTATION.md` § 6.5, which also has why every signal below is guarded by
     /// [`Pty::pid_reissued`].
     pub(crate) fn terminate(&mut self) {
@@ -234,7 +233,7 @@ impl Pty {
             // `group_alive` carries each probe's answer forward, so no signal below goes
             // to a group this has already watched go.
             let mut group_alive = rustix::process::test_kill_process_group(pid).is_ok();
-            let mut settled = !group_alive && session(raw, true).is_empty();
+            let mut settled = !group_alive && session_is_empty(raw);
             if !settled {
                 reach(pid, rustix::process::Signal::HUP, true);
                 signal_session(raw, rustix::process::Signal::HUP);
@@ -254,7 +253,7 @@ impl Pty {
                     // zombies — is ever consulted.
                     let _ = self.child.try_wait();
                     group_alive = rustix::process::test_kill_process_group(pid).is_ok();
-                    if !group_alive && session(raw, true).is_empty() {
+                    if !group_alive && session_is_empty(raw) {
                         settled = true;
                         break;
                     }
@@ -284,16 +283,22 @@ impl Pty {
     ///
     /// The two unknowns are not one unknown. A `/proc/<raw>` that cannot be read *now* is
     /// what a reaped shell with a surviving job leaves behind, and the start time taken at
-    /// spawn still says whose the number was, so that is deliberately not a reissue. A
-    /// missing start time from *spawn* is permanent — on a host where `/proc` could not be
-    /// read there is nothing to compare against for the whole of the session's life — and
-    /// it leaves the liveness probe as the only evidence, which is exactly the evidence a
-    /// stranger holding a recycled pid satisfies. So it answers `true` and the group is
-    /// left alone: the reach [`Pty::terminate`] gives up is over a child that has already
-    /// gone, and the alternative is `SIGKILL` to somebody else's process group.
-    fn pid_reissued(&self, raw: i32) -> bool {
+    /// spawn still says whose the number was, so that is deliberately not a reissue.
+    ///
+    /// A missing start time from *spawn* is permanent — one `EMFILE` while the master, the
+    /// slave and three dups were being opened, and there is nothing to compare against for
+    /// the rest of the session's life — but permanent is not the same as no evidence. An
+    /// unreaped child still owns its number, the zombie holding it until somebody waits,
+    /// which is the fact [`Pty::terminate`]'s grace loop already leans on where reaping is
+    /// what frees the pid. So the child is asked, and only a *collected* one falls through
+    /// to `true`: there the liveness probe is all that is left, which is exactly the
+    /// evidence a stranger holding a recycled pid satisfies, and the reach given up is over
+    /// a child that has indeed gone. Answering on the failed read alone would have given up
+    /// both reaches over a shell that is still running — § 6.5's orphan by the very route
+    /// the walk exists to close.
+    fn pid_reissued(&mut self, raw: i32) -> bool {
         let Some(ours) = self.started else {
-            return true;
+            return !matches!(self.child.try_wait(), Ok(None));
         };
         start_time(raw).is_some_and(|now| ours != now)
     }
@@ -322,12 +327,21 @@ fn start_time(pid: i32) -> Option<u64> {
 /// Individually, because a session is not something `kill(2)` addresses — its
 /// negative-pid form means a process *group*, and the point here is precisely the
 /// groups job control created that nobody is tracking.
+///
+/// Sent from inside the walk rather than over a set collected by it, which is as narrow as
+/// this gets without a pidfd: nothing re-checks a member between its `stat` line claiming
+/// the session and the `kill`, and [`Pty::pid_reissued`] guards the child's own pid and no
+/// member's, so a member that exits in that window takes the signal on a number somebody
+/// else now holds. Collecting first stretched the window to the rest of the walk plus every
+/// signal ahead of this one. Entries going while the walk runs is already the ordinary case
+/// — the process-group reach precedes it — and a `stat` that cannot be read drops its pid.
 fn signal_session(sid: i32, signal: rustix::process::Signal) {
-    for member in session(sid, false) {
+    walk_session(sid, |member| {
         if let Some(pid) = rustix::process::Pid::from_raw(member) {
             reach(pid, signal, false);
         }
-    }
+        true
+    });
 }
 
 /// Sends one signal, to `pid`'s process group where `group` and to `pid` alone otherwise.
@@ -409,20 +423,18 @@ fn walk_session(sid: i32, mut visit: impl FnMut(i32) -> bool) {
     }
 }
 
-/// Pids of the live processes in session `sid`, from `/proc` — all of them, or the first
-/// alone where `stop_at_first`.
+/// Whether nothing live is left in session `sid`.
 ///
-/// [`signal_session`] wants the whole set, signalling after the walk rather than during
-/// it. [`Pty::terminate`]'s grace loop only ever asks whether anything is left, so it
-/// stops the walk there rather than reading every remaining `/proc/<pid>/stat` to answer
-/// a question the first member has already answered.
-fn session(sid: i32, stop_at_first: bool) -> Vec<i32> {
-    let mut members = Vec::new();
-    walk_session(sid, |pid| {
-        members.push(pid);
-        !stop_at_first
+/// The walk stops at the first member rather than reading every remaining
+/// `/proc/<pid>/stat` to answer a question that one has already answered:
+/// [`Pty::terminate`]'s grace loop asks this every [`HANGUP_POLL_INTERVAL`].
+fn session_is_empty(sid: i32) -> bool {
+    let mut empty = true;
+    walk_session(sid, |_| {
+        empty = false;
+        false
     });
-    members
+    empty
 }
 
 /// The fields of one `/proc/<pid>/stat` from the third onwards: state, ppid, pgrp,
@@ -619,7 +631,7 @@ mod tests {
         let sid = rustix::process::getsid(None)
             .expect("this process's own session id, which the kernel cannot refuse");
         let sid = rustix::process::Pid::as_raw(Some(sid));
-        let members = session(sid, false);
+        let members = session_members(sid);
         let self_pid = as_pid(std::process::id());
         assert!(
             !members.contains(&self_pid),
@@ -729,8 +741,7 @@ mod tests {
         // Deterministic rather than hopeful: a pid stays reserved while anything still
         // names it as a session.
         assert!(
-            rustix::process::test_kill_process_group(pid).is_err()
-                && session(raw, false).is_empty(),
+            rustix::process::test_kill_process_group(pid).is_err() && session_is_empty(raw),
             "nothing of the session may be left, or this is the other case"
         );
         drop(reaches_since());
@@ -793,7 +804,7 @@ mod tests {
              about cannot happen"
         );
         assert!(
-            session(raw, false).is_empty(),
+            session_is_empty(raw),
             "the zombie must be all that is left, or the grace is owed either way"
         );
 
@@ -810,6 +821,18 @@ mod tests {
             "terminate reached for SIGKILL over a session whose last member was the \
              zombie it had been handed to reap: {sent:?}"
         );
+    }
+
+    /// Every pid [`walk_session`] offers for `sid`, which nothing outside the tests
+    /// collects: [`signal_session`] signals inside the walk and [`session_is_empty`] stops
+    /// at the first member.
+    fn session_members(sid: i32) -> Vec<i32> {
+        let mut members = Vec::new();
+        walk_session(sid, |pid| {
+            members.push(pid);
+            true
+        });
+        members
     }
 
     /// The signals [`reach`] has sent since this was last asked, and none from here on.

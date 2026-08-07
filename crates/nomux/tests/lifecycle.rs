@@ -153,9 +153,9 @@ fn a_child_killed_by_a_signal_is_reported_as_signalled_rather_than_as_a_status()
 ///
 /// `pump_output` is the only place the `Exit` frame is built, and `collect_status`
 /// used to run at the top of `event_loop` — one whole iteration earlier.
-/// `poll_timeout` clamps the sleep to `STATUS_RETRY` only while the status is still
-/// outstanding, so the pass that finally collected one no longer qualified for the
-/// clamp, and by then the master had already left the poll set with the child.
+/// `poll_timeout` carries a wakeup at `STATUS_GRACE` only while the status is still
+/// outstanding, so the pass that finally collected one no longer qualified for it,
+/// and by then the master had already left the poll set with the child.
 ///
 /// A session outlives its child on the idle rule alone (§ 6.5), and nothing between
 /// the exit and that deadline wakes the daemon: with the master out of the poll set,
@@ -310,7 +310,7 @@ fn a_shell_that_exits_behind_a_background_job_is_still_reaped() {
 /// goes is the test's to say rather than a wall clock's.
 ///
 /// Nothing supplies the pass the reap happens on, as in the sibling — and here
-/// nothing else could: `poll_timeout` stops clamping to `STATUS_RETRY` the moment
+/// nothing else could: `poll_timeout` drops its `STATUS_GRACE` wakeup the moment
 /// `exited` is set, so a session left holding a zombie sleeps on to `IDLE_TICK`. The
 /// `SIGCHLD` the real exit delivers is the whole of the wakeup, and the wait below is
 /// for what it sets off.

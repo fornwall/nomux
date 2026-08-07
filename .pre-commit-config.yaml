@@ -40,7 +40,7 @@ repos:
         files: '\.(rs|md|sh|toml|ya?ml)$|^scripts/'
         pass_filenames: false
 
-      # ci.yml carries ~60 lines of embedded shell that the hook below never sees —
+      # ci.yml carries ~50 lines of embedded shell that the hook below never sees —
       # it matches `*.sh`. actionlint shellchecks every `run:` block and validates the
       # workflow schema besides, which is the half of that file nothing else reads.
       #
