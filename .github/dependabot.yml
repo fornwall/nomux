@@ -13,8 +13,8 @@ version: 2
 # .github/workflows/ci.yml watches on a timer, running the whole workflow and with it
 # `cargo deny check advisories`, precisely because those move without this repository moving.
 updates:
-  # Action majors are tracked by a moving tag, minors are not; without this the
-  # workflow silently ages.
+  # The executable actions are commit-pinned, so Dependabot is what moves each pin. Daily checks
+  # keep that supply chain current; grouping keeps the resulting pull-request stream small.
   #
   # The two artifact actions are grouped because one hands its output to the other, and
   # ungrouped they arrive as separate pull requests: the `download-artifact` half goes green
@@ -23,28 +23,40 @@ updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: monthly
+      interval: daily
+      time: "05:17"
+      timezone: Europe/Stockholm
     groups:
       artifacts:
         patterns: ["actions/upload-artifact", "actions/download-artifact"]
+      minor-and-patch-actions:
+        patterns: ["*"]
+        exclude-patterns: ["actions/upload-artifact", "actions/download-artifact"]
+        update-types: ["minor", "patch"]
 
-  # The dependency tree is small and the binary ships to servers, so take patches.
-  # Grouped: separate PRs per crate is noise at this size.
+  # The dependency tree is small and the binary ships to servers. Minor and patch updates are one
+  # auto-merge candidate; major updates remain individual PRs for deliberate review.
   #
   - package-ecosystem: cargo
     directory: /
     schedule:
-      interval: monthly
+      interval: daily
+      time: "05:27"
+      timezone: Europe/Stockholm
     groups:
-      cargo:
+      minor-and-patch-cargo:
         patterns: ["*"]
+        update-types: ["minor", "patch"]
 
   # Separate lockfile and policy: these crates do not ship, but their build scripts execute
   # on developer and CI machines and should not silently age outside the advisory gate.
   - package-ecosystem: cargo
     directory: /fuzz
     schedule:
-      interval: monthly
+      interval: daily
+      time: "05:37"
+      timezone: Europe/Stockholm
     groups:
-      fuzz-cargo:
+      minor-and-patch-fuzz-cargo:
         patterns: ["*"]
+        update-types: ["minor", "patch"]

@@ -9,7 +9,7 @@ on:
   # No `paths-ignore`: a job a pull request skips leaves a required check sitting "expected" for
   # ever, and a documentation-only commit is exactly what scripts/check-references.sh is for.
   pull_request:
-  # The advisory database moves while this tree stands still and dependabot bumps monthly, so
+  # The advisory database moves while this tree stands still and Dependabot bumps daily, so
   # without a timer an advisory published on Tuesday waits for whoever pushes next. Weekly, two
   # direct dependencies not earning a daily run of anything. The timer exists for `cargo deny
   # check advisories` alone: `fuzz` and `release` skip scheduled runs below, `publish` is
@@ -47,7 +47,7 @@ jobs:
   # One job, so the workspace and its dependencies are compiled against a single cache.
   check:
     name: fmt, clippy, tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # A wedged PTY child would otherwise hold the runner for the six-hour default.
     timeout-minutes: 20
     # Job-level rather than per step, so every cargo below sees one value: RUSTFLAGS is part of
@@ -159,7 +159,7 @@ jobs:
   # explored, not whether a crash already found in this run is safe to publish alongside.
   fuzz:
     name: fuzz targets
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # The weekly schedule exists for the advisory check alone; see the trigger comment above.
     if: github.event_name != 'schedule'
     # Behind the gate rather than beside it, alone among the jobs here: the slowest thing in the
@@ -214,7 +214,7 @@ jobs:
   # the one thing the local hooks cannot check.
   release:
     name: musl release builds
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # The weekly schedule exists for the advisory check alone; see the trigger comment above.
     if: github.event_name != 'schedule'
     timeout-minutes: 30
@@ -296,7 +296,7 @@ jobs:
     name: publish the release
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [check, fuzz, release]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
