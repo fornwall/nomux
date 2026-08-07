@@ -81,19 +81,13 @@ fn main() -> ExitCode {
         // worker channel as stdin and interprets this errno-shaped status; it is kept
         // out of `USAGE` because it is not a user or client mode.
         Some(word @ "__relay-stdout") => only(args, word, stdout_worker),
-        Some(word @ "daemon") => with_session(word, args, |session, label, lock_fd| {
+        Some(word @ "daemon") => with_session(word, args, true, |session, label, lock_fd| {
             report(daemon::run(session, label, lock_fd))
         }),
-        Some(word @ "spawn") => with_session(word, args, |session, label, lock_fd| {
-            if lock_fd.is_some() {
-                return internal_option_error(word);
-            }
+        Some(word @ "spawn") => with_session(word, args, false, |session, label, _| {
             report_relay(attach::run(session, attach::Intent::Create(label)))
         }),
-        Some(word @ "attach") => with_session(word, args, |session, label, lock_fd| {
-            if lock_fd.is_some() {
-                return internal_option_error(word);
-            }
+        Some(word @ "attach") => with_session(word, args, false, |session, label, _| {
             // Refused rather than dropped on the floor: a `--label` on `attach` is a
             // caller that still believes `attach` might create the session.
             if label.is_some() {
@@ -104,10 +98,7 @@ fn main() -> ExitCode {
             }
             report_relay(attach::run(session, attach::Intent::Resume))
         }),
-        Some(word @ "kill") => with_session(word, args, |session, label, lock_fd| {
-            if lock_fd.is_some() {
-                return internal_option_error(word);
-            }
+        Some(word @ "kill") => with_session(word, args, false, |session, label, _| {
             if label.is_some() {
                 return usage_error(Some(
                     "`kill` takes no `--label`: labels are recorded only when a session is created",
@@ -165,19 +156,19 @@ fn usage_error(message: Option<&str>) -> ExitCode {
 /// The command line the four modes that take a session id share, parsed once and handed
 /// to whichever of them `main` matched.
 ///
-/// `word` is that mode, carried only so a refusal can name it. What each mode then does
-/// with the id and the label is its own arm above, which is where the one match on the
-/// mode is: a fifth would be a fifth arm there and nothing else.
+/// `word` is that mode, carried only so a refusal can name it. `lock_fd_ok` is passed by
+/// the daemon arm alone: everywhere else `--lock-fd` is an unknown option.
 fn with_session(
     word: &str,
     args: impl Iterator<Item = OsString>,
+    lock_fd_ok: bool,
     run: impl FnOnce(&str, Option<&str>, Option<i32>) -> ExitCode,
 ) -> ExitCode {
     let SessionArgs {
         session,
         label,
         lock_fd,
-    } = match parse_session_args(args) {
+    } = match parse_session_args(args, lock_fd_ok) {
         Ok(parsed) => parsed,
         Err(message) => return usage_error(Some(&message)),
     };
@@ -196,16 +187,15 @@ struct SessionArgs {
     lock_fd: Option<i32>,
 }
 
-/// Refuses the private descriptor handoff outside daemon mode.
-fn internal_option_error(word: &str) -> ExitCode {
-    usage_error(Some(&format!("`--lock-fd` is not valid for `{word}`")))
-}
-
-/// Splits a session-mode command line into its id and optional label.
+/// Splits a session-mode command line into its id and optional label — and, only where
+/// `lock_fd_ok`, the private `--lock-fd` handoff.
 ///
 /// Deliberately minimal — no argument parser, no abbreviations, no `--` handling.
 /// The only caller is the client, which builds this command line itself.
-fn parse_session_args(mut args: impl Iterator<Item = OsString>) -> Result<SessionArgs, String> {
+fn parse_session_args(
+    mut args: impl Iterator<Item = OsString>,
+    lock_fd_ok: bool,
+) -> Result<SessionArgs, String> {
     let mut session = None;
     let mut label = None;
     let mut lock_fd = None;
@@ -215,12 +205,12 @@ fn parse_session_args(mut args: impl Iterator<Item = OsString>) -> Result<Sessio
             .to_str()
             .ok_or_else(|| format!("argument `{}` must be valid UTF-8", arg.display()))?;
         let value = match text.split_once('=') {
-            Some(("--lock-fd", value)) => {
+            Some(("--lock-fd", value)) if lock_fd_ok => {
                 parse_lock_fd(value, &mut lock_fd)?;
                 continue;
             }
             Some(("--label", value)) => value.to_owned(),
-            _ if text == "--lock-fd" => {
+            _ if lock_fd_ok && text == "--lock-fd" => {
                 let value = args
                     .next()
                     .ok_or_else(|| "missing `--lock-fd` value".to_owned())?;

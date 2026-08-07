@@ -61,13 +61,6 @@ const PUBLISH_POLL_INTERVAL: Duration = Duration::from_millis(1);
 /// can be holding: a direction is polled for reading only while [`Pump::has_data`] is
 /// false, so it reads again only once what it read last has gone, which is why neither of
 /// the two needs a cap of its own.
-///
-/// Copied through, where this used to reach for `splice(2)` first and fall back: one
-/// memcpy of this size per this many bytes of session traffic, against the AES the same
-/// bytes meet one hop away, on a relay that exists only on hosts that could not open a
-/// `direct-streamlocal` channel — and the fast path engaged only where exactly one of
-/// stdin and stdout was a pipe. What it cost was the one state a reader of this file had
-/// to hold that nothing else here needs: a destination full with nothing buffered.
 const RELAY_CHUNK: usize = 16 * 1024;
 
 /// Whether this invocation may bring the session into being — the whole of the
@@ -443,14 +436,6 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
                 watched += 1;
             }
         }
-        // Unreachable: stdout is watched while `to_stdout` holds bytes and the socket
-        // while it does not, so one of the two is always registered unless the socket is
-        // closed — and a closed socket with nothing left for stdout is the `while` above.
-        // Kept: what it stands between is a `poll` on an empty set, which blocks for ever.
-        if watched == 0 {
-            break;
-        }
-
         // No deadline of our own: the relay lives exactly as long as the channel,
         // and every wakeup it can act on is a readiness event.
         match rustix::event::poll(fds.get_mut(..watched).unwrap_or(&mut []), None) {

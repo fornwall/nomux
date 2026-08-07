@@ -50,11 +50,8 @@ fn state_of(dir: &Path, user: &str) -> Linger {
 
 /// The login name, used as a filename component under [`LINGER_DIR`].
 ///
-/// `$USER`, then `$LOGNAME`, and nothing else. The password database used to sit in front
-/// of them and could never decide anything: [`detect`] answers `Unknown` without asking
-/// unless [`SYSTEMD_MARKER`] is there, and a host running `logind` is one where PAM has
-/// set both variables — so it bought a second parse of `/etc/passwd` per session and no
-/// answer that these two did not already give.
+/// `$USER`, then `$LOGNAME`, and nothing else — a host running `logind` is one where PAM
+/// has set both, so the password database has no answer these two do not already give.
 ///
 /// Empty, `/`, NUL, `.` and `..` are refused because this name is joined onto a system
 /// directory and `$USER` is the environment's to set: anything but a single component
