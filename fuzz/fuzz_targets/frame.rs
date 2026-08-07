@@ -1,8 +1,10 @@
 //! `Frame::decode` over arbitrary payloads, pointed at every frame type
 //! (`IMPLEMENTATION.md` § 2.2).
 //!
-//! The three properties are `crates/nomux/tests/codec.rs`'s `decode_as_every_type` and the
-//! `encode_and_split` it re-encodes through, verbatim in what they assert:
+//! Two of the three are `crates/nomux/tests/codec.rs`'s `decode_as_every_type`, verbatim in
+//! what they assert. The header check is this target's alone: `encode_and_split` gave it up
+//! as a per-case re-derivation of what `crates/nomux/src/frame.rs`'s `round_trip` and every
+//! vector's four literal header bytes already pin.
 //!
 //! * a frame decodes as the type it was asked for, so no payload can arrive as one message
 //!   and leave as another;
@@ -14,13 +16,11 @@
 //!
 //! What differs is the generator, and here that is the whole point — the payload domain
 //! being one no suite closes the way `header_decode_is_total` closes `decode_header`'s four
-//! bytes. `payload_decode_is_total` draws 2048 payloads of up to 40 uniform bytes, which
-//! reach the code past a length prefix or an enum discriminant essentially never;
-//! `mutated_encodings_decode_without_panicking` buys that back by XORing one byte of a real
-//! encoding and sometimes dropping the last, which lands on the boundaries but never more
-//! than that one edit from valid. Coverage feedback needs neither arrangement: it keeps
+//! bytes. `mutated_encodings_decode_without_panicking` reaches it by XORing one byte of a
+//! real encoding and sometimes dropping the last, which lands on the boundaries but never
+//! more than that one edit from valid. Coverage feedback needs no such arrangement: it keeps
 //! whatever got further and builds on it, and it gets tens of millions of tries rather than
-//! four thousand.
+//! a few thousand.
 //!
 //! The input is a payload rather than a whole frame. The type byte and the bytes behind it
 //! arrive from the same untrusted stream and are never checked against each other, so a
@@ -34,9 +34,9 @@
 //! the document's bytes rather than this codec's. Per vector rather than per type because
 //! the vectors are where the discriminants and the flag bits differ — `Linger`'s three
 //! values, `Hello`'s two bits, `Exit`'s kind, a negative status — which is precisely what a
-//! byte mutator would otherwise have to guess; `-2` and `-3` name that type's second and
-//! third record in the file. `Detach`, `Ping` and `Pong` are left out: their payload is the
-//! empty input, which libFuzzer tries first regardless.
+//! byte mutator would otherwise have to guess; `-2` onwards name that type's later records
+//! in the file. `Detach`, `Ping` and `Pong` are left out: their payload is the empty input,
+//! which libFuzzer tries first regardless.
 //!
 //! Note the bound this does not reach: `MAX_PAYLOAD` is 256 KiB and libFuzzer's default
 //! `-max_len` is 4096, so the oversize refusal at the top of `decode` stays covered by
@@ -75,7 +75,7 @@ fuzz_target!(|payload: &[u8]| {
             panic!("decode accepted {frame:?}, which encode then refused: {err}");
         }
 
-        // The header as well as the tail, as `encode_and_split` reads it: `conn.rs` sizes
+        // The header as well as the tail, and here alone now: `conn.rs` sizes
         // the read after a header from this length, so a header disagreeing with the bytes
         // behind it is the confusion worth finding — and comparing the tail alone, from a
         // fixed offset, is blind to exactly that.

@@ -810,11 +810,12 @@ produced it.
 The one thing a peer chooses outright is the bytes it sends, so the codec is fuzzed as well
 as generated against. `fuzz/` is a workspace of its own — libFuzzer reaches neither the
 shipped binary nor any gate but `cargo fmt`, which is the whole of why a third dependency
-was tolerable. Two targets: `header` over `decode_header`, and `frame` over `Frame::decode`
-with every frame type pointed at one payload. Both assert what `tests/codec.rs` asserts of
-the same functions, so what fuzzing adds is a coverage-guided generator rather than a
-property — and it adds it to `frame` alone, `header_decode_is_total` having already closed
-its own domain by sweeping all 256 type bytes. `sh fuzz/run.sh <target>` runs one and
+was tolerable. One target: `frame` over `Frame::decode`, with every frame type pointed at one
+payload. It asserts what `tests/codec.rs` asserts of the same function, so what fuzzing adds
+is a coverage-guided generator rather than a property. `decode_header` has none of its own,
+`header_decode_is_total` having closed that domain outright by sweeping all 256 type bytes
+against both sides of the cap — a target over it could only agree with a suite that had
+already finished. `sh fuzz/run.sh <target>` runs one and
 installs the nightly it names, as `scripts/build-release.sh` does for the release build
 (§ 8). CI gives each target sixty seconds, which checks that they still build and still pass
 over their seeds and is nowhere near a search.

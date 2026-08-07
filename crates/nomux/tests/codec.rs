@@ -25,15 +25,16 @@
 ///
 /// This is the parser's coverage on stable, run as part of the normal suite: the input
 /// space that matters is a 4-byte header and a length-prefixed payload, which a generator
-/// reaches by construction. The coverage-guided half is `fuzz/`, which reaches the same
-/// two entry points under a sanitiser and off a corpus it keeps
+/// reaches by construction. The coverage-guided half is `fuzz/`, which reaches
+/// `Frame::decode` under a sanitiser and off a corpus it keeps
 /// ([IMPLEMENTATION.md § 9](../../../IMPLEMENTATION.md#9-testing)); neither replaces the
-/// other, and only this one runs in a gate.
+/// other, and only this one runs in a gate. `decode_header` has no target of its own,
+/// [`generated::header_decode_is_total`] having closed that domain outright.
 ///
 /// The generator is a seeded [`generated::Rng`] rather than a property-testing crate. The
-/// cases here are already small — a payload is at most 40 bytes and a text field at most
-/// 24 characters — so shrinking would have nothing left to take away, and what it buys is
-/// not worth fifteen transitive dependencies and three proc-macro compiles in a tree that
+/// cases here are already small — a payload is at most a few dozen bytes and a text field at
+/// most 24 characters — so shrinking would have nothing left to take away, and what it buys
+/// is not worth fifteen transitive dependencies and three proc-macro compiles in a tree that
 /// otherwise has two. What replaces it is determinism: every case is derived from
 /// [`generated::SEED`], a failure prints the `u64` its own case came from, and
 /// `Rng::new(that)` replays it alone.
@@ -52,9 +53,9 @@ mod generated {
     /// Cases per property.
     ///
     /// High for a property count, and affordable: the codec is a few hundred branches over
-    /// tiny buffers, so the whole file still runs in well under a second, and finding a
-    /// valid `ErrorCode` in two random bytes needs the cases more than it needs the time
-    /// back.
+    /// tiny buffers, so the whole file still runs in well under a second, and a mutation
+    /// that has to pick both a frame and the byte of it to flip needs the cases more than
+    /// it needs the time back.
     const CASES: u32 = 2048;
 
     /// Cap on generated `data` and `term` lengths.
@@ -374,11 +375,16 @@ mod generated {
     }
 
     /// Encodes `frame` and returns the bytes after the header, having checked that the
-    /// header describes what follows it.
+    /// encoder's own decoder will take the header it wrote.
     ///
     /// Reports failures instead of panicking: `clippy.toml`'s `allow-*-in-tests` covers
     /// `#[test]` bodies, not helpers beside them, and the caller is the one holding the
     /// seed a failure has to be reported with.
+    ///
+    /// What that header *says* is not re-derived per case: `encode` patches it in from
+    /// `frame_type()` and the payload length it has just written, and that `decode_header`
+    /// inverts `encode_header` is asserted by `lib.rs`'s `header_round_trips` over every
+    /// type and pinned in literal bytes by every vector in [`super::vectors`].
     fn encode_and_split(frame: Frame<'_>) -> Result<Vec<u8>, String> {
         let mut buf = Vec::new();
         frame
@@ -388,24 +394,8 @@ mod generated {
         let Some(header) = buf.first_chunk::<HEADER_LEN>() else {
             return Err("encode emitted no header".to_owned());
         };
-        let header = decode_header(header).map_err(|err| format!("own header rejected: {err}"))?;
-        let payload = buf.split_off(HEADER_LEN);
-
-        if header.ty != frame.frame_type() {
-            return Err(format!(
-                "header says {:?} and the frame behind it is {:?}",
-                header.ty,
-                frame.frame_type()
-            ));
-        }
-        if header.len as usize != payload.len() {
-            return Err(format!(
-                "declared length {} disagrees with the {} bytes written",
-                header.len,
-                payload.len()
-            ));
-        }
-        Ok(payload)
+        decode_header(header).map_err(|err| format!("own header rejected: {err}"))?;
+        Ok(buf.split_off(HEADER_LEN))
     }
 
     /// Offers `payload` to every frame type and checks what must hold for bytes from a
@@ -541,10 +531,15 @@ mod generated {
 
     /// `decode_header` is total over its input, and reports only what it read.
     ///
-    /// Exhaustive in the type byte and deliberate in the length before it is random in
-    /// either: the field is 2^24 wide and what matters is the cap and the values on both
-    /// sides of it, which uniform draws land on with probability 2^-24. The random cases
-    /// afterwards are what would catch a rule neither sweep thought of.
+    /// Exhaustive in the type byte and deliberate in the length: the field is 2^24 wide and
+    /// what matters is the cap and the values either side of it, which uniform draws land on
+    /// with probability 2^-24.
+    ///
+    /// Nothing random rides on top, there being nothing left to reach: `decode_header` asks
+    /// exactly two questions — is this type byte a [`FrameType`], is this length over
+    /// [`MAX_PAYLOAD`] — and 256 type bytes crossed with lengths either side of the cap
+    /// answers both at every combination they have. That closes this function's domain on
+    /// stable and in a gate, which is why `fuzz/` is pointed at `Frame::decode` alone.
     #[test]
     fn header_decode_is_total() {
         for ty in 0..=u8::MAX {
@@ -560,65 +555,57 @@ mod generated {
                 checked!(check_header([ty, a, b, c]));
             }
         }
-
-        for case in 0..CASES {
-            let seed = case_seed(0x0003, case);
-            let mut rng = Rng::new(seed);
-            checked!(check_header([rng.u8(), rng.u8(), rng.u8(), rng.u8()]), seed);
-        }
-    }
-
-    /// `Frame::decode` is total over arbitrary payloads for every frame type.
-    ///
-    /// The type byte and the payload arrive from the same untrusted stream and are not
-    /// checked against each other, so a peer can point any type at any bytes.
-    #[test]
-    fn payload_decode_is_total() {
-        for case in 0..CASES {
-            let seed = case_seed(0x0004, case);
-            let payload = Rng::new(seed).bytes(40);
-            checked!(decode_as_every_type(&payload), seed);
-        }
     }
 
     /// A `Hello` whose declared `term_len` runs past the bytes behind it.
     ///
-    /// The one length prefix on this wire. The sweeps above reach its boundary only on the
-    /// rare payload already shaped like a `Hello`, and accept any refusal there; this
+    /// The one length prefix on this wire. The sweep below reaches its boundary only on the
+    /// rare payload already shaped like a `Hello`, and accepts any refusal there; this
     /// reaches it every time and pins which refusal.
+    ///
+    /// Three cases rather than a generated sweep, because every overstatement is the same
+    /// case: `decode` reads the fixed prefix, reads `term_len`, and asks the reader for that
+    /// many bytes, which fails before a byte of the term is looked at. So neither the term's
+    /// contents nor the size of the overshoot can change the answer, and what is left worth
+    /// writing down is the ends of the comparison — nothing at all declared as one byte, a
+    /// term declared one byte longer than it is, and the widest value the prefix can hold.
     #[test]
     fn a_hello_that_overstates_its_term_length_is_truncated() {
-        for case in 0..CASES {
-            let seed = case_seed(0x0005, case);
-            let mut rng = Rng::new(seed);
-            let term = rng.bytes(MAX_GENERATED_LEN);
-            // At least one byte past what follows, which is the whole point of the case.
-            let beyond = rng.u16().max(1);
-
+        for (term, declared) in [
+            (b"".as_slice(), 1_u16),
+            (b"vt100".as_slice(), 6),
+            (b"vt100".as_slice(), u16::MAX),
+        ] {
             // The fixed prefix § 2.2 gives `Hello` — protocol, flags, out_offset,
             // winsize — all zero, which is a shape the decoder accepts.
             let mut payload = vec![0u8; 19];
-            let declared = u16::try_from(term.len())
-                .unwrap_or(u16::MAX)
-                .saturating_add(beyond);
             payload.extend_from_slice(&declared.to_be_bytes());
-            payload.extend_from_slice(&term);
+            payload.extend_from_slice(term);
             assert_eq!(
                 Frame::decode(FrameType::Hello, &payload),
                 Err(ProtoError::Truncated),
-                "declared {declared} with {} bytes behind it (seed {seed:#018x})",
+                "declared {declared} with {} bytes behind it",
                 term.len()
             );
-            checked!(decode_as_every_type(&payload), seed);
+            checked!(decode_as_every_type(&payload));
         }
     }
 
-    /// The same, on payloads one byte away from valid.
+    /// `Frame::decode` is total over the payloads a peer can choose, for every frame type.
     ///
-    /// Uniform random bytes almost never reach the code past a length prefix or an enum
-    /// discriminant; a real encoding with one byte flipped or amputated does, and lands on
-    /// the boundaries — a `term_len` larger than what follows, a reserved flag bit, a
-    /// truncated final field.
+    /// The type byte and the payload arrive from the same untrusted stream and are never
+    /// checked against each other, so a peer can point any type at any bytes; every case
+    /// here sweeps all fifteen.
+    ///
+    /// Payloads one byte away from valid rather than uniform bytes, which this file used to
+    /// draw 2048 of beside them. Uniform bytes reach the code past a length prefix or an
+    /// enum discriminant essentially never — a draw is a `HelloOk` only if it came out 18
+    /// bytes long and its last two landed in three values of 256 and two of 256 — so the
+    /// branches they can reach are the shallow refusals a mutated encoding reaches too, and
+    /// reaches far more often. What only the mutation reaches is the far side: a `term_len`
+    /// larger than what follows, a reserved flag bit set, a truncated final field. So the
+    /// uniform draw bought cases rather than coverage, and the search that does buy coverage
+    /// here is `fuzz/frame`, which keeps whatever got further and builds on it.
     #[test]
     fn mutated_encodings_decode_without_panicking() {
         for case in 0..CASES {
@@ -686,22 +673,24 @@ mod vectors {
     /// same-width neighbours — the failure a round-trip test cannot see — changes the
     /// expected bytes.
     ///
-    /// Both handshake frames appear three times, because distinct values catch a swap
+    /// Both handshake frames appear more than once, because distinct values catch a swap
     /// between two fields and do nothing about a swap *inside* one: each repeat disagrees
-    /// with the ones before it on every bit and every enumerator that has one. Three is
-    /// what [`the_vectors_pin_every_value_of_every_closed_set`] insists on — [`Linger`] has
-    /// three values, and two `Hello` vectors cannot both show the flag bits set together
-    /// and show each of them clear.
+    /// with the ones before it on every bit and every enumerator that has one. Three apiece
+    /// is what [`the_vectors_pin_every_value_of_every_closed_set`] insists on — [`Linger`]
+    /// has three values, and two `Hello` vectors cannot both show the flag bits set together
+    /// and show each of them clear. `Hello`'s fourth answers to no closed set, and says
+    /// where it stands what it is for.
     fn vectors() -> Vec<Vector> {
         let mut all = hello_vectors();
         all.extend(hello_ok_vectors());
         all.extend(stream_vectors());
         all.extend(control_vectors());
+        all.extend(error_vectors());
         all.extend(agent_vectors());
         all
     }
 
-    /// The client's opening frame, at three different flag words.
+    /// The client's opening frame, at all four of its flag words.
     fn hello_vectors() -> Vec<Vector> {
         vec![
             // 0x01 Hello: u16 proto, u8 flags, u64 out_offset, winsize, u16 term_len,
@@ -768,6 +757,34 @@ mod vectors {
                     0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
                     0x00, 0x04, // term_len = 4
                     b'd', b'u', b'm', b'b',
+                ],
+            },
+            // 0x01 Hello a fourth time, for the empty `term` — the first of the three
+            // zero-length variable fields § 2.2 permits and this table used to show none
+            // of. An implementation that reads `term_len` and then insists on at least one
+            // byte behind it passes every vector above and is still wrong, and the client
+            // is the end that would have to be rewritten to find out.
+            //
+            // Carries bit 1 alone, the one flag word the three above leave out, and
+            // `out_offset` 0, which is the client asking for the stream from its first byte
+            // rather than for whatever is retained — a distinction `RESUME_FROM_START`
+            // above exists to make.
+            Vector {
+                frame: Frame::Hello(Hello {
+                    protocol: 8,
+                    agent_forward: false,
+                    repaint_ctrl_l: true,
+                    out_offset: 0,
+                    win: WIN,
+                    term: "",
+                }),
+                bytes: &[
+                    0x01, 0x00, 0x00, 0x15, // header: type, u24 len = 21
+                    0x00, 0x08, // protocol
+                    0x02, // flags: bit 0 clear, bit 1 repaint ctrl-l
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // out_offset
+                    0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
+                    0x00, 0x00, // term_len = 0, and nothing behind it
                 ],
             },
         ]
@@ -873,6 +890,21 @@ mod vectors {
                     0x1b, 0x5b, 0x32, 0x4a,
                 ],
             },
+            // 0x05 Output again, carrying nothing: the second of the three empty fields, and
+            // a different way to be empty from the `Hello` above — `data` runs to the end of
+            // the payload where `term` sits behind a count, so this one is a payload that is
+            // exactly its fixed prefix, which is the length a decoder demanding "an offset
+            // *and* some bytes" refuses. An implementation can get either right alone.
+            Vector {
+                frame: Frame::Output {
+                    offset: 0xa1a2_a3a4_a5a6_a7a8,
+                    data: b"",
+                },
+                bytes: &[
+                    0x05, 0x00, 0x00, 0x08, // header: len = 8 + 0
+                    0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, // offset
+                ],
+            },
             // 0x06 Resize: winsize, bare.
             Vector {
                 frame: Frame::Resize(WIN),
@@ -949,8 +981,37 @@ mod vectors {
                 frame: Frame::Pong,
                 bytes: &[0x0b, 0x00, 0x00, 0x00],
             },
-            // 0x0c Error: u16 code, UTF-8 message with no length prefix — it runs to
-            // the end of the payload.
+        ]
+    }
+
+    /// 0x0c `Error`: u16 code, UTF-8 message with no length prefix — it runs to the end of
+    /// the payload. All five codes, one vector each.
+    ///
+    /// A group of its own because it is the one most easily left half-written. `Error` is
+    /// the last frame a connection ever carries (§ 6.4), so it is what a client mishandles
+    /// exactly when the session is being torn down and the user is watching: a code read as
+    /// the wrong number is a takeover reported as an internal fault, or a version mismatch
+    /// retried forever. The set is closed (§ 2.3), so a code the peer does not know is a
+    /// protocol error rather than something to skip past, and deducing four of the five from
+    /// `Takeover` is arithmetic rather than a test.
+    ///
+    /// The messages differ in length on purpose — the field has no count in front of it and
+    /// runs to the end of the payload, so a decoder that took a fixed width would agree with
+    /// one vector and no more — and `Internal` carries none at all, which § 2.2 permits and
+    /// nothing else in this table shows for `message`.
+    fn error_vectors() -> Vec<Vector> {
+        vec![
+            Vector {
+                frame: Frame::Error {
+                    code: ErrorCode::Protocol,
+                    message: "bad frame",
+                },
+                bytes: &[
+                    0x0c, 0x00, 0x00, 0x0b, // header: len = 2 + 9
+                    0x00, 0x01, // Protocol
+                    b'b', b'a', b'd', b' ', b'f', b'r', b'a', b'm', b'e',
+                ],
+            },
             Vector {
                 frame: Frame::Error {
                     code: ErrorCode::Takeover,
@@ -960,6 +1021,38 @@ mod vectors {
                     0x0c, 0x00, 0x00, 0x0c, // header: len = 2 + 10
                     0x00, 0x02, // Takeover
                     b't', b'a', b'k', b'e', b'n', b' ', b'o', b'v', b'e', b'r',
+                ],
+            },
+            Vector {
+                frame: Frame::Error {
+                    code: ErrorCode::Version,
+                    message: "wrong version",
+                },
+                bytes: &[
+                    0x0c, 0x00, 0x00, 0x0f, // header: len = 2 + 13
+                    0x00, 0x03, // Version
+                    b'w', b'r', b'o', b'n', b'g', b' ', b'v', b'e', b'r', b's', b'i', b'o', b'n',
+                ],
+            },
+            Vector {
+                frame: Frame::Error {
+                    code: ErrorCode::InputGap,
+                    message: "input gap",
+                },
+                bytes: &[
+                    0x0c, 0x00, 0x00, 0x0b, // header: len = 2 + 9
+                    0x00, 0x04, // InputGap
+                    b'i', b'n', b'p', b'u', b't', b' ', b'g', b'a', b'p',
+                ],
+            },
+            Vector {
+                frame: Frame::Error {
+                    code: ErrorCode::Internal,
+                    message: "",
+                },
+                bytes: &[
+                    0x0c, 0x00, 0x00, 0x02, // header: len = 2 + 0
+                    0x00, 0x05, // Internal, and nothing behind it
                 ],
             },
         ]
@@ -1010,9 +1103,21 @@ mod vectors {
         ]
     }
 
-    /// The encoder emits exactly the bytes § 2.2 specifies.
+    /// The encoder emits exactly the bytes § 2.2 specifies, and the decoder reads those same
+    /// bytes back as the frame they describe.
+    ///
+    /// Both directions off the same literal, and neither off the other's output: the decode
+    /// is handed `bytes`, never the buffer `encode` has just filled, so what is asserted is
+    /// never `decode(encode(f)) == f` — the self-consistency check these vectors exist to
+    /// supplement.
+    ///
+    /// The header is not decoded separately on the way back in. Comparing the whole encoding
+    /// against `bytes` has already pinned all four of its literal bytes, discriminant and
+    /// u24 length included, so re-reading them through `decode_header` and asserting they
+    /// describe the frame they precede would only ask whether `decode_header` inverts
+    /// `encode_header` — which is `lib.rs`'s `header_round_trips`, in its own file.
     #[test]
-    fn frames_encode_to_their_documented_bytes() {
+    fn frames_encode_to_their_documented_bytes_and_decode_back() {
         for Vector { frame, bytes } in vectors() {
             let mut encoded = Vec::new();
             frame.encode(&mut encoded).unwrap();
@@ -1022,28 +1127,12 @@ mod vectors {
                 "{:?} does not encode to the bytes IMPLEMENTATION.md § 2.2 specifies",
                 frame.frame_type()
             );
-        }
-    }
-
-    /// And the decoder reads those same bytes back as the frame they describe.
-    ///
-    /// Separate from the encode direction rather than folded into it: a single
-    /// assertion that `decode(encode(f)) == f` is exactly the self-consistency check
-    /// these vectors exist to supplement.
-    #[test]
-    fn documented_bytes_decode_to_their_frames() {
-        for Vector { frame, bytes } in vectors() {
-            let (header, payload) = bytes.split_at(HEADER_LEN);
-            let header: [u8; HEADER_LEN] = header.try_into().unwrap();
-            let header = nomux::decode_header(&header).unwrap();
-
-            assert_eq!(header.ty, frame.frame_type(), "type byte");
             assert_eq!(
-                header.len as usize,
-                payload.len(),
-                "declared length disagrees with the payload that follows it"
+                Frame::decode(frame.frame_type(), &bytes[HEADER_LEN..]),
+                Ok(frame),
+                "the bytes IMPLEMENTATION.md § 2.2 specifies for {:?} do not decode back",
+                frame.frame_type()
             );
-            assert_eq!(Frame::decode(header.ty, payload).unwrap(), frame);
         }
     }
 
@@ -1219,6 +1308,11 @@ mod vectors {
     /// Every closed set on this wire is written down in bytes above, at every value it has,
     /// and the handshake vectors are written at the revision this build speaks.
     ///
+    /// The four sets are [`FrameType`], [`ExitKind`], [`Linger`] and [`ErrorCode`] — the last
+    /// being the one a table like this most easily leaves half-written, its five values
+    /// riding on a frame nobody reaches on the happy path, so a fixture pinning `Takeover`
+    /// alone reads complete and lets another implementation number the rest as it likes.
+    ///
     /// Swept from each set's `ALL` rather than from a list written out here, which would
     /// stop covering the protocol the moment the protocol grew, and quietly. The two flags
     /// bytes have no `ALL` and are destructured exhaustively instead, for the same property
@@ -1234,6 +1328,7 @@ mod vectors {
         let mut types = Vec::new();
         let mut kinds = Vec::new();
         let mut lingers = Vec::new();
+        let mut codes = Vec::new();
         let mut hello_flags = Vec::new();
         let mut agent_flags = Vec::new();
 
@@ -1265,6 +1360,7 @@ mod vectors {
                     agent_flags.push(agent);
                 }
                 Frame::Exit { kind, .. } => kinds.push(kind),
+                Frame::Error { code, .. } => codes.push(code),
                 _ => {}
             }
         }
@@ -1277,6 +1373,9 @@ mod vectors {
         }
         for linger in Linger::ALL {
             assert!(lingers.contains(&linger), "{linger:?} has no wire vector");
+        }
+        for code in ErrorCode::ALL {
+            assert!(codes.contains(&code), "{code:?} has no wire vector");
         }
         for (state, verb) in [(true, "sets"), (false, "clears")] {
             for (bit, name) in [(0, "agent_forward"), (1, "repaint_ctrl_l")] {
@@ -1348,11 +1447,16 @@ mod vectors {
     #[test]
     fn the_frozen_numbers_are_the_ones_the_document_gives() {
         /// One closed set, written the way § 2.2 writes it.
+        ///
+        /// One direction only. `wire_enum!` writes `as_wire` and `from_wire` from the same
+        /// literal — the former reads the `#[repr]` discriminant that literal declares, the
+        /// latter matches on the literal itself — and two variants cannot share one, a
+        /// duplicate discriminant being a compile error. So `from_wire(n) == Some(v)`
+        /// follows from `v.as_wire() == n` with nothing left to falsify.
         macro_rules! frozen {
             ($ty:ty, $($name:ident = $number:literal),+) => {
                 for (value, number) in [$((<$ty>::$name, $number)),+] {
                     assert_eq!(value.as_wire(), number, "{value:?} is not the § 2.2 number");
-                    assert_eq!(<$ty>::from_wire(number), Some(value), "{number} is not {value:?}");
                 }
                 for value in <$ty>::ALL {
                     let listed = [$(<$ty>::$name),+].contains(&value);

@@ -1,10 +1,11 @@
 //! What § 6.3 wants from `AF_UNIX` that `std` will not do.
 //!
-//! A `connect` that gives up rather than parking in a full backlog, and the
-//! `SO_PEERCRED` behind "one uid may have the session". Its own module because the run
-//! directory's business is names and modes: `<id>.sock` is bound over there, at the one
-//! mode that has to be exact ([`crate::rundir::bind_socket_private`]), and everything
-//! anyone does with a session socket afterwards is here.
+//! A `connect` that gives up rather than parking in a full backlog, the `SO_PEERCRED`
+//! behind "one uid may have the session", and the [`Liveness`] every caller reads out of
+//! that `connect`. Its own module because the run directory's business is names and
+//! modes: `<id>.sock` is bound over there, at the one mode that has to be exact
+//! ([`crate::rundir::bind_socket_private`]), and everything anyone does with a session
+//! socket afterwards is here.
 //!
 //! Through `libc` rather than rustix, whose sockets sit behind a `net` feature § 8's
 //! budget is why this crate does not enable.
@@ -26,12 +27,13 @@ pub(crate) const SUN_PATH_MAX: usize = 107;
 
 /// Whether a failed `connect` to a session socket means nothing is listening there.
 ///
-/// The one predicate behind every such decision in this binary, since § 6.3 requires the
-/// daemon's probe, its bind, `list` and `kill` to agree. A socket file outlives the process
-/// that bound it, so `ECONNREFUSED` is a dead daemon, and an absent name is that answer one
-/// syscall sooner. Anything else — `EACCES`, a descriptor limit — is not evidence of death
-/// and must never license an unlink: § 6.3's "`EACCES` is not staleness".
-pub(crate) fn nothing_is_listening(err: &io::Error) -> bool {
+/// The one predicate behind every such decision in this binary, reached through
+/// [`liveness`] alone, since § 6.3 requires the daemon's probe, its bind, `list` and `kill`
+/// to agree. A socket file outlives the process that bound it, so `ECONNREFUSED` is a dead
+/// daemon, and an absent name is that answer one syscall sooner. Anything else — `EACCES`,
+/// a descriptor limit — is not evidence of death and must never license an unlink: § 6.3's
+/// "`EACCES` is not staleness".
+fn nothing_is_listening(err: &io::Error) -> bool {
     matches!(
         err.kind(),
         io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
@@ -80,7 +82,8 @@ pub(crate) fn connect_within(path: &Path, within: Duration) -> io::Result<UnixSt
             // `DESIGN.md` § 8 keeps that check for, whoever won the race to bind
             // `<id>.sock` is handed the keystrokes this stream goes on to carry.
             // `EACCES` because [`nothing_is_listening`] already reads that errno as
-            // neither death nor an answer, so the refusal licenses no unlink.
+            // neither death nor an answer — [`Liveness::Unknown`] — so the refusal
+            // licenses no unlink.
             Ok(stream) if !peer_is_ours(stream.as_fd(), id) => {
                 return Err(io::Error::from_raw_os_error(libc::EACCES));
             }
@@ -100,6 +103,35 @@ pub(crate) fn connect_within(path: &Path, within: Duration) -> io::Result<UnixSt
             ));
         }
         thread::sleep(PROBE_RETRY);
+    }
+}
+
+/// State of one session as seen from the run directory alone.
+#[derive(Debug)]
+pub(crate) enum Liveness {
+    /// A daemon accepted this connection, so a process is serving the socket.
+    Alive(UnixStream),
+    /// Nothing is listening; the daemon died. Carries the errno, which is what says
+    /// whether a socket file was left behind to replace.
+    Stale(io::Error),
+    /// The `connect` failed for a reason that is not death, carrying it.
+    ///
+    /// § 6.3's "`EACCES` is not staleness": the same conservative answer as
+    /// [`Self::Alive`] for the *unlink*, and its opposite everywhere else, since only an
+    /// accepted connection may escalate to `SIGKILL`.
+    Unknown(io::Error),
+}
+
+/// Probes the socket. A refused connection means the daemon is gone; the socket file
+/// outlives the process that bound it.
+///
+/// Through [`connect_within`], which owns the argument for the deadline.
+pub(crate) fn liveness(socket: &Path, within: Duration) -> Liveness {
+    match connect_within(socket, within) {
+        Ok(stream) => Liveness::Alive(stream),
+        Err(err) if nothing_is_listening(&err) => Liveness::Stale(err),
+        // Evidence of neither death nor life — see [`Liveness::Unknown`].
+        Err(err) => Liveness::Unknown(err),
     }
 }
 

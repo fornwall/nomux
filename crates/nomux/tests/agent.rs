@@ -455,10 +455,10 @@ struct Overqueued {
     client: Client,
     /// The local `ssh-add`'s end of the connection, which has read nothing.
     peer: UnixStream,
-    /// How much the client pushed at it.
+    /// How much the client pushed at it, every byte of which the daemon owes it. What
+    /// this peer's socket did not take is [`still_owed`], and the state both tests below
+    /// are about is the one where that is not zero.
     sent: usize,
-    /// What a unix socket on this host took of that before it stopped taking any.
-    capacity: usize,
 }
 
 /// Builds [`Overqueued`] on a session named `name`.
@@ -471,6 +471,13 @@ struct Overqueued {
 /// Nothing answers an `AgentClose`, the client having forgotten the connection, so the
 /// round trip through the child behind it is what says the daemon has acted on the
 /// close, frames being handled in the order they arrive.
+///
+/// How much of what is sent here reaches the daemon's queue is a guess and cannot be
+/// anything else: `socket_capacity` measures a fresh `UnixStream::pair` with a patience
+/// of its own rather than the socket the daemon accepted. Under-measure and the daemon
+/// gives the lot to the peer's kernel buffer before the close, `flush` reports
+/// `Finished`, and the connection is forgotten there — leaving neither test below
+/// anything to be about. [`still_owed`] is what makes a bad guess a failure instead.
 fn overqueued_then_closed(name: &str) -> Overqueued {
     /// One `AgentData` frame per round, small beside `MAX_CHANNEL_QUEUE`.
     const CHUNK: usize = 32 * 1024;
@@ -511,8 +518,29 @@ fn overqueued_then_closed(name: &str) -> Overqueued {
         client,
         peer,
         sent,
-        capacity,
     }
+}
+
+/// How much of the `sent` bytes handed to the daemon for this peer it has still to hand
+/// on, which is what a queue kept past the close looks like from outside.
+///
+/// Asked of the socket that took them and asked with `FIONREAD`, which consumes nothing.
+/// Reading the queue out instead is what would end the state it is asked about: the
+/// daemon flushes into whatever space frees, and a closing channel whose queue runs dry
+/// is one it forgets on the spot. Nothing else is written to this socket, so what the
+/// kernel is holding and what the daemon still owes account for `sent` between them.
+fn still_owed(peer: &UnixStream, sent: usize) -> usize {
+    let held = rustix::io::ioctl_fionread(peer);
+    let taken = held.map_or(usize::MAX, |bytes| {
+        usize::try_from(bytes).unwrap_or(usize::MAX)
+    });
+    assert!(
+        taken <= sent,
+        "the peer's socket answered `FIONREAD` with {taken} against the {sent} bytes \
+         written at it, which is either an ask that failed ({held:?}) or a daemon \
+         writing bytes nothing here gave it"
+    );
+    sent - taken
 }
 
 /// Regression: a write that fails on a connection the client has already closed is not
@@ -533,8 +561,21 @@ fn a_failed_write_on_a_closed_agent_channel_is_never_announced() {
         session: _session,
         mut client,
         peer,
-        ..
+        sent,
     } = overqueued_then_closed("agent_epipe");
+
+    // The reply the drop below leaves queued, asserted rather than assumed: a daemon
+    // that owes this peer nothing has no write left to fail, and the negative assertion
+    // at the foot of this test would pass over a run that never reached the bug. Asked
+    // at this moment because this is the one it has to hold at, and asked without
+    // reading a byte, which is what would empty the queue it asks about.
+    assert!(
+        still_owed(&peer, sent) > 0,
+        "the daemon had handed this peer every one of the {sent} bytes sent to it \
+         before it died, so nothing here can produce the failing write this test is \
+         named for: the connection was emptied and forgotten at the close, and what \
+         follows asserts nothing"
+    );
 
     // The `ssh-add` on the other end exits with the reply still queued.
     drop(peer);
@@ -567,8 +608,18 @@ fn a_closed_agent_channel_whose_peer_stopped_reading_leaves_the_daemon_asleep() 
         mut client,
         peer: mut agent,
         sent,
-        capacity,
     } = overqueued_then_closed("agent_spin");
+
+    // Established before the measurement rather than inferred from it: a daemon with
+    // nothing left to write is a daemon with nothing to spin on, and the ticks it does
+    // not burn then say only that this run never built the state.
+    let owed = still_owed(&agent, sent);
+    assert!(
+        owed > 0,
+        "the daemon had handed this peer every one of the {sent} bytes sent to it, so \
+         it was holding no queue to spin on and the measurement below is one of an \
+         idle daemon in a state this test is not about"
+    );
 
     let burned = cpu_ticks(session.child.id());
     assert!(
@@ -578,10 +629,9 @@ fn a_closed_agent_channel_whose_peer_stopped_reading_leaves_the_daemon_asleep() 
          asking for nothing"
     );
 
-    // And the queue really was there to spin on: a connection the daemon had forgotten
-    // at the close would have taken what it was holding with it, so reading the lot
-    // back is what makes the measurement above one of the right state — and it is
-    // § 6.7's promise that a reply already sent still reaches the process waiting on it.
+    // And the queue the daemon was holding is handed over rather than merely held:
+    // § 6.7's promise that a reply already sent still reaches the process waiting on
+    // it, which is the whole reason a closing channel keeps its queue at all.
     let mut received = 0usize;
     let mut chunk = vec![0u8; 64 * 1024];
     loop {
@@ -592,10 +642,12 @@ fn a_closed_agent_channel_whose_peer_stopped_reading_leaves_the_daemon_asleep() 
         }
     }
     assert_eq!(
-        received, sent,
+        received,
+        sent,
         "the daemon was not holding the queue this test measured it against: a \
          connection it had let go of at the close takes the rest with it, and no more \
-         than the {capacity} bytes already in the kernel could have arrived"
+         than the {} bytes already in the kernel could have arrived",
+        sent - owed
     );
 
     still_serving(&mut client, "NOMUX-STILL-SERVING");

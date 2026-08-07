@@ -24,6 +24,7 @@
               modules, not integration test crates"
 )]
 
+use std::fmt::Write as _;
 use std::io::{ErrorKind, Read, Write};
 use std::ops::{Deref, DerefMut};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -99,9 +100,9 @@ pub(crate) fn poll_until(within: Duration, condition: impl FnMut() -> bool) -> b
 /// worse still, being satisfied by every arrival — a peer dribbling one frame just
 /// inside it is never late, and the loop around it has no bound at all. Everything in
 /// this suite that takes an `Instant` where a `Duration` would have done —
-/// [`join_before`], [`Client::frame_before`], [`Client::hello_before`],
-/// [`Client::waits_by`], and the `PATIENCE` constants the test binaries define — is
-/// here for this reason and says no more about it.
+/// [`join_before`], [`Client::frame_before`], [`Client::waits_by`], and the `PATIENCE`
+/// constants the test binaries define — is here for this reason and says no more about
+/// it.
 pub(crate) fn poll_by(deadline: Instant, mut condition: impl FnMut() -> bool) -> bool {
     loop {
         if condition() {
@@ -957,18 +958,6 @@ impl Client {
         self.take_hello_ok(greeting)
     }
 
-    /// [`Client::hello`] against a deadline the caller shares between several
-    /// greetings, per [`poll_by`]. What is lost without it is the failure the test was
-    /// going to report, the chaos seed § 9 promises included.
-    pub(crate) fn hello_before(&mut self, deadline: Instant, out_offset: u64) -> nomux::HelloOk {
-        self.send(&hello_frame(false, false, out_offset));
-        let awaiting = "a HelloOk from the daemon";
-        let greeting = self
-            .frame_before(deadline, awaiting)
-            .unwrap_or_else(|| panic!("timed out waiting for {awaiting}"));
-        self.take_hello_ok(greeting)
-    }
-
     /// Decodes the greeting and moves this client's two offsets onto it.
     fn take_hello_ok(&mut self, (ty, payload): (FrameType, Vec<u8>)) -> nomux::HelloOk {
         assert_eq!(ty, FrameType::HelloOk, "expected HelloOk, got {ty:?}");
@@ -1341,6 +1330,67 @@ fn assert_refusal(
         }
         other => panic!("{what}; got {other:?}"),
     }
+}
+
+/// Fails saying which offset the stream stopped meaning what the child wrote there,
+/// quoted from both sides: the number alone does not say which way the error went — a
+/// stream that resumed too early repeats bytes the client has, one that resumed too
+/// late is missing bytes it never will.
+///
+/// The one sentence every test that models the child's output fails with, so that the
+/// two binaries which do it — `tests/session.rs` against a blob, `tests/chaos.rs`
+/// against a full-screen transcript — say the same thing about the same fault rather
+/// than each keeping a copy of the reasoning.
+///
+/// `sits_in` is whatever the caller alone can say about the byte the two part company
+/// at, appended to the offset: the seed a randomised test promises to print with every
+/// failure (`IMPLEMENTATION.md` § 9), and, where the model knows its own escape
+/// sequences, which one the boundary fell inside. A closure because only the comparison
+/// below knows the index there is anything to say about.
+pub(crate) fn assert_same_stream(
+    want: &[u8],
+    got: &[u8],
+    at: u64,
+    sits_in: impl FnOnce(usize) -> String,
+) {
+    if want == got {
+        return;
+    }
+    let diff = want
+        .iter()
+        .zip(got)
+        .position(|(a, b)| a != b)
+        .unwrap_or_else(|| want.len().min(got.len()));
+    panic!(
+        "the daemon labelled a byte with an offset that is not where the child wrote \
+         it: at offset {}{}, the session sent\n  {}\nwhere the child wrote\n  {}\nThe \
+         stream is contiguous and wrong, which is what an off-by-N ring base or a slice \
+         resumed at the wrong byte looks like from a client",
+        at + diff as u64,
+        sits_in(diff),
+        quote(got, diff),
+        quote(want, diff),
+    );
+}
+
+/// A window of `bytes` around `at`, with the control bytes spelled out.
+///
+/// Read back raw, a stream of escape sequences would put the terminal running the test
+/// into the state the failure is about — alternate screen, scroll region and all — which
+/// is a poor way to report one.
+fn quote(bytes: &[u8], at: usize) -> String {
+    let mut out = String::new();
+    let window = bytes
+        .get(at.saturating_sub(24)..(at + 24).min(bytes.len()))
+        .unwrap_or_default();
+    for byte in window {
+        match byte {
+            0x1b => out.push_str("<ESC>"),
+            0x20..=0x7e => out.push(char::from(*byte)),
+            other => drop(write!(out, "<{other:02x}>")),
+        }
+    }
+    out
 }
 
 /// Whether the kernel is holding bytes for `stream` that nothing has read yet.

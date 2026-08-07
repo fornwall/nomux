@@ -21,7 +21,6 @@ use rustix::event::{PollFd, PollFlags, Timespec};
 
 use crate::agent::{self, Agent};
 use crate::conn::Conn;
-use crate::control::{Liveness, liveness};
 use crate::linger;
 use crate::nbio;
 use crate::pty::{self, Pty};
@@ -29,6 +28,7 @@ use crate::rundir::{SessionPaths, ensure_run_dir, session_ids};
 use crate::startup::{
     arm_child_signal, arm_stop_signals, leave_login_session, release_startup_state,
 };
+use crate::usock::{Liveness, liveness};
 
 /// Default ring capacity: how long a disconnect can last before scrollback is lost,
 /// times the per-host session count `MAX_SESSIONS` backstops (`IMPLEMENTATION.md` § 4).

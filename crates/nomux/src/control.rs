@@ -2,10 +2,13 @@
 //!
 //! These must work against a daemon of *any* version, so the contract here is the
 //! on-disk layout — never a protocol frame, never `PROTOCOL_VERSION`.
+//!
+//! Those two modes and nothing else. The socket probe all of this is written against is
+//! [`crate::usock::liveness`], where the daemon's bind and the attach paths reach it
+//! without reading a line of a file § 6.6 froze.
 
 use std::io::{self, Write};
 use std::os::fd::OwnedFd;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -16,7 +19,7 @@ use crate::rundir::{
     MAX_PID_LEN, MAX_SESSION_ID_LEN, SessionPaths, SpawnLock, check_run_dir, parse_pid, read_label,
     read_prefix, run_dir, session_ids,
 };
-use crate::usock::{connect_within, nothing_is_listening};
+use crate::usock::{Liveness, liveness};
 
 /// How long a probe of a session socket waits for an answer.
 ///
@@ -35,8 +38,8 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// What `list` gives a probe instead. Nothing, because only [`Liveness::Stale`] changes
 /// what it does with a session, and every errno behind `Stale` is settled on the first
-/// attempt ([`connect_within`]) — waiting a full backlog out would cost two seconds per
-/// wedged daemon to print the same line.
+/// attempt ([`crate::usock::connect_within`]) — waiting a full backlog out would cost two
+/// seconds per wedged daemon to print the same line.
 const LIST_PROBE: Duration = Duration::ZERO;
 
 /// How long `kill` gives another process to reach a point of its own: the spawn lock to
@@ -78,22 +81,6 @@ const PATH_MAX: usize = 4096;
 /// truncated in any way that matters. What settles a read that reached the end of it is
 /// [`is_daemon_for`]'s rule about `argv[1]`, never the size of this.
 const MAX_CMDLINE_LEN: usize = PATH_MAX + 1 + "daemon".len() + 1 + MAX_SESSION_ID_LEN + 1;
-
-/// State of one session as seen from the run directory alone.
-#[derive(Debug)]
-pub(crate) enum Liveness {
-    /// A daemon accepted this connection, so a process is serving the socket.
-    Alive(UnixStream),
-    /// Nothing is listening; the daemon died. Carries the errno, which is what says
-    /// whether a socket file was left behind to replace.
-    Stale(io::Error),
-    /// The `connect` failed for a reason that is not death, carrying it.
-    ///
-    /// § 6.3's "`EACCES` is not staleness": the same conservative answer as
-    /// [`Self::Alive`] for the *unlink*, and its opposite everywhere else, since only an
-    /// accepted connection may escalate to `SIGKILL`.
-    Unknown(io::Error),
-}
 
 /// Prints one line per live session: id, pid and label.
 ///
@@ -628,19 +615,6 @@ fn collect(paths: &SessionPaths) {
         // Ignored, unlike `kill`: this is opportunistic tidying behind a `list`, with no
         // caller waiting on an answer and nothing lost by trying again.
         drop(paths.unlink_all_locked(&lock));
-    }
-}
-
-/// Probes the socket. A refused connection means the daemon is gone; the socket file
-/// outlives the process that bound it.
-///
-/// Through [`connect_within`], which owns the argument for the deadline.
-pub(crate) fn liveness(socket: &Path, within: Duration) -> Liveness {
-    match connect_within(socket, within) {
-        Ok(stream) => Liveness::Alive(stream),
-        Err(err) if nothing_is_listening(&err) => Liveness::Stale(err),
-        // Evidence of neither death nor life — see [`Liveness::Unknown`].
-        Err(err) => Liveness::Unknown(err),
     }
 }
 

@@ -31,61 +31,6 @@ use harness::{
     process_alive, process_state, run_root, stat_field, still_serving, succeeded, wait_for,
 };
 
-/// The child's last words come before its status.
-///
-/// A session outlives its child (§ 6.5), so the client that collects an exit is
-/// routinely not the one that watched it happen: the shell finishes, the connection
-/// goes, and the final output and the status are both still owed to whoever comes
-/// back. The order they arrive in is the whole of it, and it is decided again for
-/// every connection — `on_hello` rewinds `sent_through` to where this client resumes
-/// and clears `exit_sent`, so a replay that got it wrong would get it wrong for the
-/// one client that has no way to ask again. That client closes the tab on `Exit` and
-/// loses the entire transcript, including whatever the shell said on its way out.
-///
-/// The reattach is prompt rather than delayed: how *long* the session holds what it
-/// is owed is
-/// [`a_session_whose_child_has_exited_keeps_its_files_and_its_status_with_nobody_attached`]'s
-/// business, and it pays six seconds of wall clock for it.
-#[test]
-fn the_exit_status_arrives_after_the_final_output() {
-    let (session, mut client, _) = Session::attached("exit_order");
-    let shell = shell_of(&session);
-
-    let command = b"printf NOMUX-LAST-WORD; exit 3\n";
-    client.input(0, command);
-    // The daemon must own the command before the connection goes away, or RST
-    // takes it with them.
-    client.wait_for_input_ack(command.len() as u64);
-    drop(client);
-
-    // The reattach has to land after the child is gone, or the ordering below is
-    // satisfied by a live stream rather than by the replay this is about — which is
-    // all a fixed sleep here could hope for, and silently miss on a loaded machine.
-    assert!(
-        poll_until(SETTLE, || !process_alive(shell)),
-        "the child never exited, so what the reattach below reads is a live stream \
-         rather than the replay this is about"
-    );
-
-    // A session whose child has gone still answers, and still owes this connection
-    // both halves of what the last one was in the middle of being told.
-    let mut client = session.connect();
-    let resumed = client.hello(RESUME_FROM_START);
-    let replay = replay_to_the_exit(&mut client);
-
-    assert_eq!(
-        (replay.status, replay.kind),
-        (3, nomux::ExitKind::Exited),
-        "the child's own status must survive into the replay"
-    );
-    assert!(
-        replay.output.contains("NOMUX-LAST-WORD"),
-        "output arrived after the exit status, or not at all: {:?} (resumed from {})",
-        replay.output,
-        resumed.resume_from
-    );
-}
-
 /// A child that was killed is reported as `Signalled` carrying the signal, not as a
 /// process that returned one (`IMPLEMENTATION.md` § 10).
 ///
@@ -95,14 +40,14 @@ fn the_exit_status_arrives_after_the_final_output() {
 /// that distinction across the wire is this one byte.
 ///
 /// This client stays attached, unlike
-/// [`the_exit_status_arrives_after_the_final_output`], so what it pins is the frame
-/// the daemon builds on the pass that collects the status — which is what makes it
-/// the place to pin `since_exit_secs` at zero. That field is how a client tells a
-/// shell that has just finished from one that finished while the laptop was shut
-/// (§ 6.5), and only a client that watched the exit happen can say what the answer
-/// must be. A daemon that stamped the frame when it *built* it rather than measuring
-/// from the end of file would pass every reattach test in this file and still tell
-/// every live client that its shell had exited some time ago.
+/// [`a_session_whose_child_has_exited_keeps_its_files_and_its_status_with_nobody_attached`],
+/// so what it pins is the frame the daemon builds on the pass that collects the
+/// status — which is what makes it the place to pin `since_exit_secs` at zero. That
+/// field is how a client tells a shell that has just finished from one that finished
+/// while the laptop was shut (§ 6.5), and only a client that watched the exit happen
+/// can say what the answer must be. A daemon that stamped the frame when it *built*
+/// it rather than measuring from the end of file would pass every reattach test in
+/// this file and still tell every live client that its shell had exited some time ago.
 ///
 /// `kill -9 $$` rather than a signal from outside, because `$$` is the shell the
 /// daemon is watching and `kill` is a builtin of it: no second process to find, and
@@ -1049,6 +994,15 @@ fn a_daemon_nobody_ever_attaches_to_reaps_itself() {
 /// The status is distinctive because the alternative is not: `exit 0` is what the
 /// daemon synthesises for a child it never got a status for (`collect_status`), so a
 /// session that had lost the real one would still answer plausibly.
+///
+/// The order the two halves arrive in is pinned here as well, for the client that has
+/// no way to ask again: `pump_output` sends the `Exit` only once `sent_through` has
+/// reached the end of the ring, and it is decided afresh for every connection —
+/// `on_hello` rewinds `sent_through` to where this client resumes and `exit_sent`
+/// starts false on every takeover. A client that was handed the status first closes
+/// the tab on it and loses the whole transcript, including whatever the shell said on
+/// its way out; [`replay_to_the_exit`] stops at the `Exit`, so output queued behind it
+/// is output the marker assertion below never sees.
 #[test]
 fn a_session_whose_child_has_exited_keeps_its_files_and_its_status_with_nobody_attached() {
     /// How long the session is left with no client and no child before anything at
@@ -1158,11 +1112,10 @@ struct Replay {
 /// Reads a reattached client's replay up to and including the exit.
 ///
 /// The ordering promise of § 6.5 is carried by the *shape* of this loop rather than
-/// by a line in either caller: the `Exit` ends it, so anything the child wrote that
-/// the daemon queued behind the status is output this never collects — and the caller
+/// by a line in its caller: the `Exit` ends it, so anything the child wrote that the
+/// daemon queued behind the status is output this never collects — and the caller
 /// then finds its marker missing rather than finding a passing test that read the
-/// frames in whatever order they came. Written once because the two callers differ
-/// only in how long the session had been sitting there when they arrived.
+/// frames in whatever order they came.
 fn replay_to_the_exit(client: &mut Client) -> Replay {
     let mut seen = Vec::new();
     let deadline = Instant::now() + FRAME_PATIENCE;

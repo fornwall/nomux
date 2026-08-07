@@ -34,8 +34,8 @@ use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags};
 
-use crate::control::{Liveness, liveness};
 use crate::rundir::{SessionPaths, check_run_dir, ensure_run_dir};
+use crate::usock::{Liveness, liveness};
 
 /// How long to wait for a freshly spawned daemon to bind its socket.
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(5);

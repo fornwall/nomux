@@ -7,15 +7,14 @@
 //! client is away. § 9's two invariants — no duplicated input, and no lost output
 //! unless a `Gap` was reported.
 //!
-//! - Bytes survive a disconnect exactly:
-//!   [`an_escape_heavy_stream_is_byte_exact_across_random_disconnects`].
 //! - Every byte lost to overflow is announced:
 //!   [`overflow_during_disconnects_is_always_reported`].
 //! - Input is applied once whatever the disconnect pattern:
 //!   [`replayed_input_across_random_disconnects_is_applied_once`].
 //! - The daemon's own boundaries — a `MAX_PAYLOAD` chunk, a send queue that filled
 //!   mid-slice, a ring that rolled — cut a full-screen program's escape sequences in
-//!   half without ever losing or repeating a byte:
+//!   half without ever losing or repeating a byte; and a disconnect the seed placed in
+//!   the middle of that stream costs it neither a byte nor its input position:
 //!   [`a_full_screen_stream_is_byte_exact_across_gaps_that_cut_its_escape_sequences`].
 //!
 //! Disconnect points come from a fixed seed so a failure is reproducible; override it
@@ -31,14 +30,13 @@
 
 mod harness;
 
-use std::fmt::Write as _;
 use std::fs;
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use nomux::{Frame, MAX_PAYLOAD, RESUME_FROM_START};
 
-use harness::{Rng, Session, poll_by, socket_capacity};
+use harness::{Rng, Session, assert_same_stream, poll_by, socket_capacity};
 
 /// `conn::MAX_PENDING_WRITE`, private to the daemon: what § 4.1 has it queue for a slow
 /// client before it stops adding. Mirrored here as the harness mirrors its neighbours,
@@ -46,16 +44,12 @@ use harness::{Rng, Session, poll_by, socket_capacity};
 /// far ahead of a client's own reads the daemon can be.
 const MAX_PENDING_WRITE: usize = 1 << 20;
 
-/// Iterations of the escape-sequence emitter. Enough output to arrive as many
-/// separate reads, so disconnects land mid-stream rather than between commands.
-const EMIT_ROUNDS: u32 = 20_000;
-
 /// How long a chaos test waits for its workload before calling it stalled.
 ///
 /// Under the forty-second kill in `.config/nextest.toml`, since a deadline at or above
 /// that can never fire — and a stall killed from outside says nothing, losing § 9's
 /// promise that every chaos failure carries its seed. Spent once per test, per
-/// `harness::poll_by`. All four finish in under two seconds.
+/// `harness::poll_by`. All three finish in under two seconds.
 const PATIENCE: Duration = Duration::from_secs(20);
 
 /// Seed used when `NOMUX_CHAOS_SEED` is unset.
@@ -81,40 +75,6 @@ fn chaos_seed() -> u64 {
         .unwrap_or(DEFAULT_SEED)
 }
 
-/// One iteration of the emitter's output: cursor addressing, an SGR colour, a
-/// four-digit counter, a minimal sixel image, and a reset.
-///
-/// Every part of it is a *sequence*, so a byte lost anywhere in here does not merely
-/// lose a character — it changes the meaning of everything read afterwards. That is
-/// what makes byte-exactness the property worth asserting.
-fn emitted_chunk(i: u32) -> String {
-    format!(
-        "\x1b[{row};1H\x1b[38;5;{colour}m{i:04}\x1bPq#0;2;0;0;0~~\x1b\\\x1b[0m|",
-        row = i % 24 + 1,
-        colour = i % 256,
-    )
-}
-
-/// Rounds between the emitter's pauses. See [`emitter_command`].
-const BURST: u32 = 500;
-
-/// The shell command that produces exactly [`emitted_chunk`] for each round,
-/// bracketed by markers.
-///
-/// The pause every [`BURST`] rounds is what makes this a test rather than a formality:
-/// without it the child outruns the client, the daemon coalesces the run into two or
-/// three maximum-size frames, and there is almost nowhere for a disconnect to land. Its
-/// stderr is discarded because a `sleep` without sub-second support would otherwise
-/// write a complaint into the very stream being compared.
-fn emitter_command(rounds: u32) -> String {
-    format!(
-        "printf 'CHAOS-BEGIN'; i=0; while [ $i -lt {rounds} ]; do \
-         printf '\\033[%d;1H\\033[38;5;%dm%04d\\033Pq#0;2;0;0;0~~\\033\\\\\\033[0m|' \
-         $((i%24+1)) $((i%256)) $i; i=$((i+1)); \
-         [ $((i%{BURST})) -eq 0 ] && sleep 0.02 2>/dev/null; done; printf 'CHAOS-END'\n"
-    )
-}
-
 /// What `yes` writes `since` bytes into its output. Checking against position rather
 /// than against "a `y` or a newline" is what catches a byte dropped, duplicated or
 /// reordered inside the stream — as far as period 2 reaches, a stream shifted by an even
@@ -124,112 +84,6 @@ fn emitter_command(rounds: u32) -> String {
 /// generate is a byte fewer through the ring.
 const fn yes_byte(since: u64) -> u8 {
     if since.is_multiple_of(2) { b'y' } else { b'\n' }
-}
-
-/// Index of the first occurrence of `needle` in `haystack`.
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
-/// A full-screen stream survives disconnects byte for byte: the ring is large enough
-/// that nothing can be dropped, so the reconstructed stream must equal what the child
-/// wrote exactly, with no gap reported and no byte repeated across a resume.
-#[test]
-fn an_escape_heavy_stream_is_byte_exact_across_random_disconnects() {
-    let chaos_seed = chaos_seed();
-    let session = Session::start_with_ring("chaos_exact", 8 << 20);
-    let deadline = Instant::now() + PATIENCE;
-    let mut client = session.connect();
-    client.waits_by(deadline);
-    let ok = client.hello(RESUME_FROM_START);
-
-    // Echo and newline translation silenced, so what arrives is exactly what the child
-    // wrote and the comparison below can be literal.
-    let ready = client.make_ready("-echo -onlcr", None, ok.resume_from);
-    let mut offset = ready.offset;
-    let mut in_offset = ready.in_offset;
-
-    let command = emitter_command(EMIT_ROUNDS);
-    client.input(in_offset, command.as_bytes());
-    in_offset += command.len() as u64;
-
-    let mut rng = Rng::new(chaos_seed);
-    let mut seen: Vec<u8> = Vec::new();
-    let mut disconnects = 0u32;
-    let mut since_disconnect = 0usize;
-    let mut next_at = 4 * 1024 + usize::try_from(rng.below(12 * 1024)).unwrap_or(0);
-
-    while find(&seen, b"CHAOS-END").is_none() {
-        let (ty, payload) = frame_by(&mut client, deadline, chaos_seed, "emitter never finished");
-        match Frame::decode(ty, &payload).expect("decode frame") {
-            Frame::Output { offset: at, data } => {
-                assert_eq!(
-                    at, offset,
-                    "output offsets must be contiguous (seed {chaos_seed})"
-                );
-                offset += data.len() as u64;
-                since_disconnect += data.len();
-                seen.extend_from_slice(data);
-            }
-            Frame::InputAck { .. } | Frame::Pong => {}
-            Frame::Gap { .. } => panic!("an 8 MiB ring must not overflow on {EMIT_ROUNDS} rounds"),
-            other => panic!("unexpected {other:?} (seed {chaos_seed})"),
-        }
-
-        // By volume rather than frame count: one frame carries anything from a few
-        // bytes to `MAX_PAYLOAD`, so counting frames would make the disconnect rate
-        // depend on how fast the machine happens to be; and the threshold is drawn
-        // once per disconnect rather than per frame, so the seed replays the run.
-        if since_disconnect >= next_at {
-            drop(client);
-            client = session.connect();
-            client.waits_by(deadline);
-            let resumed = client.hello_before(deadline, offset);
-            assert!(
-                !resumed.gap(offset),
-                "nothing should be dropped (seed {chaos_seed})"
-            );
-            assert_eq!(
-                resumed.resume_from, offset,
-                "resume must be exact (seed {chaos_seed})"
-            );
-            assert_eq!(
-                resumed.in_applied, in_offset,
-                "input position must survive the drop (seed {chaos_seed})"
-            );
-            disconnects += 1;
-            since_disconnect = 0;
-            next_at = 4 * 1024 + usize::try_from(rng.below(12 * 1024)).unwrap_or(0);
-        }
-    }
-
-    assert!(
-        disconnects >= 3,
-        "only {disconnects} disconnects landed; the test proved little (seed {chaos_seed})"
-    );
-
-    let begin = find(&seen, b"CHAOS-BEGIN").expect("start marker") + b"CHAOS-BEGIN".len();
-    let expected: String = (0..EMIT_ROUNDS).map(emitted_chunk).collect();
-    let expected = format!("{expected}CHAOS-END");
-    let got = seen.get(begin..begin + expected.len()).unwrap_or_default();
-
-    if got != expected.as_bytes() {
-        let at = got
-            .iter()
-            .zip(expected.as_bytes())
-            .position(|(a, b)| a != b)
-            .unwrap_or_else(|| got.len().min(expected.len()));
-        let from = at.saturating_sub(40);
-        panic!(
-            "stream diverged at byte {at} of {} after {disconnects} disconnects (seed {chaos_seed})\n\
-             expected: {:?}\n     got: {:?}",
-            expected.len(),
-            String::from_utf8_lossy(&expected.as_bytes()[from..(at + 40).min(expected.len())]),
-            String::from_utf8_lossy(&got[from..(at + 40).min(got.len())]),
-        );
-    }
 }
 
 /// Under a firehose and a ring too small to hold it, every byte that goes missing is
@@ -315,7 +169,7 @@ fn overflow_during_disconnects_is_always_reported() {
         std::thread::sleep(Duration::from_millis(rng.below(30)));
         client = session.connect();
         client.waits_by(deadline);
-        let resumed = client.hello_before(deadline, offset);
+        let resumed = client.hello(offset);
         assert!(
             resumed.resume_from >= offset,
             "round {round}: the daemon must never rewind (seed {chaos_seed})"
@@ -378,7 +232,7 @@ fn replayed_input_across_random_disconnects_is_applied_once() {
         drop(client);
         client = session.connect();
         client.waits_by(deadline);
-        let resumed = client.hello_before(deadline, offset);
+        let resumed = client.hello(offset);
         assert!(
             resumed.in_applied <= intended.len() as u64,
             "round {round}: the daemon applied input the client never sent (seed {chaos_seed})"
@@ -557,6 +411,20 @@ fn redraw(screen: &mut Screen, rng: &mut Rng) {
 enum Round {
     /// Read this many bytes of the stream and stay attached; `usize::MAX` for all of it.
     Read(usize),
+    /// Take the round in pieces of the sizes given, severing the connection where each
+    /// piece leaves the stream and coming straight back on a fresh one — so the cut
+    /// falls in the middle of the child's own output rather than between rounds, at a
+    /// byte neither the daemon nor the test chose.
+    ///
+    /// The two `Reattach` arms sever a connection only where the client has read none
+    /// of the round; this is the ordinary case and the one the numbers are hardest for.
+    /// The client is part way through a stream, the connection goes with output still
+    /// queued so the kernel sends RST rather than FIN — and § 9 obliges the handshake
+    /// that follows to hand back the very byte it stopped at and the input position it
+    /// had, neither of which may go with the connection. [`INTERRUPTED`] keeps the whole
+    /// round well inside the ring, so a gap here would be the daemon losing bytes
+    /// nothing obliged it to lose.
+    Interrupted([usize; DISCONNECTS]),
     /// Read none of it and come back on a fresh connection. The slice is longer than the
     /// ring, so § 4.2's comparison owes the newcomer a gap at the handshake.
     ReattachOverGap,
@@ -567,6 +435,31 @@ enum Round {
     /// mid-stream `Gap` frame `pump_output` sends rather than the handshake's comparison.
     ReadThroughGap,
 }
+
+/// How many times [`Round::Interrupted`] severs the connection.
+const DISCONNECTS: usize = 4;
+
+/// How many of those must have left this client with output still owed.
+///
+/// Not all of them, and the arithmetic is why: a cut names a number of bytes, and what
+/// arrives is whole frames. [`Replay::follow`] takes one at a time until the cut is
+/// covered, so a four-kilobyte cut can be answered with a `MAX_PAYLOAD` frame — and past
+/// the first two the round has run out, leaving the disconnect on a boundary, which is
+/// the case the two `Reattach` arms already ask about. Two is what [`INTERRUPTED`]
+/// guarantees, and it is asserted rather than assumed because it is a consequence of
+/// that figure and would go quiet if the figure moved.
+const MID_ROUND: usize = 2;
+
+/// How much the child writes in [`Round::Interrupted`]'s round.
+///
+/// Past the most this client can be handed across the first two cuts: while it is
+/// attached the daemon frames what it lifts off the PTY 64 KiB at a time, and the pass
+/// after a reattach may hand over a whole `MAX_PAYLOAD`, so 320 KiB is the ceiling on
+/// the two together and anything above it leaves both cuts strictly inside the round.
+/// Still a small fraction of [`SCREEN_RING`], so a client falling this far behind can
+/// never be gapped and a gap here would be the daemon losing bytes nothing obliged it
+/// to lose.
+const INTERRUPTED: usize = 384 * 1024;
 
 /// The whole workload: the bytes the child will write, cut into the rounds the client
 /// drives it through one line at a time, and what the client does after each.
@@ -585,8 +478,8 @@ fn workload(rng: &mut Rng, queued_ahead: usize) -> (Screen, Vec<Round>) {
 
     let mut screen = Screen::new();
     let mut plan = Vec::new();
-    let chatter = |screen: &mut Screen, rng: &mut Rng| {
-        let target = screen.bytes.len() + CHATTER;
+    let chatter = |screen: &mut Screen, rng: &mut Rng, bytes: usize| {
+        let target = screen.bytes.len() + bytes;
         while screen.bytes.len() < target {
             redraw(screen, rng);
         }
@@ -595,8 +488,21 @@ fn workload(rng: &mut Rng, queued_ahead: usize) -> (Screen, Vec<Round>) {
 
     // Warm up: everything drained, so what follows starts from a client that is exactly
     // caught up and every gap below is arithmetic on the ring alone.
-    chatter(&mut screen, rng);
+    chatter(&mut screen, rng, CHATTER);
     plan.push(Round::Read(usize::MAX));
+
+    // Where each of [`Round::Interrupted`]'s cuts falls, drawn here rather than as the
+    // round runs. That is what makes `NOMUX_CHAOS_SEED` replay a run: the generator
+    // advances a fixed number of times, decided by the plan alone, where a draw taken
+    // per frame received would depend on how the kernel chunked the stream. Four
+    // kilobytes at least, so the client is always part way into a frame's worth of
+    // output rather than none of it.
+    let mut cuts = [0usize; DISCONNECTS];
+    for cut in &mut cuts {
+        *cut = 4 * 1024 + usize::try_from(rng.below(12 * 1024)).unwrap_or(0);
+    }
+    chatter(&mut screen, rng, INTERRUPTED);
+    plan.push(Round::Interrupted(cuts));
 
     screen.image(rng, SCREEN_RING + OVER);
     screen.round();
@@ -604,7 +510,7 @@ fn workload(rng: &mut Rng, queued_ahead: usize) -> (Screen, Vec<Round>) {
 
     // Behind by a random amount, so the mid-stream gap below is met from a position
     // nothing about the test chose.
-    chatter(&mut screen, rng);
+    chatter(&mut screen, rng, CHATTER);
     plan.push(Round::Read(
         usize::try_from(rng.below(CHATTER as u64)).unwrap_or(0),
     ));
@@ -613,7 +519,7 @@ fn workload(rng: &mut Rng, queued_ahead: usize) -> (Screen, Vec<Round>) {
     screen.round();
     plan.push(Round::ReadThroughGap);
 
-    chatter(&mut screen, rng);
+    chatter(&mut screen, rng, CHATTER);
     plan.push(Round::ReattachExact);
 
     // A second handshake gap, this time on a stream that has already been through a
@@ -627,38 +533,29 @@ fn workload(rng: &mut Rng, queued_ahead: usize) -> (Screen, Vec<Round>) {
 }
 
 /// The client's side of the model: what the child wrote, where on the stream it
-/// started, and what the daemon's boundaries have landed on so far.
+/// started, where this client stands on both streams, and what the daemon's boundaries
+/// have landed on so far.
 struct Replay<'a> {
     screen: &'a Screen,
     stream_start: u64,
     seed: u64,
     deadline: Instant,
+    /// One past the last output byte this client has taken.
+    offset: u64,
+    /// One past everything the child has written, which the sentinel of the round just
+    /// finished makes exact — and which every gap below is arithmetic on.
+    written: u64,
+    /// One past the last input byte sent, kept because a reattach is told the daemon's
+    /// own count and the two must agree exactly (§ 3).
+    in_offset: u64,
+    /// Fresh connections made in the middle of the plan, of both kinds.
+    reattaches: usize,
     /// Every gap followed, as the offset the stream stood at and the one it resumed on.
     gaps: Vec<(u64, u64)>,
     /// `Output` frames whose first byte falls strictly inside an escape sequence.
     straddling_frames: u64,
     /// Gaps whose resume point does.
     straddling_gaps: u64,
-}
-
-/// A window of `bytes` around `at`, with the control bytes spelled out.
-///
-/// Read back raw, a stream of escape sequences would put the terminal running the test
-/// into the state the failure is about — alternate screen, scroll region and all — which
-/// is a poor way to report one.
-fn quote(bytes: &[u8], at: usize) -> String {
-    let mut out = String::new();
-    let window = bytes
-        .get(at.saturating_sub(24)..(at + 24).min(bytes.len()))
-        .unwrap_or_default();
-    for byte in window {
-        match byte {
-            0x1b => out.push_str("<ESC>"),
-            0x20..=0x7e => out.push(char::from(*byte)),
-            other => drop(write!(out, "<{other:02x}>")),
-        }
-    }
-    out
 }
 
 impl Replay<'_> {
@@ -687,28 +584,16 @@ impl Replay<'_> {
                     got.len(),
                 )
             });
-        if want == got {
-            return;
-        }
-        let diff = (want.iter().zip(got))
-            .position(|(a, b)| a != b)
-            .unwrap_or_else(|| want.len().min(got.len()));
-        let inside = self.screen.straddled(index + diff);
-        panic!(
-            "the daemon labelled a byte with an offset that is not where the child \
-             wrote it: at offset {}, {} bytes into {}, the session sent\n  {}\nwhere \
-             the child wrote\n  {}\nThe stream is contiguous and wrong, which is what \
-             an off-by-N base or a slice resumed at the wrong byte looks like from a \
-             client (seed {seed})",
-            at + diff as u64,
-            index + diff,
-            inside.map_or_else(
-                || "no escape sequence".to_owned(),
-                |seq| format!("the escape sequence at {}..{}", seq.start, seq.end)
-            ),
-            quote(got, diff),
-            quote(want, diff),
-        );
+        assert_same_stream(want, got, at, |diff| {
+            format!(
+                ", {} bytes into {} (seed {seed})",
+                index + diff,
+                self.screen.straddled(index + diff).map_or_else(
+                    || "no escape sequence".to_owned(),
+                    |seq| format!("the escape sequence at {}..{}", seq.start, seq.end)
+                ),
+            )
+        });
     }
 
     /// Takes output until the stream reaches `through` or `budget` bytes of it have been
@@ -757,19 +642,124 @@ impl Replay<'_> {
     fn straddles(&self, at: u64) -> bool {
         self.screen.straddled(self.index(at)).is_some()
     }
-}
 
-/// Where the client stands on both streams as the rounds move it.
-struct Cursor {
-    /// One past the last output byte this client has taken.
-    offset: u64,
-    /// One past everything the child has written, which the sentinel of the round just
-    /// finished makes exact — and which every gap below is arithmetic on.
-    written: u64,
-    /// One past the last input byte sent, kept because a reattach is told the daemon's
-    /// own count and the two must agree exactly (§ 3).
-    in_offset: u64,
-    reattaches: u32,
+    /// Reads a round's output the way `kind` says, and asserts what that leaves true.
+    ///
+    /// `client` is replaced rather than borrowed back out, every arm but the two reading
+    /// ones ending the connection it was handed.
+    fn run_round(
+        &mut self,
+        session: &Session,
+        client: &mut harness::Client,
+        round: usize,
+        kind: Round,
+    ) {
+        let seed = self.seed;
+        let deadline = self.deadline;
+        // The whole of `Ring::base` once the ring has been full since long before this
+        // round: `end - capacity`, where the sentinel has just made `end` exact.
+        // Saturating for the opening round alone, where the stream is younger than the
+        // ring and no arm below looks at this.
+        let oldest_held = self.written.saturating_sub(SCREEN_RING as u64);
+        let gaps_before = self.gaps.len();
+        match kind {
+            Round::Read(budget) => {
+                self.offset = self.follow(client, self.offset, self.written, budget);
+            }
+            Round::Interrupted(cuts) => {
+                let mut mid_round = 0usize;
+                for cut in cuts {
+                    self.offset = self.follow(client, self.offset, self.written, cut);
+                    let owed = self.written - self.offset;
+                    mid_round += usize::from(owed > 0);
+                    *client = session.connect();
+                    client.waits_by(deadline);
+                    let resumed = client.hello(self.offset);
+                    assert_eq!(
+                        resumed.resume_from, self.offset,
+                        "round {round}: this client was {owed} bytes short of the round \
+                         and well inside a {SCREEN_RING}-byte ring, so the handshake must \
+                         resume it on the byte it stopped at rather than move it at all \
+                         (seed {seed})"
+                    );
+                    assert_eq!(
+                        resumed.in_applied, self.in_offset,
+                        "round {round}: the connection went with output still queued, \
+                         which the kernel turns into an RST rather than a FIN — and the \
+                         input position the session had must survive that instead of \
+                         going with the connection (seed {seed})"
+                    );
+                    self.reattaches += 1;
+                }
+                assert!(
+                    mid_round >= MID_ROUND,
+                    "round {round}: only {mid_round} of {DISCONNECTS} disconnects left \
+                     this client with output still owed, so the rest asked the handshake \
+                     about a round boundary rather than about a stream cut in half — \
+                     which the reattaching rounds already cover (seed {seed})"
+                );
+                self.offset = self.follow(client, self.offset, self.written, usize::MAX);
+            }
+            Round::ReadThroughGap => {
+                self.offset = self.follow(client, self.offset, self.written, usize::MAX);
+                let (_, base) = *self.gaps.get(gaps_before).unwrap_or_else(|| {
+                    panic!(
+                        "round {round}: the ring overran a client that never detached and \
+                         nothing said so; the whole stream arrived contiguous, which it \
+                         cannot have been (seed {seed})"
+                    )
+                });
+                assert_eq!(
+                    self.gaps.len() - gaps_before,
+                    1,
+                    "round {round}: the child had finished before this client read a byte, \
+                     so the ring was static and one gap is all there was to report \
+                     (seed {seed})"
+                );
+                assert_eq!(
+                    base, oldest_held,
+                    "round {round}: the daemon resumed this client at {base}, where the \
+                     oldest byte a full {SCREEN_RING}-byte ring can still serve is \
+                     {oldest_held}. Below it the stream is served from somewhere other \
+                     than where it says; above it the daemon threw away scrollback it was \
+                     still holding (seed {seed})"
+                );
+            }
+            Round::ReattachOverGap | Round::ReattachExact => {
+                // The outgoing connection goes when this assignment overwrites it, which
+                // is after the new socket exists and before it greets. That window costs
+                // the session nothing: § 6.4 has the daemon promote a connection on its
+                // `Hello` and never on the `connect`, so nothing here is a takeover.
+                *client = session.connect();
+                client.waits_by(deadline);
+                let resumed = client.hello(self.offset);
+                assert_eq!(
+                    resumed.in_applied, self.in_offset,
+                    "round {round}: the sentinel proved the child ran this line, so the \
+                     daemon must report it applied and no more (seed {seed})"
+                );
+                let over = matches!(kind, Round::ReattachOverGap);
+                assert_eq!(
+                    resumed.resume_from,
+                    if over { oldest_held } else { self.offset },
+                    "round {round}: {} (seed {seed})",
+                    if over {
+                        "the slice outran the ring, so the handshake owes this client the \
+                         oldest byte the ring still holds"
+                    } else {
+                        "this client never left the ring, so the handshake must resume it \
+                         on the byte it stopped at rather than move it at all"
+                    }
+                );
+                if resumed.gap(self.offset) {
+                    self.straddling_gaps += u64::from(self.straddles(resumed.resume_from));
+                    self.gaps.push((self.offset, resumed.resume_from));
+                }
+                self.offset = self.follow(client, resumed.resume_from, self.written, usize::MAX);
+                self.reattaches += 1;
+            }
+        }
+    }
 }
 
 /// Writes each round's slice where the child can `cat` it.
@@ -785,102 +775,18 @@ fn plant(session: &Session, screen: &Screen) {
     }
 }
 
-/// Reads a round's output the way `kind` says, and asserts what that leaves true.
-///
-/// `client` is replaced rather than borrowed back out, the two reattaching arms ending
-/// the connection they were handed.
-fn run_round(
-    session: &Session,
-    client: &mut harness::Client,
-    replay: &mut Replay<'_>,
-    cursor: &mut Cursor,
-    round: usize,
-    kind: Round,
-) {
-    let seed = replay.seed;
-    let deadline = replay.deadline;
-    // The whole of `Ring::base` once the ring has been full since long before this
-    // round: `end - capacity`, where the sentinel has just made `end` exact. Saturating
-    // for the opening round alone, where the stream is younger than the ring and no arm
-    // below looks at this.
-    let oldest_held = cursor.written.saturating_sub(SCREEN_RING as u64);
-    let gaps_before = replay.gaps.len();
-    match kind {
-        Round::Read(budget) => {
-            cursor.offset = replay.follow(client, cursor.offset, cursor.written, budget);
-        }
-        Round::ReadThroughGap => {
-            cursor.offset = replay.follow(client, cursor.offset, cursor.written, usize::MAX);
-            let (_, base) = *replay.gaps.get(gaps_before).unwrap_or_else(|| {
-                panic!(
-                    "round {round}: the ring overran a client that never detached and \
-                     nothing said so; the whole stream arrived contiguous, which it \
-                     cannot have been (seed {seed})"
-                )
-            });
-            assert_eq!(
-                replay.gaps.len() - gaps_before,
-                1,
-                "round {round}: the child had finished before this client read a byte, so \
-                 the ring was static and one gap is all there was to report (seed {seed})"
-            );
-            assert_eq!(
-                base, oldest_held,
-                "round {round}: the daemon resumed this client at {base}, where the oldest \
-                 byte a full {SCREEN_RING}-byte ring can still serve is {oldest_held}. \
-                 Below it the stream is served from somewhere other than where it says; \
-                 above it the daemon threw away scrollback it was still holding \
-                 (seed {seed})"
-            );
-        }
-        Round::ReattachOverGap | Round::ReattachExact => {
-            // The outgoing connection goes when this assignment overwrites it, which is
-            // after the new socket exists and before it greets. That window costs the
-            // session nothing: § 6.4 has the daemon promote a connection on its `Hello`
-            // and never on the `connect`, so nothing here is a takeover.
-            *client = session.connect();
-            client.waits_by(deadline);
-            let resumed = client.hello_before(deadline, cursor.offset);
-            assert_eq!(
-                resumed.in_applied, cursor.in_offset,
-                "round {round}: the sentinel proved the child ran this line, so the daemon \
-                 must report it applied and no more (seed {seed})"
-            );
-            let over = matches!(kind, Round::ReattachOverGap);
-            assert_eq!(
-                resumed.resume_from,
-                if over { oldest_held } else { cursor.offset },
-                "round {round}: {} (seed {seed})",
-                if over {
-                    "the slice outran the ring, so the handshake owes this client the \
-                     oldest byte the ring still holds"
-                } else {
-                    "this client never left the ring, so the handshake must resume it on \
-                     the byte it stopped at rather than move it at all"
-                }
-            );
-            if resumed.gap(cursor.offset) {
-                replay.straddling_gaps += u64::from(replay.straddles(resumed.resume_from));
-                replay.gaps.push((cursor.offset, resumed.resume_from));
-            }
-            cursor.offset = replay.follow(client, resumed.resume_from, cursor.written, usize::MAX);
-            cursor.reattaches += 1;
-        }
-    }
-}
-
 /// A full-screen program's output survives the daemon's own boundaries byte for byte,
 /// and every byte it loses to the ring is announced first (`IMPLEMENTATION.md` § 9).
 ///
-/// The three tests above cut the *connection* where a generator chose; this one lets the
-/// daemon cut the *stream* where its own machinery does — at a `MAX_PAYLOAD` chunk, at a
-/// send queue that filled partway through a slice of the ring, and at a ring that rolled
-/// while the client was not reading — and asks the same question of every byte: is it the
-/// byte its offset names? Against a model of what the child wrote rather than against
-/// what arrived before it, since a stream resumed at the wrong byte is contiguous and
-/// wrong, which no contiguity check can see.
+/// The two tests above cut the *connection* where a generator chose; this one does that
+/// too, and also lets the daemon cut the *stream* where its own machinery does — at a
+/// `MAX_PAYLOAD` chunk, at a send queue that filled partway through a slice of the ring,
+/// and at a ring that rolled while the client was not reading — and asks the same
+/// question of every byte: is it the byte its offset names? Against a model of what the
+/// child wrote rather than against what arrived before it, since a stream resumed at the
+/// wrong byte is contiguous and wrong, which no contiguity check can see.
 ///
-/// Three things here are reachable no other way in this suite.
+/// Four things here are reachable no other way in this suite.
 ///
 /// What the child wrote, checked against a ring above `MAX_PENDING_WRITE`
 /// ([`SCREEN_RING`]) — the size at which a pass of `pump_output` *cannot* queue the ring
@@ -895,10 +801,20 @@ fn run_round(
 /// `end - SCREEN_RING` and nothing else. Both routes to one are pinned against it:
 /// § 4.2's comparison at the handshake, and the mid-stream `Gap` frame.
 ///
-/// And gaps that provably cut an escape sequence in half. Each gapping round is a single
+/// Gaps that provably cut an escape sequence in half. Each gapping round is a single
 /// sixel image longer than the ring, so the byte the stream resumes on is *inside* it by
 /// arithmetic — § 4.3's premise for the client's reset, asserted rather than assumed.
 /// The daemon must not align to any of it, and the assertion is that it does not have to.
+///
+/// And a connection severed where the client is *part way through* the child's output
+/// rather than caught up or waiting ([`Round::Interrupted`]). That is the disconnect a
+/// user's network actually produces, and the one the numbers are hardest for: the socket
+/// goes with output still queued, so the kernel sends RST and the daemon meets an
+/// `ECONNRESET` rather than an orderly close — and the handshake behind it must still
+/// name the byte the client stopped at and the input position the session had. Both are
+/// checked against the model here, so a resume point that is merely self-consistent
+/// fails; the reattaching rounds ask the same question of a client that has read all of
+/// a round or none of it, which is the case a daemon gets right by accident.
 #[test]
 fn a_full_screen_stream_is_byte_exact_across_gaps_that_cut_its_escape_sequences() {
     /// What the child prints before the transcript, so the offset the stream starts at
@@ -934,22 +850,20 @@ fn a_full_screen_stream_is_byte_exact_across_gaps_that_cut_its_escape_sequences(
         stream_start,
         seed: chaos_seed,
         deadline,
-        gaps: Vec::new(),
-        straddling_frames: 0,
-        straddling_gaps: 0,
-    };
-    let mut cursor = Cursor {
         offset: stream_start,
         written: stream_start,
         in_offset: ready.in_offset + begin.len() as u64,
         reattaches: 0,
+        gaps: Vec::new(),
+        straddling_frames: 0,
+        straddling_gaps: 0,
     };
     let mut from = 0usize;
 
     for (round, (kind, end)) in plan.iter().zip(screen.rounds.iter().copied()).enumerate() {
         let line = format!("cat s{round}; touch m{round}\n");
-        client.input(cursor.in_offset, line.as_bytes());
-        cursor.in_offset += line.len() as u64;
+        client.input(replay.in_offset, line.as_bytes());
+        replay.in_offset += line.len() as u64;
 
         // The sentinel rather than an `InputAck`: it says the child has written every
         // byte of the slice, which is what makes `written` exact and each gap arithmetic
@@ -960,28 +874,23 @@ fn a_full_screen_stream_is_byte_exact_across_gaps_that_cut_its_escape_sequences(
             poll_by(deadline, || done.exists()),
             "round {round}: the child never finished writing its slice (seed {chaos_seed})"
         );
-        cursor.written += (end - from) as u64;
+        replay.written += (end - from) as u64;
         from = end;
 
-        run_round(
-            &session,
-            &mut client,
-            &mut replay,
-            &mut cursor,
-            round,
-            *kind,
-        );
+        replay.run_round(&session, &mut client, round, *kind);
     }
 
-    let offset = replay.follow(&mut client, cursor.offset, cursor.written, usize::MAX);
+    let offset = replay.follow(&mut client, replay.offset, replay.written, usize::MAX);
     assert_eq!(
-        offset, cursor.written,
+        offset, replay.written,
         "every byte the child wrote must be accounted for, dropped behind a gap or \
          delivered (seed {chaos_seed})"
     );
     assert_eq!(
-        cursor.reattaches, 3,
-        "the plan reattaches three times (seed {chaos_seed})"
+        replay.reattaches,
+        3 + DISCONNECTS,
+        "the plan comes back on a fresh connection three times at a round boundary and \
+         {DISCONNECTS} times inside one (seed {chaos_seed})"
     );
     assert_eq!(
         replay.gaps.len(),
