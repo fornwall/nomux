@@ -253,7 +253,7 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> io::Result<UnixStream> {
 }
 
 /// Gives back the `<id>.lock` this call created and hands `err` on, a leftover name being
-/// one `session_id_of` counts as a session for § 6.3's ceiling.
+/// one `session_id_of` reads as a session and `list` reports until it is collected.
 ///
 /// Called from the two exits that established the id is nobody's and from nowhere else,
 /// § 6.6 forbidding an exit that established neither death nor life to unlink over a live

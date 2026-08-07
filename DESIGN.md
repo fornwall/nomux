@@ -118,7 +118,7 @@ session identity *is* tab identity: no naming UI, no session picker, no id ever 
 
 - The daemon never interprets an id. It is a filename component and nothing else, validated strictly against path traversal ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)).
 - Opaque ids do not survive loss of client state: after a reinstall the daemons still run but the app no longer knows which tab each was. A human-readable label therefore sits beside the socket, so `nomux list` stays meaningful and orphans are recoverable. It is also why `attach` refuses an id nothing answers for instead of creating one (§4).
-- Concurrency is *intended* to cap at 8 per host, which is the terminals one person has open at once, and the cap is the client's: only the side that knows a tab was opened can hold the real one, so nothing holds it today. What arrives far past 8 is a runaway rather than a user who wanted one more terminal, and catching *that* is the daemon's backstop underneath — a different thing, and [IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)'s.
+- Concurrency is *intended* to cap at 8 per host, which is the terminals one person has open at once, and the cap is wholly the client's: only the side that knows a tab was opened can hold the real one, so nothing holds it today. The daemon enforces no count of its own — a limit it held would refuse the user's next terminal on the strength of names on disk, which is the wrong side to decide from.
 
 ### 5.2 Reaping
 

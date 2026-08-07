@@ -10,7 +10,7 @@ use std::fs;
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixListener;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use nomux::{
@@ -23,14 +23,14 @@ use crate::agent::{self, Agent};
 use crate::conn::Conn;
 use crate::nbio;
 use crate::pty::{self, Pty};
-use crate::rundir::{SessionPaths, ensure_run_dir, session_ids};
+use crate::rundir::{SessionPaths, ensure_run_dir};
 use crate::startup::{
     arm_child_signal, arm_stop_signals, detach_from_controlling_terminal, release_startup_state,
 };
 use crate::usock::{Liveness, liveness};
 
-/// Default ring capacity: how long a disconnect can last before scrollback is lost,
-/// times the per-host session count `MAX_SESSIONS` backstops (`IMPLEMENTATION.md` § 4).
+/// Default ring capacity: how long a disconnect can last before scrollback is lost
+/// (`IMPLEMENTATION.md` § 4).
 const DEFAULT_RING_CAPACITY: usize = 4 << 20;
 
 /// Environment override for the ring capacity, in bytes.
@@ -62,10 +62,6 @@ fn allocate_ring(session_id: &str) -> io::Result<crate::ring::Ring> {
         ))
     })
 }
-
-/// Most sessions a run directory may already hold before this daemon refuses to add
-/// another: eight times the limit `DESIGN.md` § 5.1 leaves to the client (§ 6.3).
-const MAX_SESSIONS: usize = 64;
 
 /// How long a detached session survives before reaping itself. One rule whether or not
 /// the child is still running (`IMPLEMENTATION.md` § 6.5).
@@ -269,7 +265,10 @@ fn start(session_id: &str, label: Option<&str>, inherited_lock_fd: Option<i32>) 
             )
         })?,
     };
-    let listener = match ceiling_checked_bind(&paths) {
+    // The bind is whole before § 6.2's fork: past it the caller has already been
+    // answered, so every errno after it reads as success. One `Err` exit, so `<id>.lock`
+    // is scrubbed in a single place.
+    let listener = match bind_socket(&paths) {
         Ok(listener) => listener,
         Err(err) => {
             // Only an acquisition that atomically created the directory entry may scrub
@@ -371,38 +370,6 @@ fn publish(paths: &SessionPaths, label: Option<&str>) -> io::Result<(OwnedFd, Ow
     Ok((stop_pipe, child_pipe))
 }
 
-/// Everything refusable inside [`start`]'s locked region, one `Err` exit so `<id>.lock`
-/// is scrubbed in a single place: the § 6.3 ceiling, counted before the bind because
-/// taking the lock created `<id>.lock` — which `session_id_of` counts as a session, so a
-/// refusal that left it behind would ratchet the backstop against itself — and then the
-/// bind, whole, before § 6.2's fork: past it the caller has already been answered, so
-/// every errno after it reads as success.
-fn ceiling_checked_bind(paths: &SessionPaths) -> io::Result<UnixListener> {
-    let dir = paths.dir();
-    let at_ceiling = at_session_ceiling(dir, paths.id()).map_err(|err| {
-        io::Error::new(
-            err.kind(),
-            format!(
-                "{} could not be enumerated before starting session {}: {err}",
-                dir.display(),
-                paths.id()
-            ),
-        )
-    })?;
-    if at_ceiling {
-        return Err(io::Error::new(
-            io::ErrorKind::QuotaExceeded,
-            format!(
-                "{} already holds {MAX_SESSIONS} sessions, which is as many as one host \
-                 will run: `nomux list` collects the ones that have stopped, and \
-                 `nomux kill <id>` ends one that has not",
-                dir.display()
-            ),
-        ));
-    }
-    bind_socket(paths)
-}
-
 /// Binds the session socket, replacing a stale one: a socket whose `connect` is refused
 /// belongs to a dead daemon, and anything else — including `EACCES` — is left alone,
 /// removing it being how somebody else's live session gets destroyed.
@@ -445,19 +412,6 @@ fn bind_socket(paths: &SessionPaths) -> io::Result<UnixListener> {
     let listener = crate::rundir::bind_socket_private(&path)?;
     listener.set_nonblocking(true)?;
     Ok(listener)
-}
-
-/// Whether `dir` already holds [`MAX_SESSIONS`] sessions other than `mine`.
-/// `IMPLEMENTATION.md` § 6.3 has the policy, and [`session_ids`] is the rule `list`
-/// discovers sessions with (§ 6.6). Every contender has created its locked name before
-/// this call, so those names are reservations and two different ids cannot both observe
-/// the same final slot as free.
-fn at_session_ceiling(dir: &Path, mine: &str) -> io::Result<bool> {
-    Ok(session_ids(dir)?
-        .iter()
-        .filter(|id| id.as_str() != mine)
-        .count()
-        >= MAX_SESSIONS)
 }
 
 /// What one entry of the poll set belongs to.
@@ -1988,49 +1942,6 @@ mod tests {
             "the loop slept {}s, past the deadline that is the only thing able to give \
              the slot back",
             timeout.tv_sec
-        );
-    }
-
-    /// The § 5.1 backstop: a run directory already holding [`MAX_SESSIONS`] sessions
-    /// refuses to take another, and the id being started never counts against itself.
-    #[test]
-    fn a_run_directory_at_the_session_ceiling_takes_no_more() {
-        let root = Scratch::new("session-ceiling");
-        let dir = root.path();
-        // One short of the ceiling, and each of them spelled with all five names a
-        // session leaves, so what is counted is plainly ids rather than files.
-        for n in 0..MAX_SESSIONS - 1 {
-            for extension in ["sock", "pid", "lock", "label", "agent"] {
-                fs::write(dir.join(format!("s{n}.{extension}")), b"").expect("plant a run file");
-            }
-        }
-        // The two edges of `<id>.*`: a name with no extension at all is nobody's, and a
-        // name this build has never written is still the session whose id it carries
-        // rather than a session of its own.
-        fs::write(dir.join("notes"), b"").expect("plant a name with no extension");
-        fs::write(dir.join("s0.journal"), b"").expect("plant a name from a later version");
-        assert!(
-            !at_session_ceiling(dir, "mine").expect("enumerate the run directory"),
-            "{} sessions is below the ceiling",
-            MAX_SESSIONS - 1
-        );
-
-        // `try_lock_spawn` has already created this daemon's own `<id>.lock` by the
-        // time the count is taken.
-        fs::write(dir.join("mine.lock"), b"").expect("plant this session's own lock");
-        assert!(
-            !at_session_ceiling(dir, "mine").expect("enumerate the run directory"),
-            "a session that is starting must not count against itself"
-        );
-
-        fs::write(dir.join("last.sock"), b"").expect("plant the session that fills it");
-        assert!(
-            at_session_ceiling(dir, "mine").expect("enumerate the run directory"),
-            "{MAX_SESSIONS} sessions besides this one is the ceiling"
-        );
-        assert!(
-            at_session_ceiling(&root.join("never-created"), "mine").is_err(),
-            "a directory that was not read cannot honestly be reported below the ceiling"
         );
     }
 

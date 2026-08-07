@@ -75,10 +75,6 @@ const SOCKET_POLL: Duration = Duration::from_millis(100);
 /// that a condition which shells out to `nomux list` is not run back to back.
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-/// `daemon::MAX_SESSIONS`: the ids one run directory holds before it refuses (§ 4).
-/// Private to the daemon, mirrored here, and the two must move together.
-pub(crate) const MAX_SESSIONS: usize = 64;
-
 /// `daemon::MAX_PENDING_INPUT`: what § 4.1 lets a session queue for a child that is
 /// not reading. Private to the daemon, mirrored here, and the two must move together.
 pub(crate) const MAX_PENDING_INPUT: u64 = 1 << 20;

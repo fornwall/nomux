@@ -566,14 +566,8 @@ second implementation of `list` or `kill` must obey, in the order the rules bind
   - `EROFS` opening `<id>.lock` (kind `ReadOnlyFilesystem`): **the run directory is read-only, so there is no session here to start and none to remove.** A fact about the mount and not about locking.
 - **A caller with nobody to report to gives up the standing rather than the work only where no new session can be exposed**: daemon exit and `list`'s sweep skip cleanup they cannot serialise. Startup has no such arm; a daemon that does not own the lock refuses the id before probing or binding. Whoever the user is actually waiting on — `spawn`, `attach`, `kill` — turns that refusal into a message and an exit code (§ 10).
 
-The daemon refuses to start where the run directory already holds **64** other session ids
-(`MAX_SESSIONS`), a backstop under the client-side cap
-[DESIGN.md § 5.1](DESIGN.md#51-identity) argues for. Each start atomically creates and locks
-its `<id>.lock` reservation before counting, and excludes only its own id. The locks are
-per-id, but their names are global counting tokens: of two contenders for the final slot,
-whichever creates its reservation second necessarily counts the first. A collector cannot
-remove a reservation while its start holds the lock. The count is therefore a ceiling, not
-a check-then-act race, without another directory-wide mutex.
+The daemon holds no session-count limit: how many sessions a host runs is wholly the
+client's ([DESIGN.md § 5.1](DESIGN.md#51-identity)).
 
 ### 6.4 Multiple clients
 
