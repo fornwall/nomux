@@ -83,6 +83,11 @@ pub(crate) const MAX_SESSIONS: usize = 64;
 /// not reading. Private to the daemon, mirrored here, and the two must move together.
 pub(crate) const MAX_PENDING_INPUT: u64 = 1 << 20;
 
+/// `conn::MAX_PENDING_WRITE`: what § 4.1 lets a client fall behind by before the daemon
+/// stops queueing output for it. Private to the daemon, mirrored here, and the two must
+/// move together.
+pub(crate) const MAX_PENDING_WRITE: usize = 1 << 20;
+
 /// `conn::ABANDON_PENDING_WRITE`: the queue § 4.1 lets a client reach before it counts
 /// as gone rather than slow. Private to the daemon, mirrored here, and the two must
 /// move together.
@@ -645,6 +650,21 @@ pub(crate) fn nomux_with_shell(root: &Path, args: &[&str]) -> Command {
 pub(crate) fn control(root: &Path, args: &[&str]) -> Output {
     collect(
         nomux(root, args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+}
+
+/// [`control`] with [`nomux_with_shell`]'s pinned `SHELL`.
+///
+/// For invocations that could put a shell behind a PTY and still return: a refusal
+/// whose regression would be a session starting, which should then at least start a
+/// predictable `/bin/sh`, and a `spawn` whose relay ends with the closed stdin —
+/// where [`control`] itself is for modes that never reach a shell at all.
+pub(crate) fn control_with_shell(root: &Path, args: &[&str]) -> Output {
+    collect(
+        nomux_with_shell(root, args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped()),
@@ -1243,8 +1263,8 @@ impl Client {
         assert_refusal(FrameType::Error, &payload, code, None, what);
     }
 
-    /// [`Client::expect_error_among_output`] where the caller also knows the daemon's
-    /// own words for the refusal it is owed.
+    /// [`Client::expect_error_among_output`] where the caller also knows a distinctive
+    /// fragment of the daemon's own words for the refusal it is owed.
     ///
     /// [`ErrorCode`] is a small closed set, and `Protocol` is what seven separate sites
     /// in the daemon answer with — so a test asking for the code alone is satisfied by
@@ -1252,7 +1272,9 @@ impl Client {
     /// reachable from the *same* frame the message is the only thing that separates
     /// them: a second `Hello` has a refusal of its own precisely so that a connection
     /// which greeted perfectly well is not told `Hello` is a frame it may not send,
-    /// and that arm and the catch-all behind it differ in nothing else.
+    /// and that arm and the catch-all behind it differ in nothing else. A fragment
+    /// rather than the whole sentence, so a site that rewords itself around what it is
+    /// still saying does not fail every row that named it.
     pub(crate) fn expect_error_saying(&mut self, code: ErrorCode, saying: &str, what: &str) {
         let payload = self.next_of_awaiting(FrameType::Error, &format!("a refusal ({what})"));
         assert_refusal(FrameType::Error, &payload, code, Some(saying), what);
@@ -1436,7 +1458,7 @@ pub(crate) fn still_serving(client: &mut Client, tag: &str) {
 }
 
 /// Asserts that a frame the daemon sent is an `Error` carrying `code`, and — where the
-/// caller named one — the words that say which site produced it.
+/// caller named one — a fragment of the words that says which site produced it.
 ///
 /// Shared by the three ways of arriving at one, so that what a refusal has to satisfy
 /// is written once and the entry points differ only in how strictly they read.
@@ -1456,9 +1478,10 @@ fn assert_refusal(
         Frame::Error { code: got, message } => {
             assert_eq!(got, code, "{what}; the daemon said {message:?}");
             if let Some(saying) = saying {
-                assert_eq!(
-                    message, saying,
-                    "{what}; the right code from the wrong place in the daemon"
+                assert!(
+                    message.contains(saying),
+                    "{what}; the daemon said {message:?}, which says nothing about \
+                     {saying:?} — the right code from the wrong place in the daemon"
                 );
             }
         }
@@ -1525,6 +1548,125 @@ fn quote(bytes: &[u8], at: usize) -> String {
         }
     }
     out
+}
+
+/// A byte stream the test knows in full — everything the child writes from
+/// [`StreamModel::stream_start`] on — for checking the session's output against by
+/// absolute offset.
+///
+/// The assertion the gap and boundary tests exist for, and the reason the model is
+/// indexed by the offset the daemon labelled each byte with: contiguity checked
+/// *relative to* the base the daemon reported cannot fail whatever it says. A base N
+/// too low replays N bytes the client already has, one N too high drops N it never
+/// will, and both produce a perfectly contiguous stream that corrupts the user's
+/// scrollback. Only a model of the child's own output makes that falsifiable.
+pub(crate) struct StreamModel<'a> {
+    /// The whole of what the child writes: index `i` is stream offset
+    /// `stream_start + i`.
+    pub(crate) bytes: &'a [u8],
+    /// Absolute output offset of `bytes[0]`.
+    pub(crate) stream_start: u64,
+    /// Appended to every failure, carrying what only the caller can say — the seed a
+    /// randomised test promises to print with each one (`IMPLEMENTATION.md` § 9), or
+    /// nothing.
+    pub(crate) context: String,
+}
+
+/// What [`StreamModel::follow`] took from the stream.
+pub(crate) struct StreamTaken {
+    /// One past the last output byte taken.
+    pub(crate) offset: u64,
+    /// Every gap followed, as the offset the stream stood at and the base it resumed
+    /// on.
+    pub(crate) gaps: Vec<(u64, u64)>,
+    /// The offset each `Output` frame opened at, for a caller asking where the
+    /// daemon's own boundaries fell.
+    pub(crate) frame_starts: Vec<u64>,
+}
+
+impl StreamModel<'_> {
+    /// Takes output until the stream reaches `through` or `budget` bytes of it have
+    /// been taken, whichever comes first, checking every byte against the byte its
+    /// offset names and following any gap the daemon announces. A gap must move the
+    /// stream forward and is recorded rather than judged: how many were owed, and at
+    /// what base, is the caller's arithmetic.
+    ///
+    /// `deadline` is the caller's, per [`poll_by`]. `sits_in` is
+    /// [`assert_same_stream`]'s, handed the index into [`StreamModel::bytes`] of the
+    /// first differing byte.
+    pub(crate) fn follow(
+        &self,
+        client: &mut Client,
+        from: u64,
+        through: u64,
+        budget: usize,
+        deadline: Instant,
+        sits_in: impl Fn(usize) -> String,
+    ) -> StreamTaken {
+        let context = &self.context;
+        let mut taken = StreamTaken {
+            offset: from,
+            gaps: Vec::new(),
+            frame_starts: Vec::new(),
+        };
+        let mut spent = 0usize;
+        let awaiting = format!("the {} bytes the child wrote{context}", self.bytes.len());
+        while taken.offset < through && spent < budget {
+            let (ty, payload) = client.frame_before(deadline, &awaiting).unwrap_or_else(|| {
+                panic!(
+                    "the session stopped {} bytes short of everything the child wrote, \
+                     with the stream standing at {}{context}",
+                    through - taken.offset,
+                    taken.offset
+                )
+            });
+            match Frame::decode(ty, &payload).expect("decode frame") {
+                Frame::Output { offset: at, data } => {
+                    assert_eq!(
+                        at,
+                        taken.offset,
+                        "output must join up unless a Gap said otherwise, and this \
+                         frame opens {} bytes from where the stream stood{context}",
+                        at.abs_diff(taken.offset)
+                    );
+                    let index = usize::try_from(at.saturating_sub(self.stream_start))
+                        .expect("an offset within a stream this test wrote");
+                    let want = self
+                        .bytes
+                        .get(index..index + data.len())
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "the daemon sent {} bytes at offset {at}, running {} past \
+                             the end of everything the child ever wrote{context}",
+                                data.len(),
+                                index
+                                    .saturating_add(data.len())
+                                    .saturating_sub(self.bytes.len())
+                            )
+                        });
+                    assert_same_stream(want, data, at, |diff| sits_in(index + diff));
+                    taken.frame_starts.push(at);
+                    taken.offset += data.len() as u64;
+                    spent += data.len();
+                }
+                Frame::Gap { new_base_offset } => {
+                    assert!(
+                        new_base_offset > taken.offset,
+                        "a Gap must name a base past what the client was sent: \
+                         {new_base_offset} against {}{context}",
+                        taken.offset
+                    );
+                    taken.gaps.push((taken.offset, new_base_offset));
+                    taken.offset = new_base_offset;
+                }
+                Frame::InputAck { .. } | Frame::Pong => {}
+                other => {
+                    panic!("unexpected {other:?} while reading the session's output{context}")
+                }
+            }
+        }
+        taken
+    }
 }
 
 /// Whether the kernel is holding bytes for `stream` that nothing has read yet.

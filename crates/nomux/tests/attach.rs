@@ -37,10 +37,10 @@ use std::{fs, thread};
 use nomux::{Frame, Linger, RESUME_FROM_START};
 
 use harness::{
-    Rng, SETTLE, Session, Spawned, collect, control, daemon_reaper, entries, has_unread_bytes,
-    hello_frame, join_before, nomux, nomux_with_shell, poll_by, poll_until, process_state,
-    read_uninterrupted, run_root, stderr, stdout, still_serving, succeeded, wedge_socket,
-    while_nothing_forks, write_frame,
+    Rng, SETTLE, Session, Spawned, control, control_with_shell, daemon_reaper, entries,
+    has_unread_bytes, hello_frame, join_before, nomux, nomux_with_shell, poll_by, poll_until,
+    process_state, read_uninterrupted, run_root, stderr, stdout, still_serving, succeeded,
+    wedge_socket, while_nothing_forks, write_frame,
 };
 
 /// A daemon that cannot publish `<id>.pid` refuses to start rather than serving a
@@ -68,12 +68,7 @@ fn a_daemon_that_cannot_publish_its_pidfile_refuses_to_start() {
     // Waited out rather than backgrounded, which is safe only because the refusal is
     // what this asserts: a regression that got past it would hang here rather than
     // fail, and `SHELL` is set so that what it started would at least be predictable.
-    let refused = collect(
-        nomux_with_shell(&root, &["daemon", "nopid"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
-    );
+    let refused = control_with_shell(&root, &["daemon", "nopid"]);
     // No phrase to look for: `write_pid` propagates the bare `io::Error` from
     // `fs::write`, so the line names no path.
     refuses(&refused, 1, "", "a daemon that cannot publish its pidfile");
@@ -124,12 +119,7 @@ fn spawn_reports_a_session_it_could_not_start_as_no_such_session() {
     fs::create_dir_all(root.join("nomux/run").join("nostart.sock"))
         .expect("plant a directory where the session socket goes");
 
-    let refused = collect(
-        nomux_with_shell(&root, &["spawn", "nostart"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
-    );
+    let refused = control_with_shell(&root, &["spawn", "nostart"]);
     // No phrase: the number is the row under test, the wording being the failure's own.
     refuses(
         &refused,
@@ -160,12 +150,7 @@ fn spawn_reports_a_session_it_could_not_start_as_no_such_session() {
 fn spawn_refuses_an_id_something_is_already_serving() {
     let session = Session::start("spawn_taken");
 
-    let refused = collect(
-        nomux_with_shell(&session.root, &["spawn", &session.id])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
-    );
+    let refused = control_with_shell(&session.root, &["spawn", &session.id]);
 
     refuses(
         &refused,
@@ -266,12 +251,7 @@ fn spawn_refuses_a_wedged_session_without_unlinking_the_lock_it_took() {
     // turns the block this is about back into an ordinary refusal.
     let _wedged = wedge_socket(&dir.join("wedged.sock"));
 
-    let refused = collect(
-        nomux_with_shell(&root, &["spawn", "wedged"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
-    );
+    let refused = control_with_shell(&root, &["spawn", "wedged"]);
     let left = entries(&dir);
 
     refuses(
@@ -323,12 +303,7 @@ fn attach_refuses_an_id_nothing_answers_for_rather_than_inventing_a_session() {
             "a host that has never held a session"
         };
 
-        let refused = collect(
-            nomux_with_shell(&root, &["attach", "ghost"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped()),
-        );
+        let refused = control_with_shell(&root, &["attach", "ghost"]);
         // Read before anything is collected below, since what these say is the whole
         // assertion: whether the refusal created the directory, and what it left in
         // one that was already there.

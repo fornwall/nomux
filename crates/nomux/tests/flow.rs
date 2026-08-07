@@ -31,15 +31,10 @@ use std::time::{Duration, Instant};
 use nomux::{Frame, FrameType, HEADER_LEN, RESUME_FROM_START, decode_header};
 
 use harness::{
-    ABANDON_PENDING_WRITE, Cue, FRAME_PATIENCE, MAX_PENDING_INPUT, SPIN_WINDOW, Session, cpu_ticks,
-    hello_frame, poll_by, poll_until, push_until_refused, read_uninterrupted, socket_capacity,
-    still_serving, wait_for, write_frame,
+    ABANDON_PENDING_WRITE, Cue, FRAME_PATIENCE, MAX_PENDING_INPUT, MAX_PENDING_WRITE, SPIN_WINDOW,
+    Session, cpu_ticks, hello_frame, poll_by, poll_until, push_until_refused, read_uninterrupted,
+    socket_capacity, still_serving, wait_for, write_frame,
 };
-
-/// `conn::MAX_PENDING_WRITE`: what § 4.1 lets a client fall behind by before the daemon
-/// stops queueing output for it. Private to the daemon and mirrored here as the harness
-/// mirrors its neighbours; this is the one test that has to add it to a queue budget.
-const MAX_PENDING_WRITE: usize = 1 << 20;
 
 /// The PTY master is non-blocking, so a child that has stopped reading cannot
 /// wedge the daemon.

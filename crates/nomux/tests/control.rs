@@ -37,9 +37,10 @@ use std::time::{Duration, Instant};
 use nomux::PROTOCOL_VERSION;
 
 use harness::{
-    Flock, HeldLock, Reaper, Session, Spawned, collect, control, daemon_reaper, entries,
-    leads_a_process_group, nomux, nomux_with_shell, poll_by, poll_until, process_alive, run_root,
-    stderr, stdout, succeeded, wait_for, wait_until_flock, wedge_socket, while_nothing_forks,
+    Flock, HeldLock, Reaper, Session, Spawned, collect, control, control_with_shell, daemon_reaper,
+    entries, leads_a_process_group, nomux, nomux_with_shell, poll_by, poll_until, process_alive,
+    run_root, stderr, stdout, succeeded, wait_for, wait_until_flock, wedge_socket,
+    while_nothing_forks,
 };
 
 /// How long any one test here may spend waiting, across every wait it makes.
@@ -530,14 +531,7 @@ fn unidentified_pidfiles() -> [Unidentified; 5] {
             stranger: true,
             plant: |session, stranger| {
                 fs::remove_file(session.pid_path()).expect("take the real pidfile away");
-                rustix::fs::mknodat(
-                    rustix::fs::CWD,
-                    session.pid_path(),
-                    rustix::fs::FileType::Fifo,
-                    rustix::fs::Mode::from_bits_truncate(0o600),
-                    0,
-                )
-                .expect("plant a FIFO where the pidfile should be");
+                plant_fifo(&session.pid_path());
                 let reading = OpenOptions::new()
                     .read(true)
                     .custom_flags(libc::O_NONBLOCK)
@@ -887,12 +881,7 @@ fn kill_reports_an_unprobeable_socket_over_a_pidfile_that_names_no_daemon() {
 fn a_daemon_started_with_an_over_long_label_is_still_recognised_as_one() {
     let root = run_root("lk20");
     let label = "L".repeat(8192);
-    let started = collect(
-        nomux_with_shell(&root, &["spawn", "lk20", "--label", &label])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped()),
-    );
+    let started = control_with_shell(&root, &["spawn", "lk20", "--label", &label]);
     succeeded(&started, "a session with a very long label failed to start");
     let (daemon, _reaper) = daemon_reaper(&root, "lk20");
 
@@ -931,12 +920,7 @@ fn kill_signals_what_the_pidfile_names_even_when_another_daemon_answers_on_the_s
     let session = LiveSession::create("lk18");
     // A daemon of its own, in the same run directory and under a different id, whose
     // socket stands in for one an exited creator left behind.
-    let other = collect(
-        nomux_with_shell(&session.run.root, &["spawn", "lk18b"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped()),
-    );
+    let other = control_with_shell(&session.run.root, &["spawn", "lk18b"]);
     succeeded(&other, "the second daemon failed to start");
     let (creator, _reaper) = daemon_reaper(&session.run.root, "lk18b");
 
@@ -1003,14 +987,7 @@ fn no_mode_parks_on_a_spawn_lock_that_is_a_fifo() {
     let dir = root.join("nomux/run");
     fs::create_dir_all(&dir).expect("create the run directory");
     let lock = dir.join("fifo_lock.lock");
-    rustix::fs::mknodat(
-        rustix::fs::CWD,
-        &lock,
-        rustix::fs::FileType::Fifo,
-        rustix::fs::Mode::from_bits_truncate(0o600),
-        0,
-    )
-    .expect("plant a FIFO where the spawn lock should be");
+    plant_fifo(&lock);
 
     let run = |args: &[&str]| {
         ran_by(&mut nomux(&root, args), deadline)
@@ -1060,14 +1037,7 @@ fn the_control_surface_does_not_park_on_a_run_file_that_is_a_fifo() {
     let session = LiveSession::create("lk13");
     for path in [session.pid_path(), session.run.dir.join("lk13.label")] {
         drop(fs::remove_file(&path));
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            &path,
-            rustix::fs::FileType::Fifo,
-            rustix::fs::Mode::from_bits_truncate(0o600),
-            0,
-        )
-        .expect("plant a FIFO where a run file should be");
+        plant_fifo(&path);
     }
 
     // Backgrounded against a deadline: the defect is a wait with no end, and a test
@@ -1238,10 +1208,7 @@ fn list_reports_an_id_this_run_directory_cannot_address() {
     // The longest id § 6.3 accepts, so what refuses it below is the directory rather
     // than anything about the id itself.
     let id = "a".repeat(64);
-    let mut deep = run_root("unaddressable");
-    while deep.as_os_str().len() + "/nomux/run/".len() + id.len() + ".label".len() <= 107 {
-        deep.push("pad");
-    }
+    let deep = deepened_past_sun_path(&run_root("unaddressable"), &id);
     let dir = deep.join("nomux/run");
     fs::create_dir_all(&dir).expect("create a deep run directory");
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("owner-only");
@@ -1523,16 +1490,10 @@ fn invalid_session_ids_are_refused() {
     // the refusal is what is under test, and a regression that got as far as the
     // filesystem would otherwise leave its mess where every other test lives.
     let root = run_root("bad_ids");
-    // Deepened rather than taken as it comes, per
-    // [`list_reports_an_id_this_run_directory_cannot_address`]: what refuses the last
-    // row is the length of the directory plus the id against `sun_path`'s 107, so a
-    // checkout near the root would otherwise pass without reaching the case. Nothing is
-    // created along the way — the refusal precedes every syscall that would.
+    // Deepened for the last row, per [`deepened_past_sun_path`]. Nothing is created
+    // along the way — the refusal precedes every syscall that would.
     let long = "a".repeat(64);
-    let mut deep = root.clone();
-    while deep.as_os_str().len() + "/nomux/run/".len() + long.len() + ".label".len() <= 107 {
-        deep.push("pad");
-    }
+    let deep = deepened_past_sun_path(&root, &long);
 
     for (root, id, says) in [
         (&root, "../escape", "invalid session id"),
@@ -1736,12 +1697,7 @@ struct LiveSession {
 impl LiveSession {
     fn create(id: &str) -> Self {
         let run = StaleSession::empty(id);
-        let started = collect(
-            nomux_with_shell(&run.root, &["spawn", id])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped()),
-        );
+        let started = control_with_shell(&run.root, &["spawn", id]);
         succeeded(&started, "spawn failed");
         let (pid, reaper) = daemon_reaper(&run.root, id);
         Self {
@@ -1868,6 +1824,31 @@ impl PlantedRunDir {
     fn nothing_connected(&self) -> bool {
         matches!(self.listener.accept(), Err(err) if err.kind() == std::io::ErrorKind::WouldBlock)
     }
+}
+
+/// Plants a FIFO at `path`, where the control surface expects a regular file — the
+/// shape that used to park a mode in `open(2)` until somebody wrote to it.
+fn plant_fifo(path: &Path) {
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        path,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::from_bits_truncate(0o600),
+        0,
+    )
+    .expect("plant a FIFO where a run file should be");
+}
+
+/// Deepens `root` until `<root>/nomux/run/<id>.label` runs past `sun_path`'s 107
+/// bytes: what refuses an id is the length of the directory plus the id against that
+/// limit, so a checkout near the root would otherwise pass the tests about an
+/// unaddressable id without ever reaching the case.
+fn deepened_past_sun_path(root: &Path, id: &str) -> PathBuf {
+    let mut deep = root.to_path_buf();
+    while deep.as_os_str().len() + "/nomux/run/".len() + id.len() + ".label".len() <= 107 {
+        deep.push("pad");
+    }
+    deep
 }
 
 /// Binds `path` and leaves it answering nothing, which is what stale means in
