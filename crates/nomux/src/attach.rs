@@ -26,10 +26,10 @@ use std::env;
 use std::fs;
 use std::io;
 use std::net::Shutdown;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::process::{Child, ChildStderr, Command, Stdio};
+use std::process::{ChildStderr, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags};
@@ -496,52 +496,35 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
 
     // Closing the channel hands the worker EOF behind every byte already queued. Join
     // only on this normal path: if the relay itself failed, returning must not wait on
-    // a worker that may be blocked forever in the failed process's stdout.
+    // a worker that may be blocked forever in the stdout the relay is abandoning —
+    // the handle is dropped, and the process's own exit ends the thread.
     stdout.finish()
 }
 
 /// The blocking half of the relay's stdout boundary.
 ///
 /// The main loop owns one non-blocking endpoint and never writes inherited stdout.
-/// This worker owns the other endpoint and at most one [`RELAY_CHUNK`] in userspace;
-/// the socketpair's kernel buffer is the remaining fixed bound. A blocked terminal,
-/// pipe, socket or regular file therefore backpressures session output without
-/// preventing the main loop from forwarding input.
+/// This worker thread owns the other endpoint and at most one [`RELAY_CHUNK`] in
+/// userspace; the socketpair's kernel buffer is the remaining fixed bound. A blocked
+/// terminal, pipe, socket or regular file therefore backpressures session output
+/// without preventing the main loop from forwarding input.
 struct StdoutWorker {
     channel: UnixStream,
-    worker: Child,
+    worker: std::thread::JoinHandle<io::Result<()>>,
 }
 
 impl StdoutWorker {
     fn spawn() -> io::Result<Self> {
         let (channel, worker_channel) = UnixStream::pair()?;
         channel.set_nonblocking(true)?;
-        let parent = rustix::process::getpid();
-        let mut command = Command::new("/proc/self/exe");
-        command
-            .arg("__relay-stdout")
-            .stdin(Stdio::from(OwnedFd::from(worker_channel)))
-            .stdout(Stdio::inherit())
-            // The worker reports errno in its status; a second diagnostic racing the
-            // parent would duplicate and reorder the one the user is owed.
-            .stderr(Stdio::null());
-        let supervise = move || -> io::Result<()> {
-            // If the relay is killed while this worker is blocked in stdout, it must
-            // not survive as an orphan holding the caller's pipe or terminal. Set the
-            // signal before checking the parent to close the death-before-prctl race.
-            rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))?;
-            if rustix::process::getppid() != Some(parent) {
-                return Err(rustix::io::Errno::PIPE.into());
-            }
-            Ok(())
-        };
-        // SAFETY: the relay has created no threads. The closure runs between fork and
-        // exec and makes only `prctl` and `getppid` syscalls; neither allocates or takes
-        // a userspace lock.
-        unsafe {
-            command.pre_exec(supervise);
-        }
-        let worker = command.spawn()?;
+        // A thread rather than a process: the copy needs nothing but the far endpoint
+        // and the stdout every thread already shares, an abruptly killed relay cannot
+        // orphan it — a process's exit takes its threads with it — and the main loop's
+        // death notification is the socketpair itself, the far endpoint closing when
+        // the copy returns, which does not care what was holding it.
+        let worker = std::thread::Builder::new()
+            .name("stdout-worker".to_owned())
+            .spawn(move || copy_channel_to_stdout(&worker_channel))?;
         Ok(Self { channel, worker })
     }
 
@@ -552,33 +535,26 @@ impl StdoutWorker {
     /// Closes the producer end after its queued bytes, then proves the worker delivered
     /// them or reports why it could not.
     fn finish(self) -> io::Result<()> {
-        let Self {
-            channel,
-            mut worker,
-        } = self;
+        let Self { channel, worker } = self;
         drop(channel.shutdown(Shutdown::Write));
         drop(channel);
-        let status = worker.wait()?;
-        match status.code() {
-            Some(0) => Ok(()),
-            Some(code @ 1..=254) => Err(io::Error::from_raw_os_error(code)),
-            _ => Err(io::Error::other("relay stdout worker did not exit cleanly")),
-        }
+        worker
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("relay stdout worker panicked")))
     }
 }
 
 /// Copies the bounded worker channel to actual stdout.
 ///
 /// One chunk at a time and one write per readiness event. The write may still block
-/// after making partial progress — that is exactly why it lives in this worker — while
+/// after making partial progress — that is exactly why it lives on this thread — while
 /// an inherited non-blocking stdout remains correct because `EAGAIN` goes back through
 /// `poll`. `EPIPE` is the ordinary "stdout's reader left" ending [`Pump::drain_to`]
 /// already defines.
-pub(crate) fn copy_stdin_to_stdout() -> io::Result<()> {
-    let stdin = io::stdin();
+fn copy_channel_to_stdout(channel: &UnixStream) -> io::Result<()> {
     let stdout = io::stdout();
     let stdout_fd = stdout.as_fd();
-    let channel_fd = stdin.as_fd();
+    let channel_fd = channel.as_fd();
     let mut pump = Pump::default();
     let mut chunk = [0u8; RELAY_CHUNK];
 

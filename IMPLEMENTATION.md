@@ -886,12 +886,12 @@ which is why it never needs a version bump:
   copying through a per-direction `RELAY_CHUNK` of 16 KiB. Actual stdout stays blocking:
   its open-file description may be shared with the caller's shell, and `POLLOUT` promises
   that only *some* progress is possible, so even the first large write may sleep. One
-  bounded self-exec worker owns that write; it is reaped on a clean end and carries a
-  parent-death signal so an abruptly killed relay cannot orphan it. A stalled pipe,
-  terminal, socket or regular file thus backpressures session output without stopping
-  stdin from reaching the session. The socketpair channel is the only additional fixed
-  kernel buffer, and closing it both reports worker failure and flushes every accepted
-  byte on a clean end.
+  bounded worker thread owns that write; it is joined on a clean end, and an abruptly
+  killed relay cannot orphan it — a process's exit takes its threads with it. A stalled
+  pipe, terminal, socket or regular file thus backpressures session output without
+  stopping stdin from reaching the session. The socketpair channel is the only additional
+  fixed kernel buffer, and closing it both reports worker failure and flushes every
+  accepted byte on a clean end.
 - **One copying path and no fast path**: nothing reaches for `splice(2)` and nothing is
   discovered about the descriptor pair. `attach.rs` has why the extra copy is affordable —
   one 16 KiB batch at a time against the encryption the same bytes meet one hop away. No
