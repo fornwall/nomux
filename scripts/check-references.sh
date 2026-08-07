@@ -9,19 +9,19 @@
 # The rule enforced is the convention the tree already follows: a citation qualified with a
 # document name means that document, an unqualified one means IMPLEMENTATION.md from the
 # source and the enclosing document from within a document. RFC citations are somebody
-# else's numbers and PLAN.md's `P…` labels are not section citations, so neither is checked here.
+# else's numbers, so they are not checked; PLAN.md carries no numbered sections, so it is
+# skipped.
 #
 # Exits non-zero listing every citation and link that resolves to nothing.
 set -eu
 unset CDPATH
 cd -- "$(dirname -- "$0")/.."
 
-# One awk over the whole tree: the shell read-loop this replaced spawned ~2,300 sed and grep
-# to do the same work, and took twelve seconds over it. NUL-delimited so a path with a space
-# survives; `scripts/` picks up the extensionless configuration files the extension globs miss.
-# awk opens each file itself rather than taking them as operands: a
-# path can be in the index and gone from the worktree mid-rename, where `getline` answers -1
-# instead of dying, and a name holding `=` cannot be mistaken for a variable assignment.
+# One awk over the whole tree. NUL-delimited so a path with a space survives; `scripts/`
+# picks up the extensionless configuration files the extension globs miss. awk opens each
+# file itself rather than taking them as operands: a path can be in the index and gone from
+# the worktree mid-rename, where `getline` answers -1 instead of dying, and a name holding
+# `=` cannot be mistaken for a variable assignment.
 git ls-files -z '*.rs' '*.md' '*.sh' '*.toml' '*.yml' '*.yaml' scripts/ | tr '\0' '\n' | awk '
 function bad(f, n, m) { printf "%s:%s: %s\n", f, n, m > "/dev/stderr"; fails++ }
 function whose(q) {  # the document a citation names; "-" for one that is not ours to check
@@ -48,10 +48,10 @@ function load(p,   r, l, h, n) {
     if (r < 0) ex[p] = 0
     close(p)
 }
-# A link target is not prose, and reading it as prose is how `[§ 5.2](IMPLEMENTATION.md#…)`
-# came to be checked against DESIGN.md: the qualifier was whatever filename happened to sit
-# in a neighbouring URL. So every link collapses to its visible text, with the target kept in
-# front only when that text carries a `§` — the one citation that target may speak for.
+# A link target is not prose: read as prose, the filename in a neighbouring URL would
+# qualify a citation it says nothing about. So every link collapses to its visible text,
+# with the target kept in front only when that text carries a `§` — the one citation that
+# target may speak for.
 function delink(s,   t, g, i, r) {
     while (match(s, /\[[^][]*\]\([^()]*\)/)) {
         t = substr(s, RSTART, RLENGTH); i = index(t, "](")

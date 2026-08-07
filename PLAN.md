@@ -1,12 +1,6 @@
 # nomux — Backlog
 
-Open questions are recorded here in priority order when any remain. Why the system is
-shaped as it is: [DESIGN.md](DESIGN.md), whose § 10 records what was considered and
-refused. What it does and what a second implementation must obey:
-[IMPLEMENTATION.md](IMPLEMENTATION.md).
-
-The client is a separate project ([DESIGN.md § 4](DESIGN.md#4-architecture)); server work
-needed to prove that client contract belongs here.
+Open server-side work, in priority order; the client is a separate project.
 
 1. **Survive systemd logout policy honestly.** Launch or move the daemon into a user-manager
    scope/service, define behavior without a user bus, and test real SSH logout across the

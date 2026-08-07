@@ -20,7 +20,7 @@ crates/nomux/         one package, two targets:
 `main.rs` declares the rest and `lib.rs` one, each named for what it owns. Neither target
 is published ([DESIGN.md § 2](DESIGN.md#2-scope)).
 
-- Edition 2024, MSRV 1.97.1 (`rust-toolchain.toml`).
+- Edition 2024; MSRV is `rust-toolchain.toml`'s pin.
 - Lints: `[workspace.lints]` in `Cargo.toml` is the list, every entry at `warn` bar one,
   which `Cargo.toml` names and argues. The deny is `-D warnings` on the clippy hook in
   `.pre-commit-config.yaml`, which gates this tree rather than any build of it; test
@@ -517,30 +517,13 @@ Path precedence, first **absolute** one winning:
 A source naming a relative or empty path is skipped; where none names an absolute one,
 every mode fails with that — 126 from the relay, 1 from the rest (§ 10).
 
-**Which of the three won is something the bootstrap hands back, because nothing else can.**
-Every source above is *server-side* environment, unreadable without an exec, and no output
-of this binary returns it: `list` prints three columns and no path (§ 6.6), `--version`
-prints none, and § 5.1's `NOMUX-BOOTSTRAP` line echoes `$p`, the **install** directory off
-`$XDG_DATA_HOME` — another variable on another precedence. So § 5.1 and § 5.2 both restate
-this precedence in four lines of POSIX `sh` and print the result as `NOMUX-RUNDIR <dir>` on
-stderr, ahead of their `exec` in both. Ahead, and on its own line rather than a fourth field
-on `NOMUX-BOOTSTRAP`: that line is echoed *behind* the `exec`, so a field on it reaches only
-a host with no binary, and the host that needs the directory is the one already serving a
-session. That is what gives § 5.3's warm branch its central field — a `direct-streamlocal`
-opened straight at `$RUNDIR/<id>.sock` needs the directory and runs no process to learn it.
-Teaching a mode to print it instead would be a new output on the surface § 6.6 freezes, and
-would still need the exec the warm path exists to avoid.
-
-The precedence is therefore written twice: here, in Rust, and in a shell the daemon never
-runs. The shell mirrors `absolute_env` and not the three-item list above — a source counts
-**only where it names an absolute path**, so unset, empty and relative are one answer;
-`$HOME` is a substitute for `$XDG_STATE_HOME` that takes the *same* `nomux/run` under
-`.local/state` rather than a directory of its own; the runtime directory is only the
-fallback when neither persistent source is usable; and where nothing qualifies it prints
-nothing, which is this section's refusal rather than a silence. Two copies can still drift,
-and that is affordable for one reason only: a wrong directory is a `direct-streamlocal` sshd
-refuses, and § 5.3 answers a refusal with the exec relay, which resolves the path in the
-daemon's own code.
+The bootstrap restates this precedence in `sh` and hands the winner back as
+`NOMUX-RUNDIR <dir>` on stderr, ahead of its `exec` — § 5.1 is the home of that line: why
+it rides the bootstrap and no other output, why stderr and ahead of the `exec` rather than
+a `NOMUX-BOOTSTRAP` field, and why the shell mirrors `rundir::absolute_env` to the byte.
+The two copies can still drift, and that is affordable for one reason only: a wrong
+directory is a `direct-streamlocal` sshd refuses, and § 5.3 answers a refusal with the exec
+relay, which resolves the path in the daemon's own code.
 
 A `sun_path` is 108 bytes including its terminator, so the directory, a `/`, the id and a
 six-byte suffix — `.label` and `.agent`, the joint longest of the five — have to fit in
@@ -554,11 +537,14 @@ unlink.
 **Directory `0700`, everything in it `0600`, exact modes and not upper bounds.** This is
 where those two numbers live; everywhere else in the tree that names them cites here.
 Filesystem sockets only, never abstract ones ([DESIGN.md § 8](DESIGN.md#8-security-model)).
-Every mode checks the run directory — owner, type and mode — before it resolves the first
-name in it. It also refuses a symlink, a non-directory, a non-root/non-user owner, or an
-unprotected group/other write bit on every ancestor. A sticky shared directory such as
-`/tmp` is accepted only where the child entry belongs to this uid or root, which is the
-condition under which the kernel forbids another uid to rename it. The later bind and unlink
+Every mode checks the run directory — opened `O_NOFOLLOW`, a real directory, owned by this
+uid — before it resolves the first name in it. A wrong mode on it is `fchmod`ed back to
+`0700` rather than refused, from `list` and `kill` too — the one thing those modes mutate —
+**except** a group or other write bit, which is refused: tightening now does not un-plant
+whatever somebody left inside. Every ancestor must also be a real directory, owned by this
+uid or root and not group- or other-writable; a sticky shared directory such as `/tmp` is
+accepted only where the child entry belongs to this uid or root, which is the condition
+under which the kernel forbids another uid to rename it. The later bind and unlink
 operations are path-based (`bindat` does not exist), so these checks prevent another uid from
 redirecting the checked directory between validation and use.
 An `AF_UNIX` `connect` to a full backlog blocks instead of being refused, so every connect
@@ -615,7 +601,7 @@ greets, hits end of file, or misses its 5 s deadline.
 
 **A `Hello` this daemon cannot answer is refused before the eviction, not after.** The
 `Hello.protocol` check runs on the pending connection, ahead of the handshake. Deferred past
-the takeover, a newer client's *failed* greeting threw the working client off and dropped
+the takeover, a newer client's *failed* greeting would throw the working client off and drop
 the newcomer too, leaving nobody attached and nobody permitted to reconnect
 ([DESIGN.md § 6.4](DESIGN.md#64-version-skew)).
 
@@ -810,8 +796,8 @@ strand every session behind `hidepid`, so only a positive *is not* declines the 
 so is a *failure* to match wherever `argv[1]` arrived whole — the rule gives up on the mode
 before the truncation could reach anything it reads, so a full buffer is still a definitive
 *is not*. Only a read that stopped inside `argv[0]` or `argv[1]` says nothing at all. That
-narrowness is the point: a recycled pid running `java -cp <20 KiB of classpath>` filled the
-buffer, and read as *could not tell* it was signalled.
+narrowness is the point: a recycled pid running `java -cp <20 KiB of classpath>` fills the
+buffer, and read as *could not tell* it would be signalled.
 
 **What is signalled is a process, not a number.** A descriptor onto the pid is opened
 **before** that question is put, and both signals go through it; a failure of that open, of
@@ -933,7 +919,7 @@ baseline entry for as long as it ships.
 
 **Size**, because the cold upload happens over cellular. Two gates: **≤ 400 KiB per arch**,
 and growth past **3%** against the per-target figure in `scripts/size-baseline` — the
-budget alone once passed a commit that grew a target by nearly half. `NOMUX_UPDATE_BASELINE`
+budget alone would pass a commit that grows a target by nearly half. `NOMUX_UPDATE_BASELINE`
 rewrites the baseline and skips the growth gate, putting an accepted size change in a diff a
 reviewer reads. **No size table is kept here**: `scripts/size-baseline` is what a build
 writes and the gate reads.
@@ -968,20 +954,14 @@ Chaos seeds come from `NOMUX_CHAOS_SEED`, and every failure message carries the 
 produced it.
 
 The one thing a peer chooses outright is the bytes it sends, so the codec is fuzzed as well
-as generated against. `fuzz/` is a workspace of its own — libFuzzer reaches neither the
-shipped binary nor any gate but `cargo fmt`, which is the whole of why a third dependency
-was tolerable. One target: `frame` over `Frame::decode`, with every frame type pointed at one
-payload. Two of its three assertions are `tests/codec.rs`'s `decode_as_every_type` verbatim,
-where what fuzzing adds is a coverage-guided generator rather than a property; the third is
-per-case here alone — that the header `encode` writes describes the bytes behind it, which
-`encode_and_split` gave up as a re-derivation of what `frame.rs`'s `round_trip` and every
-wire vector's four literal header bytes already pin. `decode_header` has none of its own,
-`header_decode_is_total` having closed that domain outright by sweeping all 256 type bytes
-against both sides of the cap — a target over it could only agree with a suite that had
-already finished. `sh fuzz/run.sh <target>` runs one and
-installs the shared nightly in `scripts/nightly-version`, as `scripts/build-release.sh` does
-for the release build (§ 8). CI gives it sixty seconds, which checks that it still builds and
-still passes over its seeds and is nowhere near a search.
+as generated against. `fuzz/` is a workspace of its own; libFuzzer reaches neither the
+shipped binary nor any gate but `cargo fmt`. One target, `frame`, points every frame type at
+one payload and holds `Frame::decode` to three assertions: a frame decodes as the type it
+was asked for, the header `encode` writes describes the bytes behind it, and an accepted
+payload is the only encoding of what it decoded to. `sh fuzz/run.sh frame` runs it and
+installs the shared nightly named in `scripts/nightly-version` — the same pin the release
+build takes (§ 8). CI gives it sixty seconds, which checks that it still builds and still
+passes over its seeds and is nowhere near a search.
 
 What the signal guards measure is the *decision* to signal, which is the only thing that
 can be measured: `pty::reach` is that module's one door to a `kill(2)` it aims at a pid of

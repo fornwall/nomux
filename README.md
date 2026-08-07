@@ -29,7 +29,7 @@ Four properties drive it, and two of them are held on this side. What each one c
 [DESIGN.md § 3](DESIGN.md#3-key-properties):
 
 - **Byte-stream replay, not screen-state sync** — no terminal emulator on the server. *This repository.*
-- **No new ports, no new crypto** — the only endpoints are unix sockets, one per session, plus one more when agent forwarding is enabled ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket) has the modes). *This repository.*
+- **No new ports, no new crypto** — the only endpoints are unix sockets, one per session, plus one more when agent forwarding is enabled. *This repository.*
 - **Resume over a fresh SSH connection, not a side channel** — inherits ProxyJump, certificates, 2FA, agent forwarding. *The client's.*
 - **Zero server-side install** — the client carries the binary and pushes it on first use. *The client's.*
 
@@ -48,7 +48,7 @@ Cargo command.
 
 ```sh
 git clone https://github.com/fornwall/nomux && cd nomux
-cargo build     # rustup installs the pinned 1.97.1 on first use
+cargo build     # rustup installs the pinned toolchain on first use
 cargo test      # unit and integration tests, plus the one doctest
 ```
 
