@@ -10,10 +10,14 @@ its work is tracked here; what this side owes it is fixed contract in
 
 ## P1 — release process
 
-- Decide when the pinned nightly moves. Where it is named, and why the compiler that
-  measured a baseline is recorded beside it rather than checked against the one building,
-  is [IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build). Undecided is the policy for taking
-  a newer one.
+- Decide when the pinned nightly moves — **two** independently dated pins, not one policy
+  applied twice. `scripts/build-release.sh` dates its own so the bytes a client hashes
+  cannot drift; `fuzz/run.sh` dates its own so a nightly regression cannot turn a green
+  tree red with no commit behind it. They answer different questions and either can move
+  without the other, and nothing compares them — so the policy has to say whether that
+  stays true or one of the two becomes the other's floor. Where the release pin is named,
+  and why the compiler that measured a baseline is recorded beside it rather than checked
+  against the one building, is [IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build).
 
 ## P2 — test depth
 

@@ -34,7 +34,7 @@ fn expect_agent(client: &mut Client, want: FrameType, why: &str) -> u32 {
 /// The next `AgentOpen` or `AgentClose`, whichever comes first, and the channel it names.
 fn next_agent_boundary(client: &mut Client) -> (FrameType, u32) {
     loop {
-        let (ty, payload) = client.next_frame();
+        let (ty, payload) = client.frame_owed("a frame from the daemon");
         let decoded = Frame::decode(ty, &payload);
         if let Ok(Frame::AgentOpen { generation } | Frame::AgentClose { generation }) = decoded {
             return (ty, generation);

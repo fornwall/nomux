@@ -59,8 +59,7 @@ impl Pty {
     ///
     /// # Errors
     ///
-    /// Propagates failures from `openpt`, `unlockpt`, opening the slave, or spawning
-    /// the shell.
+    /// Propagates the PTY allocation, the slave `open` and the spawn.
     pub(crate) fn spawn(config: &Spawn<'_>) -> io::Result<Self> {
         // `CLOEXEC` on both ends, and what it keeps out of the child: § 6.1.
         let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC)?;
@@ -128,9 +127,6 @@ impl Pty {
             // instead the shell would carry that through exec into a session where the
             // kernel reaps its children out from under it and every `wait` it makes
             // fails `ECHILD` — job control with it.
-            //
-            // A fixed array walked in place, so this stays what a `pre_exec` has to be:
-            // allocation-free.
             for signum in [
                 libc::SIGHUP,
                 libc::SIGQUIT,
@@ -179,10 +175,6 @@ impl Pty {
     }
 
     /// Applies new dimensions, which delivers `SIGWINCH` to the foreground group.
-    ///
-    /// # Errors
-    ///
-    /// Propagates `TIOCSWINSZ` failures.
     pub(crate) fn resize(&self, win: WinSize) -> io::Result<()> {
         tcsetwinsize(&self.master, to_winsize(win))?;
         Ok(())
@@ -195,10 +187,6 @@ impl Pty {
     /// and does not reach, and why a one-column terminal is left without one: the master
     /// already holds `win` by the time a repaint is owed, so the lone resize left there
     /// is one the kernel short-circuits rather than signals.
-    ///
-    /// # Errors
-    ///
-    /// Propagates `TIOCSWINSZ` failures.
     pub(crate) fn nudge_repaint(&self, win: WinSize) -> io::Result<()> {
         if win.cols > 1 {
             let narrower = WinSize {
@@ -211,10 +199,6 @@ impl Pty {
     }
 
     /// Reaps the child if it has exited, without blocking.
-    ///
-    /// # Errors
-    ///
-    /// Propagates `waitpid` failures.
     pub(crate) fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
         self.child.try_wait()
     }
@@ -286,16 +270,14 @@ impl Pty {
     /// spawn still says whose the number was, so that is deliberately not a reissue.
     ///
     /// A missing start time from *spawn* is permanent — one `EMFILE` while the master, the
-    /// slave and three dups were being opened, and there is nothing to compare against for
-    /// the rest of the session's life — but permanent is not the same as no evidence. An
-    /// unreaped child still owns its number, the zombie holding it until somebody waits,
-    /// which is the fact [`Pty::terminate`]'s grace loop already leans on where reaping is
-    /// what frees the pid. So the child is asked, and only a *collected* one falls through
-    /// to `true`: there the liveness probe is all that is left, which is exactly the
-    /// evidence a stranger holding a recycled pid satisfies, and the reach given up is over
-    /// a child that has indeed gone. Answering on the failed read alone would have given up
-    /// both reaches over a shell that is still running — § 6.5's orphan by the very route
-    /// the walk exists to close.
+    /// slave and three dups were being opened — but permanent is not the same as no
+    /// evidence. An unreaped child still owns its number, the zombie holding it until
+    /// somebody waits, which is the fact [`Pty::terminate`]'s grace loop already leans on.
+    /// So the child is asked, and only a *collected* one falls through to `true`: there the
+    /// liveness probe is all that is left, which is exactly what a stranger holding a
+    /// recycled pid satisfies, and the reach given up is over a child that has indeed gone.
+    /// Answering on the failed read alone would have given up both reaches over a shell
+    /// still running — § 6.5's orphan by the very route the walk exists to close.
     fn pid_reissued(&mut self, raw: i32) -> bool {
         let Some(ours) = self.started else {
             return !matches!(self.child.try_wait(), Ok(None));
@@ -332,9 +314,9 @@ fn start_time(pid: i32) -> Option<u64> {
 /// this gets without a pidfd: nothing re-checks a member between its `stat` line claiming
 /// the session and the `kill`, and [`Pty::pid_reissued`] guards the child's own pid and no
 /// member's, so a member that exits in that window takes the signal on a number somebody
-/// else now holds. Collecting first stretched the window to the rest of the walk plus every
-/// signal ahead of this one. Entries going while the walk runs is already the ordinary case
-/// — the process-group reach precedes it — and a `stat` that cannot be read drops its pid.
+/// else now holds. Collecting first stretched that window to the rest of the walk plus every
+/// signal ahead of this one, and entries going mid-walk is already the ordinary case — the
+/// process-group reach precedes it.
 fn signal_session(sid: i32, signal: rustix::process::Signal) {
     walk_session(sid, |member| {
         if let Some(pid) = rustix::process::Pid::from_raw(member) {
@@ -348,10 +330,9 @@ fn signal_session(sid: i32, signal: rustix::process::Signal) {
 ///
 /// This is the module's only door to a signal: nothing else in this file may call
 /// `kill_process` or `kill_process_group`, or a later path could reach a process without
-/// `REACHES` recording it. That invariant is what the two regression tests below rest on.
-/// What those tests measure is the *decision* to signal, which is the only thing that can
-/// be measured: where the guard skips, what it skips would have landed nowhere by
-/// construction.
+/// `REACHES` recording it — the invariant the two regression tests below rest on. What they
+/// measure is the *decision* to signal, the only thing that can be: where the guard skips,
+/// what it skips would have landed nowhere by construction.
 ///
 /// The outcome is dropped throughout. A process that took the first signal and died answers
 /// the second with `ESRCH`, which is this working rather than failing.
@@ -379,11 +360,10 @@ thread_local! {
 /// Walks `/proc` for the live processes in session `sid`, offering each to `visit` until
 /// it answers `false`.
 ///
-/// Signalling by a number read out of `/proc` goes very wrong when it goes wrong, so
-/// this is deliberately narrow: `sid` comes from a child this process forked, no pid is
-/// offered unless its own `stat` line claims that session, and this process is excluded
-/// by pid whatever `/proc` says. Zombies are left out — signalling one does nothing, and
-/// counting it would keep the caller's grace loop spinning for its whole budget over the
+/// Signalling by a number read out of `/proc` goes very wrong when it goes wrong, so this is
+/// deliberately narrow: `sid` is always a child this process forked, and this process is
+/// excluded by pid whatever `/proc` says. Zombies are left out — signalling one does nothing,
+/// and counting it would keep the caller's grace loop spinning for its whole budget over the
 /// child it is about to reap.
 ///
 /// One path buffer and one read buffer for the whole walk, rather than a `format!` and a
@@ -475,11 +455,8 @@ const fn to_winsize(win: WinSize) -> Winsize {
     }
 }
 
-/// Resolves the shell to run and the dash-prefixed `argv[0]` that makes it a login
-/// shell.
-///
-/// `$SHELL` where it names an absolute path, and `/bin/sh` otherwise. The reason for the
-/// leading `-` is `IMPLEMENTATION.md` § 6.1.1.
+/// Resolves the shell to run and the dash-prefixed `argv[0]` that makes it a login shell —
+/// [`pick_shell`] has the choice, `IMPLEMENTATION.md` § 6.1.1 the leading `-`.
 ///
 /// Nothing reads the password database behind it. sshd sets `$SHELL` from that database
 /// itself, so what a lookup here answered for was a session started by something that
@@ -716,9 +693,8 @@ mod tests {
     /// cannot see. A reissued pid cannot be arranged, so the third state falsifies this
     /// side's half of the identity instead.
     ///
-    /// Counted at [`reach`], which [`reaches_since`] and that function say why: the
-    /// decision to signal is the only thing there is to observe, since where the guard
-    /// skips, what it skips would have landed nowhere by construction.
+    /// Counted at [`reach`], which says why the decision to signal is the only thing there
+    /// is to observe.
     #[test]
     fn terminate_signals_a_pid_only_while_it_is_still_the_childs() {
         // A live shell, whose session is emphatically not empty.
@@ -772,13 +748,10 @@ mod tests {
     /// Regression: a shutdown over a child that has already gone ends with the session,
     /// rather than sitting out [`HANGUP_GRACE`] behind the child's own zombie.
     ///
-    /// The child is left exited and *unreaped* — what the daemon holds between the poll
-    /// that missed the exit and the one that would collect it. A zombie is still a member
-    /// of its process group, so the liveness probe answers `Ok` for it and the `&&` never
-    /// reaches the walk that filters zombies: delete the `try_wait` from the grace loop
-    /// and the session never reads as settled, so `SIGKILL` goes out over one that
-    /// emptied itself half a second earlier. That one line is the whole of what this
-    /// holds, and taking it out is how to watch this fail.
+    /// The child is left exited and *unreaped* — what the daemon holds between the poll that
+    /// missed the exit and the one that would collect it, and the state [`Pty::terminate`]'s
+    /// grace loop argues about. Delete the `try_wait` from that loop and the session never
+    /// reads as settled: that one line is the whole of what this holds.
     ///
     /// The `SIGKILL` is the observation, not the half second: nothing is left alive to
     /// receive it, so the reach is the whole of the difference, and a wall clock would be
@@ -945,14 +918,9 @@ mod tests {
         None
     }
 
-    /// § 6.1.1's precedence, now that it is two steps: an absolute `$SHELL`, and
-    /// `/bin/sh` for everything else.
-    ///
-    /// The refusals are the point rather than the happy path. A `$SHELL` that is not a
-    /// path is one `Command` would go looking for down an inherited `PATH`, which is
-    /// how a writable directory on it becomes this user's login shell — and the shell
-    /// this daemon runs is the one thing between a session and everything the user
-    /// types into it.
+    /// § 6.1.1's precedence, now that it is two steps: an absolute `$SHELL`, and `/bin/sh`
+    /// for everything else. The refusals are the point rather than the happy path, and
+    /// [`pick_shell`] has what a relative one would cost.
     #[test]
     fn login_shell_takes_an_absolute_path_and_falls_back_to_bin_sh() {
         assert_eq!(

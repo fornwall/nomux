@@ -19,9 +19,10 @@
 
 #![allow(
     clippy::expect_used,
-    reason = "the allow-expect-in-tests setting in clippy.toml reaches `#[test]` \
-              bodies and `#[cfg(test)]` modules, not the helpers an integration \
-              test crate keeps beside them"
+    clippy::panic,
+    reason = "the allow-*-in-tests settings in clippy.toml reach `#[test]` bodies \
+              and `#[cfg(test)]` modules, not the helpers an integration test crate \
+              keeps beside them"
 )]
 
 mod harness;
@@ -36,10 +37,10 @@ use std::{fs, thread};
 use nomux::{Frame, Linger, RESUME_FROM_START};
 
 use harness::{
-    Rng, SETTLE, Session, Spawned, accept_within, collect, control, daemon_reaper, entries,
-    has_unread_bytes, hello_frame, join_before, nomux, nomux_with_shell, poll_by, poll_until,
-    process_state, read_uninterrupted, run_root, shrink_send_buffer, stderr, stdout, still_serving,
-    succeeded, wedge_socket, while_nothing_forks, write_frame,
+    Rng, SETTLE, Session, Spawned, collect, control, daemon_reaper, entries, has_unread_bytes,
+    hello_frame, join_before, nomux, nomux_with_shell, poll_by, poll_until, process_state,
+    read_uninterrupted, run_root, stderr, stdout, still_serving, succeeded, wedge_socket,
+    while_nothing_forks, write_frame,
 };
 
 /// A daemon that cannot publish `<id>.pid` refuses to start rather than serving a
@@ -1062,6 +1063,41 @@ fn a_write_to_stdout_a_signal_cut_short_does_not_park_the_relay_again() {
     );
 }
 
+/// Shrinks `socket`'s send buffer to `bytes`, so that a write larger than it cannot
+/// complete in one go.
+///
+/// A unix socket splits a write into segments of half its send buffer and waits for
+/// room for each in turn, so the size of that buffer is what decides whether a write
+/// bigger than the space available comes back short or blocks with nothing
+/// transferred. The default 208 KiB is larger than anything this suite writes in one
+/// call, which makes every write all-or-nothing; a small one is what puts a
+/// destination into the state § 7's relay has to survive.
+///
+/// Through `libc` because rustix's socket options live behind its `net` feature,
+/// which this tree does not enable — the same reason [`has_unread_bytes`] is written
+/// by hand.
+fn shrink_send_buffer(socket: &UnixStream, bytes: libc::c_int) {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: `setsockopt` is given the address and length of a `c_int` that
+    // outlives the call, on a descriptor the borrow keeps open for it.
+    let set = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            std::ptr::from_ref(&bytes).cast::<libc::c_void>(),
+            u32::try_from(size_of::<libc::c_int>()).expect("the size of a c_int"),
+        )
+    };
+    assert_eq!(
+        set,
+        0,
+        "shrinking the send buffer failed: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
 /// Whether `pid` is inside a `writev(2)` at this moment, as `/proc` reports it.
 ///
 /// The relay makes exactly one kind of write — `nbio::drain_to`'s `writev` across the
@@ -1152,6 +1188,33 @@ fn relay_onto_a_socket_over(
     peer.set_read_timeout(Some(RELAY_PATIENCE))
         .expect("a peer the test must not park on");
     (child, peer, listener)
+}
+
+/// Accepts one connection, or fails saying what never arrived.
+///
+/// A blocking `accept` on a listener nothing connects to parks the thread for ever,
+/// and a test parked there never returns — so its [`Spawned`] guards never run and
+/// the whole run hangs instead of failing. The listener is put in non-blocking mode
+/// here rather than at the call site so that no caller can forget; the connection it
+/// hands back is blocking, as `accept` does not pass the flag on.
+fn accept_within(listener: &UnixListener, within: Duration, awaiting: &str) -> UnixStream {
+    listener
+        .set_nonblocking(true)
+        .expect("a listener the test must not park on");
+    let mut accepted = None;
+    let arrived = poll_until(within, || match listener.accept() {
+        Ok((stream, _)) => {
+            accepted = Some(stream);
+            true
+        }
+        // Two ways of saying "ask again on the next pass": `WouldBlock` is the
+        // non-blocking listener reporting that nobody has arrived, and `Interrupted`
+        // is a signal having ended the call before it could report anything at all.
+        Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => false,
+        Err(err) => panic!("accepting {awaiting} failed: {err}"),
+    });
+    assert!(arrived, "timed out waiting for {awaiting}");
+    accepted.expect("the connection the wait above returned for")
 }
 
 /// Compares by first difference rather than by value: a failure here is megabytes

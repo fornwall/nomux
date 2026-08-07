@@ -172,37 +172,6 @@ fn write_uninterrupted(socket: &mut UnixStream, buf: &[u8]) -> std::io::Result<u
     }
 }
 
-/// Accepts one connection, or fails saying what never arrived.
-///
-/// A blocking `accept` on a listener nothing connects to parks the thread for ever,
-/// and a test parked there never returns — so its [`Spawned`] guards never run and
-/// the whole run hangs instead of failing. The listener is put in non-blocking mode
-/// here rather than at the call site so that no caller can forget; the connection it
-/// hands back is blocking, as `accept` does not pass the flag on.
-pub(crate) fn accept_within(
-    listener: &UnixListener,
-    within: Duration,
-    awaiting: &str,
-) -> UnixStream {
-    listener
-        .set_nonblocking(true)
-        .expect("a listener the test must not park on");
-    let mut accepted = None;
-    let arrived = poll_until(within, || match listener.accept() {
-        Ok((stream, _)) => {
-            accepted = Some(stream);
-            true
-        }
-        // Two ways of saying "ask again on the next pass": `WouldBlock` is the
-        // non-blocking listener reporting that nobody has arrived, and `Interrupted`
-        // is a signal having ended the call before it could report anything at all.
-        Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => false,
-        Err(err) => panic!("accepting {awaiting} failed: {err}"),
-    });
-    assert!(arrived, "timed out waiting for {awaiting}");
-    accepted.expect("the connection the wait above returned for")
-}
-
 /// A daemon running in an isolated run directory, killed on drop.
 pub(crate) struct Session {
     pub(crate) child: Child,
@@ -587,36 +556,6 @@ pub(crate) fn leads_a_process_group(command: &mut Command) {
             } else {
                 Err(std::io::Error::last_os_error())
             }
-        });
-    }
-}
-
-/// Hands what `command` starts a `SIGTERM` that is blocked *and already pending*, the
-/// state `exec` preserves and § 6.2's arming has to survive.
-///
-/// A shell holding the signal blocked, a systemd unit, a harness — the daemon inherits
-/// both halves, and the pending one is delivered the instant anything clears the mask.
-/// `startup::arm_stop_signals` therefore has to install the handlers *before* it
-/// unblocks: the other order delivers this signal at `SIG_DFL` with the socket already
-/// bound, killing the daemon where it stands with § 6.5's shutdown unrun.
-pub(crate) fn arrives_with_a_stop_signal_pending(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-
-    // SAFETY: the closure runs in the forked child before exec, so it must be
-    // async-signal-safe. `sigemptyset`, `sigaddset`, `sigprocmask` and `raise` all are,
-    // and nothing here allocates or takes a lock.
-    unsafe {
-        command.pre_exec(|| {
-            let mut set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
-            if libc::sigemptyset(set.as_mut_ptr()) != 0
-                || libc::sigaddset(set.as_mut_ptr(), libc::SIGTERM) != 0
-                || libc::sigprocmask(libc::SIG_BLOCK, set.as_ptr(), std::ptr::null_mut()) != 0
-                // Blocked first, so this makes it pending rather than fatal.
-                || libc::raise(libc::SIGTERM) != 0
-            {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
         });
     }
 }
@@ -1014,12 +953,13 @@ impl Client {
         }
     }
 
-    pub(crate) fn next_frame(&mut self) -> (FrameType, Vec<u8>) {
-        self.frame_owed("a frame from the daemon")
-    }
-
     /// The next frame by this client's deadline, or the failure naming what was owed.
-    fn frame_owed(&mut self, awaiting: &str) -> (FrameType, Vec<u8>) {
+    ///
+    /// Reachable from the test binaries so that a test waiting on frames this harness
+    /// has no name for — `agent.rs` taking whichever of `AgentOpen` and `AgentClose`
+    /// comes first — says what it is owed in its own words, per
+    /// [`Client::next_of_awaiting`]'s reason.
+    pub(crate) fn frame_owed(&mut self, awaiting: &str) -> (FrameType, Vec<u8>) {
         self.frame_before(self.deadline, awaiting)
             .unwrap_or_else(|| out_of_time(awaiting))
     }
@@ -1427,41 +1367,6 @@ pub(crate) fn has_unread_bytes(stream: &UnixStream) -> bool {
         }
         return peeked > 0;
     }
-}
-
-/// Shrinks `socket`'s send buffer to `bytes`, so that a write larger than it cannot
-/// complete in one go.
-///
-/// A unix socket splits a write into segments of half its send buffer and waits for
-/// room for each in turn, so the size of that buffer is what decides whether a write
-/// bigger than the space available comes back short or blocks with nothing
-/// transferred. The default 208 KiB is larger than anything this suite writes in one
-/// call, which makes every write all-or-nothing; a small one is what puts a
-/// destination into the state § 7's relay has to survive.
-///
-/// Through `libc` because rustix's socket options live behind its `net` feature,
-/// which this tree does not enable — the same reason [`has_unread_bytes`] is written
-/// by hand.
-pub(crate) fn shrink_send_buffer(socket: &UnixStream, bytes: libc::c_int) {
-    use std::os::fd::AsRawFd;
-
-    // SAFETY: `setsockopt` is given the address and length of a `c_int` that
-    // outlives the call, on a descriptor the borrow keeps open for it.
-    let set = unsafe {
-        libc::setsockopt(
-            socket.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_SNDBUF,
-            std::ptr::from_ref(&bytes).cast::<libc::c_void>(),
-            u32::try_from(size_of::<libc::c_int>()).expect("the size of a c_int"),
-        )
-    };
-    assert_eq!(
-        set,
-        0,
-        "shrinking the send buffer failed: {}",
-        std::io::Error::last_os_error()
-    );
 }
 
 /// The greeting the tests send: the current protocol, [`WIN`], and a terminal type

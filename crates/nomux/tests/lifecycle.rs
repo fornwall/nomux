@@ -19,7 +19,7 @@ mod harness;
 use std::fs;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -778,7 +778,7 @@ fn a_daemon_that_inherits_a_pending_stop_signal_still_runs_its_shutdown() {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    harness::arrives_with_a_stop_signal_pending(&mut command);
+    arrives_with_a_stop_signal_pending(&mut command);
     let finished = harness::collect(&mut command);
 
     let complaint = harness::stderr(&finished);
@@ -789,6 +789,36 @@ fn a_daemon_that_inherits_a_pending_stop_signal_still_runs_its_shutdown() {
          was cleared before the handlers were installed and the signal landed on SIG_DFL \
          with the socket already bound: {complaint:?}"
     );
+}
+
+/// Hands what `command` starts a `SIGTERM` that is blocked *and already pending*, the
+/// state `exec` preserves and § 6.2's arming has to survive.
+///
+/// A shell holding the signal blocked, a systemd unit, a harness — the daemon inherits
+/// both halves, and the pending one is delivered the instant anything clears the mask.
+/// `startup::arm_stop_signals` therefore has to install the handlers *before* it
+/// unblocks: the other order delivers this signal at `SIG_DFL` with the socket already
+/// bound, killing the daemon where it stands with § 6.5's shutdown unrun.
+fn arrives_with_a_stop_signal_pending(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: the closure runs in the forked child before exec, so it must be
+    // async-signal-safe. `sigemptyset`, `sigaddset`, `sigprocmask` and `raise` all are,
+    // and nothing here allocates or takes a lock.
+    unsafe {
+        command.pre_exec(|| {
+            let mut set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+            if libc::sigemptyset(set.as_mut_ptr()) != 0
+                || libc::sigaddset(set.as_mut_ptr(), libc::SIGTERM) != 0
+                || libc::sigprocmask(libc::SIG_BLOCK, set.as_ptr(), std::ptr::null_mut()) != 0
+                // Blocked first, so this makes it pending rather than fatal.
+                || libc::raise(libc::SIGTERM) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 }
 
 /// The other side of that scrub, and why it cannot be unconditional: a daemon refused
