@@ -4,17 +4,17 @@
 #
 # Twenty seconds clears the slowest ordinary test, which finishes in ten. Forty is a backstop
 # against a run that has stopped making progress, and deliberately not a ceiling above every
-# deadline a test gives itself — it cannot be one. `Session::connect` mints a fresh
-# `FRAME_PATIENCE` per client, so a test that reconnects in a loop owes fifteen seconds a
-# round: `a_takeover_never_discards_input_already_delivered` stacks fifteen rounds onto an
-# `attached` for 250 seconds, and a kill above that would be a four-minute ceiling on
-# everything, catching nothing.
+# deadline a test gives itself. No test's budget multiplies any more — `Session::connect_by`
+# hands a reconnecting loop the caller's deadline, so its rounds share one `FRAME_PATIENCE`
+# instead of owing fifteen seconds each — but a test that waits for several things one after
+# another is still bounded by their sum, and a dozen of them sum past forty:
+# `input_delivered_before_a_half_close_is_applied_rather_than_dropped` is the worst at 85
+# seconds, made of a start-up, two clients, a cue and two polls, none of them renewed.
 #
 # The cost of that is real and worth naming rather than papering over: a test slow enough to
 # reach forty is reported slow rather than on the wait it was actually owed, and for chaos.rs
-# without the seed that would reproduce it. The fix is in the harness — a `connect` taking the
-# caller's deadline, which `Client::waits_by` already allows and chaos.rs already does by hand
-# at every reconnect — and not one this file can make by choosing a larger number.
+# without the seed that would reproduce it. What removes it is one deadline per test rather
+# than one per phase (`tests/harness/mod.rs`'s `poll_by`), and not a larger number here.
 [profile.default]
 slow-timeout = { period = "20s", terminate-after = 2 }
 

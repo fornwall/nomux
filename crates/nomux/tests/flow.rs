@@ -110,6 +110,17 @@ fn reconnecting_does_not_raise_the_input_ceiling() {
     const TOLERATED: usize = 8 << 20;
 
     let (session, mut client, ok) = Session::attached("input_ceiling");
+    // One deadline for the whole test rather than one per round (`harness::poll_by`), held
+    // by the client that sets the child up and by the probe every round greets with. What
+    // the rounds do inside it is bounded by the daemon rather than by patience: the first
+    // fills the input queue in a handful of pushes and every later one is answered by a
+    // daemon that has already stopped taking, so a full [`FRAME_PATIENCE`] is reached only
+    // by the defect below. A budget per round instead — one for the loop and a fresh one
+    // for each probe's connection — bounded this test at 146 seconds, well past
+    // `.config/nextest.toml`'s kill, and a run that reached it was reported killed rather
+    // than on the wait it was owed.
+    let deadline = Instant::now() + FRAME_PATIENCE;
+    client.waits_by(deadline);
 
     // The `sleep` holds the terminal without reading a byte for far longer than this
     // test runs — a child that woke up and drained the queue would make the ceiling
@@ -137,10 +148,11 @@ fn reconnecting_does_not_raise_the_input_ceiling() {
         // is where the departing connection's buffer is drained — and that moved
         // `in_applied` by nothing is the daemon having stopped taking input, which is
         // the state a ceiling has to be measured in. A daemon that was merely asleep
-        // does not produce that answer, because it did not answer. The deadline is a
-        // backstop for one that never stops taking, which is the defect itself; the
-        // equality below is what reports it.
-        let deadline = Instant::now() + FRAME_PATIENCE;
+        // does not produce that answer, because it did not answer. The test's deadline is
+        // a backstop for one that never stops taking, which is the defect itself; the
+        // equality below is what reports it, and it reports it just as well from a round
+        // that took a single push — which is all a round after the first needs, the
+        // daemon having stopped taking before it started.
         let applied = loop {
             // Every push starts where the daemon says it has got to, which is what
             // makes the measurement mean anything: input below `in_applied` is trimmed
@@ -157,7 +169,7 @@ fn reconnecting_does_not_raise_the_input_ceiling() {
                  that read none of them"
             );
 
-            let mut probe = session.connect();
+            let mut probe = session.connect_by(deadline);
             let applied = probe.hello(RESUME_FROM_START).in_applied;
             drop(probe);
             drop(blaster);

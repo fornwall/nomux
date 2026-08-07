@@ -68,6 +68,19 @@ pub(crate) fn sanitize_label(label: &str) -> String {
     out.trim().to_owned()
 }
 
+/// Assembles the bounded line [`send`] writes, filtered over the whole of it rather than
+/// over the message alone (§ 11): the text beside a session id is usually an `io::Error`
+/// carrying a run directory somebody else chose, and the id is not always validated either
+/// — `daemon::run` reports a startup failure before anything has looked at its argument.
+fn format_line(priority: u8, session_id: &str, message: &str) -> String {
+    let mut line = sanitize_text(&format!(
+        "<{priority}>nomux[{pid}]: session {session_id}: {message}",
+        pid = std::process::id(),
+    ));
+    line.truncate(line.floor_char_boundary(MAX_LINE_LEN));
+    line
+}
+
 /// Sends one line to the journal, and never reports whether it arrived.
 ///
 /// `priority` is RFC 5424 § 6.2.1's `facility * 8 + severity`: 11 is `user.err` and
@@ -80,15 +93,7 @@ pub(crate) fn sanitize_label(label: &str) -> String {
 /// No timestamp and no hostname: an RFC 3164 timestamp is local time, so it would mean
 /// carrying a timezone database to restate what every collector stamps anyway.
 fn send(priority: u8, session_id: &str, message: &str) {
-    // Filtered over the whole assembled line rather than over the message alone (§ 11): the
-    // text beside a session id is usually an `io::Error` carrying a run directory somebody
-    // else chose, and the id is not always validated either — `daemon::run` reports a
-    // startup failure before anything has looked at its argument.
-    let mut line = sanitize_text(&format!(
-        "<{priority}>nomux[{pid}]: session {session_id}: {message}",
-        pid = std::process::id(),
-    ));
-    line.truncate(line.floor_char_boundary(MAX_LINE_LEN));
+    let line = format_line(priority, session_id, message);
     if let Ok(socket) = UnixDatagram::unbound() {
         // A full collector must not park the daemon inside a `send`. Dropping the
         // line is the right answer to a log nobody is draining.
@@ -242,5 +247,80 @@ mod tests {
                 "one hazard, one filter: {message:?}"
             );
         }
+    }
+
+    /// Everything a receiver has one of: no RFC 5424 header is emitted, so the priority and
+    /// the `tag[pid]:` are the whole of the framing — and both sit ahead of anything a
+    /// caller supplied, which is why a cut taken off the tail cannot damage them.
+    fn framing() -> String {
+        format!("<11>nomux[{}]: session ", std::process::id())
+    }
+
+    /// A line that fits comes through byte for byte, or the bound would be quietly eating
+    /// the diagnostics it exists to deliver.
+    #[test]
+    fn an_ordinary_line_is_not_truncated() {
+        assert_eq!(
+            format_line(11, "build", "run directory /run/user/1000: it is a symlink"),
+            format!(
+                "{}build: run directory /run/user/1000: it is a symlink",
+                framing()
+            )
+        );
+        assert_eq!(
+            format_line(14, "build", "started"),
+            format!("<14>nomux[{}]: session build: started", std::process::id())
+        );
+    }
+
+    /// The reachable oversize, and the whole reason for [`MAX_LINE_LEN`]: `daemon::run`
+    /// reports a bad session id before anything has looked at its length, and the
+    /// `io::Error` beside it quotes the id as well — so one argv element at Linux's
+    /// `MAX_ARG_STRLEN` assembles twice its own size. Unbounded that is a datagram past
+    /// `wmem_default`, refused with `EMSGSIZE` and swallowed like every other failure here,
+    /// which loses the one line that would have said why the daemon declined to start.
+    #[test]
+    fn an_argv_sized_session_id_still_fits_one_datagram() {
+        let huge = "x".repeat(128 * 1024);
+        let line = format_line(11, &huge, &format!("invalid session id {huge:?}"));
+        assert_eq!(line.len(), MAX_LINE_LEN, "the bound is over the whole line");
+        assert!(
+            line.starts_with(&framing()),
+            "the framing must survive the cut"
+        );
+    }
+
+    /// `String::truncate` panics on a split codepoint rather than yielding invalid UTF-8, so
+    /// what can be shown is the cut walking back off one: with a three-byte character laid
+    /// across the bound, the line lands short by exactly the bytes of it that were inside.
+    #[test]
+    fn the_bound_is_taken_on_a_character_boundary() {
+        for (inside, len, last) in [
+            (3, MAX_LINE_LEN, '€'),
+            (2, MAX_LINE_LEN - 2, 'x'),
+            (1, MAX_LINE_LEN - 1, 'x'),
+        ] {
+            let id = "x".repeat(MAX_LINE_LEN - framing().len() - inside) + &"€".repeat(4);
+            let line = format_line(11, &id, "started");
+            assert_eq!(line.len(), len, "{inside} of three bytes inside the bound");
+            assert_eq!(
+                line.chars().next_back(),
+                Some(last),
+                "cut inside a character"
+            );
+        }
+    }
+
+    /// Filtered first and cut second, which is the only order that leaves the bound
+    /// measuring what a receiver will actually see: the other spends the budget on
+    /// characters that are about to be dropped anyway, and drops the tail that says what
+    /// went wrong to pay for them.
+    #[test]
+    fn the_line_is_filtered_before_it_is_cut() {
+        let id = format!("{}build", "\u{7}".repeat(MAX_LINE_LEN));
+        assert_eq!(
+            format_line(11, &id, "started"),
+            format!("{}build: started", framing())
+        );
     }
 }

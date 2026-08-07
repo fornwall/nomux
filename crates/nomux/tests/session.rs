@@ -555,10 +555,14 @@ fn a_second_client_takes_over_and_the_first_is_told_why() {
 fn frames_a_client_may_not_send_are_refused_and_the_connection_closed() {
     let cases = refusals_a_connection_can_earn();
     let session = Session::start("refuse");
-    // One deadline for the table, checked between rows (`harness::poll_by`): every wait
-    // inside a row carries its own patience, so this is what bounds them in aggregate.
+    // One deadline for the table (`harness::poll_by`): held by every connection the rows
+    // make, and checked between rows so that a table which merely *finished* late says
+    // which row it was. Nine rows of round trips against a daemon on this machine are a
+    // small fraction of one wait's patience; what this replaces is a connection per row
+    // minting a budget of its own, which bounded the table at the rows times the patience
+    // rather than at the patience.
     let deadline = Instant::now() + FRAME_PATIENCE;
-    let mut client = session.connect();
+    let mut client = session.connect_by(deadline);
     let start = client.hello(RESUME_FROM_START).resume_from;
 
     for (round, case) in cases.iter().enumerate() {
@@ -580,7 +584,7 @@ fn frames_a_client_may_not_send_are_refused_and_the_connection_closed() {
 
             // The whole point of refusing on the connection's own terms: the shell is
             // still there, at the offsets it had, for whoever attaches next.
-            client = session.connect();
+            client = session.connect_by(deadline);
             let resumed = client.hello(start);
             assert!(
                 !resumed.gap(start),
@@ -600,7 +604,7 @@ fn frames_a_client_may_not_send_are_refused_and_the_connection_closed() {
             // rows ask for is the refusal *and* an incumbent that never heard about it —
             // which is what the `still_serving` below, on the connection that was never
             // dropped, is the answer to.
-            let mut ungreeted = session.connect();
+            let mut ungreeted = session.connect_by(deadline);
             (case.write)(&mut ungreeted);
             ungreeted.expect_error_saying(ErrorCode::Protocol, case.saying, case.what);
             ungreeted.expect_eof(case.what);
@@ -1142,12 +1146,21 @@ fn position(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[test]
 fn a_takeover_never_discards_input_already_delivered() {
     let (session, mut client, _) = Session::attached("takeover_input");
+    // One deadline for all fifteen rounds rather than one per reconnect
+    // (`harness::poll_by`), held by the client already attached as well as by every one
+    // the loop makes. A round is a ping, a keystroke and a handshake against a daemon on
+    // this machine, so the whole loop is a small fraction of one wait's patience — where a
+    // budget minted per round put this test 250 seconds out, past `.config/nextest.toml`'s
+    // kill by six times over, so that a slow run was reported killed rather than on the
+    // frame it was still owed.
+    let deadline = Instant::now() + FRAME_PATIENCE;
+    client.waits_by(deadline);
 
     let command = b"true NOMUX-KEEP\n";
     let mut expected = 0u64;
 
     for round in 0..15 {
-        let mut next = session.connect();
+        let mut next = session.connect_by(deadline);
         // The accept, asked for rather than waited out. `connect` on a listening unix
         // socket completes in the kernel, so the connection is already in the backlog
         // and the next `poll` reports the listener; that same pass services the client,

@@ -50,9 +50,10 @@ pub(crate) const WIN: WinSize = WinSize {
 /// sequence of them.
 ///
 /// Spent once per [`Client`] rather than renewed per wait, for [`poll_by`]'s reason; a
-/// test whose waits legitimately outlast it says so with [`Client::waits_by`]. One
-/// value rather than one per site, since every wait here is on a daemon that is either
-/// about to answer or never going to.
+/// test whose waits legitimately outlast it says so with [`Client::waits_by`], and one
+/// that makes a client per round asks for them with [`Session::connect_by`] so that all
+/// the rounds share the one budget. One value rather than one per site, since every wait
+/// here is on a daemon that is either about to answer or never going to.
 pub(crate) const FRAME_PATIENCE: Duration = Duration::from_secs(15);
 
 /// How long a test waits for something outside the protocol — a file appearing, a
@@ -263,6 +264,31 @@ impl Session {
         }
     }
 
+    /// [`Session::connect`] against a deadline the caller already holds.
+    ///
+    /// [`Session::connect`] mints a [`FRAME_PATIENCE`] of its own, which is what a client
+    /// made once per test wants: the budget is that connection's and nothing else is
+    /// spending it. A loop that reconnects is the case [`poll_by`] is written against — a
+    /// client per round renews a budget meant to be spent once, so what bounds the test is
+    /// [`FRAME_PATIENCE`] times the rounds rather than [`FRAME_PATIENCE`], and past
+    /// `.config/nextest.toml`'s kill there is no wait left to name. This is the same
+    /// connection carrying the caller's deadline instead, so a test of many rounds spends
+    /// one budget across all of them.
+    ///
+    /// A second constructor rather than an argument on [`Session::connect`], because
+    /// sharing is the exception: the two dozen clients in this suite that are the only one
+    /// in their test have nothing to share with, and `connect(Instant::now() +
+    /// FRAME_PATIENCE)` at each of them would say only what the default already says — and
+    /// would let a loop mint a fresh budget while looking deliberate. It is the pairing the
+    /// rest of the harness has, [`poll_until`] beside [`poll_by`] and
+    /// [`Client::frame_owed`] beside [`Client::frame_before`], where the sibling taking an
+    /// `Instant` is the one for a caller that is bounding several waits at once.
+    pub(crate) fn connect_by(&self, deadline: Instant) -> Client {
+        let mut client = self.connect();
+        client.waits_by(deadline);
+        client
+    }
+
     /// A daemon with one client attached to it, greeted from the start of both
     /// streams: how most of the suite opens.
     ///
@@ -369,9 +395,9 @@ impl Cue {
 /// until the daemon itself says so turns that into a wait on the thing being waited
 /// for.
 ///
-/// `deadline` is the caller's, spent here rather than renewed: a fresh [`Client`] per
-/// round would otherwise mint a fresh frame budget every time round, which is the case
-/// [`poll_by`] is written against.
+/// `deadline` is the caller's, spent here rather than renewed ([`Session::connect_by`]):
+/// a fresh [`Client`] per round would otherwise mint a fresh frame budget every time
+/// round, which is the case [`poll_by`] is written against.
 ///
 /// Only the repaint flag, since every greeting here resumes a session that is already
 /// there and `agent_forward` is honoured on the one that creates it.
@@ -382,8 +408,7 @@ pub(crate) fn reconnect_until_gap(
     out_offset: u64,
 ) -> (Client, nomux::HelloOk) {
     loop {
-        let mut client = session.connect();
-        client.waits_by(deadline);
+        let mut client = session.connect_by(deadline);
         let resumed = client.hello_with(false, repaint_ctrl_l, out_offset);
         if resumed.gap(out_offset) {
             return (client, resumed);
@@ -971,8 +996,9 @@ impl Client {
     /// Hands this client `deadline` in place of the [`FRAME_PATIENCE`] it connected
     /// with.
     ///
-    /// For the test whose waits legitimately outlast that, and for the loop that
-    /// reconnects — where a client per round renews a budget meant to be spent once.
+    /// For the test whose waits legitimately outlast that, and — through
+    /// [`Session::connect_by`], which is this call and nothing else — for the loop that
+    /// reconnects, where a client per round renews a budget meant to be spent once.
     pub(crate) const fn waits_by(&mut self, deadline: Instant) {
         self.deadline = deadline;
     }

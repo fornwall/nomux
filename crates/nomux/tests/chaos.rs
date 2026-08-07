@@ -95,8 +95,7 @@ fn overflow_during_disconnects_is_always_reported() {
     let chaos_seed = chaos_seed();
     let session = Session::start_with_ring("chaos_firehose", 32 * 1024);
     let deadline = Instant::now() + PATIENCE;
-    let mut client = session.connect();
-    client.waits_by(deadline);
+    let mut client = session.connect_by(deadline);
     let ok = client.hello(RESUME_FROM_START);
 
     let ready = client.make_ready("-echo -onlcr", None, ok.resume_from);
@@ -167,8 +166,7 @@ fn overflow_during_disconnects_is_always_reported() {
 
         drop(client);
         std::thread::sleep(Duration::from_millis(rng.below(30)));
-        client = session.connect();
-        client.waits_by(deadline);
+        client = session.connect_by(deadline);
         let resumed = client.hello(offset);
         assert!(
             resumed.resume_from >= offset,
@@ -209,8 +207,7 @@ fn replayed_input_across_random_disconnects_is_applied_once() {
     // One deadline for all twelve rounds, as the two tests above have — handed to every
     // client the loop makes, since a fresh one would otherwise start the budget again.
     let deadline = Instant::now() + PATIENCE;
-    let mut client = session.connect();
-    client.waits_by(deadline);
+    let mut client = session.connect_by(deadline);
     let ok = client.hello(RESUME_FROM_START);
 
     let ready = client.make_ready("-echo -onlcr", None, ok.resume_from);
@@ -230,8 +227,7 @@ fn replayed_input_across_random_disconnects_is_applied_once() {
         client.input(applied, &intended[from..]);
 
         drop(client);
-        client = session.connect();
-        client.waits_by(deadline);
+        client = session.connect_by(deadline);
         let resumed = client.hello(offset);
         assert!(
             resumed.in_applied <= intended.len() as u64,
@@ -672,8 +668,7 @@ impl Replay<'_> {
                     self.offset = self.follow(client, self.offset, self.written, cut);
                     let owed = self.written - self.offset;
                     mid_round += usize::from(owed > 0);
-                    *client = session.connect();
-                    client.waits_by(deadline);
+                    *client = session.connect_by(deadline);
                     let resumed = client.hello(self.offset);
                     assert_eq!(
                         resumed.resume_from, self.offset,
@@ -730,8 +725,7 @@ impl Replay<'_> {
                 // is after the new socket exists and before it greets. That window costs
                 // the session nothing: § 6.4 has the daemon promote a connection on its
                 // `Hello` and never on the `connect`, so nothing here is a takeover.
-                *client = session.connect();
-                client.waits_by(deadline);
+                *client = session.connect_by(deadline);
                 let resumed = client.hello(self.offset);
                 assert_eq!(
                     resumed.in_applied, self.in_offset,
@@ -830,8 +824,7 @@ fn a_full_screen_stream_is_byte_exact_across_gaps_that_cut_its_escape_sequences(
 
     let session = Session::start_with_ring("chaos_screen", SCREEN_RING);
     let deadline = Instant::now() + PATIENCE;
-    let mut client = session.connect();
-    client.waits_by(deadline);
+    let mut client = session.connect_by(deadline);
     let ok = client.hello(RESUME_FROM_START);
 
     // `-opost` rather than the `-onlcr` the tests above use: no output post-processing
