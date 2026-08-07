@@ -22,6 +22,9 @@ state_root="$run_root/state"
 session=release-smoke
 relay=
 cleanup() {
+    # A second signal during cleanup must not re-enter this function, and an EXIT caused by a
+    # signal must not run it a second time.
+    trap - EXIT HUP INT TERM
     exec 3>&- 4>&-
     if [ -n "$relay" ]; then
         kill "$relay" >/dev/null 2>&1 || :
@@ -30,7 +33,15 @@ cleanup() {
     XDG_STATE_HOME="$state_root" "$binary" kill "$session" >/dev/null 2>&1 || :
     rm -rf -- "$run_root"
 }
-trap cleanup EXIT HUP INT TERM
+signal_exit() {
+    status=$1
+    cleanup
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'signal_exit 129' HUP
+trap 'signal_exit 130' INT
+trap 'signal_exit 143' TERM
 
 # Emit a byte without relying on a non-POSIX `printf \xNN` extension.
 emit_byte() {
@@ -181,12 +192,14 @@ wait_for_relay() {
 
 marker_octal='\116\117\115\125\130\055\122\105\114\105\101\123\105\055\123\115\117\113\105\012'
 continue_file="$run_root/continue"
-command="stty -echo; printf '$marker_octal'; while [ ! -f '$continue_file' ]; do sleep 0.05; done; exit"
+# The file path stays in the environment rather than being quoted into shell source. Besides
+# being simpler, this remains correct when TMPDIR contains a single quote or shell metacharacter.
+command="stty -echo; printf '$marker_octal'; while [ ! -f \"\$NOMUX_SMOKE_CONTINUE\" ]; do sleep 0.05; done; exit"
 
 # Create a real PTY and detach while its shell is provably still running.
 mkfifo "$run_root/spawn-input"
 : >"$run_root/spawn-transcript"
-XDG_STATE_HOME="$state_root" SHELL=/bin/sh \
+XDG_STATE_HOME="$state_root" SHELL=/bin/sh NOMUX_SMOKE_CONTINUE="$continue_file" \
     "$binary" spawn "$session" <"$run_root/spawn-input" \
     >"$run_root/spawn-transcript" 2>"$run_root/spawn-stderr" &
 relay=$!

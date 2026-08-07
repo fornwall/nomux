@@ -1,0 +1,78 @@
+name: Auto-merge trusted pull requests
+
+# `pull_request_target` is required for a token that can enable auto-merge on a Dependabot PR.
+# Nothing here checks out or executes the pull request: every step runs from the protected base
+# branch, and the CI workflow remains the authority on the proposed tree.
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  owner:
+    name: enable for owner PR
+    if: >-
+      github.event.pull_request.user.login == github.repository_owner &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !github.event.pull_request.draft &&
+      github.event.pull_request.auto_merge == null
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      # GitHub requires both permissions to enable native auto-merge. They apply only to this job;
+      # the workflow-level token has no permissions at all.
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Enable auto-merge after every branch rule passes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge --auto --merge "$PR_URL"
+
+  verify_dependabot:
+    name: verify compatible dependency update
+    if: >-
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      !github.event.pull_request.draft &&
+      github.event.pull_request.auto_merge == null
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    outputs:
+      update-type: ${{ steps.metadata.outputs.update-type }}
+    steps:
+      # Besides exposing the semantic update type, this rejects a PR whose author or commits do
+      # not verify as Dependabot's. This third-party code gets a read-only token; the separate job
+      # below is the only Dependabot path that gets write permission. Pin the action just as CI
+      # pins every executable action.
+      - name: Verify the Dependabot PR and read its update type
+        id: metadata
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+
+  dependabot:
+    name: enable for compatible dependency update
+    needs: verify_dependabot
+    if: >-
+      needs.verify_dependabot.outputs.update-type == 'version-update:semver-patch' ||
+      needs.verify_dependabot.outputs.update-type == 'version-update:semver-minor'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      # A major upgrade can change an action's runtime contract or a crate's API even when today's
+      # tests pass, so it remains a reviewed PR. Patch and minor updates still wait for every
+      # branch rule and required check; this command merely records that pending decision.
+      - name: Enable auto-merge for patch and minor updates
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge --auto --merge "$PR_URL"

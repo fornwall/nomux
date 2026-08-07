@@ -42,6 +42,20 @@ fi
 target=$1
 shift
 
+# The name is used as both a cargo argument and a directory below fuzz/corpus/. Keep an
+# accidental path (or a leading option) from escaping that directory or being interpreted by
+# cargo-fuzz. Cargo target names use this same conservative alphabet.
+case "$target" in
+'' | -* | *[!A-Za-z0-9_-]*)
+    echo "invalid fuzz target name: $target" >&2
+    exit 64
+    ;;
+esac
+if [ ! -f "fuzz/fuzz_targets/$target.rs" ]; then
+    echo "unknown fuzz target: $target" >&2
+    exit 64
+fi
+
 # Installed rather than detected and complained about, as scripts/build-release.sh does it:
 # one idempotent command, so a runner and a laptop provision identically and ci.yml needs no
 # step of its own that could drift from the name above. Chatter to stderr, stdout being

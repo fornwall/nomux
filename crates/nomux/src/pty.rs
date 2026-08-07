@@ -49,6 +49,9 @@ const HANGUP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_mill
 pub(crate) struct Pty {
     master: OwnedFd,
     child: Child,
+    /// Whether [`Pty::try_wait`] has collected the child. Past that point its numeric
+    /// pid can be reissued, so no process-group operation may use it again.
+    reaped: bool,
     /// The child's start time, read once at spawn — the other half of its identity, for
     /// [`Pty::pid_reissued`], which has what a `None` costs and why it is not the whole of
     /// the answer.
@@ -155,6 +158,7 @@ impl Pty {
         Ok(Self {
             master,
             child,
+            reaped: false,
             started,
         })
     }
@@ -188,7 +192,19 @@ impl Pty {
 
     /// Reaps the child if it has exited, without blocking.
     pub(crate) fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
-        self.child.try_wait()
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    self.reaped = true;
+                    return Ok(Some(status));
+                }
+                // A signal says nothing about the child. Losing the daemon's one
+                // `SIGCHLD` wakeup to `EINTR` can otherwise leave a zombie until the
+                // session's idle timeout, because no second child event is owed.
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                outcome => return outcome,
+            }
+        }
     }
 
     /// Terminates everything the session started, then the child itself.
@@ -202,12 +218,17 @@ impl Pty {
         if let Some(pid) = Pid::from_raw(raw)
             && !self.pid_reissued(raw)
         {
-            // `group_alive` carries each probe's answer forward, so no signal below goes
-            // to a group this has already watched go.
-            let mut group_alive = rustix::process::test_kill_process_group(pid).is_ok();
-            let mut settled = !group_alive && session_is_empty(raw);
+            // Nothing reaps the child inside this region. Where it was still waitable on
+            // entry, its zombie keeps the numeric session and process-group id reserved;
+            // where the daemon collected it earlier, `reaped` disables the numeric group
+            // reach and the session walk signals only members it pins first.
+            let mut group_alive =
+                !self.reaped && rustix::process::test_kill_process_group(pid).is_ok();
+            let mut settled = session_is_empty(raw);
             if !settled {
-                reach(Reach::Group(pid), Signal::HUP);
+                if group_alive {
+                    reach(Reach::Group(pid), Signal::HUP);
+                }
                 signal_session(raw, Signal::HUP);
 
                 // Real grace, not a formality: checking microseconds after the signal
@@ -216,25 +237,23 @@ impl Pty {
                 // emptying, not the direct child exiting.
                 let deadline = std::time::Instant::now() + HANGUP_GRACE;
                 while std::time::Instant::now() < deadline {
-                    // Reaped every pass, and not merely for tidiness: an unreaped
-                    // zombie is still a member of its own process group, so
-                    // `test_kill_process_group` answers `Ok` for it and the `&&`
-                    // below short-circuits before the walk — which *does* filter
-                    // zombies — is ever consulted.
-                    let _ = self.child.try_wait();
-                    group_alive = rustix::process::test_kill_process_group(pid).is_ok();
-                    if !group_alive && session_is_empty(raw) {
+                    // A zombie still makes its group look alive, so settlement is the
+                    // `/proc` walk alone: it filters zombies and sees every background
+                    // process in the session, including those in groups of their own.
+                    group_alive =
+                        !self.reaped && rustix::process::test_kill_process_group(pid).is_ok();
+                    if session_is_empty(raw) {
                         settled = true;
                         break;
                     }
                     std::thread::sleep(HANGUP_POLL_INTERVAL);
                 }
             }
-            // The guard is asked again because the loop above can be what changes the
-            // answer: its `try_wait` reaps the child, and reaping frees the number. The
-            // two reaches are separately conditional because their conditions come
-            // apart — a backgrounded job in a group of its own outlives the grace while
-            // the *child's* group is already gone.
+            // Asked again because a child collected before `terminate` can leave its
+            // numeric session id reserved only by the background jobs above; if the last
+            // one exits during the grace, that number becomes reusable. The two reaches
+            // are separately conditional because their conditions come apart — a job in
+            // a group of its own may outlive the child's group.
             if !settled && !self.pid_reissued(raw) {
                 if group_alive {
                     reach(Reach::Group(pid), Signal::KILL);
@@ -242,8 +261,12 @@ impl Pty {
                 signal_session(raw, Signal::KILL);
             }
         }
-        drop(self.child.kill());
-        drop(self.child.wait());
+        if !self.reaped {
+            drop(self.child.kill());
+        }
+        if self.child.wait().is_ok() {
+            self.reaped = true;
+        }
     }
 
     /// Whether `raw` has been handed to somebody else since the spawn (§ 6.5): a
@@ -259,7 +282,7 @@ impl Pty {
     /// walk exists to close.
     fn pid_reissued(&mut self, raw: i32) -> bool {
         let Some(ours) = self.started else {
-            return !matches!(self.child.try_wait(), Ok(None));
+            return !matches!(self.try_wait(), Ok(None));
         };
         start_time(raw).is_some_and(|now| ours != now)
     }
@@ -284,7 +307,7 @@ fn start_time(pid: i32) -> Option<u64> {
 /// is tracking. Each member is pinned before the `stat` read that establishes membership
 /// and signalled through that pidfd, or the reuse window a numeric `kill(2)` has reopens.
 fn signal_session(sid: i32, signal: Signal) {
-    walk_session(sid, true, |_, pinned| {
+    let _ = walk_session(sid, true, |_, pinned| {
         // A missing pidfd is ambiguity, not licence to fall back to the number:
         // signalling nothing is safer than reaching a process that inherited it. The
         // child's own process-group reach remains.
@@ -339,14 +362,20 @@ thread_local! {
 /// cannot be pinned is still visible to the emptiness check but never safe to signal.
 /// One path and one read buffer for the whole walk: [`Pty::terminate`]'s grace loop
 /// reaches here every [`HANGUP_POLL_INTERVAL`] inside [`HANGUP_GRACE`].
-fn walk_session(sid: i32, pin: bool, mut visit: impl FnMut(i32, Option<&OwnedFd>) -> bool) {
+///
+/// Returns whether `/proc` could be enumerated. A stopped visit is still a successful
+/// enumeration: the caller already learned what it asked.
+fn walk_session(sid: i32, pin: bool, mut visit: impl FnMut(i32, Option<&OwnedFd>) -> bool) -> bool {
     let Ok(entries) = std::fs::read_dir("/proc") else {
-        return;
+        return false;
     };
     let self_pid = as_pid(std::process::id());
     let mut path = PathBuf::from("/proc");
     let mut stat = Vec::with_capacity(1024);
-    for entry in entries.filter_map(Result::ok) {
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
         let name = entry.file_name();
         let Some(pid) = name.to_str().and_then(|name| name.parse::<i32>().ok()) else {
             continue;
@@ -373,23 +402,26 @@ fn walk_session(sid: i32, pin: bool, mut visit: impl FnMut(i32, Option<&OwnedFd>
         if stat_session(&stat).is_some_and(|(session, zombie)| session == sid && !zombie)
             && !visit(pid, pinned.as_ref())
         {
-            return;
+            return true;
         }
     }
+    true
 }
 
 /// Whether nothing live is left in session `sid`.
 ///
 /// The walk stops at the first member rather than reading every remaining
 /// `/proc/<pid>/stat` to answer a question that one has already answered:
-/// [`Pty::terminate`]'s grace loop asks this every [`HANGUP_POLL_INTERVAL`].
+/// [`Pty::terminate`]'s grace loop asks this every [`HANGUP_POLL_INTERVAL`]. A `/proc`
+/// enumeration failure answers false, the safe direction: it must not suppress the
+/// group reach and final child kill on evidence it never obtained.
 fn session_is_empty(sid: i32) -> bool {
     let mut empty = true;
-    walk_session(sid, false, |_, _| {
+    let scanned = walk_session(sid, false, |_, _| {
         empty = false;
         false
     });
-    empty
+    scanned && empty
 }
 
 /// The fields of one `/proc/<pid>/stat` from the third onwards, taken from the last `)`
@@ -613,10 +645,10 @@ mod tests {
     }
 
     /// The other side of that guard: a reaped child whose session is *not* empty still
-    /// gets both reaches — what an ordinary exit leaves when the shell had a job
-    /// running. A guard written on the group alone would skip and leave the job running
-    /// under a clean shutdown, § 6.5's orphan by another route; the pid cannot have been
-    /// reissued while anything still names it as a session.
+    /// gets the pidfd-pinned session reach — what an ordinary exit leaves when the shell
+    /// had a job running. The numeric group reach is deliberately unavailable once the
+    /// shell has been collected; skipping the session walk too would leave the job running
+    /// under a clean shutdown, § 6.5's orphan by another route.
     #[test]
     fn terminate_still_collects_a_job_whose_shell_has_been_reaped() {
         let mut pty = shell("terminate_orphan");
@@ -704,10 +736,9 @@ mod tests {
 
     /// Regression: a shutdown over a child that has already gone ends with the session,
     /// rather than sitting out [`HANGUP_GRACE`] behind the child's own zombie. The child
-    /// is left exited and *unreaped* — delete the `try_wait` from the grace loop and the
-    /// session never reads as settled. The `SIGKILL` is the observation, not the half
-    /// second; the `SIGHUP` that opens the shutdown goes out either way, and proves the
-    /// instrument is reading anything at all.
+    /// is left exited and *unreaped*: settlement must ignore that zombie without reaping
+    /// it, since keeping it is what reserves the numeric session id until every signal
+    /// addressed through that id has gone out.
     #[test]
     fn terminate_ends_a_settled_session_without_reaching_for_sigkill() {
         let mut pty = shell("terminate_quiet");
@@ -735,15 +766,11 @@ mod tests {
         drop(reaches_since());
         pty.terminate();
         let sent = reaches_since();
-        assert!(
-            sent.contains(&Signal::HUP),
-            "the shutdown sent no SIGHUP, so the assertion below is about an instrument \
-             that measures nothing: {sent:?}"
-        );
-        assert!(
-            !sent.contains(&Signal::KILL),
-            "terminate reached for SIGKILL over a session whose last member was the \
-             zombie it had been handed to reap: {sent:?}"
+        assert_eq!(
+            sent,
+            [],
+            "terminate signalled a session whose only member was the zombie it held \
+             unreaped as an identity guard: {sent:?}"
         );
     }
 
