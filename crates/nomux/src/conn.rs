@@ -863,9 +863,17 @@ mod tests {
             assert!(!conn.is_eof(), "the peer is still there");
             drop(peer);
 
-            for _ in 0..2 {
+            // Another unit test may be between `fork` and `exec` while this peer is
+            // dropped. That child briefly inherited the descriptor and keeps EOF from
+            // becoming observable until CLOEXEC takes effect, so wait for the kernel's
+            // report instead of requiring it in the next two syscalls.
+            let deadline = Instant::now() + std::time::Duration::from_secs(1);
+            while !conn.is_eof() && Instant::now() < deadline {
                 fill(&mut conn).expect("a fill after the peer closed");
-                assert!(conn.is_eof(), "the close must be reported");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(conn.is_eof(), "the close must be reported");
+            for _ in 0..2 {
                 assert!(
                     matches!(conn.take_frame(&mut scratch), Ok(None)),
                     "a frame whose payload never arrived must not be handed over"

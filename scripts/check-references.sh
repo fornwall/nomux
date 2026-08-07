@@ -9,7 +9,7 @@
 # The rule enforced is the convention the tree already follows: a citation qualified with a
 # document name means that document, an unqualified one means IMPLEMENTATION.md from the
 # source and the enclosing document from within a document. RFC citations are somebody
-# else's numbers and PLAN.md numbers its own sections `P3`, so neither is checked here.
+# else's numbers and PLAN.md's `P…` labels are not section citations, so neither is checked here.
 #
 # Exits non-zero listing every citation and link that resolves to nothing.
 set -eu
@@ -18,7 +18,8 @@ cd -- "$(dirname -- "$0")/.."
 
 # One awk over the whole tree: the shell read-loop this replaced spawned ~2,300 sed and grep
 # to do the same work, and took twelve seconds over it. NUL-delimited so a path with a space
-# survives; `scripts/` picks up the extensionless `size-baseline` the extension globs miss. awk opens each file itself rather than taking them as operands: a
+# survives; `scripts/` picks up the extensionless configuration files the extension globs miss.
+# awk opens each file itself rather than taking them as operands: a
 # path can be in the index and gone from the worktree mid-rename, where `getline` answers -1
 # instead of dying, and a name holding `=` cannot be mistaken for a variable assignment.
 git ls-files -z '*.rs' '*.md' '*.sh' '*.toml' '*.yml' '*.yaml' scripts/ | tr '\0' '\n' | awk '

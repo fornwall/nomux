@@ -29,10 +29,9 @@ repos:
       # alone matched neither this file — the gate itself, and a `.yaml` — nor anything a
       # future workflow adds under that spelling; and `scripts/size-baseline`, read by
       # scripts/build-release.sh, carries no extension at all, so a baseline refresh used to
-      # be a commit that fired no hook whatsoever. The nightly is a line of that script now,
-      # which the extension globs already reach. This pattern decides only when the hook
-      # runs; what it then reads is the file list inside scripts/check-references.sh, and
-      # the two are kept in step.
+      # be a commit that fired no hook whatsoever. The shared nightly pin is extensionless too;
+      # `^scripts/` reaches both. This pattern decides only when the hook runs; what it then
+      # reads is the file list inside scripts/check-references.sh, and the two are kept in step.
       - id: section-references-resolve
         name: every § names a section that exists
         entry: sh scripts/check-references.sh

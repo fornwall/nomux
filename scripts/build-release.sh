@@ -38,16 +38,22 @@ cd "$repo"
 
 dist="$repo/target/dist"
 baseline_file="$repo/scripts/size-baseline"
+nightly_file="$repo/scripts/nightly-version"
 update_baseline="${NOMUX_UPDATE_BASELINE:-0}"
 
 # Nightly, because the released std does not fit: rebuilding it with -Cpanic=immediate-abort
 # is the only configuration that ships. Dated rather than floating, because the SHA-256 the
-# client pins would drift under a name that moves. Named in the script rather than taken from
-# the environment, so a laptop and the runner measure the same bytes by construction; editing
-# it shows up in `git status`, which an override would not. fuzz/run.sh names the same date
-# for its own reason and argues there why the two lines are not one; either can move without
-# the other, so a bump here is this line and a refreshed baseline.
-nightly='nightly-2026-08-07'
+# client pins would drift under a name that moves. Read from the same tracked file as fuzz/run.sh,
+# so advancing either workflow advances both and shows up in `git status`; an environment override
+# would do neither. A bump is that file and, if its size review accepts material growth, a refreshed
+# baseline.
+nightly=$(awk 'NF { if (++seen > 1 || NF != 1) exit 1; value = $1 }
+    END { if (seen != 1) exit 1; print value }' "$nightly_file") ||
+    die "$nightly_file must contain exactly one toolchain name"
+case "$nightly" in
+nightly-[0-9][0-9][0-9][0-9]-[01][0-9]-[0-3][0-9]) ;;
+*) die "$nightly_file must name a dated nightly toolchain" ;;
+esac
 
 # One `target bytes` pair per line, # comments ignored; nothing at all for a target it has no
 # usable figure for. The gate below treats that as a failure rather than as a first build, so a
@@ -72,19 +78,18 @@ RUSTUP_TOOLCHAIN="$nightly"
 export RUSTUP_TOOLCHAIN
 toolchain="$nightly"
 
-# The resolved compiler, never the name it was asked for: `nightly` floats, and two builds a day
-# apart can both answer to that name and disagree about every figure below.
+# The resolved compiler, not merely the requested toolchain name: this records the exact compiler
+# commit beside a refreshed size baseline and includes it in any channel-mismatch diagnostic.
 version=$(rustc --version)
 
-# -Zbuild-std and -Cpanic=immediate-abort are nightly-only, and the pin above is the one place a
-# stable toolchain can now get in: rustup installs one just as willingly, and nothing after this
-# looks at the channel — so unchecked it would die minutes into the first cross build, nowhere
-# near the cause. Asked of rustc rather than matched on the name, so a linked nightly stands.
+# -Zbuild-std and -Cpanic=immediate-abort are nightly-only. The pin's syntax says what was
+# requested, while rustc says what rustup actually resolved; check the latter too so an unexpected
+# compiler fails here rather than minutes into the first cross build, nowhere near the cause.
 case "$version" in
 *-nightly* | *-dev*) ;;
 *) die "$toolchain is not a nightly toolchain: $version" \
         "  the shipping build rebuilds std with panics compiled out, which only" \
-        "  nightly accepts. Name a nightly in \$nightly at the top of this script." ;;
+        "  nightly accepts. Name a dated nightly in scripts/nightly-version." ;;
 esac
 
 # Joined by U+001F as CARGO_ENCODED_RUSTFLAGS, not a whitespace-split RUSTFLAGS: three of these
