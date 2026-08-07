@@ -24,7 +24,8 @@
 use std::collections::VecDeque;
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, Read, Write};
+use std::mem::{MaybeUninit, size_of};
 use std::net::Shutdown;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
@@ -494,10 +495,10 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
         }
     }
 
-    // Closing the channel hands the worker EOF behind every byte already queued. Join
+    // Closing the channel hands the worker EOF behind every byte already queued. Wait
     // only on this normal path: if the relay itself failed, returning must not wait on
     // a worker that may be blocked forever in the stdout the relay is abandoning —
-    // the handle is dropped, and the process's own exit ends the thread.
+    // the channel is dropped, and the process's own exit ends the detached thread.
     stdout.finish()
 }
 
@@ -510,7 +511,6 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
 /// without preventing the main loop from forwarding input.
 struct StdoutWorker {
     channel: UnixStream,
-    worker: std::thread::JoinHandle<io::Result<()>>,
 }
 
 impl StdoutWorker {
@@ -522,10 +522,37 @@ impl StdoutWorker {
         // orphan it — a process's exit takes its threads with it — and the main loop's
         // death notification is the socketpair itself, the far endpoint closing when
         // the copy returns, which does not care what was holding it.
-        let worker = std::thread::Builder::new()
-            .name("stdout-worker".to_owned())
-            .spawn(move || copy_channel_to_stdout(&worker_channel))?;
-        Ok(Self { channel, worker })
+        // `std::thread::spawn` brings roughly 20–24 KiB of generic thread machinery into
+        // these static release binaries. libc's pthread entry point is already the whole
+        // primitive this one fixed worker needs and keeps the upload inside § 8's
+        // growth budget.
+        let worker_channel = Box::into_raw(Box::new(worker_channel));
+        let mut worker = MaybeUninit::uninit();
+        // SAFETY: `worker_channel` owns a valid, Send `UnixStream` allocation which the
+        // entry point takes exactly once. `worker` points at storage for pthread_t, and
+        // the default attributes remain valid for the thread's lifetime.
+        let error = unsafe {
+            libc::pthread_create(
+                worker.as_mut_ptr(),
+                std::ptr::null(),
+                stdout_worker,
+                worker_channel.cast(),
+            )
+        };
+        if error != 0 {
+            // SAFETY: pthread_create failed, so no thread took this allocation.
+            drop(unsafe { Box::from_raw(worker_channel) });
+            return Err(io::Error::from_raw_os_error(error));
+        }
+        // SAFETY: a successful pthread_create initialized `worker`.
+        let worker = unsafe { worker.assume_init() };
+        // The channel carries completion as well as output, so no join handle is needed.
+        // SAFETY: the successful pthread_create returned a live, joinable thread.
+        let error = unsafe { libc::pthread_detach(worker) };
+        if error != 0 {
+            return Err(io::Error::from_raw_os_error(error));
+        }
+        Ok(Self { channel })
     }
 
     fn fd(&self) -> BorrowedFd<'_> {
@@ -534,14 +561,31 @@ impl StdoutWorker {
 
     /// Closes the producer end after its queued bytes, then proves the worker delivered
     /// them or reports why it could not.
-    fn finish(self) -> io::Result<()> {
-        let Self { channel, worker } = self;
-        drop(channel.shutdown(Shutdown::Write));
-        drop(channel);
-        worker
-            .join()
-            .unwrap_or_else(|_| Err(io::Error::other("relay stdout worker panicked")))
+    fn finish(mut self) -> io::Result<()> {
+        // No more relay writes follow, so blocking here cannot stall the bidirectional
+        // pump. The worker sends its result back only after consuming this EOF and
+        // delivering everything before it.
+        self.channel.set_nonblocking(false)?;
+        drop(self.channel.shutdown(Shutdown::Write));
+        let mut status = [0; size_of::<i32>()];
+        self.channel.read_exact(&mut status)?;
+        match i32::from_ne_bytes(status) {
+            0 => Ok(()),
+            error if error > 0 => Err(io::Error::from_raw_os_error(error)),
+            _ => Err(io::Error::other("relay stdout worker failed")),
+        }
     }
+}
+
+extern "C" fn stdout_worker(channel: *mut libc::c_void) -> *mut libc::c_void {
+    // SAFETY: spawn passed ownership of a Box<UnixStream> as this pointer.
+    let mut channel = unsafe { Box::from_raw(channel.cast::<UnixStream>()) };
+    let status = match copy_channel_to_stdout(&channel) {
+        Ok(()) => 0,
+        Err(error) => error.raw_os_error().filter(|raw| *raw > 0).unwrap_or(-1),
+    };
+    drop(channel.write_all(&status.to_ne_bytes()));
+    std::ptr::null_mut()
 }
 
 /// Copies the bounded worker channel to actual stdout.
