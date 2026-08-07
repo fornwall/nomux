@@ -1399,8 +1399,14 @@ impl Daemon {
             }
 
             // The second half of the wrapped deque is only labelled correctly if the first
-            // was queued whole, so short progress stops the loop: otherwise a saturated
-            // queue labels it too low, corrupting the stream rather than slowing it.
+            // was queued whole, so short progress stops the loop. Defence in depth rather
+            // than a live boundary: `send_output` re-checks the cap per chunk and nothing
+            // flushes within a pass, so a short return already guarantees the next call
+            // queues nothing and hands its offset back untouched. What this guards is a
+            // future where that stops holding — a second short-return path, or a flush
+            // moved inside the pass — in which the second half would be labelled too low
+            // and the stream would be contiguous and wrong, which is the one corruption a
+            // client cannot detect. Deleting the break fails no test in the suite.
             for part in self.ring.slices_from(client.sent_through) {
                 if part.is_empty() {
                     continue;

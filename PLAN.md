@@ -17,5 +17,9 @@ its work is tracked here; what this side owes it is fixed contract in
 
 ## P2 — test depth
 
-- Chaos against a real full-screen program; the suite stays deterministic on sixel and
-  CSI from `sh`, and driving an actual `vim` would test `vim`.
+- A repaint interleaved with an exactly-once resend: `ctrl_l` repainting
+  ([IMPLEMENTATION.md § 4.3](IMPLEMENTATION.md#43-gap-handling)) puts a form feed into the
+  child's input while the client resends from `in_applied` across repeated overflow, and
+  the two are covered apart but never together. It wants a child that tolerates a stray
+  `0x0c` in its input, which the marker-counting shells in `chaos.rs` do not — so it is a
+  test of its own rather than a case added to one.
