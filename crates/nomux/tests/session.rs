@@ -39,9 +39,12 @@ use harness::{
 #[test]
 fn output_resumes_contiguously_after_a_reconnect() {
     let (session, mut client, ok) = Session::attached("resume");
-    assert!(
-        !ok.gap(RESUME_FROM_START),
-        "a fresh session has dropped nothing"
+    // The first byte of the stream rather than `!ok.gap(RESUME_FROM_START)`, which is
+    // `!(resume_from > u64::MAX)` and so is true of every answer a daemon can give.
+    assert_eq!(
+        ok.resume_from, 0,
+        "a fresh session has dropped nothing, so it resumes at the first byte it \
+         ever produced"
     );
 
     let first = b"echo NOMUX-BEFORE\n";
@@ -489,10 +492,12 @@ fn an_overflow_that_outruns_an_attached_client_is_reported_as_a_gap_mid_stream()
     let session = Session::start_with_ring("midstream_gap", RING);
     let mut client = session.connect();
     let ok = client.hello(RESUME_FROM_START);
-    assert!(
-        !ok.gap(RESUME_FROM_START),
-        "a session nobody has attached to before has nothing to report at the \
-         handshake, so every gap below is one this connection was sent"
+    // The first byte of the stream rather than `!ok.gap(RESUME_FROM_START)`, which is
+    // `!(resume_from > u64::MAX)` and so is true of every answer a daemon can give.
+    assert_eq!(
+        ok.resume_from, 0,
+        "a session nobody has attached to before is holding everything it ever \
+         produced, so every gap below is one this connection was sent"
     );
 
     // Echo off, so everything from the opening marker on is the child's own bytes. The
@@ -641,74 +646,45 @@ fn a_second_client_takes_over_and_the_first_is_told_why() {
     second.read_until("NOMUX-TOOK-OVER", ok.resume_from);
 }
 
-/// The refusals an *attached* client can earn, and the session surviving each.
+/// The refusals a connection can earn against a session that is already serving, and
+/// the session surviving each.
 ///
-/// `handle_frame`'s "frame is not valid from a client" arm and both of `read_client`'s
-/// `reject(Protocol, …)` sites have no other caller in the suite. The last of those is
-/// the one that matters: a frame boundary the daemon has lost track of is a stream in
-/// which every subsequent `Input` offset is somebody else's number.
+/// `handle_frame`'s "frame is not valid from a client" arm and its "already greeted"
+/// one, both of `read_client`'s `reject(Protocol, …)` sites and the two unparseable
+/// ones of `read_pending`'s three have no other caller in the suite — the third being
+/// `a_connection_that_does_not_greet_first_is_refused_alone`'s. The frame-boundary pair
+/// matters most: a frame boundary the daemon has lost track of is a stream in which
+/// every subsequent `Input` offset is somebody else's number.
 ///
-/// Five rows reaching the refusal by three routes. A `HelloOk`, an `Output` and a `Gap`
+/// Eight rows reaching a refusal by five routes. A `HelloOk`, an `Output` and a `Gap`
 /// are well-formed frames the *daemon* sends, so they decode perfectly and fall through
-/// the match. A discriminant no `FrameType` has never reaches the match at all. And a
-/// `Resize` whose payload is four bytes rather than eight has a header that decodes and
-/// a body that does not — the one case where the daemon knows how many bytes to skip
-/// and still must not. Each row asserts all three of what a refusal is: the code, that
-/// the connection then closes without a second complaint — which is what
-/// `Client::expect_eof` separates from a frame quietly *honoured* — and that a fresh
-/// client can still drive the shell. One session for all five, so each row lands on one
-/// the rows before it have abused.
+/// the match. A second `Hello` decodes just as well and is refused for having arrived at
+/// all, greeting being what *makes* a connection the client — honouring one would rewind
+/// both streams under a session that has been running against them. A discriminant no
+/// `FrameType` has never reaches the match at all. And a `Resize` whose payload is four
+/// bytes rather than eight has a header that decodes and a body that does not — the one
+/// case where the daemon knows how many bytes to skip and still must not.
+///
+/// The last two rows put the two unparseable shapes to a connection that has *not*
+/// greeted, where `read_pending` answers rather than `read_client`: those are the sites
+/// reached before a session exists for the connection, and the every-row `still_serving`
+/// that opens a round is exactly what keeps them out of reach of the rows above.
+///
+/// Every row names the daemon's own words as well as its code, because the code does not
+/// separate these sites: `Protocol` is what all six of them answer with. For the second
+/// `Hello` that is the whole question — its arm and the catch-all behind it produce the
+/// same code, the same close and the same silence about the session, and differ in the
+/// message and in nothing else.
+///
+/// Each row asserts all of what a refusal is: the code and the words, that the
+/// connection then closes without a second complaint — which is what
+/// `Client::expect_eof` separates from a frame quietly *honoured* — that the session's
+/// input position did not move over it, and that a client can still drive the shell
+/// afterwards. One session for all eight, so each row lands on one the rows before it
+/// have abused.
 #[test]
 fn frames_a_client_may_not_send_are_refused_and_the_connection_closed() {
-    /// One case: what the client puts on the wire, and what the failure says it was.
-    struct Refused {
-        what: &'static str,
-        write: fn(&mut Client),
-    }
-
-    let cases = [
-        Refused {
-            what: "a HelloOk, which is the daemon's own answer coming back at it",
-            write: |client| {
-                client.send(&Frame::HelloOk(nomux::HelloOk {
-                    resume_from: 0,
-                    in_applied: 0,
-                    linger: Linger::Unknown,
-                    agent: false,
-                }));
-            },
-        },
-        Refused {
-            what: "an Output, which only the session has any business producing",
-            write: |client| {
-                client.send(&Frame::Output {
-                    offset: 0,
-                    data: b"not from here",
-                });
-            },
-        },
-        Refused {
-            what: "a Gap, which is a claim about a ring the client does not own",
-            write: |client| {
-                client.send(&Frame::Gap {
-                    new_base_offset: 1 << 40,
-                });
-            },
-        },
-        Refused {
-            what: "a header carrying a discriminant no FrameType has",
-            // `0xff` is past every variant, and the length is zero so that a daemon
-            // which skipped the frame rather than refusing it would find the stream
-            // still framed — the failure has to come from the unreadable header.
-            write: |client| client.send_raw(&[0xff, 0x00, 0x00, 0x00]),
-        },
-        Refused {
-            what: "a Resize whose payload is half a WinSize",
-            // Four bytes where the frame's four `u16`s need eight.
-            write: |client| client.send_raw(&[0x06, 0x00, 0x00, 0x04, 0, 80, 0, 24]),
-        },
-    ];
-
+    let cases = refusals_a_connection_can_earn();
     let session = Session::start("refuse");
     // One deadline for the table, checked between rows (`harness::poll_by`): every wait
     // inside a row carries its own patience, so this is what bounds them in aggregate.
@@ -723,20 +699,44 @@ fn frames_a_client_may_not_send_are_refused_and_the_connection_closed() {
         // satisfied by the one before it.
         still_serving(&mut client, &format!("NOMUX-BEFORE-{round}"));
 
-        (case.write)(&mut client);
-        client.expect_error_among_output(ErrorCode::Protocol, case.what);
-        client.expect_eof(case.what);
-        drop(client);
+        if case.greeted {
+            // What the daemon has taken ownership of, taken before the frame that is
+            // going to be refused so that the reconnect below can be asked whether
+            // refusing it moved the session's input position.
+            let delivered = client.in_offset();
+            (case.write)(&mut client);
+            client.expect_error_saying(ErrorCode::Protocol, case.saying, case.what);
+            client.expect_eof(case.what);
+            drop(client);
 
-        // The whole point of refusing on the connection's own terms: the shell is
-        // still there, at the offsets it had, for whoever attaches next.
-        client = session.connect();
-        let resumed = client.hello(start);
-        assert!(
-            !resumed.gap(start),
-            "{}: the session lost output while refusing one connection",
-            case.what
-        );
+            // The whole point of refusing on the connection's own terms: the shell is
+            // still there, at the offsets it had, for whoever attaches next.
+            client = session.connect();
+            let resumed = client.hello(start);
+            assert!(
+                !resumed.gap(start),
+                "{}: the session lost output while refusing one connection",
+                case.what
+            );
+            assert_eq!(
+                resumed.in_applied, delivered,
+                "{}: the session's input position moved over a frame it refused, so \
+                 every offset the next client sends is one the daemon will answer with \
+                 an Error{{InputGap}}",
+                case.what
+            );
+        } else {
+            // Refused before it has a session to lose: `reject_pending` empties the slot
+            // the newcomer is waiting in and never reaches the client, so what these
+            // rows ask for is the refusal *and* an incumbent that never heard about it —
+            // which is what the `still_serving` below, on the connection that was never
+            // dropped, is the answer to.
+            let mut ungreeted = session.connect();
+            (case.write)(&mut ungreeted);
+            ungreeted.expect_error_saying(ErrorCode::Protocol, case.saying, case.what);
+            ungreeted.expect_eof(case.what);
+        }
+
         still_serving(&mut client, &format!("NOMUX-SERVING-{round}"));
         assert!(
             Instant::now() < deadline,
@@ -745,6 +745,117 @@ fn frames_a_client_may_not_send_are_refused_and_the_connection_closed() {
             case.what
         );
     }
+}
+
+/// One case of [`frames_a_client_may_not_send_are_refused_and_the_connection_closed`]:
+/// what goes on the wire, what the daemon owes back, and what the failure says it was.
+struct Refused {
+    what: &'static str,
+    write: fn(&mut Client),
+    /// The daemon's own words for the refusal this row earns. See the test above for
+    /// why the `ErrorCode` alone will not do.
+    saying: &'static str,
+    /// Whether the connection that sends it has greeted. A row that has not gets a
+    /// connection of its own, and the session's client stays attached throughout.
+    greeted: bool,
+}
+
+/// The table itself, out here so that the test reading it stays one screen long.
+fn refusals_a_connection_can_earn() -> [Refused; 8] {
+    [
+        Refused {
+            what: "a HelloOk, which is the daemon's own answer coming back at it",
+            write: |client| {
+                client.send(&Frame::HelloOk(nomux::HelloOk {
+                    resume_from: 0,
+                    in_applied: 0,
+                    linger: Linger::Unknown,
+                    agent: false,
+                }));
+            },
+            saying: "frame is not valid from a client",
+            greeted: true,
+        },
+        Refused {
+            what: "an Output, which only the session has any business producing",
+            write: |client| {
+                client.send(&Frame::Output {
+                    offset: 0,
+                    data: b"not from here",
+                });
+            },
+            saying: "frame is not valid from a client",
+            greeted: true,
+        },
+        Refused {
+            what: "a Gap, which is a claim about a ring the client does not own",
+            write: |client| {
+                client.send(&Frame::Gap {
+                    new_base_offset: 1 << 40,
+                });
+            },
+            saying: "frame is not valid from a client",
+            greeted: true,
+        },
+        Refused {
+            what: "a second Hello on a connection that has already greeted",
+            // Well formed and current, so nothing but *when* it arrives is wrong with
+            // it: the same frame one connection earlier is how this session was made.
+            write: |client| client.send(&hello_frame(false, false, RESUME_FROM_START)),
+            saying: "this connection has already greeted",
+            greeted: true,
+        },
+        Refused {
+            what: "a header carrying a discriminant no FrameType has",
+            // `0xff` is past every variant, and the length is zero so that a daemon
+            // which skipped the frame rather than refusing it would find the stream
+            // still framed — the failure has to come from the unreadable header.
+            write: |client| client.send_raw(&[0xff, 0x00, 0x00, 0x00]),
+            saying: "unparseable frame header",
+            greeted: true,
+        },
+        Refused {
+            what: "a Resize whose payload is half a WinSize",
+            // Four bytes where the frame's four `u16`s need eight.
+            write: |client| client.send_raw(&[0x06, 0x00, 0x00, 0x04, 0, 80, 0, 24]),
+            saying: "unparseable frame payload",
+            greeted: true,
+        },
+        Refused {
+            what: "a header carrying a discriminant no FrameType has, before greeting",
+            write: |client| client.send_raw(&[0xff, 0x00, 0x00, 0x00]),
+            saying: "unparseable frame header",
+            greeted: false,
+        },
+        Refused {
+            what: "a Hello whose header declares one byte less than it delivers",
+            // Encoded properly and then told to be shorter, so the header decodes and
+            // says `Hello`: the daemon gets past "the first frame must be a Hello" and
+            // fails on the frame itself, which is a `TERM` a byte short of its own
+            // length prefix. The spare byte behind it goes with the connection.
+            write: |client| {
+                let mut wire = Vec::new();
+                hello_frame(false, false, RESUME_FROM_START)
+                    .encode(&mut wire)
+                    .expect("encode a Hello");
+                let short = u32::try_from(wire.len() - HEADER_LEN - 1)
+                    .expect("a Hello is far shorter than a header can say");
+                // § 2.1's header: the discriminant, then the length big endian in the
+                // three bytes that follow — which are the low three of a `u32`.
+                wire.get_mut(1..HEADER_LEN)
+                    .expect("the length field of a header")
+                    .copy_from_slice(
+                        short
+                            .to_be_bytes()
+                            .get(1..)
+                            .expect("the low three bytes of a u32"),
+                    );
+                client.send_raw(&wire);
+            },
+            saying: "unparseable Hello",
+            greeted: false,
+        },
+    ]
 }
 
 /// A session whose shell cannot be started is refused with `Error{INTERNAL}`.

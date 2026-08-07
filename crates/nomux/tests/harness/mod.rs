@@ -590,6 +590,36 @@ pub(crate) fn leads_a_process_group(command: &mut Command) {
     }
 }
 
+/// Hands what `command` starts a `SIGTERM` that is blocked *and already pending*, the
+/// state `exec` preserves and § 6.2's arming has to survive.
+///
+/// A shell holding the signal blocked, a systemd unit, a harness — the daemon inherits
+/// both halves, and the pending one is delivered the instant anything clears the mask.
+/// `startup::arm_stop_signals` therefore has to install the handlers *before* it
+/// unblocks: the other order delivers this signal at `SIG_DFL` with the socket already
+/// bound, killing the daemon where it stands with § 6.5's shutdown unrun.
+pub(crate) fn arrives_with_a_stop_signal_pending(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: the closure runs in the forked child before exec, so it must be
+    // async-signal-safe. `sigemptyset`, `sigaddset`, `sigprocmask` and `raise` all are,
+    // and nothing here allocates or takes a lock.
+    unsafe {
+        command.pre_exec(|| {
+            let mut set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+            if libc::sigemptyset(set.as_mut_ptr()) != 0
+                || libc::sigaddset(set.as_mut_ptr(), libc::SIGTERM) != 0
+                || libc::sigprocmask(libc::SIG_BLOCK, set.as_ptr(), std::ptr::null_mut()) != 0
+                // Blocked first, so this makes it pending rather than fatal.
+                || libc::raise(libc::SIGTERM) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 /// [`nomux`] with a `SHELL` the developer's login environment cannot vary.
 ///
 /// For every invocation that could put a shell behind a PTY — including the ones where
@@ -1091,14 +1121,39 @@ impl Client {
     /// code after its replacement has already evicted it was given the wrong answer.
     pub(crate) fn expect_error(&mut self, code: ErrorCode, what: &str) {
         let (ty, payload) = self.frame_owed(&format!("a refusal ({what})"));
-        assert_refusal(ty, &payload, code, what);
+        assert_refusal(ty, &payload, code, None, what);
     }
 
     /// [`Client::expect_error`] for a connection the session is also writing output
     /// to, where the refusal is not the only thing that can be in flight.
     pub(crate) fn expect_error_among_output(&mut self, code: ErrorCode, what: &str) {
         let payload = self.next_of_awaiting(FrameType::Error, &format!("a refusal ({what})"));
-        assert_refusal(FrameType::Error, &payload, code, what);
+        assert_refusal(FrameType::Error, &payload, code, None, what);
+    }
+
+    /// [`Client::expect_error_among_output`] where the caller also knows the daemon's
+    /// own words for the refusal it is owed.
+    ///
+    /// [`ErrorCode`] is a small closed set, and `Protocol` is what seven separate sites
+    /// in the daemon answer with — so a test asking for the code alone is satisfied by
+    /// any of them, and cannot say which one answered. Where two of those sites are
+    /// reachable from the *same* frame the message is the only thing that separates
+    /// them: a second `Hello` has a refusal of its own precisely so that a connection
+    /// which greeted perfectly well is not told `Hello` is a frame it may not send,
+    /// and that arm and the catch-all behind it differ in nothing else.
+    pub(crate) fn expect_error_saying(&mut self, code: ErrorCode, saying: &str, what: &str) {
+        let payload = self.next_of_awaiting(FrameType::Error, &format!("a refusal ({what})"));
+        assert_refusal(FrameType::Error, &payload, code, Some(saying), what);
+    }
+
+    /// One past the last input byte this client has delivered.
+    ///
+    /// The daemon's `in_applied` is authoritative and comes back on every `HelloOk`,
+    /// so what a test checks it against is the client's own count of what it sent —
+    /// which is how "the refusal cost the session nothing" is asked as a number rather
+    /// than as a session that still answers.
+    pub(crate) const fn in_offset(&self) -> u64 {
+        self.in_offset
     }
 
     /// Waits for the daemon to close the connection after `after`, without
@@ -1257,11 +1312,18 @@ pub(crate) fn still_serving(client: &mut Client, tag: &str) {
     client.read_until(&format!("{tag}-42"), client.out_offset);
 }
 
-/// Asserts that a frame the daemon sent is an `Error` carrying `code`.
+/// Asserts that a frame the daemon sent is an `Error` carrying `code`, and — where the
+/// caller named one — the words that say which site produced it.
 ///
-/// Shared by the two ways of arriving at one, so that what a refusal has to satisfy
+/// Shared by the three ways of arriving at one, so that what a refusal has to satisfy
 /// is written once and the entry points differ only in how strictly they read.
-fn assert_refusal(ty: FrameType, payload: &[u8], code: ErrorCode, what: &str) {
+fn assert_refusal(
+    ty: FrameType,
+    payload: &[u8],
+    code: ErrorCode,
+    saying: Option<&str>,
+    what: &str,
+) {
     assert_eq!(
         ty,
         FrameType::Error,
@@ -1270,6 +1332,12 @@ fn assert_refusal(ty: FrameType, payload: &[u8], code: ErrorCode, what: &str) {
     match Frame::decode(ty, payload).expect("decode the refusal") {
         Frame::Error { code: got, message } => {
             assert_eq!(got, code, "{what}; the daemon said {message:?}");
+            if let Some(saying) = saying {
+                assert_eq!(
+                    message, saying,
+                    "{what}; the right code from the wrong place in the daemon"
+                );
+            }
         }
         other => panic!("{what}; got {other:?}"),
     }

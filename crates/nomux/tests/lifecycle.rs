@@ -810,6 +810,43 @@ fn a_spawn_whose_socket_cannot_be_bound_leaves_no_lock_behind() {
     );
 }
 
+/// A stop signal the daemon inherited already pending must reach § 6.5's shutdown, not
+/// the default disposition.
+///
+/// `exec` preserves a blocked signal *and* a pending one, so the daemon starts owing a
+/// `SIGTERM` it has not heard yet, and `startup::arm_stop_signals` decides which of two
+/// things happens when it clears the mask. Handlers installed first: the byte goes down
+/// the stop pipe and leaving unlinks the run files. The mask cleared first: `SIG_DFL`
+/// kills the process between `bind_socket` and the event loop, and `<id>.sock` and
+/// `<id>.lock` are left for the next daemon and for `list` to read as a live session.
+///
+/// The directory is what is asserted, rather than the exit status: both orders end the
+/// process, and only one of them ends it having tidied up.
+#[test]
+fn a_daemon_that_inherits_a_pending_stop_signal_still_runs_its_shutdown() {
+    let root = run_root("pending_term");
+    let dir = root.join("nomux");
+    fs::create_dir_all(&dir).expect("create the run directory");
+    let before = entries(&dir);
+
+    let mut command = nomux_with_shell(&root, &["daemon", "pending"]);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    harness::arrives_with_a_stop_signal_pending(&mut command);
+    let finished = harness::collect(&mut command);
+
+    let complaint = harness::stderr(&finished);
+    assert_eq!(
+        entries(&dir),
+        before,
+        "a daemon that inherited a pending SIGTERM left its run files behind, so the mask \
+         was cleared before the handlers were installed and the signal landed on SIG_DFL \
+         with the socket already bound: {complaint:?}"
+    );
+}
+
 /// The other side of that scrub, and why it cannot be unconditional: a daemon refused
 /// because a live session already holds the id must leave that session's `<id>.lock`
 /// alone.
