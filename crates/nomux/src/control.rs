@@ -82,7 +82,8 @@ pub(crate) fn list() -> io::Result<()> {
             // § 6.3's `sun_path` refusal, a property of this directory rather than of the id,
             // so this is the one session `list` can neither print nor collect.
             Err(err) => {
-                eprintln!("nomux: {err}; its files are left where they are");
+                let complaint = format!("{err}; its files are left where they are");
+                eprintln!("nomux: {}", complaint.escape_debug());
                 continue;
             }
         };

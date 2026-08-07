@@ -1208,7 +1208,10 @@ fn list_reports_an_id_this_run_directory_cannot_address() {
     // The longest id § 6.3 accepts, so what refuses it below is the directory rather
     // than anything about the id itself.
     let id = "a".repeat(64);
-    let deep = deepened_past_sun_path(&run_root("unaddressable"), &id);
+    // This path is repeated in the per-entry diagnostic. It crosses a terminal boundary
+    // inside `list`, before `main` gets a final error to escape, so make the fixture hostile.
+    let root = run_root("unaddressable").join("line\n\u{1b}]0;forged-title\u{7}");
+    let deep = deepened_past_sun_path(&root, &id);
     let dir = deep.join("nomux/run");
     fs::create_dir_all(&dir).expect("create a deep run directory");
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("owner-only");
@@ -1226,6 +1229,14 @@ fn list_reports_an_id_this_run_directory_cannot_address() {
     assert!(
         said.contains(&id),
         "the id has to be named, being the only thing a user can act on: {said:?}"
+    );
+    assert!(
+        !said.contains('\u{1b}') && said.lines().count() == 1,
+        "a runtime-controlled path emitted terminal controls verbatim: {said:?}"
+    );
+    assert!(
+        said.contains("\\n") && said.contains("\\u{1b}"),
+        "the escaped refusal no longer identifies the failing path: {said:?}"
     );
     assert!(
         planted.exists(),
