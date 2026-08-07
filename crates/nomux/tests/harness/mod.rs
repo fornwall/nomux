@@ -24,6 +24,7 @@
               modules, not integration test crates"
 )]
 
+use std::fmt::Write as _;
 use std::io::{ErrorKind, Read, Write};
 use std::ops::{Deref, DerefMut};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -49,9 +50,10 @@ pub(crate) const WIN: WinSize = WinSize {
 /// sequence of them.
 ///
 /// Spent once per [`Client`] rather than renewed per wait, for [`poll_by`]'s reason; a
-/// test whose waits legitimately outlast it says so with [`Client::waits_by`]. One
-/// value rather than one per site, since every wait here is on a daemon that is either
-/// about to answer or never going to.
+/// test whose waits legitimately outlast it says so with [`Client::waits_by`], and one
+/// that makes a client per round asks for them with [`Session::connect_by`] so that all
+/// the rounds share the one budget. One value rather than one per site, since every wait
+/// here is on a daemon that is either about to answer or never going to.
 pub(crate) const FRAME_PATIENCE: Duration = Duration::from_secs(15);
 
 /// How long a test waits for something outside the protocol — a file appearing, a
@@ -99,9 +101,9 @@ pub(crate) fn poll_until(within: Duration, condition: impl FnMut() -> bool) -> b
 /// worse still, being satisfied by every arrival — a peer dribbling one frame just
 /// inside it is never late, and the loop around it has no bound at all. Everything in
 /// this suite that takes an `Instant` where a `Duration` would have done —
-/// [`join_before`], [`Client::frame_before`], [`Client::hello_before`],
-/// [`Client::waits_by`], and the `PATIENCE` constants the test binaries define — is
-/// here for this reason and says no more about it.
+/// [`join_before`], [`Client::frame_before`], [`Client::waits_by`], and the `PATIENCE`
+/// constants the test binaries define — is here for this reason and says no more about
+/// it.
 pub(crate) fn poll_by(deadline: Instant, mut condition: impl FnMut() -> bool) -> bool {
     loop {
         if condition() {
@@ -169,37 +171,6 @@ fn write_uninterrupted(socket: &mut UnixStream, buf: &[u8]) -> std::io::Result<u
             outcome => return outcome,
         }
     }
-}
-
-/// Accepts one connection, or fails saying what never arrived.
-///
-/// A blocking `accept` on a listener nothing connects to parks the thread for ever,
-/// and a test parked there never returns — so its [`Spawned`] guards never run and
-/// the whole run hangs instead of failing. The listener is put in non-blocking mode
-/// here rather than at the call site so that no caller can forget; the connection it
-/// hands back is blocking, as `accept` does not pass the flag on.
-pub(crate) fn accept_within(
-    listener: &UnixListener,
-    within: Duration,
-    awaiting: &str,
-) -> UnixStream {
-    listener
-        .set_nonblocking(true)
-        .expect("a listener the test must not park on");
-    let mut accepted = None;
-    let arrived = poll_until(within, || match listener.accept() {
-        Ok((stream, _)) => {
-            accepted = Some(stream);
-            true
-        }
-        // Two ways of saying "ask again on the next pass": `WouldBlock` is the
-        // non-blocking listener reporting that nobody has arrived, and `Interrupted`
-        // is a signal having ended the call before it could report anything at all.
-        Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => false,
-        Err(err) => panic!("accepting {awaiting} failed: {err}"),
-    });
-    assert!(arrived, "timed out waiting for {awaiting}");
-    accepted.expect("the connection the wait above returned for")
 }
 
 /// A daemon running in an isolated run directory, killed on drop.
@@ -291,6 +262,31 @@ impl Session {
             out_offset: 0,
             deadline: Instant::now() + FRAME_PATIENCE,
         }
+    }
+
+    /// [`Session::connect`] against a deadline the caller already holds.
+    ///
+    /// [`Session::connect`] mints a [`FRAME_PATIENCE`] of its own, which is what a client
+    /// made once per test wants: the budget is that connection's and nothing else is
+    /// spending it. A loop that reconnects is the case [`poll_by`] is written against — a
+    /// client per round renews a budget meant to be spent once, so what bounds the test is
+    /// [`FRAME_PATIENCE`] times the rounds rather than [`FRAME_PATIENCE`], and past
+    /// `.config/nextest.toml`'s kill there is no wait left to name. This is the same
+    /// connection carrying the caller's deadline instead, so a test of many rounds spends
+    /// one budget across all of them.
+    ///
+    /// A second constructor rather than an argument on [`Session::connect`], because
+    /// sharing is the exception: the two dozen clients in this suite that are the only one
+    /// in their test have nothing to share with, and `connect(Instant::now() +
+    /// FRAME_PATIENCE)` at each of them would say only what the default already says — and
+    /// would let a loop mint a fresh budget while looking deliberate. It is the pairing the
+    /// rest of the harness has, [`poll_until`] beside [`poll_by`] and
+    /// [`Client::frame_owed`] beside [`Client::frame_before`], where the sibling taking an
+    /// `Instant` is the one for a caller that is bounding several waits at once.
+    pub(crate) fn connect_by(&self, deadline: Instant) -> Client {
+        let mut client = self.connect();
+        client.waits_by(deadline);
+        client
     }
 
     /// A daemon with one client attached to it, greeted from the start of both
@@ -399,9 +395,9 @@ impl Cue {
 /// until the daemon itself says so turns that into a wait on the thing being waited
 /// for.
 ///
-/// `deadline` is the caller's, spent here rather than renewed: a fresh [`Client`] per
-/// round would otherwise mint a fresh frame budget every time round, which is the case
-/// [`poll_by`] is written against.
+/// `deadline` is the caller's, spent here rather than renewed ([`Session::connect_by`]):
+/// a fresh [`Client`] per round would otherwise mint a fresh frame budget every time
+/// round, which is the case [`poll_by`] is written against.
 ///
 /// Only the repaint flag, since every greeting here resumes a session that is already
 /// there and `agent_forward` is honoured on the one that creates it.
@@ -412,8 +408,7 @@ pub(crate) fn reconnect_until_gap(
     out_offset: u64,
 ) -> (Client, nomux::HelloOk) {
     loop {
-        let mut client = session.connect();
-        client.waits_by(deadline);
+        let mut client = session.connect_by(deadline);
         let resumed = client.hello_with(false, repaint_ctrl_l, out_offset);
         if resumed.gap(out_offset) {
             return (client, resumed);
@@ -586,36 +581,6 @@ pub(crate) fn leads_a_process_group(command: &mut Command) {
             } else {
                 Err(std::io::Error::last_os_error())
             }
-        });
-    }
-}
-
-/// Hands what `command` starts a `SIGTERM` that is blocked *and already pending*, the
-/// state `exec` preserves and § 6.2's arming has to survive.
-///
-/// A shell holding the signal blocked, a systemd unit, a harness — the daemon inherits
-/// both halves, and the pending one is delivered the instant anything clears the mask.
-/// `startup::arm_stop_signals` therefore has to install the handlers *before* it
-/// unblocks: the other order delivers this signal at `SIG_DFL` with the socket already
-/// bound, killing the daemon where it stands with § 6.5's shutdown unrun.
-pub(crate) fn arrives_with_a_stop_signal_pending(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-
-    // SAFETY: the closure runs in the forked child before exec, so it must be
-    // async-signal-safe. `sigemptyset`, `sigaddset`, `sigprocmask` and `raise` all are,
-    // and nothing here allocates or takes a lock.
-    unsafe {
-        command.pre_exec(|| {
-            let mut set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
-            if libc::sigemptyset(set.as_mut_ptr()) != 0
-                || libc::sigaddset(set.as_mut_ptr(), libc::SIGTERM) != 0
-                || libc::sigprocmask(libc::SIG_BLOCK, set.as_ptr(), std::ptr::null_mut()) != 0
-                // Blocked first, so this makes it pending rather than fatal.
-                || libc::raise(libc::SIGTERM) != 0
-            {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
         });
     }
 }
@@ -864,6 +829,125 @@ pub(crate) fn wedge_socket(path: &Path) -> (UnixListener, UnixStream) {
     (listener, queued)
 }
 
+/// The spawn lock at `<id>.lock`, held until the guard is dropped, and released as a
+/// property of the open file description rather than by closing a descriptor.
+///
+/// `fork` duplicates the descriptor into every other test's children ([`FORKS`]), and
+/// `flock(2)` holds the lock until *all* of those duplicates are closed — but releases it
+/// on an explicit `LOCK_UN` through any one of them, because they share one open file
+/// description. So this is the same shape as the `shutdown` that abandons a listening
+/// socket: the release is a property of the object rather than of a descriptor, and no
+/// stray copy can undo it.
+pub(crate) struct HeldLock(fs::File);
+
+impl HeldLock {
+    /// Takes the lock at `path` the way `spawn` takes it (§ 6.3), creating the file if
+    /// nothing is there — which is what `rundir::try_lock_spawn` does, and what makes
+    /// the inode this hands back the one another process will queue behind.
+    pub(crate) fn take(path: &Path) -> Self {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .expect("open the spawn lock");
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+            .expect("take the spawn lock");
+        Self(file)
+    }
+
+    /// What was locked, for a caller naming its `dev:ino` to [`wait_until_flock`] — the
+    /// file this guard holds rather than whatever is at the path by then, which is the
+    /// whole distinction one of those callers is about.
+    pub(crate) fn metadata(&self) -> std::io::Result<fs::Metadata> {
+        self.0.metadata()
+    }
+}
+
+impl Drop for HeldLock {
+    fn drop(&mut self) {
+        let _ = rustix::fs::flock(&self.0, rustix::fs::FlockOperation::Unlock);
+    }
+}
+
+/// Which of the two states `/proc/locks` reports an `flock` request in.
+#[derive(Clone, Copy)]
+pub(crate) enum Flock {
+    /// Still queued behind somebody else's lock on the same file.
+    Queued,
+    /// Granted, and held until whoever took it lets go.
+    Granted,
+}
+
+/// Waits until an `flock` on `dev:ino` is in `state`, or says what never happened.
+///
+/// Every caller is trying to catch another process mid-operation, and without this each
+/// would race the very thing it means to observe: `tests/lifecycle.rs`'s spawn test would
+/// collect the lock before anything was waiting on it, and `tests/control.rs`'s `kill`
+/// test would move the ground under `kill` before it had reached the region it is about.
+/// None asserts anything then, and none says so — which is what makes a fixed sleep the
+/// wrong tool for any of them. `/proc/locks` lists queued requests alongside granted ones,
+/// so both are conditions to wait on.
+///
+/// The deadline is the caller's, per [`poll_by`].
+pub(crate) fn wait_until_flock(state: Flock, dev: u64, ino: u64, what: &str, deadline: Instant) {
+    let reached = poll_by(deadline, || {
+        // A kernel without `/proc/locks` cannot be waited on, and the assertions
+        // that follow would then pass without ever having reached the window they
+        // are about. Failing loudly is the point: a guard that quietly stops
+        // guarding is worse than one that is not there.
+        let locks = fs::read_to_string("/proc/locks").unwrap_or_else(|err| {
+            panic!(
+                "/proc/locks is unreadable ({err}), so nothing here can tell \
+                    whether {what}"
+            )
+        });
+        locks.lines().any(|line| is_flock(line, state, dev, ino))
+    });
+    assert!(reached, "nothing ever showed that {what}, for inode {ino}");
+}
+
+/// Whether one `/proc/locks` line reports an `flock` on `dev:ino` in `state`:
+///
+/// ```text
+/// 1:    FLOCK  ADVISORY  WRITE 3389 08:01:7746 0 EOF
+/// 2: -> FLOCK  ADVISORY  WRITE 3390 08:01:7746 0 EOF
+/// ```
+///
+/// The `->` is the whole of the difference between the two: it marks a request still
+/// queued behind the lock above it, and a line without one is a lock somebody holds.
+/// Neither that field nor the file's is recognised by position, since the columns
+/// before them vary with the lock type.
+fn is_flock(line: &str, state: Flock, dev: u64, ino: u64) -> bool {
+    if line.contains("->") != matches!(state, Flock::Queued) {
+        return false;
+    }
+    line.contains("FLOCK")
+        && line
+            .split_whitespace()
+            .any(|field| names_the_file(field, dev, ino))
+}
+
+/// Whether a `/proc/locks` field is the `MAJOR:MINOR:INODE` of one file.
+///
+/// The kernel prints it as `%02x:%02x:%llu` — the device in hex, the inode in
+/// decimal — and all three are checked. Inode numbers are unique only within a
+/// filesystem, and `CARGO_TARGET_TMPDIR` need not be on the same one as anything
+/// else this process has open, so matching the inode alone would match a stranger's
+/// lock on a stranger's file.
+fn names_the_file(field: &str, dev: u64, ino: u64) -> bool {
+    let mut parts = field.split(':');
+    let (Some(major), Some(minor), Some(inode), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    u32::from_str_radix(major, 16) == Ok(libc::major(dev))
+        && u32::from_str_radix(minor, 16) == Ok(libc::minor(dev))
+        && inode.parse::<u64>() == Ok(ino)
+}
+
 /// A protocol client: enough of one to assert on daemon behaviour.
 pub(crate) struct Client {
     stream: UnixStream,
@@ -912,8 +996,9 @@ impl Client {
     /// Hands this client `deadline` in place of the [`FRAME_PATIENCE`] it connected
     /// with.
     ///
-    /// For the test whose waits legitimately outlast that, and for the loop that
-    /// reconnects — where a client per round renews a budget meant to be spent once.
+    /// For the test whose waits legitimately outlast that, and — through
+    /// [`Session::connect_by`], which is this call and nothing else — for the loop that
+    /// reconnects, where a client per round renews a budget meant to be spent once.
     pub(crate) const fn waits_by(&mut self, deadline: Instant) {
         self.deadline = deadline;
     }
@@ -954,18 +1039,6 @@ impl Client {
     ) -> nomux::HelloOk {
         self.send(&hello_frame(agent_forward, repaint_ctrl_l, out_offset));
         let greeting = self.frame_owed("a HelloOk from the daemon");
-        self.take_hello_ok(greeting)
-    }
-
-    /// [`Client::hello`] against a deadline the caller shares between several
-    /// greetings, per [`poll_by`]. What is lost without it is the failure the test was
-    /// going to report, the chaos seed § 9 promises included.
-    pub(crate) fn hello_before(&mut self, deadline: Instant, out_offset: u64) -> nomux::HelloOk {
-        self.send(&hello_frame(false, false, out_offset));
-        let awaiting = "a HelloOk from the daemon";
-        let greeting = self
-            .frame_before(deadline, awaiting)
-            .unwrap_or_else(|| panic!("timed out waiting for {awaiting}"));
         self.take_hello_ok(greeting)
     }
 
@@ -1025,12 +1098,13 @@ impl Client {
         }
     }
 
-    pub(crate) fn next_frame(&mut self) -> (FrameType, Vec<u8>) {
-        self.frame_owed("a frame from the daemon")
-    }
-
     /// The next frame by this client's deadline, or the failure naming what was owed.
-    fn frame_owed(&mut self, awaiting: &str) -> (FrameType, Vec<u8>) {
+    ///
+    /// Reachable from the test binaries so that a test waiting on frames this harness
+    /// has no name for — `agent.rs` taking whichever of `AgentOpen` and `AgentClose`
+    /// comes first — says what it is owed in its own words, per
+    /// [`Client::next_of_awaiting`]'s reason.
+    pub(crate) fn frame_owed(&mut self, awaiting: &str) -> (FrameType, Vec<u8>) {
         self.frame_before(self.deadline, awaiting)
             .unwrap_or_else(|| out_of_time(awaiting))
     }
@@ -1343,6 +1417,67 @@ fn assert_refusal(
     }
 }
 
+/// Fails saying which offset the stream stopped meaning what the child wrote there,
+/// quoted from both sides: the number alone does not say which way the error went — a
+/// stream that resumed too early repeats bytes the client has, one that resumed too
+/// late is missing bytes it never will.
+///
+/// The one sentence every test that models the child's output fails with, so that the
+/// two binaries which do it — `tests/session.rs` against a blob, `tests/chaos.rs`
+/// against a full-screen transcript — say the same thing about the same fault rather
+/// than each keeping a copy of the reasoning.
+///
+/// `sits_in` is whatever the caller alone can say about the byte the two part company
+/// at, appended to the offset: the seed a randomised test promises to print with every
+/// failure (`IMPLEMENTATION.md` § 9), and, where the model knows its own escape
+/// sequences, which one the boundary fell inside. A closure because only the comparison
+/// below knows the index there is anything to say about.
+pub(crate) fn assert_same_stream(
+    want: &[u8],
+    got: &[u8],
+    at: u64,
+    sits_in: impl FnOnce(usize) -> String,
+) {
+    if want == got {
+        return;
+    }
+    let diff = want
+        .iter()
+        .zip(got)
+        .position(|(a, b)| a != b)
+        .unwrap_or_else(|| want.len().min(got.len()));
+    panic!(
+        "the daemon labelled a byte with an offset that is not where the child wrote \
+         it: at offset {}{}, the session sent\n  {}\nwhere the child wrote\n  {}\nThe \
+         stream is contiguous and wrong, which is what an off-by-N ring base or a slice \
+         resumed at the wrong byte looks like from a client",
+        at + diff as u64,
+        sits_in(diff),
+        quote(got, diff),
+        quote(want, diff),
+    );
+}
+
+/// A window of `bytes` around `at`, with the control bytes spelled out.
+///
+/// Read back raw, a stream of escape sequences would put the terminal running the test
+/// into the state the failure is about — alternate screen, scroll region and all — which
+/// is a poor way to report one.
+fn quote(bytes: &[u8], at: usize) -> String {
+    let mut out = String::new();
+    let window = bytes
+        .get(at.saturating_sub(24)..(at + 24).min(bytes.len()))
+        .unwrap_or_default();
+    for byte in window {
+        match byte {
+            0x1b => out.push_str("<ESC>"),
+            0x20..=0x7e => out.push(char::from(*byte)),
+            other => drop(write!(out, "<{other:02x}>")),
+        }
+    }
+    out
+}
+
 /// Whether the kernel is holding bytes for `stream` that nothing has read yet.
 ///
 /// `MSG_PEEK`, so asking does not consume them — which is the entire point at the
@@ -1377,41 +1512,6 @@ pub(crate) fn has_unread_bytes(stream: &UnixStream) -> bool {
         }
         return peeked > 0;
     }
-}
-
-/// Shrinks `socket`'s send buffer to `bytes`, so that a write larger than it cannot
-/// complete in one go.
-///
-/// A unix socket splits a write into segments of half its send buffer and waits for
-/// room for each in turn, so the size of that buffer is what decides whether a write
-/// bigger than the space available comes back short or blocks with nothing
-/// transferred. The default 208 KiB is larger than anything this suite writes in one
-/// call, which makes every write all-or-nothing; a small one is what puts a
-/// destination into the state § 7's relay has to survive.
-///
-/// Through `libc` because rustix's socket options live behind its `net` feature,
-/// which this tree does not enable — the same reason [`has_unread_bytes`] is written
-/// by hand.
-pub(crate) fn shrink_send_buffer(socket: &UnixStream, bytes: libc::c_int) {
-    use std::os::fd::AsRawFd;
-
-    // SAFETY: `setsockopt` is given the address and length of a `c_int` that
-    // outlives the call, on a descriptor the borrow keeps open for it.
-    let set = unsafe {
-        libc::setsockopt(
-            socket.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_SNDBUF,
-            std::ptr::from_ref(&bytes).cast::<libc::c_void>(),
-            u32::try_from(size_of::<libc::c_int>()).expect("the size of a c_int"),
-        )
-    };
-    assert_eq!(
-        set,
-        0,
-        "shrinking the send buffer failed: {}",
-        std::io::Error::last_os_error()
-    );
 }
 
 /// The greeting the tests send: the current protocol, [`WIN`], and a terminal type

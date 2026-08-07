@@ -191,7 +191,7 @@ fn parse_session_args(
 ///
 /// `IMPLEMENTATION.md` § 10's first table, which `daemon`, `list` and `kill` are scored
 /// against: a failure is a failure. What both tables share is `InvalidInput`, which every
-/// mode gives `EX_USAGE`: [`rundir::SessionPaths::new`] is the only place the crate
+/// mode gives `EX_USAGE`: [`rundir::SessionPaths::in_dir`] is the only place the crate
 /// *constructs* one, so it means an id that could never have named a session rather than
 /// an operation that failed — a distinction the client acts on, caching "unattachable"
 /// per host and otherwise caching its own typo. That makes this kind a reserved word

@@ -19,26 +19,28 @@
 
 #![allow(
     clippy::expect_used,
-    reason = "the allow-expect-in-tests setting in clippy.toml reaches `#[test]` \
-              bodies and `#[cfg(test)]` modules, not the helpers an integration \
-              test crate keeps beside them"
+    clippy::panic,
+    reason = "the allow-*-in-tests settings in clippy.toml reach `#[test]` bodies \
+              and `#[cfg(test)]` modules, not the helpers an integration test crate \
+              keeps beside them"
 )]
 
 mod harness;
 
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
-use nomux::{Frame, RESUME_FROM_START};
+use nomux::{Frame, Linger, RESUME_FROM_START};
 
 use harness::{
-    Rng, SETTLE, Session, Spawned, accept_within, collect, control, daemon_reaper, entries,
-    has_unread_bytes, hello_frame, join_before, nomux, nomux_with_shell, poll_by, poll_until,
-    process_state, read_uninterrupted, run_root, shrink_send_buffer, stderr, stdout, still_serving,
-    succeeded, wedge_socket, while_nothing_forks, write_frame,
+    Rng, SETTLE, Session, Spawned, collect, control, daemon_reaper, entries, has_unread_bytes,
+    hello_frame, join_before, nomux, nomux_with_shell, poll_by, poll_until, process_state,
+    read_uninterrupted, run_root, stderr, stdout, still_serving, succeeded, wedge_socket,
+    while_nothing_forks, write_frame,
 };
 
 /// A daemon that cannot publish `<id>.pid` refuses to start rather than serving a
@@ -173,8 +175,55 @@ fn spawn_refuses_an_id_something_is_already_serving() {
     );
 
     let mut client = session.connect();
-    client.hello(RESUME_FROM_START);
+    let ok = client.hello(RESUME_FROM_START);
+    // Riding on the greeting this test already makes, this file's only one. § 6.2 has
+    // the daemon carry `linger::detect`'s answer in this field so a client can warn a
+    // user whose session dies at logout, and nothing in the tree had ever read it off a
+    // daemon: every other mention of `linger` is a codec fixture or a frame a test wrote
+    // itself, so a daemon that had stopped calling `detect` passed the whole suite.
+    assert_eq!(
+        ok.linger,
+        linger_of_this_host(),
+        "the greeting must report what § 6.2 says about *this* host, which is the whole \
+         of what a client has to warn its user with"
+    );
     still_serving(&mut client, "NOMUX-SURVIVED");
+}
+
+/// The linger state `IMPLEMENTATION.md` § 6.2 owes a client greeting a daemon on this
+/// host, worked out from the same files the daemon's own `linger::detect` reads.
+///
+/// Read rather than called: `detect` is the binary crate's, where an integration test
+/// cannot reach it — which is the reason the wiring needs asserting from out here at
+/// all. Falsifiable on any host, and in both directions: on one running `logind` this
+/// answers `Enabled` or `Disabled` and refuses the `Unknown` a daemon that had stopped
+/// asking would send, and on one without it answers `Unknown` and refuses the other two.
+///
+/// § 6.2's lookups in § 6.2's order and no third: whether `logind` is the running init,
+/// then whether this user has a marker file under it. `$USER` before `$LOGNAME`, and a
+/// name that is not a single path component decides nothing — the daemon will not join
+/// one onto a system directory, so an environment saying something strange gets
+/// `Unknown` from both sides rather than a disagreement. The daemon a test starts
+/// inherits this process's environment but for the handful the harness sets, none of
+/// which are these.
+fn linger_of_this_host() -> Linger {
+    if !Path::new("/run/systemd/system").is_dir() {
+        return Linger::Unknown;
+    }
+    let named = ["USER", "LOGNAME"]
+        .into_iter()
+        .filter_map(|variable| std::env::var(variable).ok())
+        .find(|name| {
+            !name.is_empty() && !name.contains(['/', '\0']) && name != "." && name != ".."
+        });
+    let Some(user) = named else {
+        return Linger::Unknown;
+    };
+    match fs::metadata(Path::new("/var/lib/systemd/linger").join(user)) {
+        Ok(_) => Linger::Enabled,
+        Err(err) if err.kind() == ErrorKind::NotFound => Linger::Disabled,
+        Err(_) => Linger::Unknown,
+    }
 }
 
 /// Regression: a session whose backlog is full is a session, so `spawn` must report it
@@ -560,6 +609,9 @@ fn spawn_starts_the_binary_it_is_running_not_the_one_now_at_its_path() {
 /// protocol.
 #[test]
 fn the_relay_moves_bulk_traffic_both_ways_without_losing_a_byte() {
+    use std::net::Shutdown;
+    use std::sync::Arc;
+
     // Eight pipes and two and a half socket buffers per direction, which is what
     // "fill and refill" above asks for. It was two megabytes, on no argument beyond
     // being a round number: what a mis-slice or a swallowed short read does at one
@@ -567,63 +619,17 @@ fn the_relay_moves_bulk_traffic_both_ways_without_losing_a_byte() {
     // seconds.
     const BULK: usize = 512 * 1024;
 
-    let (mut child, peer, _listener) = relay_onto_a_socket("relay_bulk", Stdio::piped());
+    let (mut child, peer, _listener) =
+        relay_onto_a_socket_over("relay_bulk", Stdio::piped(), Stdio::piped(), Stdio::piped());
     let mut stdin = child.stdin.take().expect("stdin");
     let mut stdout = child.stdout.take().expect("stdout");
-
-    assert_relay_moves_bulk(
-        child,
-        peer,
-        BULK,
-        (0x5eed_1234, 0xfeed_9876),
-        move |data| {
-            stdin.write_all(data).expect("write to relay stdin");
-            // Half-close, which the relay must turn into shutdown(SHUT_WR) on the
-            // socket while still draining the other direction.
-            drop(stdin);
-        },
-        move || {
-            let mut got = Vec::new();
-            stdout.read_to_end(&mut got).expect("read relay stdout");
-            got
-        },
-    );
-}
-
-/// The budget a relay test gives the relay, as a whole rather than per wait.
-///
-/// Far above the second or so the transfers really take, and far below the
-/// termination in `.config/nextest.toml`, so a stalled relay fails here — naming the
-/// direction that stopped — rather than being killed there with nothing to point at.
-/// Spent once per *test*, for `harness::poll_by`'s reason.
-///
-/// The read timeout in [`relay_onto_a_socket_over`] is the one place it is a per-call
-/// figure, and it is not a deadline: it is what stops a `read_to_end` on a socket
-/// with no timeout of its own from parking a test thread for ever, so the wait that
-/// *is* bounded — the join around that thread — can report it.
-const RELAY_PATIENCE: Duration = Duration::from_secs(25);
-
-/// Moves `bulk` bytes each way through a relay and compares both directions.
-///
-/// `feed` writes the upstream bytes and then half-closes; `drain` reads the
-/// downstream ones to end of file. Both own their descriptor, so the choice of pipe
-/// or `socketpair` stays with the caller that made it.
-fn assert_relay_moves_bulk(
-    mut child: Spawned,
-    peer: UnixStream,
-    bulk: usize,
-    seeds: (u64, u64),
-    feed: impl FnOnce(&[u8]) + Send + 'static,
-    drain: impl FnOnce() -> Vec<u8> + Send + 'static,
-) {
-    use std::net::Shutdown;
-    use std::sync::Arc;
-
-    let peer = Arc::new(peer);
     let mut stderr = child.stderr.take().expect("stderr");
+    let peer = Arc::new(peer);
 
-    let upstream = Rng::new(seeds.0).bytes(bulk);
-    let downstream = Rng::new(seeds.1).bytes(bulk);
+    // Two seeds rather than one, so a relay that fed a direction back on itself would
+    // be caught rather than compared against the bytes it copied.
+    let upstream = Rng::new(0x5eed_1234).bytes(BULK);
+    let downstream = Rng::new(0xfeed_9876).bytes(BULK);
 
     // Four threads because all four flows must run at once: with any one of them
     // parked the relay's back pressure would deadlock the other three. Sharply so,
@@ -631,7 +637,12 @@ fn assert_relay_moves_bulk(
     // relay rather than filling a buffer.
     let feeder = {
         let data = upstream.clone();
-        thread::spawn(move || feed(&data))
+        thread::spawn(move || {
+            stdin.write_all(&data).expect("write to relay stdin");
+            // Half-close, which the relay must turn into shutdown(SHUT_WR) on the
+            // socket while still draining the other direction.
+            drop(stdin);
+        })
     };
     let push = {
         let data = downstream.clone();
@@ -650,7 +661,11 @@ fn assert_relay_moves_bulk(
             got
         })
     };
-    let downlink = thread::spawn(drain);
+    let downlink = thread::spawn(move || {
+        let mut got = Vec::new();
+        stdout.read_to_end(&mut got).expect("read relay stdout");
+        got
+    });
 
     let deadline = Instant::now() + RELAY_PATIENCE;
     join_before(feeder, deadline, "feeder");
@@ -676,6 +691,19 @@ fn assert_relay_moves_bulk(
     assert_same(&upstream, &uplink, "stdin -> socket", &complaints);
     assert_same(&downstream, &downlink, "socket -> stdout", &complaints);
 }
+
+/// The budget a relay test gives the relay, as a whole rather than per wait.
+///
+/// Far above the second or so the transfers really take, and far below the
+/// termination in `.config/nextest.toml`, so a stalled relay fails here — naming the
+/// direction that stopped — rather than being killed there with nothing to point at.
+/// Spent once per *test*, for `harness::poll_by`'s reason.
+///
+/// The read timeout in [`relay_onto_a_socket_over`] is the one place it is a per-call
+/// figure, and it is not a deadline: it is what stops a `read_to_end` on a socket
+/// with no timeout of its own from parking a test thread for ever, so the wait that
+/// *is* bounded — the join around that thread — can report it.
+const RELAY_PATIENCE: Duration = Duration::from_secs(25);
 
 /// Regression: the relay must leave when its stdout dies while nothing is owed to it,
 /// which is the state it is in almost all of the time. It used to answer the `EPIPE`
@@ -866,7 +894,8 @@ fn a_relay_that_fails_mid_stream_is_not_a_host_the_client_gives_up_on() {
 /// that state hands the peer the last of the data and then `ECONNRESET` where an
 /// orderly close gives it a zero.
 ///
-/// `copy_in` mapped only `EIO` to an ending, so that reset came back out of `relay` as
+/// The read half of the copy — `copy_in` then, `Pump::fill_from` now — mapped only
+/// `EIO` to an ending, so that reset came back out of `relay` as
 /// `nomux: Connection reset by peer` and a refusal, where § 10 gives 0 to "the session
 /// ended and the `Exit` frame was delivered". The last of the session's output went
 /// with it — a `relay` that returns `Err` never goes back for what stdout is owed, and
@@ -1034,6 +1063,41 @@ fn a_write_to_stdout_a_signal_cut_short_does_not_park_the_relay_again() {
     );
 }
 
+/// Shrinks `socket`'s send buffer to `bytes`, so that a write larger than it cannot
+/// complete in one go.
+///
+/// A unix socket splits a write into segments of half its send buffer and waits for
+/// room for each in turn, so the size of that buffer is what decides whether a write
+/// bigger than the space available comes back short or blocks with nothing
+/// transferred. The default 208 KiB is larger than anything this suite writes in one
+/// call, which makes every write all-or-nothing; a small one is what puts a
+/// destination into the state § 7's relay has to survive.
+///
+/// Through `libc` because rustix's socket options live behind its `net` feature,
+/// which this tree does not enable — the same reason [`has_unread_bytes`] is written
+/// by hand.
+fn shrink_send_buffer(socket: &UnixStream, bytes: libc::c_int) {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: `setsockopt` is given the address and length of a `c_int` that
+    // outlives the call, on a descriptor the borrow keeps open for it.
+    let set = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            std::ptr::from_ref(&bytes).cast::<libc::c_void>(),
+            u32::try_from(size_of::<libc::c_int>()).expect("the size of a c_int"),
+        )
+    };
+    assert_eq!(
+        set,
+        0,
+        "shrinking the send buffer failed: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
 /// Whether `pid` is inside a `writev(2)` at this moment, as `/proc` reports it.
 ///
 /// The relay makes exactly one kind of write — `nbio::drain_to`'s `writev` across the
@@ -1077,25 +1141,18 @@ fn marker_arrived(peer: &mut UnixStream, seen: &mut Vec<u8>, marker: &[u8]) -> b
 ///
 /// The scaffolding every relay test needs and none of them is about: a run directory
 /// of the mode the binary insists on, a session socket bound by the test rather than
-/// by a daemon, and the relay started against it. What they do differ in is where the
-/// relay's complaints go, so that is the argument — the bulk test reads them into its
-/// failure messages, and the ones about the relay leaving have nobody left to read
-/// them.
+/// by a daemon, and the relay started against it.
+///
+/// All three descriptors are the caller's to choose, because all three are what some
+/// test here is about. What is on the far end of stdin and stdout decides how a stdout
+/// reports its death — a pipe answers `POLLERR` and a `socketpair` answers `EPIPE` on
+/// the write — and the complaints go where the test can use them: the bulk test reads
+/// them into its failure messages, and the ones about the relay leaving have nobody
+/// left to read them.
 ///
 /// The listener comes back with the rest because it has to outlive the relay: a
 /// connection arriving at a closed one is refused, and a refusal would look like the
 /// relay giving up rather than like the test having tidied away too early.
-fn relay_onto_a_socket(id: &str, complaints: Stdio) -> (Spawned, UnixStream, UnixListener) {
-    relay_onto_a_socket_over(id, Stdio::piped(), Stdio::piped(), complaints)
-}
-
-/// [`relay_onto_a_socket`] with the relay's stdin and stdout chosen by the caller.
-///
-/// What is on the far end of those two is not a detail of the scaffolding wherever a
-/// test is about how a stdout reports its death: a pipe answers `POLLERR` and a
-/// `socketpair` answers `EPIPE` on the write. Kept apart from the common form so that
-/// the tests which only want a relay do not have to say which of the two they are
-/// getting — the answer is the pipes everybody assumes.
 fn relay_onto_a_socket_over(
     id: &str,
     input: Stdio,
@@ -1131,6 +1188,33 @@ fn relay_onto_a_socket_over(
     peer.set_read_timeout(Some(RELAY_PATIENCE))
         .expect("a peer the test must not park on");
     (child, peer, listener)
+}
+
+/// Accepts one connection, or fails saying what never arrived.
+///
+/// A blocking `accept` on a listener nothing connects to parks the thread for ever,
+/// and a test parked there never returns — so its [`Spawned`] guards never run and
+/// the whole run hangs instead of failing. The listener is put in non-blocking mode
+/// here rather than at the call site so that no caller can forget; the connection it
+/// hands back is blocking, as `accept` does not pass the flag on.
+fn accept_within(listener: &UnixListener, within: Duration, awaiting: &str) -> UnixStream {
+    listener
+        .set_nonblocking(true)
+        .expect("a listener the test must not park on");
+    let mut accepted = None;
+    let arrived = poll_until(within, || match listener.accept() {
+        Ok((stream, _)) => {
+            accepted = Some(stream);
+            true
+        }
+        // Two ways of saying "ask again on the next pass": `WouldBlock` is the
+        // non-blocking listener reporting that nobody has arrived, and `Interrupted`
+        // is a signal having ended the call before it could report anything at all.
+        Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => false,
+        Err(err) => panic!("accepting {awaiting} failed: {err}"),
+    });
+    assert!(arrived, "timed out waiting for {awaiting}");
+    accepted.expect("the connection the wait above returned for")
 }
 
 /// Compares by first difference rather than by value: a failure here is megabytes

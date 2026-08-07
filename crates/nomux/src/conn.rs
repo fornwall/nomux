@@ -1,13 +1,12 @@
 //! Non-blocking framed connection to a client.
 //!
-//! Reads accumulate until a whole frame is available; writes accumulate until the
-//! socket accepts them. Decoding copies each payload into caller-owned scratch so the
-//! borrow of the receive buffer ends before the frame is handled — cheap, because that
-//! direction only ever carries keystrokes and control frames.
+//! Reads accumulate until a whole frame is available; writes accumulate until the socket
+//! accepts them. Decoding copies each payload into caller-owned scratch so the borrow of
+//! the receive buffer ends before the frame is handled — cheap, that direction carrying
+//! only keystrokes and control frames.
 //!
 //! What the two buffers are *allowed* to reach is not decided here: § 4.1's caps live
-//! together in `daemon.rs`, and [`Conn::queued`] and [`Conn::buffered`] are what the
-//! daemon measures them with.
+//! together in `daemon.rs`, measured through [`Conn::queued`] and [`Conn::buffered`].
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -21,27 +20,32 @@ const _: () = assert!(
     "MAX_PENDING_READ must have room for a whole frame, or take_frame never completes one"
 );
 
-/// Capacity an emptied buffer keeps rather than hold one paste's peak for a week.
+/// Capacity an emptied *send* queue keeps rather than hold one paste's peak for a week.
 ///
 /// Above one PTY read and its framing — `daemon.rs` reads 64 KiB a pass — because a
 /// floor below that reallocates the send queue down and back up on every pass of a
 /// busy session, which is the one path this must cost nothing on.
 const RETAINED_CAPACITY: usize = 128 * 1024;
 
-/// Reclaims the consumed prefix of a cursor-and-`Vec` buffer.
+/// The same for the receive buffer, and three orders of magnitude smaller because the
+/// argument above is the send side's alone: this direction carries keystrokes and control
+/// frames, and only a paste ever takes it past a page.
+const RETAINED_INPUT: usize = 4096;
+
+/// Reclaims the consumed prefix of a cursor-and-`Vec` buffer, keeping `floor` bytes of
+/// capacity where it empties one.
 ///
-/// Both directions carry one, and both would otherwise grow without bound across a
-/// long session: neither cursor ever moves backwards, so the bytes below it are dead
-/// the moment they are passed. The empty case is separated because clearing is free
-/// where draining is not, and the surviving case moves on a *ratio* rather than at a
+/// Both directions carry one, and neither cursor moves backwards, so the bytes below it
+/// are dead the moment they are passed. The empty case is separated because clearing is
+/// free where draining is not, and the surviving case moves on a *ratio* rather than at a
 /// fixed number of bytes: draining a queue of `n` bytes in `c`-byte writes at a fixed
 /// threshold moves about `n²/2c`, so the cost per byte delivered rises with the queue.
-/// Halving instead moves at most as many bytes as the compaction retires, which is
-/// O(1) amortised however the writes fall.
-fn compact(buf: &mut Vec<u8>, pos: &mut usize) {
+/// Halving moves at most as many bytes as the compaction retires, O(1) amortised however
+/// the writes fall.
+fn compact(buf: &mut Vec<u8>, pos: &mut usize, floor: usize) {
     if *pos == buf.len() {
         buf.clear();
-        buf.shrink_to(RETAINED_CAPACITY);
+        buf.shrink_to(floor);
         *pos = 0;
     } else if *pos * 2 >= buf.len() {
         buf.drain(..*pos);
@@ -101,50 +105,43 @@ impl Conn {
         self.tx.len() - self.tx_pos
     }
 
-    /// Input read off the socket and not yet decoded, against § 4.1's
-    /// `MAX_PENDING_READ`.
+    /// Input read off the socket and not yet decoded, against § 4.1's `MAX_PENDING_READ`.
     ///
-    /// Non-zero is also what sends the event loop back for frames no second `POLLIN`
-    /// will ever announce: the daemon stops decoding while the PTY queue is full
-    /// (`IMPLEMENTATION.md` § 4.1), which can leave whole frames sitting here.
+    /// Non-zero is also what sends the event loop back for frames no second `POLLIN` will
+    /// ever announce: the daemon stops decoding while the PTY queue is full (§ 4.1), which
+    /// can leave whole frames sitting here.
     #[must_use]
     pub(crate) const fn buffered(&self) -> usize {
         self.rx.len() - self.rx_pos
     }
 
-    /// Queues a frame, and reports whether anything was queued.
+    /// Queues a frame, dropping one that cannot be encoded.
     ///
-    /// The encode failures — an oversized payload, a `TERM` this side would not
-    /// accept back — are both unreachable: every caller here chunks to at most
-    /// [`MAX_PAYLOAD`], and every caller in the daemon queues a control frame whose
-    /// size it fixed itself. Reported rather than discarded for
-    /// [`Conn::send_output`], the one caller that has something to get wrong about it.
-    pub(crate) fn send(&mut self, frame: &Frame<'_>) -> bool {
-        frame.encode(&mut self.tx).is_ok()
+    /// Both encode failures — an oversized payload, a `TERM` this side would not accept
+    /// back — are unreachable: every caller here chunks to at most [`MAX_PAYLOAD`], and
+    /// every caller in the daemon queues a control frame whose size it fixed itself.
+    pub(crate) fn send(&mut self, frame: &Frame<'_>) {
+        let _ = frame.encode(&mut self.tx);
     }
 
     /// Queues raw output bytes as one or more `Output` frames, splitting at
     /// [`MAX_PAYLOAD`].
     ///
     /// Returns the offset one past the last byte queued, which is short of
-    /// `offset + data.len()` when the queue filled partway through.
+    /// `offset + data.len()` when the queue filled partway through. The cap is re-checked
+    /// per chunk rather than once on entry, which is what makes a short return *final*
+    /// within a pass — `pump_output` walks the ring's two halves on that.
     pub(crate) fn send_output(&mut self, mut offset: u64, data: &[u8]) -> u64 {
         // Leave room for the 8-byte offset that shares the payload.
         let chunk = MAX_PAYLOAD as usize - 8;
         for part in data.chunks(chunk) {
-            // Re-checked per chunk, not just before the call: the ring can be far
-            // larger than the queue budget, and a single pump would otherwise queue
-            // the whole of it for a client that has stopped reading. The caller
-            // resumes from the returned offset.
+            // The ring can be far larger than the queue budget, so a single pump would
+            // otherwise queue the whole of it for a client that has stopped reading. The
+            // caller resumes from the returned offset.
             if self.queued() >= MAX_PENDING_WRITE {
                 break;
             }
-            // Ahead of the offset rather than beside it. A frame that was not queued
-            // is one the client never sees, and an offset moved over it is the daemon
-            // certain it delivered bytes that are now unreachable in the ring.
-            if !self.send(&Frame::Output { offset, data: part }) {
-                break;
-            }
+            self.send(&Frame::Output { offset, data: part });
             offset += part.len() as u64;
         }
         offset
@@ -168,8 +165,7 @@ impl Conn {
     /// [`MAX_PENDING_READ`] still undecoded.
     ///
     /// `chunk` is the caller's, and is only ever written to: a buffer of its own would be
-    /// zeroed on every call, and the daemon already carries one big enough that a burst
-    /// costs a quarter of the reads.
+    /// zeroed on every call, and the daemon already carries one.
     ///
     /// # Errors
     ///
@@ -206,25 +202,23 @@ impl Conn {
                 Err(err) => return Err(err),
             }
         }
-        compact(&mut self.tx, &mut self.tx_pos);
+        compact(&mut self.tx, &mut self.tx_pos, RETAINED_CAPACITY);
         Ok(())
     }
 
-    /// Pushes out whatever is queued, giving up [`FINAL_FLUSH_TIMEOUT`] after it
-    /// started.
+    /// Pushes out whatever is queued, giving up [`FINAL_FLUSH_TIMEOUT`] after it started.
     ///
-    /// Private, and reached only by [`Conn::close_with`]: it goes *blocking*, so for as
-    /// long as it runs the caller's event loop is not running — no PTY drained, no
-    /// reaping — and its timeout path hands back a socket still in that mode.
+    /// Private, and reached only by [`Conn::close_with`]: it goes *blocking*, so for as long
+    /// as it runs the caller's event loop is not — no PTY drained, no reaping — and its
+    /// timeout path hands back a socket still in that mode.
     ///
     /// # Errors
     ///
     /// Propagates write failures, including the deadline expiring.
     fn flush_final(&mut self) -> io::Result<()> {
-        // Bounded because the peer being flushed has frequently stopped reading
-        // (§ 6.4), and against the whole call rather than each `write` (§ 6.5):
-        // `SO_SNDTIMEO` restarts per syscall, so a peer reading a trickle keeps
-        // resetting it.
+        // Bounded because the peer being flushed has frequently stopped reading (§ 6.4),
+        // and against the whole call rather than each `write` (§ 6.5): `SO_SNDTIMEO`
+        // restarts per syscall, so a peer reading a trickle keeps resetting it.
         self.stream.set_nonblocking(false)?;
         let deadline = std::time::Instant::now() + FINAL_FLUSH_TIMEOUT;
         while self.tx_pos < self.tx.len() {
@@ -250,10 +244,10 @@ impl Conn {
     /// with `None`, whatever is already queued. Waits up to [`FINAL_FLUSH_TIMEOUT`] for a
     /// peer that is not taking it.
     ///
-    /// A `frame` replaces the queue rather than joining it: a reattaching client replays
-    /// all of that from the ring (§ 6.4), and a small final write is what completes against
-    /// a peer that is barely reading. `None` is for the one departure with nothing behind
-    /// it — the session's own shutdown (§ 6.5), where the ring goes with the daemon.
+    /// A `frame` replaces the queue rather than joining it: a reattaching client replays all
+    /// of that from the ring (§ 6.4), and a small final write is what completes against a
+    /// peer that is barely reading. `None` is for the one departure with nothing behind it,
+    /// the session's own shutdown (§ 6.5).
     ///
     /// Consumed rather than borrowed because [`Conn::flush_final`] returns on its timeout
     /// path with the queue untouched and the socket back in blocking mode, which no event
@@ -291,7 +285,7 @@ impl Conn {
         scratch.extend_from_slice(payload);
         self.rx_pos += HEADER_LEN + len;
 
-        compact(&mut self.rx, &mut self.rx_pos);
+        compact(&mut self.rx, &mut self.rx_pos, RETAINED_INPUT);
         Ok(Some(ty))
     }
 }
@@ -367,10 +361,16 @@ mod tests {
         wire
     }
 
+    /// What the daemon's event loop carries for the whole pass, and so the most a single
+    /// read can take. Named because one test's bound on how far [`Conn::fill`] may
+    /// overshoot the read cap is exactly this, and a helper that quietly used another
+    /// size would loosen that bound without saying so.
+    const READ_CHUNK: usize = 64 * 1024;
+
     /// Fills through a buffer of the caller's, as the daemon's event loop does with the
     /// one it carries for the whole pass.
     fn fill(conn: &mut Conn) -> io::Result<()> {
-        let mut chunk = vec![0u8; 64 * 1024];
+        let mut chunk = vec![0u8; READ_CHUNK];
         conn.fill(&mut chunk)
     }
 
@@ -503,6 +503,114 @@ mod tests {
         );
         assert_eq!(take(&mut conn, &mut scratch), Some(frame));
         assert_eq!(&scratch[..], &wire[HEADER_LEN..]);
+    }
+
+    /// A peer that goes on writing is stopped at [`MAX_PENDING_READ`] with the rest of
+    /// what it wrote still in the kernel — the runtime half of what `daemon.rs` argues
+    /// the constant for, where the static assert above covers only the arithmetic.
+    ///
+    /// What is asserted is that [`Conn::fill`] stops *while the socket still holds
+    /// bytes*, that being the whole of the difference: capped or not, the loop returns,
+    /// and only one of the two leaves the undelivered bytes with the peer. The
+    /// decode-and-fill at the end is what says the socket really did still hold them,
+    /// and so that the fills before it stopped on the cap rather than on an `EAGAIN`.
+    ///
+    /// The megabyte is accumulated over many reads rather than staged for one, because a
+    /// stock host's send buffer is a fifth of it and no single write can put a whole one
+    /// in front of a single `fill`. Forcing that with `SO_SNDBUF` would pin the test to
+    /// `net.core.wmem_max` — 4 MiB on the machine this was written on, 208 KiB by
+    /// default — so wherever that number was the smaller one the cap would go unreached
+    /// and the test would pass regardless, which is the one shape a guard must not have.
+    /// Only the read that crosses the cap has to find the socket full, and that one is
+    /// staged.
+    ///
+    /// Accumulating is also how the daemon gets there. `rx` survives every pass in which
+    /// the input cap stopped the decode loop short of what the pass before had read
+    /// (§ 4.1), so it climbs a read buffer at a time: a client blasting at a child taking
+    /// 4 KiB every 50 ms was measured crossing the cap in about ten seconds. Ten seconds
+    /// paced by a shell loop is not a gate, which is why this is here rather than in
+    /// `flow.rs`.
+    #[test]
+    fn a_peer_that_keeps_writing_is_stopped_at_the_read_cap() {
+        // One byte short of the cap, so exactly one read crosses it and the overshoot
+        // below is one buffer rather than however many reads it took to get there.
+        let preload = MAX_PENDING_READ - 1;
+        // 60 KiB payloads, as `flow.rs` blasts and well inside `MAX_PAYLOAD`. Whole
+        // frames, so the release at the end has something to decode.
+        let payload = bulk(60 * 1024);
+        let mut wire = Vec::new();
+        let mut offset = 0;
+        while wire.len() < preload + 8 * READ_CHUNK {
+            Frame::Input {
+                offset,
+                data: &payload,
+            }
+            .encode(&mut wire)
+            .expect("a valid frame");
+            offset += payload.len() as u64;
+        }
+
+        let (mut peer, mut conn) = pair();
+        feed(&mut peer, &mut conn, &wire[..preload]);
+        assert_eq!(conn.buffered(), preload, "every byte given must be kept");
+        assert!(
+            conn.buffered() < MAX_PENDING_READ,
+            "a byte short of the cap is not the cap"
+        );
+
+        // Written at the socket with nothing draining it, which is the peer that has
+        // gone on writing while this side was busy. It ends refused, that being what the
+        // cap leaves a peer doing.
+        let mut staged = 0;
+        while let Some(rest) = wire.get(preload + staged..) {
+            match peer.write(rest) {
+                Ok(0) => break,
+                Ok(n) => staged += n,
+                Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+                Err(err) => panic!("the peer could not write: {err}"),
+            }
+        }
+        assert!(
+            staged > READ_CHUNK,
+            "the socket took {staged} bytes, which one read empties — so a `fill` with no \
+             cap in it would stop here too and the bound below would prove nothing"
+        );
+
+        fill(&mut conn).expect("a fill");
+        let taken = conn.buffered() - preload;
+        assert!(
+            conn.buffered() >= MAX_PENDING_READ,
+            "the fill stopped short of the cap"
+        );
+        assert!(
+            taken <= READ_CHUNK,
+            "the fill took {taken} of the {staged} bytes waiting: past the cap it goes on \
+             reading for as long as the peer goes on writing"
+        );
+
+        // And goes on declining. Nothing empties this buffer while the caller has stopped
+        // decoding, so every later pass finds the same wall.
+        fill(&mut conn).expect("a fill");
+        assert_eq!(
+            conn.buffered() - preload,
+            taken,
+            "a fill that starts at the cap must take nothing"
+        );
+
+        let mut scratch = Vec::new();
+        while conn.buffered() >= MAX_PENDING_READ {
+            assert!(
+                take(&mut conn, &mut scratch).is_some(),
+                "the cap must leave room for a whole frame, or nothing here ever completes"
+            );
+        }
+        let under_cap = conn.buffered();
+        fill(&mut conn).expect("a fill");
+        assert!(
+            conn.buffered() > under_cap,
+            "nothing was left for this fill to take, so the two above stopped on an empty \
+             socket rather than on the cap"
+        );
     }
 
     /// `send_output` chunks at exactly [`MAX_PAYLOAD`], so the production path emits

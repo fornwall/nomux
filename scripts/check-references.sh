@@ -18,8 +18,7 @@ cd -- "$(dirname -- "$0")/.."
 
 # One awk over the whole tree: the shell read-loop this replaced spawned ~2,300 sed and grep
 # to do the same work, and took twelve seconds over it. NUL-delimited so a path with a space
-# survives; `scripts/` picks up the extensionless `nightly-version` and `size-baseline` the
-# extension globs miss. awk opens each file itself rather than taking them as operands: a
+# survives; `scripts/` picks up the extensionless `size-baseline` the extension globs miss. awk opens each file itself rather than taking them as operands: a
 # path can be in the index and gone from the worktree mid-rename, where `getline` answers -1
 # instead of dying, and a name holding `=` cannot be mistaken for a variable assignment.
 git ls-files -z '*.rs' '*.md' '*.sh' '*.toml' '*.yml' '*.yaml' scripts/ | tr '\0' '\n' | awk '

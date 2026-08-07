@@ -5,10 +5,9 @@
 //! `poll` loop not being able to afford to be parked inside a `read` or a `write`, so
 //! `EINTR` and `EAGAIN` are part of the ordinary flow rather than failures.
 //!
-//! What an outcome *means* is mostly not here: a closed peer ends the session for the
-//! PTY, one channel for the agent and one direction for the relay, so [`drain_to`]
-//! hands `EPIPE` back as it arrived rather than folded into a decision two of the three
-//! callers would get wrong. [`read_or_eof`] is the one fold they do agree on.
+//! What an outcome *means* is mostly not here: [`drain_to`] hands `EPIPE` back rather than
+//! folded into a decision two of the three callers would get wrong; [`read_or_eof`] is the one
+//! fold the PTY and the agent agree on; the relay folds its own in `attach.rs`'s `fill_from`.
 
 use std::collections::VecDeque;
 use std::io::IoSlice;
@@ -19,14 +18,11 @@ use rustix::io::Errno;
 /// Outcome of one [`read_or_eof`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReadOutcome {
-    /// Bytes are available in the buffer.
     Data(usize),
-    /// The peer is gone, or the descriptor failed. One ending: the payload is opaque,
-    /// so there is nothing worth telling apart.
+    /// Peer gone or descriptor failed, folded: the payload is opaque, nothing worth telling apart.
     Eof,
-    /// Nothing buffered right now, which is the whole reason this is an enum: on a
-    /// non-blocking descriptor this and [`ReadOutcome::Eof`] both arrive as an error return,
-    /// and confusing the two would end the session on every spurious wakeup.
+    /// The whole reason this is an enum: this and [`ReadOutcome::Eof`] both arrive as an error
+    /// return, and confusing the two would end the session on every spurious wakeup.
     WouldBlock,
 }
 
@@ -41,23 +37,16 @@ pub(crate) fn read(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<usize, Errno> {
     }
 }
 
-/// Reads from a descriptor whose only endings are bytes and gone: the PTY master and
-/// an agent channel's socket.
+/// Reads from a descriptor whose only endings are bytes and gone: PTY master, agent channel.
 ///
-/// Linux fails master reads with `EIO`, rather than returning 0, once the last process
-/// holding the slave exits — so the kernel's own EOF is folded in here too. Nothing is
-/// propagated, which is why there is no `Result`: one `poll` pass reports several sources
-/// at once (`daemon.rs`, around `ACCEPT_BEFORE_READ`), and `daemon::Daemon::read_client`
-/// states the rule this is the other half of — a failure on one descriptor ends that
-/// connection and never the event loop. An errno this does not know is a descriptor nothing
-/// can be read from, and both callers answer [`ReadOutcome::Eof`] by dropping it out of the poll
-/// set, so nothing spins on one either.
+/// Linux fails master reads with `EIO`, rather than returning 0, once the last process holding
+/// the slave exits — so the kernel's own EOF is folded in here too. Nothing is propagated,
+/// hence no `Result`, for the reason `daemon::Daemon::read_client` gives; both callers drop a
+/// descriptor answering [`ReadOutcome::Eof`] from the poll set, so an unknown errno never spins.
 ///
-/// An empty `buf` answers [`ReadOutcome::WouldBlock`]: `read(fd, &mut [])` is `Ok(0)`, which every
-/// caller here reads as the peer having gone, and the caller that would act on it hardest
-/// (`daemon.rs`'s `on_child_exit`) would declare a session over with its child still alive.
-/// No call site passes one today — all three hand over the whole 64 KiB buffer — so this is
-/// the arm that keeps it that way rather than one anybody reaches.
+/// An empty `buf` answers [`ReadOutcome::WouldBlock`]: `read(fd, &mut [])` is `Ok(0)`, which
+/// every caller here reads as the peer having gone — `daemon.rs`'s `on_child_exit` would
+/// declare a session over with its child still alive. Both callers hand over the whole 64 KiB.
 pub(crate) fn read_or_eof(fd: BorrowedFd<'_>, buf: &mut [u8]) -> ReadOutcome {
     if buf.is_empty() {
         return ReadOutcome::WouldBlock;
@@ -71,23 +60,19 @@ pub(crate) fn read_or_eof(fd: BorrowedFd<'_>, buf: &mut [u8]) -> ReadOutcome {
 
 /// Writes as much of `queue` as `fd` will take, removing what it accepted.
 ///
-/// Returning with a non-empty queue is the normal ending rather than a failure: ask
-/// `poll` for `POLLOUT` and come back. Errors are the caller's to interpret.
+/// A non-empty queue on return is normal, not a failure: come back on `POLLOUT` (§ 4.1).
 ///
-/// One write, not a loop until `EAGAIN`. On the blocking stdout above `POLLOUT`
-/// promises only that *some* write will succeed, so even the first one can park for up
-/// to a whole 16 KiB chunk where a byte of room was reported, and a second would park
-/// on no promise at all — the relay's other direction unserved throughout.
+/// One write, not a loop until `EAGAIN`: on the blocking stdout above, `POLLOUT` promises only
+/// that *some* write will succeed, so even the first can park where a byte of room was
+/// reported, and a second would park on no promise at all — the other direction unserved.
 ///
 /// One `writev` over both halves rather than a write apiece, load-bearing rather than
 /// an optimisation: a wrapped `VecDeque` served back-first delivers transposed
 /// keystrokes rather than an error anybody could see, and an empty front handed to
 /// `write` alone comes back `Ok(0)`, after which the queue never drains again.
 ///
-/// `Ok(0)` on a non-empty queue is "come back on `POLLOUT`" here, and deliberately not the
-/// `WriteZero` that `Conn::flush_some` makes of the same count: no descriptor in this tree
-/// answers a non-empty write with zero, so a zero can only mean nothing moved, which is
-/// never grounds for tearing down a queue that still owes its bytes.
+/// `Ok(0)` on a non-empty queue is "come back on `POLLOUT`", deliberately not the `WriteZero`
+/// `Conn::flush_some` makes of the same count: here a zero can only mean nothing moved.
 pub(crate) fn drain_to(queue: &mut VecDeque<u8>, fd: BorrowedFd<'_>) -> Result<(), Errno> {
     if queue.is_empty() {
         return Ok(());

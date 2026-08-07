@@ -27,11 +27,12 @@ repos:
       #
       # `ya?ml` and `^scripts/`, which is what it takes to reach every tracked file. `yml`
       # alone matched neither this file — the gate itself, and a `.yaml` — nor anything a
-      # future workflow adds under that spelling; and `scripts/nightly-version` and
-      # `scripts/size-baseline`, both read by scripts/build-release.sh, carry no extension at
-      # all, so a nightly bump or a baseline refresh used to be a commit that fired no hook
-      # whatsoever. This pattern decides only when the hook runs; what it then reads is the
-      # file list inside scripts/check-references.sh, and the two are kept in step.
+      # future workflow adds under that spelling; and `scripts/size-baseline`, read by
+      # scripts/build-release.sh, carries no extension at all, so a baseline refresh used to
+      # be a commit that fired no hook whatsoever. The nightly is a line of that script now,
+      # which the extension globs already reach. This pattern decides only when the hook
+      # runs; what it then reads is the file list inside scripts/check-references.sh, and
+      # the two are kept in step.
       - id: section-references-resolve
         name: every § names a section that exists
         entry: sh scripts/check-references.sh
@@ -39,7 +40,7 @@ repos:
         files: '\.(rs|md|sh|toml|ya?ml)$|^scripts/'
         pass_filenames: false
 
-      # ci.yml carries ~60 lines of embedded shell that the hook below never sees —
+      # ci.yml carries ~50 lines of embedded shell that the hook below never sees —
       # it matches `*.sh`. actionlint shellchecks every `run:` block and validates the
       # workflow schema besides, which is the half of that file nothing else reads.
       #
@@ -67,6 +68,19 @@ repos:
         entry: cargo fmt --all --check
         language: system
         files: '\.rs$|^rustfmt\.toml$'
+        pass_filenames: false
+
+      # fuzz/ is a workspace of its own — fuzz/Cargo.toml says why — so `--all` above stops
+      # at the root's one member and rustfmt never sees a fuzz target. Its own hook rather
+      # than a second command on the one above, a hook being one entry, and it costs
+      # nothing: rustfmt resolves no dependencies, so this wants neither the nightly a fuzz
+      # build needs nor the C++ compile of libFuzzer it drags in. That compile is why the
+      # clippy pass over fuzz/ is a step in ci.yml's fuzz job and not a hook beside this.
+      - id: cargo-fmt-fuzz
+        name: cargo fmt --check (fuzz)
+        entry: cargo fmt --manifest-path fuzz/Cargo.toml --all --check
+        language: system
+        files: '^fuzz/.*\.(rs|toml)$|^rustfmt\.toml$'
         pass_filenames: false
 
       # `-- -D warnings` rather than a deny in [workspace.lints], for the reason

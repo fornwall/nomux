@@ -1,10 +1,11 @@
 //! What a session's processes do at their two ends.
 //!
-//! Starting: a daemon that detaches from whoever launched it (`IMPLEMENTATION.md`
-//! § 6.2) and a child that inherits nothing but its stdio. Ending: the exit status
-//! the client is owed and when it arrives (§ 6.5, § 10), the reaping of everything
-//! the session leaves behind it — including the child a synthesised status has
-//! already spoken for — and the shutdown a signal or an idle deadline sets off.
+//! Starting: the id a daemon claims and the spawn lock it holds while claiming it
+//! (`IMPLEMENTATION.md` § 6.3), the detachment from whoever launched it (§ 6.2), and
+//! a child that inherits nothing but its stdio. Ending: the exit status the client is
+//! owed and when it arrives (§ 6.5, § 10), the reaping of everything the session
+//! leaves behind it — including the child a synthesised status has already spoken
+//! for — and the shutdown a signal or an idle deadline sets off.
 
 #![allow(
     clippy::expect_used,
@@ -17,74 +18,30 @@
 mod harness;
 
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use nomux::{Frame, FrameType, RESUME_FROM_START};
 
 use harness::{
-    Client, Cue, FRAME_PATIENCE, MAX_SESSIONS, Reaper, Rng, SETTLE, SPIN_WINDOW, Session, Spawned,
-    StatField, control, cpu_ticks, entries, leads_a_process_group, nomux_with_shell, poll_until,
-    process_alive, process_state, run_root, stat_field, still_serving, succeeded, wait_for,
+    Client, Cue, FRAME_PATIENCE, Flock, HeldLock, MAX_SESSIONS, Reaper, Rng, SETTLE, SPIN_WINDOW,
+    Session, Spawned, StatField, control, cpu_ticks, daemon_reaper, entries, leads_a_process_group,
+    nomux_with_shell, poll_by, poll_until, process_alive, process_state, run_root, stat_field,
+    still_serving, succeeded, wait_for, wait_until_flock, wedge_socket,
 };
 
-/// The child's last words come before its status.
+/// How long a test that waits on a second process reaching a window may spend waiting,
+/// across every wait it makes.
 ///
-/// A session outlives its child (§ 6.5), so the client that collects an exit is
-/// routinely not the one that watched it happen: the shell finishes, the connection
-/// goes, and the final output and the status are both still owed to whoever comes
-/// back. The order they arrive in is the whole of it, and it is decided again for
-/// every connection — `on_hello` rewinds `sent_through` to where this client resumes
-/// and clears `exit_sent`, so a replay that got it wrong would get it wrong for the
-/// one client that has no way to ask again. That client closes the tab on `Exit` and
-/// loses the entire transcript, including whatever the shell said on its way out.
-///
-/// The reattach is prompt rather than delayed: how *long* the session holds what it
-/// is owed is
-/// [`a_session_whose_child_has_exited_keeps_its_files_and_its_status_with_nobody_attached`]'s
-/// business, and it pays six seconds of wall clock for it.
-#[test]
-fn the_exit_status_arrives_after_the_final_output() {
-    let (session, mut client, _) = Session::attached("exit_order");
-    let shell = shell_of(&session);
-
-    let command = b"printf NOMUX-LAST-WORD; exit 3\n";
-    client.input(0, command);
-    // The daemon must own the command before the connection goes away, or RST
-    // takes it with them.
-    client.wait_for_input_ack(command.len() as u64);
-    drop(client);
-
-    // The reattach has to land after the child is gone, or the ordering below is
-    // satisfied by a live stream rather than by the replay this is about — which is
-    // all a fixed sleep here could hope for, and silently miss on a loaded machine.
-    assert!(
-        poll_until(SETTLE, || !process_alive(shell)),
-        "the child never exited, so what the reattach below reads is a live stream \
-         rather than the replay this is about"
-    );
-
-    // A session whose child has gone still answers, and still owes this connection
-    // both halves of what the last one was in the middle of being told.
-    let mut client = session.connect();
-    let resumed = client.hello(RESUME_FROM_START);
-    let replay = replay_to_the_exit(&mut client);
-
-    assert_eq!(
-        (replay.status, replay.kind),
-        (3, nomux::ExitKind::Exited),
-        "the child's own status must survive into the replay"
-    );
-    assert!(
-        replay.output.contains("NOMUX-LAST-WORD"),
-        "output arrived after the exit status, or not at all: {:?} (resumed from {})",
-        replay.output,
-        resumed.resume_from
-    );
-}
+/// One figure per test rather than one per wait, for `harness::poll_by`'s reason. Above
+/// [`SETTLE`], which bounds one wait for this process's own filesystem to catch up,
+/// because what the two spawn-lock tests at the end of this file wait for is another
+/// process arriving somewhere under whatever load the rest of the suite is applying.
+const PATIENCE: Duration = Duration::from_secs(30);
 
 /// A child that was killed is reported as `Signalled` carrying the signal, not as a
 /// process that returned one (`IMPLEMENTATION.md` § 10).
@@ -95,14 +52,14 @@ fn the_exit_status_arrives_after_the_final_output() {
 /// that distinction across the wire is this one byte.
 ///
 /// This client stays attached, unlike
-/// [`the_exit_status_arrives_after_the_final_output`], so what it pins is the frame
-/// the daemon builds on the pass that collects the status — which is what makes it
-/// the place to pin `since_exit_secs` at zero. That field is how a client tells a
-/// shell that has just finished from one that finished while the laptop was shut
-/// (§ 6.5), and only a client that watched the exit happen can say what the answer
-/// must be. A daemon that stamped the frame when it *built* it rather than measuring
-/// from the end of file would pass every reattach test in this file and still tell
-/// every live client that its shell had exited some time ago.
+/// [`a_session_whose_child_has_exited_keeps_its_files_and_its_status_with_nobody_attached`],
+/// so what it pins is the frame the daemon builds on the pass that collects the
+/// status — which is what makes it the place to pin `since_exit_secs` at zero. That
+/// field is how a client tells a shell that has just finished from one that finished
+/// while the laptop was shut (§ 6.5), and only a client that watched the exit happen
+/// can say what the answer must be. A daemon that stamped the frame when it *built*
+/// it rather than measuring from the end of file would pass every reattach test in
+/// this file and still tell every live client that its shell had exited some time ago.
 ///
 /// `kill -9 $$` rather than a signal from outside, because `$$` is the shell the
 /// daemon is watching and `kill` is a builtin of it: no second process to find, and
@@ -153,9 +110,9 @@ fn a_child_killed_by_a_signal_is_reported_as_signalled_rather_than_as_a_status()
 ///
 /// `pump_output` is the only place the `Exit` frame is built, and `collect_status`
 /// used to run at the top of `event_loop` — one whole iteration earlier.
-/// `poll_timeout` clamps the sleep to `STATUS_RETRY` only while the status is still
-/// outstanding, so the pass that finally collected one no longer qualified for the
-/// clamp, and by then the master had already left the poll set with the child.
+/// `poll_timeout` carries a wakeup at `STATUS_GRACE` only while the status is still
+/// outstanding, so the pass that finally collected one no longer qualified for it,
+/// and by then the master had already left the poll set with the child.
 ///
 /// A session outlives its child on the idle rule alone (§ 6.5), and nothing between
 /// the exit and that deadline wakes the daemon: with the master out of the poll set,
@@ -238,16 +195,18 @@ fn a_synthesised_exit_status_is_sent_on_the_pass_that_collects_it() {
 /// shell was therefore left a zombie for the whole life of the session, which is up
 /// to the seven-day idle timeout.
 ///
-/// Collecting is not reporting, and the two are asserted together: `next_of` refuses
-/// anything but the session's own chatter, so an `Exit` frame arriving here would
-/// fail this test. It must not, because the transcript is plainly not finished —
-/// the job that outlived the shell still has the terminal.
+/// Nothing is sent to provoke the pass the reap happens on, and that is the other
+/// half of what this pins. With the client idle and the master silent — the job says
+/// nothing for five minutes — a daemon whose child exited behind a held slave has no
+/// wakeup left short of `IDLE_TICK`, an hour away, so a reap that depended on one
+/// would be a reap the user waits an hour for. What supplies it is the `SIGCHLD`
+/// handler `startup::arm_child_signal` installs: the exit is itself the event.
 ///
-/// The reap happens on an event-loop pass, and with the client idle there are none:
-/// nothing wakes a daemon whose child exits behind a held slave, `SIGCHLD` being at
-/// its default disposition and so discarded. The `Ping` is what supplies one, on a
-/// condition rather than a sleep — the `Pong` answering it is queued by the same
-/// pass that collects.
+/// Collecting is not reporting, which is what the `Ping` below asks about, once the
+/// reap it is not responsible for has already happened: `next_of` refuses anything
+/// but the session's own chatter, so an `Exit` frame arriving here would fail this
+/// test. It must not, because the transcript is plainly not finished — the job that
+/// outlived the shell still has the terminal.
 #[test]
 fn a_shell_that_exits_behind_a_background_job_is_still_reaped() {
     let (session, mut client, ok) = Session::attached("zombie_shell");
@@ -262,15 +221,14 @@ fn a_shell_that_exits_behind_a_background_job_is_still_reaped() {
         "the shell never exited"
     );
 
+    assert!(
+        poll_until(SETTLE, || process_state(shell) != Some('Z')),
+        "the shell exited behind a job that still holds the slave and was left a \
+         zombie as pid {shell}, nothing having woken the daemon to collect it"
+    );
+
     client.send(&Frame::Ping);
     drop(client.next_of(FrameType::Pong));
-
-    assert_ne!(
-        process_state(shell),
-        Some('Z'),
-        "the shell exited behind a job that still holds the slave and was left a \
-         zombie as pid {shell}"
-    );
 
     // The job still has the terminal, and `Session` drops its daemon with `SIGKILL`,
     // which runs none of § 6.5's collection — so the `sleep` would outlive this test
@@ -308,9 +266,11 @@ fn a_shell_that_exits_behind_a_background_job_is_still_reaped() {
 /// non-interactive shell that blocks on the cue rather than a `sleep`, so when the child
 /// goes is the test's to say rather than a wall clock's.
 ///
-/// The `Ping` supplies the pass the reap happens on, as in the sibling — and here
-/// nothing else could: `poll_timeout` stops clamping to `STATUS_RETRY` the moment
-/// `exited` is set, so a session left holding a zombie sleeps on to `IDLE_TICK`.
+/// Nothing supplies the pass the reap happens on, as in the sibling — and here
+/// nothing else could: `poll_timeout` drops its `STATUS_GRACE` wakeup the moment
+/// `exited` is set, so a session left holding a zombie sleeps on to `IDLE_TICK`. The
+/// `SIGCHLD` the real exit delivers is the whole of the wakeup, and the wait below is
+/// for what it sets off.
 #[test]
 fn a_child_that_exits_after_its_status_was_synthesised_is_still_reaped() {
     let (session, mut client, ok) = Session::attached("zombie_synth");
@@ -333,12 +293,8 @@ fn a_child_that_exits_after_its_status_was_synthesised_is_still_reaped() {
          that outlived its process"
     );
 
-    client.send(&Frame::Ping);
-    drop(client.next_of(FrameType::Pong));
-
-    assert_ne!(
-        process_state(child),
-        Some('Z'),
+    assert!(
+        poll_until(SETTLE, || process_state(child) != Some('Z')),
         "the daemon answered for pid {child} at the grace and then stopped reaping, so \
          the child it spoke for is a zombie it holds until the session ends"
     );
@@ -834,7 +790,7 @@ fn a_daemon_that_inherits_a_pending_stop_signal_still_runs_its_shutdown() {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    harness::arrives_with_a_stop_signal_pending(&mut command);
+    arrives_with_a_stop_signal_pending(&mut command);
     let finished = harness::collect(&mut command);
 
     let complaint = harness::stderr(&finished);
@@ -845,6 +801,36 @@ fn a_daemon_that_inherits_a_pending_stop_signal_still_runs_its_shutdown() {
          was cleared before the handlers were installed and the signal landed on SIG_DFL \
          with the socket already bound: {complaint:?}"
     );
+}
+
+/// Hands what `command` starts a `SIGTERM` that is blocked *and already pending*, the
+/// state `exec` preserves and § 6.2's arming has to survive.
+///
+/// A shell holding the signal blocked, a systemd unit, a harness — the daemon inherits
+/// both halves, and the pending one is delivered the instant anything clears the mask.
+/// `startup::arm_stop_signals` therefore has to install the handlers *before* it
+/// unblocks: the other order delivers this signal at `SIG_DFL` with the socket already
+/// bound, killing the daemon where it stands with § 6.5's shutdown unrun.
+fn arrives_with_a_stop_signal_pending(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: the closure runs in the forked child before exec, so it must be
+    // async-signal-safe. `sigemptyset`, `sigaddset`, `sigprocmask` and `raise` all are,
+    // and nothing here allocates or takes a lock.
+    unsafe {
+        command.pre_exec(|| {
+            let mut set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+            if libc::sigemptyset(set.as_mut_ptr()) != 0
+                || libc::sigaddset(set.as_mut_ptr(), libc::SIGTERM) != 0
+                || libc::sigprocmask(libc::SIG_BLOCK, set.as_ptr(), std::ptr::null_mut()) != 0
+                // Blocked first, so this makes it pending rather than fatal.
+                || libc::raise(libc::SIGTERM) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 }
 
 /// The other side of that scrub, and why it cannot be unconditional: a daemon refused
@@ -900,6 +886,110 @@ fn a_daemon_refused_by_a_live_session_leaves_that_session_its_lock() {
     let mut client = session.connect();
     client.hello(RESUME_FROM_START);
     still_serving(&mut client, "NOMUX-AFTER-DUP");
+}
+
+/// A spawn whose lock is collected while it waits goes back for the file that is now
+/// at the path.
+///
+/// This is the half of the fix that is not "take the lock first": `flock` attaches
+/// to the inode, so a spawn that was blocked on a lock file somebody unlinked
+/// wakes up holding a lock nobody else can see. The next spawn creates a fresh
+/// file at the same path, locks that, and both start a daemon for one session.
+///
+/// `spawn` rather than `attach` because creating is what takes this lock at all
+/// (§ 6.3): `attach` connects to a session that is already there and never reaches
+/// the region under test.
+///
+/// The interleaving is forced rather than hoped for: the collection happens only
+/// once `/proc/locks` shows something blocked on this test's lock.
+#[test]
+fn a_spawn_re_takes_a_spawn_lock_that_was_collected() {
+    let deadline = Instant::now() + PATIENCE;
+    let root = run_root("collected_lock");
+    let dir = root.join("nomux");
+    fs::create_dir_all(&dir).expect("create the run directory");
+    let lock_path = dir.join("collected.lock");
+    let lock = HeldLock::take(&lock_path);
+    let held = lock.metadata().expect("stat the held lock");
+    let orphan = held.ino();
+
+    let _relay = Spawned::spawn(
+        nomux_with_shell(&root, &["spawn", "collected"])
+            .env("NOMUX_RING_BYTES", "65536")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    );
+
+    wait_until_flock(
+        Flock::Queued,
+        held.dev(),
+        orphan,
+        "the spawn waited for the spawn lock",
+        deadline,
+    );
+
+    // Exactly what collection used to do to a lock in use.
+    fs::remove_file(&lock_path).expect("unlink the lock");
+    drop(lock);
+
+    let socket = dir.join("collected.sock");
+    assert!(
+        poll_by(deadline, || socket.exists()),
+        "the spawn never brought up a socket for the session"
+    );
+    // Nothing collects this session by an explicit `nomux kill`, and the guard has to
+    // cover the failing assertion below too.
+    let (_pid, _reaper) = daemon_reaper(&root, "collected");
+
+    assert!(
+        lock_path.exists(),
+        "the session came up without the spawn lock the layout promises, so the \
+         spawn started it holding an unlinked inode"
+    );
+}
+
+/// Regression: a daemon holds `<id>.lock` across claiming its id, so nothing can
+/// collect the session it is in the middle of publishing.
+///
+/// `spawn` holds that lock from before the fork until `<id>.pid` exists (§ 6.3) and
+/// `list` and `kill` take it before they unlink anything (§ 6.6) — but a `nomux daemon
+/// <id>` started by hand, which § 6.2 is written for, took nothing at all. A `list`
+/// that had already probed the stale socket then unlinked the socket and pidfile this
+/// daemon had bound in between, and through `kill` the same interleaving exits 0
+/// reporting no such session while a daemon holds the user's shell.
+///
+/// The window is three syscalls wide, so it is held open rather than waited for:
+/// `bind_socket` probes the socket before it touches anything, and a `connect` to a
+/// listener whose backlog is full blocks, so [`wedge_socket`] parks the daemon inside
+/// the region under test for as long as this test likes.
+#[test]
+fn a_daemon_holds_the_spawn_lock_while_it_claims_the_id() {
+    let deadline = Instant::now() + PATIENCE;
+    let root = run_root("claimed_lock");
+    let dir = root.join("nomux");
+    fs::create_dir_all(&dir).expect("create the run directory");
+    // Created here so the wait below has an inode to name; the daemon opens this same
+    // path, and `SpawnLock` checks that what it locked is still the file at it.
+    let lock = fs::File::create(dir.join("claimed.lock")).expect("create the spawn lock");
+    let lock = lock.metadata().expect("stat the spawn lock");
+
+    let _wedged = wedge_socket(&dir.join("claimed.sock"));
+
+    let _daemon = Spawned::spawn(
+        nomux_with_shell(&root, &["daemon", "claimed"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    );
+
+    wait_until_flock(
+        Flock::Granted,
+        lock.dev(),
+        lock.ino(),
+        "the daemon took the spawn lock before it went near the socket",
+        deadline,
+    );
 }
 
 /// Every file in `dir` belonging to session `id`, by name.
@@ -1050,6 +1140,15 @@ fn a_daemon_nobody_ever_attaches_to_reaps_itself() {
 /// The status is distinctive because the alternative is not: `exit 0` is what the
 /// daemon synthesises for a child it never got a status for (`collect_status`), so a
 /// session that had lost the real one would still answer plausibly.
+///
+/// The order the two halves arrive in is pinned here as well, for the client that has
+/// no way to ask again: `pump_output` sends the `Exit` only once `sent_through` has
+/// reached the end of the ring, and it is decided afresh for every connection —
+/// `on_hello` rewinds `sent_through` to where this client resumes and `exit_sent`
+/// starts false on every takeover. A client that was handed the status first closes
+/// the tab on it and loses the whole transcript, including whatever the shell said on
+/// its way out; [`replay_to_the_exit`] stops at the `Exit`, so output queued behind it
+/// is output the marker assertion below never sees.
 #[test]
 fn a_session_whose_child_has_exited_keeps_its_files_and_its_status_with_nobody_attached() {
     /// How long the session is left with no client and no child before anything at
@@ -1159,11 +1258,10 @@ struct Replay {
 /// Reads a reattached client's replay up to and including the exit.
 ///
 /// The ordering promise of § 6.5 is carried by the *shape* of this loop rather than
-/// by a line in either caller: the `Exit` ends it, so anything the child wrote that
-/// the daemon queued behind the status is output this never collects — and the caller
+/// by a line in its caller: the `Exit` ends it, so anything the child wrote that the
+/// daemon queued behind the status is output this never collects — and the caller
 /// then finds its marker missing rather than finding a passing test that read the
-/// frames in whatever order they came. Written once because the two callers differ
-/// only in how long the session had been sitting there when they arrived.
+/// frames in whatever order they came.
 fn replay_to_the_exit(client: &mut Client) -> Replay {
     let mut seen = Vec::new();
     let deadline = Instant::now() + FRAME_PATIENCE;

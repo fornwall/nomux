@@ -16,5 +16,5 @@ There is no SLA — this is a personal project — but reports are read.
 None. No released version receives security updates; fixes land on `main`.
 
 What is in scope, what is deliberately accepted, and who each boundary holds against are
-[DESIGN.md § 8](DESIGN.md#8-security-model); the gaps that are known and open are
-[PLAN.md](PLAN.md).
+[DESIGN.md § 8](DESIGN.md#8-security-model); the gap that is known and open, an upload
+nothing verifies once it lands, is [IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build).

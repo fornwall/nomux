@@ -35,7 +35,7 @@ Five files, held to a rule that none of them repeats another:
 
 - [DESIGN.md](DESIGN.md) — problem, properties, architecture, security model, prior art, rejected alternatives.
 - [IMPLEMENTATION.md](IMPLEMENTATION.md) — wire protocol, ring buffer, PTY handling, bootstrap, build.
-- [PLAN.md](PLAN.md) — what is open, the client above it.
+- [PLAN.md](PLAN.md) — what is open on this side.
 - [SECURITY.md](SECURITY.md) — how to report a vulnerability, and what gets fixed.
 - [LICENSE](LICENSE) — Apache-2.0.
 
@@ -51,9 +51,8 @@ cargo test      # unit and integration tests, plus the one doctest
 prek install    # once per clone: the commit gate, `.pre-commit-config.yaml`
 ```
 
-[prek](https://github.com/j178/prek) runs the same hooks CI does. Release builds,
-size budgets, the pinned nightly and the debug companions are in
-[IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build).
+[prek](https://github.com/j178/prek) runs the same hooks CI does. Release builds, size
+budgets and the pinned nightly are in [IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build).
 
 ## Status
 
@@ -63,7 +62,7 @@ Complete and under test on Linux at the protocol revision
 - **Platform** — Linux only; everywhere else, plain SSH ([DESIGN.md § 7](DESIGN.md#7-degradation)).
 - **Suite** — layers and invariants in [IMPLEMENTATION.md § 9](IMPLEMENTATION.md#9-testing); CI adds `--run-ignored all`.
 - **Release** — both musl targets build reproducibly inside the size and growth gates, and a `v*` tag builds, checks and publishes them ([IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)).
-- **Not started** — the client ([PLAN.md § P1](PLAN.md#p1--the-client)). Every piece of it has a server-side contract already fixed in [IMPLEMENTATION.md](IMPLEMENTATION.md).
+- **Client** — not started; every piece of it has a server-side contract already fixed in [IMPLEMENTATION.md](IMPLEMENTATION.md).
 
 ## License
 

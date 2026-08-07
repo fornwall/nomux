@@ -31,47 +31,10 @@ use nomux::{
 };
 
 use harness::{
-    Client, DEFAULT_TEST_RING, FRAME_PATIENCE, Rng, Session, Spawned, hello_frame,
-    nomux_with_shell, poll_by, poll_until, read_uninterrupted, reconnect_until_gap, run_root,
-    still_serving,
+    Client, DEFAULT_TEST_RING, FRAME_PATIENCE, Rng, Session, Spawned, assert_same_stream,
+    hello_frame, nomux_with_shell, poll_by, poll_until, read_uninterrupted, reconnect_until_gap,
+    run_root, still_serving,
 };
-
-#[test]
-fn output_resumes_contiguously_after_a_reconnect() {
-    let (session, mut client, ok) = Session::attached("resume");
-    // The first byte of the stream rather than `!ok.gap(RESUME_FROM_START)`, which is
-    // `!(resume_from > u64::MAX)` and so is true of every answer a daemon can give.
-    assert_eq!(
-        ok.resume_from, 0,
-        "a fresh session has dropped nothing, so it resumes at the first byte it \
-         ever produced"
-    );
-
-    let first = b"echo NOMUX-BEFORE\n";
-    client.input(0, first);
-    let (_, offset) = client.read_until("NOMUX-BEFORE", ok.resume_from);
-
-    // Sever the connection the way a network drop would.
-    drop(client);
-    let mut client = session.connect();
-    let ok = client.hello(offset);
-    assert_eq!(
-        ok.resume_from, offset,
-        "resume must continue from exactly where the client left off"
-    );
-    assert_eq!(
-        ok.in_applied,
-        first.len() as u64,
-        "daemon reports authoritative input position"
-    );
-    assert!(
-        !ok.gap(offset),
-        "nothing should have been dropped in this window"
-    );
-
-    client.input(ok.in_applied, b"echo NOMUX-AFTER\n");
-    client.read_until("NOMUX-AFTER", ok.resume_from);
-}
 
 /// A client claiming output the session never produced is clamped down to the end of
 /// the stream rather than believed (`IMPLEMENTATION.md` § 4.2).
@@ -99,10 +62,6 @@ fn an_out_offset_past_the_end_of_the_stream_is_clamped_rather_than_believed() {
 
     let mut client = session.connect();
     let resumed = client.hello(end + FAR);
-    assert!(
-        !resumed.gap(end + FAR),
-        "nothing was dropped, so nothing may be reported as a gap"
-    );
     // An equality rather than an upper bound: clamping to the ring's *base* also comes
     // in under anything claimed, also reports no gap, and also leaves the read at the
     // end of this test finding its marker.
@@ -342,7 +301,9 @@ fn read_against(client: &mut Client, planted: &Planted, from: u64) -> Vec<(u64, 
                         index + data.len() - expected.len()
                     )
                 });
-                assert_same_stream(want, data, at);
+                // Nothing to add to the offset: this model has no structure of its own
+                // to place a byte in, and nothing here is drawn from a seed.
+                assert_same_stream(want, data, at, |_| String::new());
                 offset += data.len() as u64;
             }
             Frame::Gap { new_base_offset } => {
@@ -359,34 +320,6 @@ fn read_against(client: &mut Client, planted: &Planted, from: u64) -> Vec<(u64, 
         }
     }
     gaps
-}
-
-/// Fails saying which offset the stream stopped meaning what the child wrote there,
-/// quoted from both sides: the number alone does not say which way the error went — a
-/// stream that resumed too early repeats bytes the client has, one that resumed too
-/// late is missing bytes it never will.
-fn assert_same_stream(want: &[u8], got: &[u8], at: u64) {
-    if want == got {
-        return;
-    }
-    let diff = want
-        .iter()
-        .zip(got)
-        .position(|(a, b)| a != b)
-        .unwrap_or_else(|| want.len().min(got.len()));
-    let window = |bytes: &[u8]| {
-        String::from_utf8_lossy(bytes.get(diff..(diff + 48).min(bytes.len())).unwrap_or(&[]))
-            .into_owned()
-    };
-    panic!(
-        "the daemon labelled a byte with an offset that is not where the child wrote \
-         it: at offset {}, the session sent {:?} where the child wrote {:?}. The \
-         stream is contiguous and wrong, which is what an off-by-N ring base looks \
-         like from a client",
-        at + diff as u64,
-        window(got),
-        window(want),
-    );
 }
 
 /// A gap reported at the handshake must name the byte the stream really resumes at.
@@ -549,72 +482,6 @@ fn an_overflow_that_outruns_an_attached_client_is_reported_as_a_gap_mid_stream()
     );
 }
 
-/// A `NOMUX_RING_BYTES` the daemon cannot use falls back to the default rather than
-/// refusing to start (`IMPLEMENTATION.md` § 4).
-///
-/// A mistyped tuning variable should never cost somebody their session. `Ring::new`
-/// clamps rather than asserts — the clamp keeps an abort site out of a `panic = "abort"`
-/// binary — so what a lost filter costs is not a daemon that dies before it binds but a
-/// session whose scrollback is a byte.
-///
-/// The default it lands on is asserted rather than the session merely answering, which
-/// any fallback above a few hundred bytes satisfies: the child writes past
-/// [`DEFAULT_RING`] with nobody attached, so the ring is exactly full and the byte it
-/// offers to resume at is arithmetic. That is the same reading as
-/// [`a_gap_at_the_handshake_names_the_byte_the_stream_actually_resumes_at`], asked of a
-/// capacity nobody chose.
-#[test]
-fn a_ring_capacity_the_daemon_cannot_use_falls_back_to_the_default() {
-    /// `daemon::DEFAULT_RING_CAPACITY`. Private to the daemon, mirrored here, and the
-    /// two must move together.
-    const DEFAULT_RING: usize = 4 << 20;
-    /// Comfortably past it, so what is retained is a full ring rather than everything
-    /// the child ever wrote.
-    const PRODUCED: usize = DEFAULT_RING + (1 << 20);
-
-    for (name, value) in [("ring_zero", "0"), ("ring_garbage", "not-a-number")] {
-        // Serving, rather than merely having bound a socket: the socket is bound before
-        // the ring is built, so a daemon that died over one leaves the file behind and
-        // the harness's wait is satisfied by a corpse. Everything below is a round trip
-        // through the child, and each failure names the case so that it says which
-        // `NOMUX_RING_BYTES` the daemon choked on.
-        let session = Session::start_with(name, value, "/bin/sh");
-        let mut client = session.connect();
-        let ok = client.hello(RESUME_FROM_START);
-        // Echo off, so the stream from the marker on is the child's own bytes.
-        let ready = client.make_ready("-echo -onlcr", None, ok.resume_from);
-        let planted = plant_blob(
-            &session,
-            &mut client,
-            ready.offset,
-            ready.in_offset,
-            PRODUCED,
-        );
-
-        // The daemon has to own the command before the connection goes, per
-        // `a_gap_at_the_handshake_names_the_byte_the_stream_actually_resumes_at`.
-        client.wait_for_input_ack(planted.in_offset);
-        drop(client);
-        assert!(
-            poll_until(Duration::from_secs(30), || planted.sentinel.exists()),
-            "{name}: the child never finished writing its {PRODUCED} bytes"
-        );
-
-        let mut client = session.connect();
-        let resumed = client.hello(planted.stream_start);
-        let stream_end = planted.stream_start + planted.expected.len() as u64;
-        let oldest_held = stream_end - DEFAULT_RING as u64;
-        assert_eq!(
-            resumed.resume_from, oldest_held,
-            "{name}: the daemon offered to resume at {}, where a session that fell back \
-             to the {DEFAULT_RING}-byte default still holds everything from \
-             {oldest_held}. A ring the clamp left at a byte, or a default that is no \
-             longer the default, lands somewhere else",
-            resumed.resume_from
-        );
-    }
-}
-
 /// § 6.4's whole sentence, rather than its first clause: "the previous connection
 /// receives `Error{TAKEOVER}` **and closes**", and the session goes to the newcomer.
 ///
@@ -650,13 +517,12 @@ fn a_second_client_takes_over_and_the_first_is_told_why() {
 /// the session surviving each.
 ///
 /// `handle_frame`'s "frame is not valid from a client" arm and its "already greeted"
-/// one, both of `read_client`'s `reject(Protocol, …)` sites and the two unparseable
-/// ones of `read_pending`'s three have no other caller in the suite — the third being
-/// `a_connection_that_does_not_greet_first_is_refused_alone`'s. The frame-boundary pair
-/// matters most: a frame boundary the daemon has lost track of is a stream in which
-/// every subsequent `Input` offset is somebody else's number.
+/// one, both of `read_client`'s `reject(Protocol, …)` sites and all three of
+/// `read_pending`'s have no other caller in the suite. The frame-boundary pair matters
+/// most: a frame boundary the daemon has lost track of is a stream in which every
+/// subsequent `Input` offset is somebody else's number.
 ///
-/// Eight rows reaching a refusal by five routes. A `HelloOk`, an `Output` and a `Gap`
+/// Nine rows reaching a refusal by six routes. A `HelloOk`, an `Output` and a `Gap`
 /// are well-formed frames the *daemon* sends, so they decode perfectly and fall through
 /// the match. A second `Hello` decodes just as well and is refused for having arrived at
 /// all, greeting being what *makes* a connection the client — honouring one would rewind
@@ -665,13 +531,16 @@ fn a_second_client_takes_over_and_the_first_is_told_why() {
 /// bytes rather than eight has a header that decodes and a body that does not — the one
 /// case where the daemon knows how many bytes to skip and still must not.
 ///
-/// The last two rows put the two unparseable shapes to a connection that has *not*
-/// greeted, where `read_pending` answers rather than `read_client`: those are the sites
-/// reached before a session exists for the connection, and the every-row `still_serving`
-/// that opens a round is exactly what keeps them out of reach of the rows above.
+/// The last three rows put an unparseable header, an unparseable `Hello` and a
+/// perfectly good frame that simply is not one to a connection that has *not* greeted,
+/// where `read_pending` answers rather than `read_client`: those are the sites reached
+/// before a session exists for the connection, and the every-row `still_serving` that
+/// opens a round is exactly what keeps them out of reach of the rows above. The `Ping`
+/// among them is the shape a client speaking out of turn takes — well formed, current,
+/// and refused for being spoken before the greeting that would give it a session.
 ///
 /// Every row names the daemon's own words as well as its code, because the code does not
-/// separate these sites: `Protocol` is what all six of them answer with. For the second
+/// separate these sites: `Protocol` is what all seven of them answer with. For the second
 /// `Hello` that is the whole question — its arm and the catch-all behind it produce the
 /// same code, the same close and the same silence about the session, and differ in the
 /// message and in nothing else.
@@ -680,16 +549,20 @@ fn a_second_client_takes_over_and_the_first_is_told_why() {
 /// connection then closes without a second complaint — which is what
 /// `Client::expect_eof` separates from a frame quietly *honoured* — that the session's
 /// input position did not move over it, and that a client can still drive the shell
-/// afterwards. One session for all eight, so each row lands on one the rows before it
+/// afterwards. One session for all nine, so each row lands on one the rows before it
 /// have abused.
 #[test]
 fn frames_a_client_may_not_send_are_refused_and_the_connection_closed() {
     let cases = refusals_a_connection_can_earn();
     let session = Session::start("refuse");
-    // One deadline for the table, checked between rows (`harness::poll_by`): every wait
-    // inside a row carries its own patience, so this is what bounds them in aggregate.
+    // One deadline for the table (`harness::poll_by`): held by every connection the rows
+    // make, and checked between rows so that a table which merely *finished* late says
+    // which row it was. Nine rows of round trips against a daemon on this machine are a
+    // small fraction of one wait's patience; what this replaces is a connection per row
+    // minting a budget of its own, which bounded the table at the rows times the patience
+    // rather than at the patience.
     let deadline = Instant::now() + FRAME_PATIENCE;
-    let mut client = session.connect();
+    let mut client = session.connect_by(deadline);
     let start = client.hello(RESUME_FROM_START).resume_from;
 
     for (round, case) in cases.iter().enumerate() {
@@ -711,7 +584,7 @@ fn frames_a_client_may_not_send_are_refused_and_the_connection_closed() {
 
             // The whole point of refusing on the connection's own terms: the shell is
             // still there, at the offsets it had, for whoever attaches next.
-            client = session.connect();
+            client = session.connect_by(deadline);
             let resumed = client.hello(start);
             assert!(
                 !resumed.gap(start),
@@ -731,7 +604,7 @@ fn frames_a_client_may_not_send_are_refused_and_the_connection_closed() {
             // rows ask for is the refusal *and* an incumbent that never heard about it —
             // which is what the `still_serving` below, on the connection that was never
             // dropped, is the answer to.
-            let mut ungreeted = session.connect();
+            let mut ungreeted = session.connect_by(deadline);
             (case.write)(&mut ungreeted);
             ungreeted.expect_error_saying(ErrorCode::Protocol, case.saying, case.what);
             ungreeted.expect_eof(case.what);
@@ -761,7 +634,7 @@ struct Refused {
 }
 
 /// The table itself, out here so that the test reading it stays one screen long.
-fn refusals_a_connection_can_earn() -> [Refused; 8] {
+fn refusals_a_connection_can_earn() -> [Refused; 9] {
     [
         Refused {
             what: "a HelloOk, which is the daemon's own answer coming back at it",
@@ -855,6 +728,17 @@ fn refusals_a_connection_can_earn() -> [Refused; 8] {
             saying: "unparseable Hello",
             greeted: false,
         },
+        Refused {
+            what: "a Ping from a connection that has not greeted yet",
+            // Nothing is wrong with the frame: the daemon answers this exact one with a
+            // `Pong` on every connection that greeted first. What it earns here is the
+            // rule that a connection says `Hello` before it says anything — and the
+            // incumbent, which is never told about any of it, is the other half of what
+            // this row is for.
+            write: |client| client.send(&Frame::Ping),
+            saying: "first frame from a client must be Hello",
+            greeted: false,
+        },
     ]
 }
 
@@ -880,24 +764,6 @@ fn a_session_whose_shell_cannot_be_started_is_refused_as_an_internal_failure() {
         "a shell that cannot be started must be reported as the daemon's failure",
     );
     client.expect_eof("an Error{INTERNAL}");
-}
-
-/// A connection that speaks out of turn is refused on its own terms, without
-/// costing the session its client.
-#[test]
-fn a_connection_that_does_not_greet_first_is_refused_alone() {
-    let (session, mut client, ok) = Session::attached("no_greeting");
-
-    let mut rude = session.connect();
-    rude.send(&Frame::Ping);
-    rude.expect_error(
-        ErrorCode::Protocol,
-        "a connection that speaks before it greets must be refused on its own terms",
-    );
-    drop(rude);
-
-    client.input(0, b"echo NOMUX-UNDISTURBED\n");
-    client.read_until("NOMUX-UNDISTURBED", ok.resume_from);
 }
 
 /// `Resize` reaches the child's terminal (`IMPLEMENTATION.md` § 2.2).
@@ -1280,12 +1146,21 @@ fn position(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[test]
 fn a_takeover_never_discards_input_already_delivered() {
     let (session, mut client, _) = Session::attached("takeover_input");
+    // One deadline for all fifteen rounds rather than one per reconnect
+    // (`harness::poll_by`), held by the client already attached as well as by every one
+    // the loop makes. A round is a ping, a keystroke and a handshake against a daemon on
+    // this machine, so the whole loop is a small fraction of one wait's patience — where a
+    // budget minted per round put this test 250 seconds out, past `.config/nextest.toml`'s
+    // kill by six times over, so that a slow run was reported killed rather than on the
+    // frame it was still owed.
+    let deadline = Instant::now() + FRAME_PATIENCE;
+    client.waits_by(deadline);
 
     let command = b"true NOMUX-KEEP\n";
     let mut expected = 0u64;
 
     for round in 0..15 {
-        let mut next = session.connect();
+        let mut next = session.connect_by(deadline);
         // The accept, asked for rather than waited out. `connect` on a listening unix
         // socket completes in the kernel, so the connection is already in the backlog
         // and the next `poll` reports the listener; that same pass services the client,

@@ -4,9 +4,13 @@
 # come back. Nothing here was produced by the encoder under test — these are the
 # document's bytes, not this codec's, which is what makes them a check on it.
 #
-# Not the original. The `vectors` module of `crates/nomux/tests/codec.rs` holds the same
-# table as Rust literals read out of § 2.2 by hand, renders this file from them and fails
-# if the two disagree, so a wire change reaches both or neither.
+# Written by hand from § 2.2, not rendered from anything: the `vectors` module of
+# `crates/nomux/tests/codec.rs` holds the same table as Rust literals read out of § 2.2 the
+# same way, parses this file, and fails if the two disagree — so a wire change has to be
+# made twice, in two notations, and a slip in either is caught by the other. It parses
+# strictly: an unknown key, a record with no `bytes`, a number written to the wrong width
+# each fail, a reader that stepped over what it did not understand being one that would
+# retire this file a line at a time.
 #
 # Grammar, so a reader needs no library: a line is blank, a comment — `#` its first
 # non-blank character — or a key and a value separated by whitespace. `frame` opens a
@@ -54,6 +58,18 @@ ypixel 0x0280
 term 0x64756d62
 bytes 0x0100001900080081828384858687880078002803c00280000464756d62
 
+frame Hello
+protocol 0x0008
+agent_forward false
+repaint_ctrl_l true
+out_offset 0x0000000000000000
+cols 0x0078
+rows 0x0028
+xpixel 0x03c0
+ypixel 0x0280
+term 0x
+bytes 0x0100001500080200000000000000000078002803c002800000
+
 frame HelloOk
 resume_from 0x2122232425262728
 in_applied 0x3132333435363738
@@ -89,6 +105,11 @@ offset 0x4142434445464748
 data 0x1b5b324a
 bytes 0x0500000c41424344454647481b5b324a
 
+frame Output
+offset 0xa1a2a3a4a5a6a7a8
+data 0x
+bytes 0x05000008a1a2a3a4a5a6a7a8
+
 frame Resize
 cols 0x0078
 rows 0x0028
@@ -122,9 +143,29 @@ frame Pong
 bytes 0x0b000000
 
 frame Error
+code Protocol
+message 0x626164206672616d65
+bytes 0x0c00000b0001626164206672616d65
+
+frame Error
 code Takeover
 message 0x74616b656e206f766572
 bytes 0x0c00000c000274616b656e206f766572
+
+frame Error
+code Version
+message 0x77726f6e672076657273696f6e
+bytes 0x0c00000f000377726f6e672076657273696f6e
+
+frame Error
+code InputGap
+message 0x696e70757420676170
+bytes 0x0c00000b0004696e70757420676170
+
+frame Error
+code Internal
+message 0x
+bytes 0x0c0000020005
 
 frame AgentOpen
 generation 0x11121314

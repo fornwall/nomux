@@ -142,7 +142,7 @@ frozen for the session's lifetime and a later reconnect's `DISPLAY` or `AcceptEn
 invisible to the child: inherent to persistence, `tmux`'s too, and §5.4 is the one case
 worth solving. It wants solving on *both* sides of the opt-in: with §5.4 off, a session
 created over `ForwardAgent` freezes a path sshd will unlink, and that warning is the
-client's ([PLAN.md § P1](PLAN.md#p1--the-client)).
+client's.
 
 ### 5.4 Agent forwarding
 
@@ -174,13 +174,12 @@ the replay out; no process spawned, no shell parsed.
 First contact with a host, or after a version bump: a probe `exec` that runs the binary
 where it is already present, then an upload and a second `exec` where it is not. Two
 round trips cold, zero extra warm; `$MODE` is `spawn` or `attach` and the client always
-knows which ([IMPLEMENTATION.md § Bootstrap](IMPLEMENTATION.md#5-bootstrap)).
+knows which ([IMPLEMENTATION.md § 5](IMPLEMENTATION.md#5-bootstrap)).
 
 ### 6.3 Gap
 
-The buffer is bounded, and resuming mid-escape-sequence after it overflows would
-corrupt the client's emulator, so overflow is an explicit `Gap` frame: the client
-resets, the daemon repaints from the child ([IMPLEMENTATION.md § 4.3](IMPLEMENTATION.md#43-gap-handling)).
+§3 prices the overflow; the `Gap` frame and the repaint that answers it are
+[IMPLEMENTATION.md § 4.3](IMPLEMENTATION.md#43-gap-handling)'s.
 
 ### 6.4 Version skew
 
@@ -192,10 +191,9 @@ from release 5 to release 8 without ever running 6 or 7, and an N-1 window assum
 client runs under every release, while revisions are append-only integers and a codec
 is a few hundred lines, so keeping them all costs nothing.
 
-Safe because reaping never uses the session protocol — `kill` and `list` act on the run
-directory ([IMPLEMENTATION.md § 6.6](IMPLEMENTATION.md#66-frozen-control-surface)), so
-the fallback is never an orphaned shell. The daemon carries none of it, speaking only
-its own version and rejecting a mismatched `Hello.protocol`.
+Safe because `kill` and `list` never speak the session protocol (§4), so the fallback is
+never an orphaned shell. The daemon carries none of it, speaking only its own version and
+rejecting a mismatched `Hello.protocol`.
 
 ## 7. Degradation
 
@@ -205,11 +203,11 @@ session, cached per host so it is not re-probed, on the conditions in
 
 ## 8. Security model
 
-- **No new *network* attack surface.** No listening TCP or UDP port. The local surface is what follows: a unix socket per session, an optional agent socket, and a process outliving the login. The uploaded binary is not part of it — anyone who can write `~/.local/share/nomux/` can already edit `.bashrc`.
-- **That equivalence holds for the same user only.** The run directory is checked (`O_NOFOLLOW`, uid, mode — [IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)) while the install directory is only created ([§ 5.2](IMPLEMENTATION.md#52-upload-and-attach-in-one-round-trip)), so another user able to write there replaces the binary every connection on the exec path runs: code execution as the victim. The published command line holds `mkdir -p -m 700` and `set -C`, and the client must check a directory that already exists and refuse a parent that is not the user's.
-- **No new secrets.** No keys, no tokens, no crypto. Authentication is the unix socket's filesystem permissions ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)) plus SSH itself. The daemon also refuses an accepted connection whose `SO_PEERCRED` uid is not its own ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)) — defence in depth for a host whose modes do not hold, rather than a second authenticator.
+- **No new *network* attack surface** (§3). The local surface is what follows: a unix socket per session, an optional agent socket, and a process outliving the login. The uploaded binary is not part of it — anyone who can write `~/.local/share/nomux/` can already edit `.bashrc`.
+- **That equivalence holds for the same user only.** The run directory is opened `O_NOFOLLOW` and held to this uid at exactly `0700` — a wrong mode is `fchmod`ed back rather than refused, from `list` and `kill` too, which is the one thing they mutate; group- or other-writable is the loosening refused instead, tightening not un-planting whatever was left inside ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)). The install directory is only created ([§ 5.2](IMPLEMENTATION.md#52-upload-and-attach-in-one-round-trip)), so another user able to write there replaces the binary every connection on the exec path runs: code execution as the victim. The published command line holds `mkdir -p -m 700` and `set -C`, and the client must check a directory that already exists and refuse a parent that is not the user's.
+- **No new secrets** (§3). `SO_PEERCRED` is checked in both directions besides: the daemon refuses an accepted connection whose uid is not its own, and a `connect` refuses a socket bound by anybody else ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)) — defence in depth for a host whose modes do not hold, rather than a second authenticator.
 - **No abstract sockets.** They are namespace-scoped, not permission-scoped, and would be reachable by any local user.
-- **Agent forwarding is a real capability expansion — the only one here.** The daemon serves an `ssh-agent` socket of its own, so a session reaches the user's keys over a connection that never set `ForwardAgent`, and only a session created with the flag set gets one (§5.4).
+- **Agent forwarding is a real capability expansion — the only one here**, and the only item on this list that reaches past what the login already had (§5.4).
 - **Auditability.** A persistent shell can outlive the login session that spawned it. On hosts with session recording that is a policy question, not a technical one, and it is why the feature is opt-in per host.
 - **File integrity monitoring** (AIDE, tripwire, osquery) will flag a new executable in a home directory. Expected, documented, not worked around.
 
@@ -243,10 +241,29 @@ one as a gap.
   6–8 KiB of binary and costs 21× on the PTY push path, 2.8 ms a MiB on the x86_64 the
   throughput was taken on. It trades memory for CPU, and a larger default ring buys the
   same scrollback for neither.
+- **Draining the PTY to `EAGAIN`.** A *reattaching* client is served the same bytes either
+  way — the ring holds the last `capacity` bytes however the reading is spelled — so a
+  drain buys no scrollback, and what it costs is fairness: every other step of a pass runs
+  a bounded number of times, `write_pty` at most twice and `read_client` at most three,
+  where a drain has no bound in the daemon and ends only when the producer pauses, which
+  during a flood is never. Ctrl-C reaches the child through `write_pty` alone, so interrupt
+  latency becomes the length of the drain, in exactly the situation a person is reaching
+  for Ctrl-C — the hazard `Conn::fill` already argues, answered there by `MAX_PENDING_READ`
+  ([IMPLEMENTATION.md § 4.1](IMPLEMENTATION.md#41-backpressure)) and against the master by
+  nothing at all. What reopens it: a measurement showing the per-pass `poll` is a material
+  fraction of flood throughput, together with a bound below both `MAX_PENDING_WRITE` and
+  the ring capacity.
 - **A server-side screen snapshot on overflow.** This is the second, lossier emulator §3
   rejects: deterministic but not exact, and the visible screen only. `libvterm` would
   also be the first C object in a tree whose musl targets build from `rustup target add`
   alone ([IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)).
+- **Scrubbing `SSH_AUTH_SOCK` in the child.** The server-side answer to the stale forwarded
+  path §5.3 ends on, and the daemon cannot tell sshd's socket from a stable local one —
+  `gpg-agent --enable-ssh-support`, gnome-keyring, `keychain` — so scrubbing would break
+  exactly the users whose agent lives on the server and survives every reconnect. Only the
+  client knows both what it forwarded and what it asked nomux for, which is why §5.3 leaves
+  the warning there; the variable is inherited untouched
+  ([IMPLEMENTATION.md § 6.1.1](IMPLEMENTATION.md#611-what-the-child-runs)).
 - **Cross-device handover.** Takeover is the right primitive
   ([IMPLEMENTATION.md § 6.4](IMPLEMENTATION.md#64-multiple-clients)), but handover needs
   an input offset in `Hello`, a client that never auto-reconnects after

@@ -34,8 +34,8 @@ use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags};
 
-use crate::control::{Liveness, liveness};
 use crate::rundir::{SessionPaths, check_run_dir, ensure_run_dir};
+use crate::usock::{Liveness, liveness};
 
 /// How long to wait for a freshly spawned daemon to bind its socket.
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -58,8 +58,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const PUBLISH_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Largest transfer either direction makes in one call, and the whole of what a [`Pump`]
-/// can be holding: [`Pump::wants_source`] is false while [`Pump::has_data`], so a
-/// direction reads again only once what it read last has gone, which is why neither of
+/// can be holding: a direction is polled for reading only while [`Pump::has_data`] is
+/// false, so it reads again only once what it read last has gone, which is why neither of
 /// the two needs a cap of its own.
 ///
 /// Copied through, where this used to reach for `splice(2)` first and fall back: one
@@ -110,8 +110,8 @@ pub(crate) fn run(session_id: &str, intent: Intent<'_>) -> io::Result<()> {
 /// host out of the client's rotation over a full disk.
 ///
 /// One kind for all of them, since none of what `relay` can propagate — `poll`,
-/// [`copy_in`], [`Pump::drain_to`] — says anything about the session, and nothing else in
-/// this crate constructs it.
+/// [`Pump::fill_from`], [`Pump::drain_to`] — says anything about the session, and nothing
+/// else in this crate constructs it.
 fn relay_failed(err: &io::Error) -> io::Error {
     io::Error::new(
         io::ErrorKind::ConnectionAborted,
@@ -211,11 +211,6 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> io::Result<UnixStream> {
     // the path.
     let _spawn_lock = paths.lock_spawn()?;
 
-    spawn_and_join(paths, label)
-}
-
-/// The body of [`create`], as one call so that lock has a single owner.
-fn spawn_and_join(paths: &SessionPaths, label: Option<&str>) -> io::Result<UnixStream> {
     let socket = paths.socket();
     // Once, and under the lock: another spawn may have created the session while we
     // waited for it, and the loser of that race is refused rather than handed the
@@ -402,9 +397,9 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
 
     while stdout_open && (socket_open || to_stdout.has_data()) {
         let mut stdin_flags = PollFlags::empty();
-        stdin_flags.set(PollFlags::IN, stdin_open && to_socket.wants_source());
+        stdin_flags.set(PollFlags::IN, stdin_open && !to_socket.has_data());
         let mut socket_flags = PollFlags::empty();
-        socket_flags.set(PollFlags::IN, socket_open && to_stdout.wants_source());
+        socket_flags.set(PollFlags::IN, socket_open && !to_stdout.has_data());
         socket_flags.set(PollFlags::OUT, to_socket.has_data());
         let mut stdout_flags = PollFlags::empty();
         stdout_flags.set(PollFlags::OUT, to_stdout.has_data());
@@ -424,9 +419,10 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
                 watched += 1;
             }
         }
-        // Unreachable, [`Pump::wants_source`] being exactly `!has_data()`, and kept
-        // because what it stands between is a `poll` on an empty set, which blocks
-        // for ever.
+        // Unreachable: stdout is watched while `to_stdout` holds bytes and the socket
+        // while it does not, so one of the two is always registered unless the socket is
+        // closed — and a closed socket with nothing left for stdout is the `while` above.
+        // Kept: what it stands between is a `poll` on an empty set, which blocks for ever.
         if watched == 0 {
             break;
         }
@@ -463,7 +459,12 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
             // Half-close propagation (§ 7).
             drop(stream.shutdown(Shutdown::Write));
         }
-        if socket_events.intersects(readable) && !to_stdout.fill_from(sock_fd, &mut chunk)? {
+        // `HUP` and `ERR` arrive unrequested, so an `OUT`-only pass reaches here too:
+        // without the emptiness check that would read a second chunk into a full pump.
+        if socket_events.intersects(readable)
+            && !to_stdout.has_data()
+            && !to_stdout.fill_from(sock_fd, &mut chunk)?
+        {
             socket_open = false;
         }
         // Speculative on a non-empty buffer as well as on `POLLOUT`, which stdout below
@@ -493,29 +494,6 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
     Ok(())
 }
 
-/// Reads once through `chunk` into `buf`. `false` means the source reached EOF.
-fn copy_in(fd: BorrowedFd<'_>, buf: &mut VecDeque<u8>, chunk: &mut [u8]) -> io::Result<bool> {
-    match crate::nbio::read(fd, chunk) {
-        // Four shapes of one ending. A PTY-backed peer reports end of session as `EIO`
-        // rather than 0; a socket peer that closed with bytes of *ours* still unread hands
-        // over the last of its own and then answers `ECONNRESET` — the ordinary way a
-        // session ends here (§ 4.1), and a failure here would cost the relay the exit
-        // status § 10 gives a delivered `Exit` frame; and `ENOTCONN` where the connection
-        // is already gone by the time the read lands.
-        Ok(0)
-        | Err(rustix::io::Errno::IO | rustix::io::Errno::CONNRESET | rustix::io::Errno::NOTCONN) => {
-            Ok(false)
-        }
-        Ok(n) => {
-            buf.extend(chunk.get(..n).unwrap_or(&[]));
-            Ok(true)
-        }
-        // Nothing pending is not EOF: the peer is still there with nothing to say.
-        Err(rustix::io::Errno::AGAIN) => Ok(true),
-        Err(err) => Err(err.into()),
-    }
-}
-
 /// One direction of the relay, whose whole state is whatever the destination would not
 /// take yet: which of the two ends the poll set wants is that and its negation.
 #[derive(Debug, Default)]
@@ -525,22 +503,34 @@ struct Pump {
 }
 
 impl Pump {
-    /// Whether the source is worth polling: only with the destination caught up, so
-    /// nothing can overtake bytes that are already owed to it — and so what [`copy_in`]
-    /// appends is all [`Pump::buf`] ever holds.
-    fn wants_source(&self) -> bool {
-        !self.has_data()
-    }
-
-    /// Whether anything is still held in userspace for the destination, which is also
-    /// the only reason to poll that destination for writability.
+    /// Whether anything is still held in userspace for the destination: the only reason
+    /// to poll that destination for writability, and — negated — the only condition under
+    /// which the source is read at all, so nothing can overtake bytes already owed.
     fn has_data(&self) -> bool {
         !self.buf.is_empty()
     }
 
     /// Takes one batch off `src` for the destination. `false` means `src` reached EOF.
     fn fill_from(&mut self, src: BorrowedFd<'_>, chunk: &mut [u8]) -> io::Result<bool> {
-        copy_in(src, &mut self.buf, chunk)
+        match crate::nbio::read(src, chunk) {
+            // Four shapes of one ending. A PTY-backed peer reports end of session as `EIO`
+            // rather than 0; a socket peer that closed with bytes of *ours* still unread
+            // hands over the last of its own and then answers `ECONNRESET` — the ordinary
+            // way a session ends here (§ 4.1), and a failure here would cost the relay the
+            // exit status § 10 gives a delivered `Exit` frame; and `ENOTCONN` where the
+            // connection is already gone by the time the read lands.
+            Ok(0)
+            | Err(
+                rustix::io::Errno::IO | rustix::io::Errno::CONNRESET | rustix::io::Errno::NOTCONN,
+            ) => Ok(false),
+            Ok(n) => {
+                self.buf.extend(chunk.get(..n).unwrap_or(&[]));
+                Ok(true)
+            }
+            // Nothing pending is not EOF: the peer is still there with nothing to say.
+            Err(rustix::io::Errno::AGAIN) => Ok(true),
+            Err(err) => Err(err.into()),
+        }
     }
 
     /// Hands the destination whatever is owed it. `false` means the destination has

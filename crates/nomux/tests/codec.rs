@@ -23,14 +23,18 @@
 /// panics on any input" — `indexing_slicing` is denied crate-wide, which makes an
 /// out-of-bounds panic unlikely rather than impossible.
 ///
-/// This is the fuzzing story for the parser, run on stable as part of the normal suite
-/// rather than as a `cargo-fuzz` target: the input space that matters is a 4-byte header
-/// and a length-prefixed payload, which a generator reaches by construction.
+/// This is the parser's coverage on stable, run as part of the normal suite: the input
+/// space that matters is a 4-byte header and a length-prefixed payload, which a generator
+/// reaches by construction. The coverage-guided half is `fuzz/`, which reaches
+/// `Frame::decode` under a sanitiser and off a corpus it keeps
+/// ([IMPLEMENTATION.md § 9](../../../IMPLEMENTATION.md#9-testing)); neither replaces the
+/// other, and only this one runs in a gate. `decode_header` has no target of its own,
+/// [`generated::header_decode_is_total`] having closed that domain outright.
 ///
 /// The generator is a seeded [`generated::Rng`] rather than a property-testing crate. The
-/// cases here are already small — a payload is at most 40 bytes and a text field at most
-/// 24 characters — so shrinking would have nothing left to take away, and what it buys is
-/// not worth fifteen transitive dependencies and three proc-macro compiles in a tree that
+/// cases here are already small — a payload is at most a few dozen bytes and a text field at
+/// most 24 characters — so shrinking would have nothing left to take away, and what it buys
+/// is not worth fifteen transitive dependencies and three proc-macro compiles in a tree that
 /// otherwise has two. What replaces it is determinism: every case is derived from
 /// [`generated::SEED`], a failure prints the `u64` its own case came from, and
 /// `Rng::new(that)` replays it alone.
@@ -49,9 +53,9 @@ mod generated {
     /// Cases per property.
     ///
     /// High for a property count, and affordable: the codec is a few hundred branches over
-    /// tiny buffers, so the whole file still runs in well under a second, and finding a
-    /// valid `ErrorCode` in two random bytes needs the cases more than it needs the time
-    /// back.
+    /// tiny buffers, so the whole file still runs in well under a second, and a mutation
+    /// that has to pick both a frame and the byte of it to flip needs the cases more than
+    /// it needs the time back.
     const CASES: u32 = 2048;
 
     /// Cap on generated `data` and `term` lengths.
@@ -371,11 +375,16 @@ mod generated {
     }
 
     /// Encodes `frame` and returns the bytes after the header, having checked that the
-    /// header describes what follows it.
+    /// encoder's own decoder will take the header it wrote.
     ///
     /// Reports failures instead of panicking: `clippy.toml`'s `allow-*-in-tests` covers
     /// `#[test]` bodies, not helpers beside them, and the caller is the one holding the
     /// seed a failure has to be reported with.
+    ///
+    /// What that header *says* is not re-derived per case: `encode` patches it in from
+    /// `frame_type()` and the payload length it has just written, and that `decode_header`
+    /// inverts `encode_header` is asserted by `lib.rs`'s `header_round_trips` over every
+    /// type and pinned in literal bytes by every vector in [`super::vectors`].
     fn encode_and_split(frame: Frame<'_>) -> Result<Vec<u8>, String> {
         let mut buf = Vec::new();
         frame
@@ -385,24 +394,8 @@ mod generated {
         let Some(header) = buf.first_chunk::<HEADER_LEN>() else {
             return Err("encode emitted no header".to_owned());
         };
-        let header = decode_header(header).map_err(|err| format!("own header rejected: {err}"))?;
-        let payload = buf.split_off(HEADER_LEN);
-
-        if header.ty != frame.frame_type() {
-            return Err(format!(
-                "header says {:?} and the frame behind it is {:?}",
-                header.ty,
-                frame.frame_type()
-            ));
-        }
-        if header.len as usize != payload.len() {
-            return Err(format!(
-                "declared length {} disagrees with the {} bytes written",
-                header.len,
-                payload.len()
-            ));
-        }
-        Ok(payload)
+        decode_header(header).map_err(|err| format!("own header rejected: {err}"))?;
+        Ok(buf.split_off(HEADER_LEN))
     }
 
     /// Offers `payload` to every frame type and checks what must hold for bytes from a
@@ -446,7 +439,10 @@ mod generated {
         let len = u32::from_be_bytes([0, a, b, c]);
         match decode_header(&bytes) {
             Ok(header) => {
-                if FrameType::from_wire(ty) != Some(header.ty) {
+                // Through `as_wire`, not `from_wire`: `decode_header` is built out of the
+                // latter, so comparing against it asserts that a function agrees with
+                // itself. The byte it was handed is the only independent witness there is.
+                if header.ty.as_wire() != ty {
                     return Err(format!("{bytes:02x?}: invented the type {:?}", header.ty));
                 }
                 if header.len != len {
@@ -466,7 +462,7 @@ mod generated {
                 if reported != ty {
                     return Err(format!("{bytes:02x?}: reported a byte it did not read"));
                 }
-                if FrameType::from_wire(ty).is_some() {
+                if FrameType::ALL.iter().any(|known| known.as_wire() == ty) {
                     return Err(format!("{bytes:02x?}: refused a known type"));
                 }
             }
@@ -535,10 +531,15 @@ mod generated {
 
     /// `decode_header` is total over its input, and reports only what it read.
     ///
-    /// Exhaustive in the type byte and deliberate in the length before it is random in
-    /// either: the field is 2^24 wide and what matters is the cap and the values on both
-    /// sides of it, which uniform draws land on with probability 2^-24. The random cases
-    /// afterwards are what would catch a rule neither sweep thought of.
+    /// Exhaustive in the type byte and deliberate in the length: the field is 2^24 wide and
+    /// what matters is the cap and the values either side of it, which uniform draws land on
+    /// with probability 2^-24.
+    ///
+    /// Nothing random rides on top, there being nothing left to reach: `decode_header` asks
+    /// exactly two questions — is this type byte a [`FrameType`], is this length over
+    /// [`MAX_PAYLOAD`] — and 256 type bytes crossed with lengths either side of the cap
+    /// answers both at every combination they have. That closes this function's domain on
+    /// stable and in a gate, which is why `fuzz/` is pointed at `Frame::decode` alone.
     #[test]
     fn header_decode_is_total() {
         for ty in 0..=u8::MAX {
@@ -554,65 +555,57 @@ mod generated {
                 checked!(check_header([ty, a, b, c]));
             }
         }
-
-        for case in 0..CASES {
-            let seed = case_seed(0x0003, case);
-            let mut rng = Rng::new(seed);
-            checked!(check_header([rng.u8(), rng.u8(), rng.u8(), rng.u8()]), seed);
-        }
-    }
-
-    /// `Frame::decode` is total over arbitrary payloads for every frame type.
-    ///
-    /// The type byte and the payload arrive from the same untrusted stream and are not
-    /// checked against each other, so a peer can point any type at any bytes.
-    #[test]
-    fn payload_decode_is_total() {
-        for case in 0..CASES {
-            let seed = case_seed(0x0004, case);
-            let payload = Rng::new(seed).bytes(40);
-            checked!(decode_as_every_type(&payload), seed);
-        }
     }
 
     /// A `Hello` whose declared `term_len` runs past the bytes behind it.
     ///
-    /// The one length prefix on this wire. The sweeps above reach its boundary only on the
-    /// rare payload already shaped like a `Hello`, and accept any refusal there; this
+    /// The one length prefix on this wire. The sweep below reaches its boundary only on the
+    /// rare payload already shaped like a `Hello`, and accepts any refusal there; this
     /// reaches it every time and pins which refusal.
+    ///
+    /// Three cases rather than a generated sweep, because every overstatement is the same
+    /// case: `decode` reads the fixed prefix, reads `term_len`, and asks the reader for that
+    /// many bytes, which fails before a byte of the term is looked at. So neither the term's
+    /// contents nor the size of the overshoot can change the answer, and what is left worth
+    /// writing down is the ends of the comparison — nothing at all declared as one byte, a
+    /// term declared one byte longer than it is, and the widest value the prefix can hold.
     #[test]
     fn a_hello_that_overstates_its_term_length_is_truncated() {
-        for case in 0..CASES {
-            let seed = case_seed(0x0005, case);
-            let mut rng = Rng::new(seed);
-            let term = rng.bytes(MAX_GENERATED_LEN);
-            // At least one byte past what follows, which is the whole point of the case.
-            let beyond = rng.u16().max(1);
-
+        for (term, declared) in [
+            (b"".as_slice(), 1_u16),
+            (b"vt100".as_slice(), 6),
+            (b"vt100".as_slice(), u16::MAX),
+        ] {
             // The fixed prefix § 2.2 gives `Hello` — protocol, flags, out_offset,
             // winsize — all zero, which is a shape the decoder accepts.
             let mut payload = vec![0u8; 19];
-            let declared = u16::try_from(term.len())
-                .unwrap_or(u16::MAX)
-                .saturating_add(beyond);
             payload.extend_from_slice(&declared.to_be_bytes());
-            payload.extend_from_slice(&term);
+            payload.extend_from_slice(term);
             assert_eq!(
                 Frame::decode(FrameType::Hello, &payload),
                 Err(ProtoError::Truncated),
-                "declared {declared} with {} bytes behind it (seed {seed:#018x})",
+                "declared {declared} with {} bytes behind it",
                 term.len()
             );
-            checked!(decode_as_every_type(&payload), seed);
+            checked!(decode_as_every_type(&payload));
         }
     }
 
-    /// The same, on payloads one byte away from valid.
+    /// `Frame::decode` is total over the payloads a peer can choose, for every frame type.
     ///
-    /// Uniform random bytes almost never reach the code past a length prefix or an enum
-    /// discriminant; a real encoding with one byte flipped or amputated does, and lands on
-    /// the boundaries — a `term_len` larger than what follows, a reserved flag bit, a
-    /// truncated final field.
+    /// The type byte and the payload arrive from the same untrusted stream and are never
+    /// checked against each other, so a peer can point any type at any bytes; every case
+    /// here sweeps all fifteen.
+    ///
+    /// Payloads one byte away from valid rather than uniform bytes, which this file used to
+    /// draw 2048 of beside them. Uniform bytes reach the code past a length prefix or an
+    /// enum discriminant essentially never — a draw is a `HelloOk` only if it came out 18
+    /// bytes long and its last two landed in three values of 256 and two of 256 — so the
+    /// branches they can reach are the shallow refusals a mutated encoding reaches too, and
+    /// reaches far more often. What only the mutation reaches is the far side: a `term_len`
+    /// larger than what follows, a reserved flag bit set, a truncated final field. So the
+    /// uniform draw bought cases rather than coverage, and the search that does buy coverage
+    /// here is `fuzz/frame`, which keeps whatever got further and builds on it.
     #[test]
     fn mutated_encodings_decode_without_panicking() {
         for case in 0..CASES {
@@ -645,17 +638,20 @@ mod generated {
 /// bump and an edit to § 2.2, or a bug. It is never a test that needs relaxing.
 ///
 /// The same table is written out beside this file as `wire-vectors.txt`, in a form an
-/// implementation in another language reads without parsing Rust;
-/// [`vectors::the_hex_fixture_carries_the_same_table`] renders these vectors and holds that
-/// file to the rendering, so neither can move alone.
+/// implementation in another language reads without parsing Rust. It is transcribed from
+/// § 2.2 by hand as these vectors are, not generated from them;
+/// [`vectors::the_hex_fixture_carries_the_same_table`] parses it and holds the two against
+/// each other, so neither can move alone and a slip in either is caught by the other.
 mod vectors {
+    use std::{cell::Cell, fmt::Debug};
+
     use nomux::{
         ErrorCode, ExitKind, Frame, FrameType, HEADER_LEN, Hello, HelloOk, Linger, MAX_PAYLOAD,
         PROTOCOL_VERSION, RESUME_FROM_START, WinSize,
     };
 
-    /// The language-neutral copy of the table below, compiled in rather than read: a test
-    /// holding a file it cannot open is a test that cannot quietly rewrite it.
+    /// The language-neutral transcription of the table below, compiled in rather than opened:
+    /// a test holding a file it has no handle to is a test that cannot quietly rewrite it.
     const FIXTURE: &str = include_str!("wire-vectors.txt");
 
     /// Distinct in all four fields on purpose: `cols`, `rows`, `xpixel` and `ypixel`
@@ -680,22 +676,24 @@ mod vectors {
     /// same-width neighbours — the failure a round-trip test cannot see — changes the
     /// expected bytes.
     ///
-    /// Both handshake frames appear three times, because distinct values catch a swap
+    /// Both handshake frames appear more than once, because distinct values catch a swap
     /// between two fields and do nothing about a swap *inside* one: each repeat disagrees
-    /// with the ones before it on every bit and every enumerator that has one. Three is
-    /// what [`the_vectors_pin_every_value_of_every_closed_set`] insists on — [`Linger`] has
-    /// three values, and two `Hello` vectors cannot both show the flag bits set together
-    /// and show each of them clear.
+    /// with the ones before it on every bit and every enumerator that has one. Three apiece
+    /// is what [`the_vectors_pin_every_value_of_every_closed_set`] insists on — [`Linger`]
+    /// has three values, and two `Hello` vectors cannot both show the flag bits set together
+    /// and show each of them clear. `Hello`'s fourth answers to no closed set, and says
+    /// where it stands what it is for.
     fn vectors() -> Vec<Vector> {
         let mut all = hello_vectors();
         all.extend(hello_ok_vectors());
         all.extend(stream_vectors());
         all.extend(control_vectors());
+        all.extend(error_vectors());
         all.extend(agent_vectors());
         all
     }
 
-    /// The client's opening frame, at three different flag words.
+    /// The client's opening frame, at all four of its flag words.
     fn hello_vectors() -> Vec<Vector> {
         vec![
             // 0x01 Hello: u16 proto, u8 flags, u64 out_offset, winsize, u16 term_len,
@@ -762,6 +760,34 @@ mod vectors {
                     0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
                     0x00, 0x04, // term_len = 4
                     b'd', b'u', b'm', b'b',
+                ],
+            },
+            // 0x01 Hello a fourth time, for the empty `term` — the first of the three
+            // zero-length variable fields § 2.2 permits and this table used to show none
+            // of. An implementation that reads `term_len` and then insists on at least one
+            // byte behind it passes every vector above and is still wrong, and the client
+            // is the end that would have to be rewritten to find out.
+            //
+            // Carries bit 1 alone, the one flag word the three above leave out, and
+            // `out_offset` 0, which is the client asking for the stream from its first byte
+            // rather than for whatever is retained — a distinction `RESUME_FROM_START`
+            // above exists to make.
+            Vector {
+                frame: Frame::Hello(Hello {
+                    protocol: 8,
+                    agent_forward: false,
+                    repaint_ctrl_l: true,
+                    out_offset: 0,
+                    win: WIN,
+                    term: "",
+                }),
+                bytes: &[
+                    0x01, 0x00, 0x00, 0x15, // header: type, u24 len = 21
+                    0x00, 0x08, // protocol
+                    0x02, // flags: bit 0 clear, bit 1 repaint ctrl-l
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // out_offset
+                    0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
+                    0x00, 0x00, // term_len = 0, and nothing behind it
                 ],
             },
         ]
@@ -867,6 +893,21 @@ mod vectors {
                     0x1b, 0x5b, 0x32, 0x4a,
                 ],
             },
+            // 0x05 Output again, carrying nothing: the second of the three empty fields, and
+            // a different way to be empty from the `Hello` above — `data` runs to the end of
+            // the payload where `term` sits behind a count, so this one is a payload that is
+            // exactly its fixed prefix, which is the length a decoder demanding "an offset
+            // *and* some bytes" refuses. An implementation can get either right alone.
+            Vector {
+                frame: Frame::Output {
+                    offset: 0xa1a2_a3a4_a5a6_a7a8,
+                    data: b"",
+                },
+                bytes: &[
+                    0x05, 0x00, 0x00, 0x08, // header: len = 8 + 0
+                    0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, // offset
+                ],
+            },
             // 0x06 Resize: winsize, bare.
             Vector {
                 frame: Frame::Resize(WIN),
@@ -943,8 +984,37 @@ mod vectors {
                 frame: Frame::Pong,
                 bytes: &[0x0b, 0x00, 0x00, 0x00],
             },
-            // 0x0c Error: u16 code, UTF-8 message with no length prefix — it runs to
-            // the end of the payload.
+        ]
+    }
+
+    /// 0x0c `Error`: u16 code, UTF-8 message with no length prefix — it runs to the end of
+    /// the payload. All five codes, one vector each.
+    ///
+    /// A group of its own because it is the one most easily left half-written. `Error` is
+    /// the last frame a connection ever carries (§ 6.4), so it is what a client mishandles
+    /// exactly when the session is being torn down and the user is watching: a code read as
+    /// the wrong number is a takeover reported as an internal fault, or a version mismatch
+    /// retried forever. The set is closed (§ 2.3), so a code the peer does not know is a
+    /// protocol error rather than something to skip past, and deducing four of the five from
+    /// `Takeover` is arithmetic rather than a test.
+    ///
+    /// The messages differ in length on purpose — the field has no count in front of it and
+    /// runs to the end of the payload, so a decoder that took a fixed width would agree with
+    /// one vector and no more — and `Internal` carries none at all, which § 2.2 permits and
+    /// nothing else in this table shows for `message`.
+    fn error_vectors() -> Vec<Vector> {
+        vec![
+            Vector {
+                frame: Frame::Error {
+                    code: ErrorCode::Protocol,
+                    message: "bad frame",
+                },
+                bytes: &[
+                    0x0c, 0x00, 0x00, 0x0b, // header: len = 2 + 9
+                    0x00, 0x01, // Protocol
+                    b'b', b'a', b'd', b' ', b'f', b'r', b'a', b'm', b'e',
+                ],
+            },
             Vector {
                 frame: Frame::Error {
                     code: ErrorCode::Takeover,
@@ -954,6 +1024,38 @@ mod vectors {
                     0x0c, 0x00, 0x00, 0x0c, // header: len = 2 + 10
                     0x00, 0x02, // Takeover
                     b't', b'a', b'k', b'e', b'n', b' ', b'o', b'v', b'e', b'r',
+                ],
+            },
+            Vector {
+                frame: Frame::Error {
+                    code: ErrorCode::Version,
+                    message: "wrong version",
+                },
+                bytes: &[
+                    0x0c, 0x00, 0x00, 0x0f, // header: len = 2 + 13
+                    0x00, 0x03, // Version
+                    b'w', b'r', b'o', b'n', b'g', b' ', b'v', b'e', b'r', b's', b'i', b'o', b'n',
+                ],
+            },
+            Vector {
+                frame: Frame::Error {
+                    code: ErrorCode::InputGap,
+                    message: "input gap",
+                },
+                bytes: &[
+                    0x0c, 0x00, 0x00, 0x0b, // header: len = 2 + 9
+                    0x00, 0x04, // InputGap
+                    b'i', b'n', b'p', b'u', b't', b' ', b'g', b'a', b'p',
+                ],
+            },
+            Vector {
+                frame: Frame::Error {
+                    code: ErrorCode::Internal,
+                    message: "",
+                },
+                bytes: &[
+                    0x0c, 0x00, 0x00, 0x02, // header: len = 2 + 0
+                    0x00, 0x05, // Internal, and nothing behind it
                 ],
             },
         ]
@@ -1004,9 +1106,21 @@ mod vectors {
         ]
     }
 
-    /// The encoder emits exactly the bytes § 2.2 specifies.
+    /// The encoder emits exactly the bytes § 2.2 specifies, and the decoder reads those same
+    /// bytes back as the frame they describe.
+    ///
+    /// Both directions off the same literal, and neither off the other's output: the decode
+    /// is handed `bytes`, never the buffer `encode` has just filled, so what is asserted is
+    /// never `decode(encode(f)) == f` — the self-consistency check these vectors exist to
+    /// supplement.
+    ///
+    /// The header is not decoded separately on the way back in. Comparing the whole encoding
+    /// against `bytes` has already pinned all four of its literal bytes, discriminant and
+    /// u24 length included, so re-reading them through `decode_header` and asserting they
+    /// describe the frame they precede would only ask whether `decode_header` inverts
+    /// `encode_header` — which is `lib.rs`'s `header_round_trips`, in its own file.
     #[test]
-    fn frames_encode_to_their_documented_bytes() {
+    fn frames_encode_to_their_documented_bytes_and_decode_back() {
         for Vector { frame, bytes } in vectors() {
             let mut encoded = Vec::new();
             frame.encode(&mut encoded).unwrap();
@@ -1016,202 +1130,394 @@ mod vectors {
                 "{:?} does not encode to the bytes IMPLEMENTATION.md § 2.2 specifies",
                 frame.frame_type()
             );
-        }
-    }
-
-    /// And the decoder reads those same bytes back as the frame they describe.
-    ///
-    /// Separate from the encode direction rather than folded into it: a single
-    /// assertion that `decode(encode(f)) == f` is exactly the self-consistency check
-    /// these vectors exist to supplement.
-    #[test]
-    fn documented_bytes_decode_to_their_frames() {
-        for Vector { frame, bytes } in vectors() {
-            let (header, payload) = bytes.split_at(HEADER_LEN);
-            let header: [u8; HEADER_LEN] = header.try_into().unwrap();
-            let header = nomux::decode_header(&header).unwrap();
-
-            assert_eq!(header.ty, frame.frame_type(), "type byte");
             assert_eq!(
-                header.len as usize,
-                payload.len(),
-                "declared length disagrees with the payload that follows it"
+                Frame::decode(frame.frame_type(), &bytes[HEADER_LEN..]),
+                Ok(frame),
+                "the bytes IMPLEMENTATION.md § 2.2 specifies for {:?} do not decode back",
+                frame.frame_type()
             );
-            assert_eq!(Frame::decode(header.ty, payload).unwrap(), frame);
         }
     }
 
-    /// A byte string as the fixture writes one.
-    fn hex(bytes: &[u8]) -> String {
-        let mut out = String::from("0x");
-        // `'?'` is unreachable, a nibble being a base-16 digit by construction; it stands in
-        // for an `unwrap` the lint wall refuses outside a `#[test]`.
-        out.extend(
-            bytes
+    /// A value as the fixture's grammar writes one.
+    ///
+    /// Hex is decoded at the line that carries it rather than where it is read, so a value
+    /// that is not hex names its own line. What the bytes then mean — a number as wide as its
+    /// field, or the field's own bytes — is the frame type's business, and is read below.
+    enum Value<'a> {
+        /// Lowercase hex behind an `0x`. An empty `term` is this, carrying nothing.
+        Hex(Vec<u8>),
+        /// A bare word: `true`, `false`, an enumerator, or the decimal `status` is written in.
+        Word(&'a str),
+    }
+
+    /// One `key value` line under a `frame`.
+    struct Field<'a> {
+        /// Where it was written, so a complaint can name it.
+        line: usize,
+        /// The key, spelled as § 2.2 names that field.
+        key: &'a str,
+        /// The value under it.
+        value: Value<'a>,
+        /// Whether the frame this record describes asked for it.
+        ///
+        /// The one risk a parser runs and a renderer does not: a reader that stepped over what
+        /// it did not recognise would turn a mistyped key into a field this file quietly stops
+        /// pinning, and the fixture into a no-op one line at a time.
+        read: Cell<bool>,
+    }
+
+    /// A `frame` line, the fields under it, and the `bytes` that close it.
+    struct Record<'a> {
+        /// The line the `frame` sits on.
+        line: usize,
+        /// The message it names, spelled as the [`FrameType`] variant.
+        name: &'a str,
+        /// The fields under it, read below by name — so a file whose lines were reordered
+        /// still passes, and what is pinned is the value under each key.
+        fields: Vec<Field<'a>>,
+        /// The whole frame, four-byte header included, once `closed`.
+        bytes: Vec<u8>,
+        /// Whether a `bytes` line has closed it. Tracked rather than read off `bytes`, the
+        /// grammar letting `0x` stand for no bytes at all.
+        closed: bool,
+    }
+
+    /// One lowercase hex digit. Uppercase is refused rather than folded: the grammar writes
+    /// one spelling, and a file written in two is one whose diffs stop reading cleanly.
+    fn nibble(digit: char) -> Option<u8> {
+        if digit.is_ascii_uppercase() {
+            return None;
+        }
+        u8::try_from(digit.to_digit(16)?).ok()
+    }
+
+    /// The bytes behind an `0x`, or what is wrong with the value.
+    fn hex(line: usize, value: &str) -> Result<Vec<u8>, String> {
+        let complaint =
+            || format!("wire-vectors.txt:{line}: `{value}` is not lowercase hex behind an `0x`");
+        let mut digits = value.strip_prefix("0x").ok_or_else(complaint)?.chars();
+        let mut bytes = Vec::new();
+        while let Some(high) = digits.next() {
+            let low = digits.next().ok_or_else(complaint)?;
+            let (Some(high), Some(low)) = (nibble(high), nibble(low)) else {
+                return Err(complaint());
+            };
+            bytes.push((high << 4) | low);
+        }
+        Ok(bytes)
+    }
+
+    /// The value of a closed set that `Debug` spells `word`, swept from the set's own `ALL` so
+    /// that a value added to the protocol is spelled here without this being edited.
+    fn by_name<T: Copy + Debug>(all: &[T], word: &str) -> Option<T> {
+        all.iter()
+            .copied()
+            .find(|value| format!("{value:?}") == word)
+    }
+
+    impl Record<'_> {
+        /// A complaint about one of this record's fields.
+        fn wrong(&self, key: &str, detail: &str) -> String {
+            format!(
+                "wire-vectors.txt:{}: `{key}` under this `frame {}` {detail}",
+                self.line, self.name
+            )
+        }
+
+        /// The value under `key`, marked read.
+        fn value(&self, key: &str) -> Result<&Value<'_>, String> {
+            let field = self
+                .fields
                 .iter()
-                .flat_map(|byte| [byte >> 4, byte & 0x0f])
-                .map(|nibble| char::from_digit(u32::from(nibble), 16).unwrap_or('?')),
-        );
-        out
-    }
-
-    /// The four fields of a winsize, destructured so that a fifth would not be dropped
-    /// silently from the fixture.
-    fn win_lines(win: WinSize) -> [String; 4] {
-        let WinSize {
-            cols,
-            rows,
-            xpixel,
-            ypixel,
-        } = win;
-        [
-            format!("cols {cols:#06x}"),
-            format!("rows {rows:#06x}"),
-            format!("xpixel {xpixel:#06x}"),
-            format!("ypixel {ypixel:#06x}"),
-        ]
-    }
-
-    /// One vector as `wire-vectors.txt` writes it.
-    ///
-    /// The values are the frame's, not the wire's: booleans where § 2.3 has flag bits, a
-    /// name where the wire has a discriminant, no `term_len` an encoder can count for
-    /// itself. Rendering the wire form instead would make each record a restatement of its
-    /// own `bytes`, which is the one thing a reader must not be handed.
-    fn record(vector: &Vector) -> String {
-        let &Vector { frame, bytes } = vector;
-        let mut lines = vec![format!("frame {:?}", frame.frame_type())];
-        match frame {
-            Frame::Hello(Hello {
-                protocol,
-                agent_forward,
-                repaint_ctrl_l,
-                out_offset,
-                win,
-                term,
-            }) => {
-                lines.push(format!("protocol {protocol:#06x}"));
-                lines.push(format!("agent_forward {agent_forward}"));
-                lines.push(format!("repaint_ctrl_l {repaint_ctrl_l}"));
-                lines.push(format!("out_offset {out_offset:#018x}"));
-                lines.extend(win_lines(win));
-                lines.push(format!("term {}", hex(term.as_bytes())));
-            }
-            Frame::HelloOk(HelloOk {
-                resume_from,
-                in_applied,
-                linger,
-                agent,
-            }) => {
-                lines.push(format!("resume_from {resume_from:#018x}"));
-                lines.push(format!("in_applied {in_applied:#018x}"));
-                lines.push(format!("linger {linger:?}"));
-                lines.push(format!("agent {agent}"));
-            }
-            Frame::Input { offset, data } | Frame::Output { offset, data } => {
-                lines.push(format!("offset {offset:#018x}"));
-                lines.push(format!("data {}", hex(data)));
-            }
-            Frame::InputAck { applied_through } => {
-                lines.push(format!("applied_through {applied_through:#018x}"));
-            }
-            Frame::Resize(win) => lines.extend(win_lines(win)),
-            Frame::Gap { new_base_offset } => {
-                lines.push(format!("new_base_offset {new_base_offset:#018x}"));
-            }
-            Frame::Exit {
-                status,
-                kind,
-                since_exit_secs,
-            } => {
-                lines.push(format!("status {status}"));
-                lines.push(format!("kind {kind:?}"));
-                lines.push(format!("since_exit_secs {since_exit_secs:#010x}"));
-            }
-            Frame::Error { code, message } => {
-                lines.push(format!("code {code:?}"));
-                lines.push(format!("message {}", hex(message.as_bytes())));
-            }
-            Frame::AgentOpen { generation } | Frame::AgentClose { generation } => {
-                lines.push(format!("generation {generation:#010x}"));
-            }
-            Frame::AgentData { generation, data } => {
-                lines.push(format!("generation {generation:#010x}"));
-                lines.push(format!("data {}", hex(data)));
-            }
-            Frame::Detach | Frame::Ping | Frame::Pong => {}
+                .find(|field| field.key == key)
+                .ok_or_else(|| self.wrong(key, "is missing"))?;
+            field.read.set(true);
+            Ok(&field.value)
         }
-        lines.push(format!("bytes {}", hex(bytes)));
-        lines.join("\n")
-    }
 
-    /// The whole table as the fixture writes it.
-    fn rendered_fixture() -> String {
-        let records: Vec<String> = vectors().iter().map(record).collect();
-        format!("{}\n", records.join("\n\n"))
-    }
+        /// A field the grammar writes in hex.
+        fn bytes(&self, key: &str) -> Result<&[u8], String> {
+            match self.value(key)? {
+                Value::Hex(bytes) => Ok(bytes),
+                Value::Word(_) => Err(self.wrong(key, "is not `0x` hex")),
+            }
+        }
 
-    /// The lines of a fixture that say something, numbered from one — the reader its own
-    /// grammar promises, which is the one thing here that has to be naive.
-    fn content(text: &str) -> Vec<(usize, String)> {
-        text.lines()
-            .enumerate()
-            .map(|(index, line)| {
-                (
-                    index + 1,
-                    line.split_whitespace().collect::<Vec<_>>().join(" "),
-                )
+        /// A field the grammar writes as a bare word.
+        fn word(&self, key: &str) -> Result<&str, String> {
+            match self.value(key)? {
+                Value::Word(word) => Ok(word),
+                Value::Hex(_) => Err(self.wrong(key, "is hex where a word belongs")),
+            }
+        }
+
+        /// A number as wide as § 2.2 gives it, big-endian.
+        ///
+        /// The width is the array's, so a value written short — which the grammar's
+        /// zero-padding rules out and a hand-edit does not — fails here rather than reading
+        /// back as a number that happens to be equal.
+        fn fixed<const N: usize>(&self, key: &str) -> Result<[u8; N], String> {
+            let bytes = self.bytes(key)?;
+            let width = bytes.len();
+            <[u8; N]>::try_from(bytes)
+                .map_err(|_| self.wrong(key, &format!("is {width} bytes, not § 2.2's {N}")))
+        }
+
+        /// A `u16` field.
+        fn u16(&self, key: &str) -> Result<u16, String> {
+            Ok(u16::from_be_bytes(self.fixed(key)?))
+        }
+
+        /// A `u32` field.
+        fn u32(&self, key: &str) -> Result<u32, String> {
+            Ok(u32::from_be_bytes(self.fixed(key)?))
+        }
+
+        /// A `u64` field.
+        fn u64(&self, key: &str) -> Result<u64, String> {
+            Ok(u64::from_be_bytes(self.fixed(key)?))
+        }
+
+        /// The one signed field on this wire, and so the one value written in decimal: a
+        /// two's-complement pattern is a reinterpretation the fixture does not ask for.
+        fn decimal(&self, key: &str) -> Result<i32, String> {
+            let word = self.word(key)?;
+            word.parse()
+                .map_err(|_| self.wrong(key, "is no decimal `i32`"))
+        }
+
+        /// A flag, where § 2.3 has a bit.
+        fn flag(&self, key: &str) -> Result<bool, String> {
+            match self.word(key)? {
+                "true" => Ok(true),
+                "false" => Ok(false),
+                _ => Err(self.wrong(key, "is neither `true` nor `false`")),
+            }
+        }
+
+        /// A text field: bytes here, UTF-8 on the wire (§ 2.2).
+        fn text(&self, key: &str) -> Result<&str, String> {
+            str::from_utf8(self.bytes(key)?).map_err(|_| self.wrong(key, "is not UTF-8"))
+        }
+
+        /// An enumerator of a closed set, by the name it is written under.
+        fn enumerator<T: Copy + Debug>(&self, key: &str, all: &[T]) -> Result<T, String> {
+            let word = self.word(key)?;
+            by_name(all, word).ok_or_else(|| self.wrong(key, "names no value § 2.2 gives it"))
+        }
+
+        /// The four fields of a winsize, wherever one is written out.
+        fn win(&self) -> Result<WinSize, String> {
+            Ok(WinSize {
+                cols: self.u16("cols")?,
+                rows: self.u16("rows")?,
+                xpixel: self.u16("xpixel")?,
+                ypixel: self.u16("ypixel")?,
             })
-            .filter(|(_, line)| !line.is_empty() && !line.starts_with('#'))
-            .collect()
+        }
+
+        /// The frame this record describes, built from its field lines.
+        ///
+        /// From the fields and never from `bytes`, which are what the frame is then held
+        /// against: a record decoded from its own bytes would agree with itself while every
+        /// field line above them went unread. The match is exhaustive on [`FrameType`], so a
+        /// frame added to the protocol is one this has to learn to read rather than one the
+        /// fixture silently never carries.
+        fn frame(&self) -> Result<Frame<'_>, String> {
+            let Some(frame_type) = by_name(&FrameType::ALL, self.name) else {
+                return Err(format!(
+                    "wire-vectors.txt:{}: `{}` names no frame in § 2.2's table",
+                    self.line, self.name
+                ));
+            };
+            let frame = match frame_type {
+                FrameType::Hello => Frame::Hello(Hello {
+                    protocol: self.u16("protocol")?,
+                    agent_forward: self.flag("agent_forward")?,
+                    repaint_ctrl_l: self.flag("repaint_ctrl_l")?,
+                    out_offset: self.u64("out_offset")?,
+                    win: self.win()?,
+                    term: self.text("term")?,
+                }),
+                FrameType::HelloOk => Frame::HelloOk(HelloOk {
+                    resume_from: self.u64("resume_from")?,
+                    in_applied: self.u64("in_applied")?,
+                    linger: self.enumerator("linger", &Linger::ALL)?,
+                    agent: self.flag("agent")?,
+                }),
+                FrameType::Input => Frame::Input {
+                    offset: self.u64("offset")?,
+                    data: self.bytes("data")?,
+                },
+                FrameType::InputAck => Frame::InputAck {
+                    applied_through: self.u64("applied_through")?,
+                },
+                FrameType::Output => Frame::Output {
+                    offset: self.u64("offset")?,
+                    data: self.bytes("data")?,
+                },
+                FrameType::Resize => Frame::Resize(self.win()?),
+                FrameType::Gap => Frame::Gap {
+                    new_base_offset: self.u64("new_base_offset")?,
+                },
+                FrameType::Exit => Frame::Exit {
+                    status: self.decimal("status")?,
+                    kind: self.enumerator("kind", &ExitKind::ALL)?,
+                    since_exit_secs: self.u32("since_exit_secs")?,
+                },
+                FrameType::Detach => Frame::Detach,
+                FrameType::Ping => Frame::Ping,
+                FrameType::Pong => Frame::Pong,
+                FrameType::Error => Frame::Error {
+                    code: self.enumerator("code", &ErrorCode::ALL)?,
+                    message: self.text("message")?,
+                },
+                FrameType::AgentOpen => Frame::AgentOpen {
+                    generation: self.u32("generation")?,
+                },
+                FrameType::AgentData => Frame::AgentData {
+                    generation: self.u32("generation")?,
+                    data: self.bytes("data")?,
+                },
+                FrameType::AgentClose => Frame::AgentClose {
+                    generation: self.u32("generation")?,
+                },
+            };
+
+            if let Some(field) = self.fields.iter().find(|field| !field.read.get()) {
+                return Err(format!(
+                    "wire-vectors.txt:{}: `{}` is a line no {frame_type:?} reads — a key that \
+                     frame does not have, or a second value under one it does",
+                    field.line, field.key
+                ));
+            }
+            Ok(frame)
+        }
     }
 
-    /// `wire-vectors.txt` says what this table says, so a second implementation can be
-    /// built against these bytes without reading Rust.
+    /// The fixture's records in file order, or the first thing about it that is not the
+    /// grammar its own header states.
     ///
-    /// The table is the original and the fixture is rendered from it rather than the other
-    /// way round: what the two tests above are worth rests on the vectors being literals
-    /// read out of § 2.2 by hand and reviewed as a diff, and the fixture's `bytes` come from
-    /// those literals rather than from `encode`, so what it offers another implementation is
-    /// the document and not this codec's opinion of it. Both sides are read through the
-    /// ignorable-line rule the fixture states, so a re-commented or hand-aligned file still
-    /// passes and only the data is pinned.
+    /// Every line opens a record, closes one, or lands in the open one; a key with nowhere to
+    /// go fails rather than being stepped over. Blank lines, `#` comments and the alignment
+    /// are all that is thrown away, so a re-commented or hand-aligned file still passes and
+    /// only the data is pinned.
+    fn records(text: &str) -> Result<Vec<Record<'_>>, String> {
+        let mut records: Vec<Record<'_>> = Vec::new();
+        for (index, raw) in text.lines().enumerate() {
+            let (line, raw) = (index + 1, raw.trim());
+            if raw.is_empty() || raw.starts_with('#') {
+                continue;
+            }
+            let complaint = |detail| format!("wire-vectors.txt:{line}: `{raw}` {detail}");
+            let Some((key, value)) = raw.split_once(char::is_whitespace) else {
+                return Err(complaint("is a key with no value"));
+            };
+            let value = value.trim();
+            if key == "frame" {
+                records.push(Record {
+                    line,
+                    name: value,
+                    fields: Vec::new(),
+                    bytes: Vec::new(),
+                    closed: false,
+                });
+            } else if let Some(record) = records.last_mut().filter(|record| !record.closed) {
+                if key == "bytes" {
+                    record.bytes = hex(line, value)?;
+                    record.closed = true;
+                } else {
+                    let value = match value.strip_prefix("0x") {
+                        Some(_) => Value::Hex(hex(line, value)?),
+                        None => Value::Word(value),
+                    };
+                    let field = Field {
+                        line,
+                        key,
+                        value,
+                        read: Cell::new(false),
+                    };
+                    record.fields.push(field);
+                }
+            } else {
+                return Err(complaint(
+                    "is under no open record, preceding the first `frame` or following the \
+                     `bytes` that closed one",
+                ));
+            }
+        }
+        if let Some(open) = records.iter().find(|record| !record.closed) {
+            return Err(format!(
+                "wire-vectors.txt:{}: this `frame {}` reaches the end of the file with no \
+                 `bytes` line to close it",
+                open.line, open.name
+            ));
+        }
+        Ok(records)
+    }
+
+    /// `wire-vectors.txt` says what this table says, so a second implementation can be built
+    /// against these bytes without reading Rust.
     ///
-    /// A stale fixture fails here and is never rewritten: [`FIXTURE`] is `include_str!`, so
-    /// this test has no handle to write through, and the rendering rides on the failure
-    /// instead — which is what a maintainer pastes, a vector added or dropped having moved
-    /// every line after it.
+    /// Neither side is generated from the other. Both are § 2.2 transcribed by hand — once as
+    /// the Rust literals above, once in the fixture's own notation — and this reads the file
+    /// back and holds the two against each other, so a wire change has to be made twice and a
+    /// slip in either is caught by the other. A file rendered from the table would instead
+    /// have carried whatever the table said, mistakes included: a fixture that agrees with
+    /// this code by construction is evidence about nothing, and the second reading of § 2.2 is
+    /// the whole of what it has to offer.
+    ///
+    /// The record's own fields are read and the frame built from them, which is then held
+    /// against `bytes`. So a record is wrong if any line of it is, and neither half of one can
+    /// be right on account of the other.
+    ///
+    /// [`FIXTURE`] is `include_str!`, so there is no handle to write the file through and no
+    /// flag that would rewrite it: a disagreement is settled against § 2.2 rather than blessed.
     #[test]
     fn the_hex_fixture_carries_the_same_table() {
-        let rendered = rendered_fixture();
-        let table = content(&rendered);
-        let carried = content(FIXTURE);
+        let records = records(FIXTURE).unwrap_or_else(|complaint| panic!("{complaint}"));
+        let table = vectors();
 
-        let complaint = table
-            .iter()
-            .enumerate()
-            .find_map(|(index, (_, want))| match carried.get(index) {
-                Some((_, found)) if found == want => None,
-                Some((number, found)) => Some(format!(
-                    "wire-vectors.txt:{number} carries `{found}`, and this table renders `{want}`"
-                )),
-                None => Some(format!(
-                    "wire-vectors.txt ends before this table does, at `{want}`"
-                )),
-            })
-            .or_else(|| {
-                carried.get(table.len()).map(|(number, extra)| {
-                    format!("wire-vectors.txt:{number} carries `{extra}`, which no vector renders")
-                })
-            });
+        for (index, record) in records.iter().enumerate() {
+            let Some(&Vector { frame, bytes }) = table.get(index) else {
+                panic!(
+                    "wire-vectors.txt:{} carries a `frame {}` no vector in this table answers",
+                    record.line, record.name
+                );
+            };
+            let carried = record
+                .frame()
+                .unwrap_or_else(|complaint| panic!("{complaint}"));
+            assert_eq!(
+                carried, frame,
+                "wire-vectors.txt:{} describes a frame this table writes otherwise",
+                record.line
+            );
+            assert_eq!(
+                record.bytes,
+                bytes,
+                "wire-vectors.txt:{} gives {:?} bytes this table does not",
+                record.line,
+                frame.frame_type()
+            );
+        }
 
-        if let Some(complaint) = complaint {
-            panic!("{complaint}\n\nthe table renders:\n\n{rendered}");
+        if let Some(Vector { frame, .. }) = table.get(records.len()) {
+            panic!(
+                "this table holds a {:?} vector that wire-vectors.txt has no record for",
+                frame.frame_type()
+            );
         }
     }
 
     /// Every closed set on this wire is written down in bytes above, at every value it has,
     /// and the handshake vectors are written at the revision this build speaks.
+    ///
+    /// The four sets are [`FrameType`], [`ExitKind`], [`Linger`] and [`ErrorCode`] — the last
+    /// being the one a table like this most easily leaves half-written, its five values
+    /// riding on a frame nobody reaches on the happy path, so a fixture pinning `Takeover`
+    /// alone reads complete and lets another implementation number the rest as it likes.
     ///
     /// Swept from each set's `ALL` rather than from a list written out here, which would
     /// stop covering the protocol the moment the protocol grew, and quietly. The two flags
@@ -1228,6 +1534,7 @@ mod vectors {
         let mut types = Vec::new();
         let mut kinds = Vec::new();
         let mut lingers = Vec::new();
+        let mut codes = Vec::new();
         let mut hello_flags = Vec::new();
         let mut agent_flags = Vec::new();
 
@@ -1259,6 +1566,7 @@ mod vectors {
                     agent_flags.push(agent);
                 }
                 Frame::Exit { kind, .. } => kinds.push(kind),
+                Frame::Error { code, .. } => codes.push(code),
                 _ => {}
             }
         }
@@ -1271,6 +1579,9 @@ mod vectors {
         }
         for linger in Linger::ALL {
             assert!(lingers.contains(&linger), "{linger:?} has no wire vector");
+        }
+        for code in ErrorCode::ALL {
+            assert!(codes.contains(&code), "{code:?} has no wire vector");
         }
         for (state, verb) in [(true, "sets"), (false, "clears")] {
             for (bit, name) in [(0, "agent_forward"), (1, "repaint_ctrl_l")] {
@@ -1342,11 +1653,16 @@ mod vectors {
     #[test]
     fn the_frozen_numbers_are_the_ones_the_document_gives() {
         /// One closed set, written the way § 2.2 writes it.
+        ///
+        /// One direction only. `wire_enum!` writes `as_wire` and `from_wire` from the same
+        /// literal — the former reads the `#[repr]` discriminant that literal declares, the
+        /// latter matches on the literal itself — and two variants cannot share one, a
+        /// duplicate discriminant being a compile error. So `from_wire(n) == Some(v)`
+        /// follows from `v.as_wire() == n` with nothing left to falsify.
         macro_rules! frozen {
             ($ty:ty, $($name:ident = $number:literal),+) => {
                 for (value, number) in [$((<$ty>::$name, $number)),+] {
                     assert_eq!(value.as_wire(), number, "{value:?} is not the § 2.2 number");
-                    assert_eq!(<$ty>::from_wire(number), Some(value), "{number} is not {value:?}");
                 }
                 for value in <$ty>::ALL {
                     let listed = [$(<$ty>::$name),+].contains(&value);
