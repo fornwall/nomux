@@ -31,13 +31,20 @@ updates:
   # The dependency tree is small and the binary ships to servers, so take patches.
   # Grouped: separate PRs per crate is noise at this size.
   #
-  # No second entry for `/fuzz`, which has a lockfile of its own: it is held outside the
-  # supply-chain gates on the argument deny.toml makes, and a harness that ships nothing is
-  # not worth a monthly PR against the tree that does.
   - package-ecosystem: cargo
     directory: /
     schedule:
       interval: monthly
     groups:
       cargo:
+        patterns: ["*"]
+
+  # Separate lockfile and policy: these crates do not ship, but their build scripts execute
+  # on developer and CI machines and should not silently age outside the advisory gate.
+  - package-ecosystem: cargo
+    directory: /fuzz
+    schedule:
+      interval: monthly
+    groups:
+      fuzz-cargo:
         patterns: ["*"]

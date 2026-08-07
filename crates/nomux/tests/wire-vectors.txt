@@ -23,7 +23,7 @@
 # two's-complement pattern being a reinterpretation this file should not ask for.
 
 frame Hello
-protocol 0x0008
+protocol 0x0009
 agent_forward true
 repaint_ctrl_l true
 out_offset 0x0102030405060708
@@ -32,10 +32,10 @@ rows 0x0028
 xpixel 0x03c0
 ypixel 0x0280
 term 0x787465726d2d323536636f6c6f72
-bytes 0x0100002300080301020304050607080078002803c00280000e787465726d2d323536636f6c6f72
+bytes 0x0100002300090301020304050607080078002803c00280000e787465726d2d323536636f6c6f72
 
 frame Hello
-protocol 0x0008
+protocol 0x0009
 agent_forward true
 repaint_ctrl_l false
 out_offset 0xffffffffffffffff
@@ -44,10 +44,10 @@ rows 0x0028
 xpixel 0x03c0
 ypixel 0x0280
 term 0x7674313030
-bytes 0x0100001a000801ffffffffffffffff0078002803c0028000057674313030
+bytes 0x0100001a000901ffffffffffffffff0078002803c0028000057674313030
 
 frame Hello
-protocol 0x0008
+protocol 0x0009
 agent_forward false
 repaint_ctrl_l false
 out_offset 0x8182838485868788
@@ -56,10 +56,10 @@ rows 0x0028
 xpixel 0x03c0
 ypixel 0x0280
 term 0x64756d62
-bytes 0x0100001900080081828384858687880078002803c00280000464756d62
+bytes 0x0100001900090081828384858687880078002803c00280000464756d62
 
 frame Hello
-protocol 0x0008
+protocol 0x0009
 agent_forward false
 repaint_ctrl_l true
 out_offset 0x0000000000000000
@@ -68,7 +68,7 @@ rows 0x0028
 xpixel 0x03c0
 ypixel 0x0280
 term 0x
-bytes 0x0100001500080200000000000000000078002803c002800000
+bytes 0x0100001500090200000000000000000078002803c002800000
 
 frame HelloOk
 resume_from 0x2122232425262728
@@ -124,14 +124,20 @@ bytes 0x070000080000000000002000
 frame Exit
 status 130
 kind Signalled
-since_exit_secs 0x0a0b0c0d
+since_terminal_closed_secs 0x0a0b0c0d
 bytes 0x0800000900000082010a0b0c0d
 
 frame Exit
 status -1
 kind Exited
-since_exit_secs 0x00000000
+since_terminal_closed_secs 0x00000000
 bytes 0x08000009ffffffff0000000000
+
+frame Exit
+status 0
+kind Unknown
+since_terminal_closed_secs 0x10203040
+bytes 0x08000009000000000210203040
 
 frame Detach
 bytes 0x09000000

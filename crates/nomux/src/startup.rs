@@ -104,7 +104,7 @@ pub(crate) fn arm_stop_signals() -> io::Result<OwnedFd> {
 }
 
 /// Routes `SIGCHLD` into a descriptor of its own for the poll set, and hands back its
-/// read end. What the daemon then does with it is `daemon.rs`'s `collect_status`.
+/// read end. What the daemon then does with it is `daemon.rs`'s `collect_outcome`.
 ///
 /// A second pipe rather than a second byte down [`arm_stop_signals`]'s, for § 6.5's reason.
 /// What sharing would have cost is a drain handing the shutdown decision bytes to classify,
@@ -118,7 +118,7 @@ pub(crate) fn arm_stop_signals() -> io::Result<OwnedFd> {
 /// Called *before* [`arm_stop_signals`], which is the call that clears an inherited mask, so
 /// § 6.2's rule about arming ahead of that clear is what fixes the order. What it costs here
 /// is the milder half, `SIGCHLD`'s default being to ignore: not a daemon that dies but a
-/// notification dropped, and a dropped one is a reap nobody makes now that `collect_status`
+/// notification dropped, and a dropped one is a reap nobody makes now that `collect_outcome`
 /// has stopped asking on every pass.
 pub(crate) fn arm_child_signal() -> io::Result<OwnedFd> {
     // `CLOEXEC` and the leaked write end are [`arm_stop_signals`]'s, for its reasons.

@@ -84,7 +84,7 @@ and never has to scan for a boundary. *winsize* is four `u16`s — cols, rows, x
 | `0x05` | D→C | `Output` | `u64` offset, bytes |
 | `0x06` | C→D | `Resize` | `u16` cols, `u16` rows, `u16` xpixel, `u16` ypixel |
 | `0x07` | D→C | `Gap` | `u64` new_base_offset |
-| `0x08` | D→C | `Exit` | `i32` status, `u8` kind (0 = exited, 1 = signalled), `u32` since_exit_secs |
+| `0x08` | D→C | `Exit` | `i32` status, `u8` kind (0 = exited, 1 = signalled, 2 = unknown), `u32` since_terminal_closed_secs |
 | `0x09` | C→D | `Detach` | — |
 | `0x0a` | C→D | `Ping` | — |
 | `0x0b` | D→C | `Pong` | — |
@@ -93,7 +93,7 @@ and never has to scan for a boundary. *winsize* is four `u16`s — cols, rows, x
 | `0x0e` | ↔ | `AgentData` | `u32` generation, opaque `ssh-agent` bytes |
 | `0x0f` | ↔ | `AgentClose` | `u32` generation |
 
-`Hello` carries the current revision, **8** — `PROTOCOL_VERSION` in
+`Hello` carries the current revision, **9** — `PROTOCOL_VERSION` in
 `crates/nomux/src/lib.rs`, bumped on any wire change, compatible ones included.
 
 The session id is *not* in `Hello`: the socket path fixes it warm, and the id handed to
@@ -115,8 +115,11 @@ on everything it sends for that channel; the daemon discards any `AgentData` or
 `MAX_PAYLOAD` bytes, which both ends subtract when they chunk. §6.7 has why an unnamed
 channel would not do.
 
-`Exit.since_exit_secs` counts whole seconds since the child let go of the terminal,
-elapsed against a monotonic clock and saturating at `u32::MAX`.
+`Exit` closes the terminal transcript; it does not claim the process has terminated. A
+known outcome carries its exit status or signal. If the terminal has closed but `waitpid`
+still has no outcome at the reporting deadline, kind 2 (`unknown`) carries the canonical
+status 0. `Exit.since_terminal_closed_secs` counts whole seconds since the child let go
+of the terminal, elapsed against a monotonic clock and saturating at `u32::MAX`.
 
 `Ping` is the client's alone: the daemon never sends one, answers every one it decodes with
 a `Pong`, and holds no inactivity deadline over an attached client — § 6.4's six endings
@@ -558,23 +561,25 @@ the socket the winner bound and is told the id is taken (§ 10). A stale socket 
 second implementation of `list` or `kill` must obey, in the order the rules bind:
 
 - **Anything that unlinks takes the lock first and holds it to the end** — `list`'s sweep, `kill` (§ 6.6), the daemon's own exit (§ 6.5).
-- **The daemon takes it before probing for a stale socket**, and never blocks for it: a sweep descheduled after the same probe would unlink what this daemon has bound since.
-- **`spawn` holds it past the successful `connect`, until `<id>.pid` exists**, since the daemon binds before it writes that file (§ 6.2) and a `kill` landing in that window would find a live daemon and no pid. Bounded by the spawn timeout, never fatal.
+- **The daemon owns it before probing for a stale socket.** A direct `daemon` start takes it nonblocking and refuses a held id. `spawn` clears `FD_CLOEXEC` on its already locked descriptor for the child only, passes its number as the private `--lock-fd` capability, and the daemon validates that descriptor against the current path before doing anything. This closes the fork/exec handoff without a second, necessarily failing `flock` attempt and without treating failure as permission to proceed.
+- **`spawn` and its daemon hold the same open-file-description lock past the successful `connect`, until `<id>.pid` exists**, since the daemon binds before it writes that file (§ 6.2) and a `kill` landing in that window would find a live daemon and no pid. Bounded by the spawn timeout, never fatal.
 - **The daemon drops it once `<id>.pid` and the label are written.** One still holding it at `kill`'s 2 s deadline (§ 6.6) would be one nothing could stop.
 - **Every acquirer confirms that what it locked is still the file at that path** — `fstat` against `stat`, device and inode — and re-takes it if not, `LOCK_ATTEMPTS` times in all: the take plus one re-take. Out of attempts it refuses and never proceeds unlocked.
+- **The name must resolve to a regular file and is opened nonblocking.** In particular, a FIFO at `<id>.lock` is rejected rather than parking the process inside `open(2)` before any lock deadline can apply.
 - **`<id>.lock` is unlinked last**, after every other `<id>.*` name and not merely the four the layout freezes: once its name is gone the lock guards nothing, so a later unlink lands on somebody else's new session.
 - **A lock nobody could hold is a refusal, never licence to go on.** Acquiring answers in three ways, and the last two are not one: *held*; *not held right now* — `EWOULDBLOCK`, `ENOLCK`, `EMFILE`, `ELOOP`, or the file replaced under it — which makes a caller wait, skip or retry and claims nothing; and *there is no lock to be had here*, which is an **error** and refuses the id. Two errnos reach that third answer and they are reported apart, because the repairs are nothing alike:
   - `EACCES`/`EPERM` opening `<id>.lock`, or `ENOTSUP` from `flock`: **this filesystem cannot serialise session startup.** Going ahead unlocked is how two daemons come to claim one id and unlink each other's live sessions. A mode is one `chmod` away; a filesystem with no `flock` is a run directory to point elsewhere with `XDG_RUNTIME_DIR`.
   - `EROFS` opening `<id>.lock` (kind `ReadOnlyFilesystem`): **the run directory is read-only, so there is no session here to start and none to remove.** A fact about the mount and not about locking.
-- **A caller with nobody to report to gives up the standing rather than the work**: the daemon publishing its own id, its exit, and `list`'s sweep meet both of the last two answers the same way — they go on with what needs no lock and skip what does. So a daemon on such a host still binds and serves, but scrubs no `<id>.lock` and unlinks nothing on the way out. Whoever the user is actually waiting on — `spawn`, `attach`, `kill` — is what turns it into a message and an exit code (§ 10).
+- **A caller with nobody to report to gives up the standing rather than the work only where no new session can be exposed**: daemon exit and `list`'s sweep skip cleanup they cannot serialise. Startup has no such arm; a daemon that does not own the lock refuses the id before probing or binding. Whoever the user is actually waiting on — `spawn`, `attach`, `kill` — turns that refusal into a message and an exit code (§ 10).
 
 The daemon refuses to start where the run directory already holds **64** other session ids
 (`MAX_SESSIONS`), a backstop under the client-side cap
-[DESIGN.md § 5.1](DESIGN.md#51-identity) argues for. It is counted inside the locked region
-and before the bind, since taking the lock creates an `<id>.lock` the count would otherwise
-score against the caller. But the lock is per-*id* and the count is per-*directory*, so two
-starts on two ids hold a lock each and can read the same 63: **64 is a backstop a race can
-cross, not a ceiling.**
+[DESIGN.md § 5.1](DESIGN.md#51-identity) argues for. Each start atomically creates and locks
+its `<id>.lock` reservation before counting, and excludes only its own id. The locks are
+per-id, but their names are global counting tokens: of two contenders for the final slot,
+whichever creates its reservation second necessarily counts the first. A collector cannot
+remove a reservation while its start holds the lock. The count is therefore a ceiling, not
+a check-then-act race, without another directory-wide mutex.
 
 ### 6.4 Multiple clients
 
@@ -625,19 +630,22 @@ greeting on the one already attached.
 
 ### 6.5 Shutdown
 
-The child's exit is not the daemon's. `waitpid` → flush the ring to any attached client
-→ `Exit` frame → and the session goes on holding the status, the kind and the ring until
+The terminal's end is not the daemon's. End of file → collect a process outcome or reach
+the explicit unknown deadline → flush the ring to any attached client → `Exit` frame →
+and the session goes on holding the outcome and the ring until
 `last_detach + IDLE_TIMEOUT` reaps it, seven days from the departure that left it alone.
-That is the only deadline there is, so a client that attaches, reads the status and leaves
+That is the only deadline there is, so a client that attaches, reads the outcome and leaves
 starts a fresh seven days from *that* moment. A session that never started a PTY is reaped
 after 30 s instead. Nothing is written down for the interval: a tombstone would be a sixth
 name in the frozen layout ([DESIGN.md § 5.2](DESIGN.md#52-reaping)).
 
-The status is not readable the instant the master reports end of file, so it stays unknown
-for up to 2 s (`STATUS_GRACE`). **Past that the daemon synthesises one, and a client author
-has to know which:** `Exit{status: 0, kind: Exited}`, indistinguishable on the wire from a
-real exit 0 and a *fabrication*. Only a child that closed its terminal without exiting
-reaches it, and that process may still be running.
+The outcome is not readable the instant the master reports end of file, so it stays pending
+for up to 2 s (`OUTCOME_GRACE`). Past that the daemon reports
+`Exit{status: 0, kind: Unknown}`. This closes the transcript without inventing a process
+outcome: only a child that closed its terminal without exiting reaches this arm, and that
+process may still be running. `waitpid` remains active on `SIGCHLD`, so the child is still
+reaped if it exits after the frame has been sent; the already reported unknown outcome is
+never rewritten underneath a client.
 
 **End of file is not the only way an exit is heard about, and cannot be.** A shell that
 exits behind a job still holding the slave — `sleep 3600 &` then `exit` — never brings the
@@ -646,19 +654,20 @@ set (§ 6.2). That pipe is drained on the pass that reads it, where the stop pip
 deliberately never read at all: this session goes on, and a byte left in a watched
 descriptor is a `poll` that returns at once for the rest of its life. Two pipes rather than
 one carrying two kinds of byte, so no drain can mistake a stop for a child. The `waitpid`
-is then spent only where something says it may be ready — a `SIGCHLD`, an end of file still
-owing a status inside `STATUS_GRACE`, or a host where the pipe could not be armed — rather
-than on every pass of a running child's whole life. That grace is one `poll` wakeup at
-`gone_at + STATUS_GRACE` and not a cadence: an ordinary exit arrives as a `SIGCHLD` within
-microseconds, so polling for it would buy only the host with no pipe, which already asks
-every pass. Reporting is unchanged: the client hears nothing until the transcript is
-complete, which is still end of file.
+is then spent only where something says it may be ready — a `SIGCHLD`, or an end of file
+still owing an outcome inside `OUTCOME_GRACE` — rather than on every pass of a running
+child's whole life. Startup refuses the session if either signal pipe cannot be armed;
+running without the shutdown wakeup would bypass cleanup, and running without the child
+wakeup would leave some exits unreaped. That grace is one `poll` wakeup at
+`terminal_closed_at + OUTCOME_GRACE` and not a cadence: an ordinary exit arrives as a
+`SIGCHLD` within microseconds. The client hears nothing until the transcript is complete,
+which is still end of file.
 
 **The order is load-bearing**: `Exit` is queued only once *that* client's `sent_through` has
 reached the end of the ring, and a greeting rewinds `sent_through` to where the client
-resumes and clears the per-connection `exit_sent`. So a client that closes the tab on `Exit`
-never loses the transcript, and one arriving a week later replays it and is *then* handed
-the status.
+resumes and clears the per-connection `terminal_end_sent`. So a client that closes the tab
+on `Exit` never loses the transcript, and one arriving a week later replays it and is
+*then* handed the outcome.
 
 Reaping is self-inflicted — no cron, no supervisor. `SIGTERM` and `SIGINT` reach the same
 exit, so `nomux kill` (§ 6.6) collects the child and unlinks the run files instead of
@@ -867,12 +876,20 @@ first contact with every host, before any profile is cached, and again on any ho
 the client cannot open a `direct-streamlocal` channel to the socket. Deliberately dumb,
 which is why it never needs a version bump:
 
-- `poll` on stdin, stdout and the socket, copying through a per-direction buffer of one
-  `RELAY_CHUNK` — 16 KiB, the same figure both ways. **One copying path and no fast path**:
-  nothing reaches for `splice(2)` and nothing is discovered about the pair, so a direction
-  is only ever reading or holding what it read. `attach.rs` has why that is affordable —
-  one memcpy per 16 KiB, against the AES the same bytes meet one hop away. No frame is
-  parsed and nothing protocol-shaped is held.
+- The main loop polls stdin, the session socket and a non-blocking worker channel,
+  copying through a per-direction `RELAY_CHUNK` of 16 KiB. Actual stdout stays blocking:
+  its open-file description may be shared with the caller's shell, and `POLLOUT` promises
+  that only *some* progress is possible, so even the first large write may sleep. One
+  bounded self-exec worker owns that write; it is reaped on a clean end and carries a
+  parent-death signal so an abruptly killed relay cannot orphan it. A stalled pipe,
+  terminal, socket or regular file thus backpressures session output without stopping
+  stdin from reaching the session. The socketpair channel is the only additional fixed
+  kernel buffer, and closing it both reports worker failure and flushes every accepted
+  byte on a clean end.
+- **One copying path and no fast path**: nothing reaches for `splice(2)` and nothing is
+  discovered about the descriptor pair. `attach.rs` has why the extra copy is affordable —
+  one 16 KiB batch at a time against the encryption the same bytes meet one hop away. No
+  frame is parsed and nothing protocol-shaped is held.
 - It connects to the session's socket. Where nothing answers, `spawn` starts the daemon
   (§ 6.3) and waits for it; `attach` refuses (§ 10).
 - Half-close propagates: EOF on stdin becomes `shutdown(SHUT_WR)` on the socket, and the
@@ -966,8 +983,9 @@ of these each can produce. It reports the fate of *the relay*, never of the chil
 | 126 | This mode cannot have the session: `spawn` met an id already taken, `attach` one it could not join, or either met a socket that would not answer at all — full backlog, `EACCES`, descriptor limit — and a probe settling neither death nor life is evidence *of* a session (§ 6.3). Also a run directory refused (§ 6.3) — group-writable, another uid's, a symlink, unopenable by its owner — or one no source names at all, or one on a filesystem that can give no `flock` and so cannot serialise a spawn |
 | 127 | No such session. `attach`: a refused `connect`, a socket no longer there, or a run directory simply absent. `spawn`: a daemon that never bound within the timeout |
 
-The child's own status arrives in the `Exit` frame (§ 2.2) the relay cannot read (§ 7);
-`128+n` is the client's convention for it.
+The child's own status, when known, arrives in the `Exit` frame (§ 2.2) the relay cannot
+read (§ 7); `128+n` is the client's convention for a known signal. Kind `Unknown` carries
+no shell status and must not be interpreted as the canonical sentinel zero it transports.
 
 Only 64 is `sysexits.h`'s. 126 and 127 are the *shell's* exec codes applied to a session,
 and the collision is deliberate: a client runs these over an SSH exec channel where a

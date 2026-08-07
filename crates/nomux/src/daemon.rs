@@ -65,9 +65,9 @@ const MAX_SESSIONS: usize = 64;
 )]
 const IDLE_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
-/// How long a status may stay unreadable before the daemon reports one it invented, and
+/// How long an outcome may stay unreadable before the daemon reports it as unknown, and
 /// so how long after end of file the loop wakes to try a last `waitpid` (§ 6.5).
-const STATUS_GRACE: Duration = Duration::from_secs(2);
+const OUTCOME_GRACE: Duration = Duration::from_secs(2);
 
 /// Longest the poll loop sleeps with nothing else pending.
 #[expect(
@@ -137,9 +137,9 @@ const PENDING_INPUT_RETAINED: usize = 4096;
 #[derive(Debug)]
 struct Attached {
     conn: Conn,
-    /// Whether this connection has been told the child exited. Per connection, the session
-    /// outliving its child (§ 6.5): every later attach hears the status behind its replay.
-    exit_sent: bool,
+    /// Whether this connection has been told the terminal transcript ended. Per
+    /// connection, because every later attach hears the outcome behind its replay (§ 6.5).
+    terminal_end_sent: bool,
     /// Output offset already queued to this connection.
     sent_through: u64,
     /// Post-gap repaint policy, as this connection's `Hello` stated it (§ 4.3).
@@ -153,12 +153,12 @@ impl Attached {
     /// The connection promoted by a `Hello` that has not been answered yet.
     ///
     /// Three of the four are what [`Daemon::on_hello`] decides next, off that same
-    /// greeting. `exit_sent` is the one it does not touch: a connection hears the status
-    /// once, and this is the only place a fresh one starts owed it.
+    /// greeting. `terminal_end_sent` is the one it does not touch: a connection hears
+    /// the end once, and this is the only place a fresh one starts owed it.
     const fn greeting(conn: Conn) -> Self {
         Self {
             conn,
-            exit_sent: false,
+            terminal_end_sent: false,
             sent_through: 0,
             repaint_ctrl_l: false,
             repaint_due: false,
@@ -170,13 +170,12 @@ impl Attached {
 struct Daemon {
     paths: SessionPaths,
     listener: UnixListener,
-    /// Read end of the self-pipe [`crate::startup::arm_stop_signals`] armed, or
-    /// `None` on a host where it could not be armed at all.
+    /// Read end of the self-pipe [`crate::startup::arm_stop_signals`] armed. `None`
+    /// exists only for event-loop unit fixtures; startup refuses a session without it.
     stop_pipe: Option<OwnedFd>,
     /// The same for `SIGCHLD` ([`crate::startup::arm_child_signal`]), which is a
-    /// descriptor of its own for the reason that function gives. `None` is a worse
-    /// daemon rather than a broken one: [`Daemon::worth_a_waitpid`] then asks on every
-    /// pass, which is what the whole loop used to do.
+    /// descriptor of its own for the reason that function gives. As above, `None` is
+    /// only a unit-fixture fallback; startup refuses a session without the wakeup.
     child_pipe: Option<OwnedFd>,
     /// Why this session is ending, once anything has decided it should: a stop signal,
     /// or something it could not do without having failed. The loop leaves on its next
@@ -213,11 +212,12 @@ struct Daemon {
     /// order — so a signal landing between the two leaves its byte in an emptied pipe,
     /// which is the next wakeup rather than a reap nobody makes.
     child_signalled: bool,
-    /// When the PTY master reported end of file. Distinct from `exited`: the status is
-    /// usually not readable yet at that moment.
-    child_gone: Option<Instant>,
-    /// The child's status, `None` until `waitpid` hands it over.
-    exited: Option<(i32, ExitKind)>,
+    /// When the PTY master reported end of file. Distinct from `outcome`: `waitpid`
+    /// usually has no result yet at that moment.
+    terminal_closed_at: Option<Instant>,
+    /// The child's known outcome, or `Unknown` once the terminal has been closed for
+    /// [`OUTCOME_GRACE`] without one.
+    outcome: Option<(i32, ExitKind)>,
     /// When the listener may be polled again, after an `accept` that failed for a
     /// reason that will still be there next pass. `None` is the ordinary state.
     accept_retry: Option<Instant>,
@@ -229,7 +229,7 @@ struct Daemon {
     last_detach: Instant,
 }
 
-/// Runs the daemon for `session_id` until the child exits or the session is reaped.
+/// Runs the daemon for `session_id` until the session is stopped or reaped.
 ///
 /// `label` is the advisory display name for `nomux list` (`IMPLEMENTATION.md` § 6.6).
 ///
@@ -237,8 +237,12 @@ struct Daemon {
 ///
 /// Fails if the run directory or socket cannot be created, or if another daemon already
 /// owns this session.
-pub(crate) fn run(session_id: &str, label: Option<&str>) -> io::Result<()> {
-    let result = start(session_id, label);
+pub(crate) fn run(
+    session_id: &str,
+    label: Option<&str>,
+    inherited_lock_fd: Option<i32>,
+) -> io::Result<()> {
+    let result = start(session_id, label, inherited_lock_fd);
     if let Err(err) = &result {
         // Also to syslog, not only through the `Err` the caller prints: past
         // `release_startup_state` there is no stderr left to reach anybody through.
@@ -248,22 +252,29 @@ pub(crate) fn run(session_id: &str, label: Option<&str>) -> io::Result<()> {
 }
 
 /// The body of [`run`], separated so that every way out of it is logged once.
-fn start(session_id: &str, label: Option<&str>) -> io::Result<()> {
+fn start(session_id: &str, label: Option<&str>, inherited_lock_fd: Option<i32>) -> io::Result<()> {
     let paths = SessionPaths::new(session_id)?;
     ensure_run_dir(paths.dir())?;
 
-    // Asked before the lock creates the file, and the whole of what licenses removing it
-    // below: `<id>.lock` outlives the daemon that made it, so a name already here is
-    // somebody else's standing on the id and no refusal of ours may take it away. An
-    // answer that cannot be read counts as theirs, which removes nothing.
-    let lock_is_ours = !fs::exists(paths.lock()).unwrap_or(true);
-
-    // Held across the whole of claiming the id, which turns on the evidence `list` and
-    // `kill` read. Never blocking, and going ahead unlocked rather than refusing (§ 6.3).
-    let publishing = paths.try_lock_spawn();
-    // Standing to remove `<id>.lock` on the way out, and it takes both halves: a lock
-    // that came back, over a name this call is what put there.
-    let scrub_lock = publishing.is_some() && lock_is_ours;
+    // The authority to probe, replace and bind this id. `spawn` hands its already-locked
+    // open-file description across exec; a daemon invoked directly has to acquire the
+    // same lock for itself. Proceeding without either is the probe/unlink race that can
+    // leave two live daemons owning one id.
+    let publishing = match inherited_lock_fd {
+        Some(raw) => paths.inherit_spawn_lock(raw)?,
+        None => paths.try_lock_spawn_or_refuse()?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                format!(
+                    "session {} is being started or removed by another process",
+                    paths.id()
+                ),
+            )
+        })?,
+    };
+    // Only an acquisition that atomically created the directory entry may scrub it on
+    // a refusal. For an inherited authority the parent owns failed-handoff cleanup.
+    let scrub_lock = publishing.created_name();
 
     // Inside that locked region and before the bind, per § 6.3: taking the lock created
     // `<id>.lock`, which `session_id_of` counts as a session, so a refusal that left it
@@ -304,10 +315,11 @@ fn start(session_id: &str, label: Option<&str>) -> io::Result<()> {
     let (stop_pipe, child_pipe) = match publish(&paths, label) {
         Ok(pipes) => pipes,
         Err(err) => {
-            // Released first: `unlink_all` takes this same lock, and `flock` conflicts
-            // between two open descriptions of one file even within a process (§ 6.6).
-            drop(publishing);
-            paths.unlink_all();
+            // This is still the publication authority, including when `spawn` retains
+            // another reference to the same inherited open-file description. Cleaning
+            // through it avoids releasing and then parking behind the parent that is
+            // waiting for this startup to finish.
+            drop(paths.unlink_all_locked(&publishing));
             return Err(err);
         }
     };
@@ -338,8 +350,8 @@ fn start(session_id: &str, label: Option<&str>) -> io::Result<()> {
         win: WinSize::default(),
         applied_win: None,
         child_signalled: false,
-        child_gone: None,
-        exited: None,
+        terminal_closed_at: None,
+        outcome: None,
         accept_retry: None,
         agent_accept_retry: None,
         last_detach: Instant::now(),
@@ -362,9 +374,8 @@ fn start(session_id: &str, label: Option<&str>) -> io::Result<()> {
 ///
 /// # Errors
 ///
-/// Propagates the failure to write `<id>.pid`, and only that: a daemon sharing a login
-/// session, one without a stop pipe, one without a child pipe and one without a label in
-/// `list` are worse daemons rather than reasons to have no session.
+/// Propagates failures to arm either required signal path or write `<id>.pid`. Detachment
+/// and the advisory label remain best effort: neither can make the event loop unsafe.
 fn publish(
     paths: &SessionPaths,
     label: Option<&str>,
@@ -384,8 +395,8 @@ fn publish(
     // `arm_stop_signals` is the call that clears the inherited mask and a signal blocked
     // and pending is delivered the instant it does, so a handler installed afterwards
     // silently misses the first notification.
-    let child_pipe = arm_child_signal().ok();
-    let stop_pipe = arm_stop_signals().ok();
+    let child_pipe = Some(arm_child_signal()?);
+    let stop_pipe = Some(arm_stop_signals()?);
 
     paths.write_pid()?;
     if let Some(label) = label {
@@ -444,7 +455,9 @@ fn bind_socket(paths: &SessionPaths) -> io::Result<UnixListener> {
 
 /// Whether `dir` already holds [`MAX_SESSIONS`] sessions other than `mine`.
 /// `IMPLEMENTATION.md` § 6.3 has the policy, and [`session_ids`] is the rule `list`
-/// discovers sessions with (§ 6.6).
+/// discovers sessions with (§ 6.6). Every contender has created its locked name before
+/// this call, so those names are reservations and two different ids cannot both observe
+/// the same final slot as free.
 fn at_session_ceiling(dir: &Path, mine: &str) -> bool {
     session_ids(dir)
         .iter()
@@ -604,7 +617,10 @@ impl Daemon {
             // Dropped once the child is gone: the master reports `HUP` from then on, which
             // would spin the loop for the rest of the session (§ 6.5) with nothing to read.
             Source::Pty => {
-                let pty = self.pty.as_ref().filter(|_| self.child_gone.is_none())?;
+                let pty = self
+                    .pty
+                    .as_ref()
+                    .filter(|_| self.terminal_closed_at.is_none())?;
                 let mut flags = PollFlags::IN;
                 if !self.pending_input.is_empty() {
                     flags |= PollFlags::OUT;
@@ -774,7 +790,7 @@ impl Daemon {
         }
         // Emptied, where the pipe just above deliberately is not: this session goes on, and
         // a byte left in a watched descriptor is [`ACCEPT_BACKOFF`]'s spin with nothing
-        // wrong at all. Before the `waitpid` [`Daemon::collect_status`] spends at the end
+        // wrong at all. Before the `waitpid` [`Daemon::collect_outcome`] spends at the end
         // of this pass, in [`Daemon::child_signalled`]'s order.
         if revents(Source::Child).intersects(READABLE) {
             self.child_signalled = true;
@@ -843,10 +859,10 @@ impl Daemon {
         if self.input_backlog() {
             self.read_client(read_buf, scratch);
         }
-        // Immediately before the pump that turns a status into a frame: nothing arranges a
-        // wakeup for a status already collected, so with the master out of the poll set an
-        // `Exit` left for the next pass waits on [`IDLE_TICK`].
-        self.collect_status();
+        // Immediately before the pump that turns an outcome into a frame: nothing
+        // arranges a wakeup for one already collected, so with the master out of the
+        // poll set an `Exit` left for the next pass waits on [`IDLE_TICK`].
+        self.collect_outcome();
         self.pump_output();
         self.write_client();
     }
@@ -859,19 +875,20 @@ impl Daemon {
             at.saturating_duration_since(Instant::now()).min(IDLE_TICK)
         });
         // A listener out of the poll set, a pending connection that says nothing, an agent
-        // connection gone quiet, and a status § 6.5 is about to synthesise have no other
-        // wakeup behind them. The grace itself rather than a retry regime: an ordinary exit
-        // arrives as a `SIGCHLD` byte within microseconds, and a host with no child pipe —
+        // connection gone quiet, and an unknown outcome § 6.5 is about to report have no
+        // other wakeup behind them. The grace itself rather than a retry regime: an
+        // ordinary exit arrives as a `SIGCHLD` byte within microseconds, and a host with no
+        // child pipe —
         // where [`Daemon::worth_a_waitpid`] already asks every pass — hears about one up to
-        // [`STATUS_GRACE`] late rather than within 5 ms.
+        // [`OUTCOME_GRACE`] late rather than within 5 ms.
         if let Some(at) = [
             self.accept_retry,
             self.agent_accept_retry,
             self.pending.as_ref().map(|(_, at)| *at),
             self.agent.as_ref().and_then(Agent::deadline),
-            self.child_gone
-                .filter(|_| self.exited.is_none())
-                .map(|gone_at| gone_at + STATUS_GRACE),
+            self.terminal_closed_at
+                .filter(|_| self.outcome.is_none())
+                .map(|closed_at| closed_at + OUTCOME_GRACE),
         ]
         .into_iter()
         .flatten()
@@ -996,13 +1013,18 @@ impl Daemon {
         let Some(pty) = self.pty.as_ref() else {
             return;
         };
-        // [`nbio::read_or_eof`] answers a stray errno with `Eof` rather than propagating
-        // it, for the reason [`Daemon::write_pty`] gives about the other half.
         match nbio::read_or_eof(pty.master(), buf) {
             // Always drain, attached or not: an unread PTY blocks the child on write (§ 4).
             nbio::ReadOutcome::Data(n) => self.ring.push(buf.get(..n).unwrap_or(&[])),
-            nbio::ReadOutcome::Eof => self.on_child_exit(),
+            nbio::ReadOutcome::Eof => self.on_terminal_closed(),
             nbio::ReadOutcome::WouldBlock => {}
+            nbio::ReadOutcome::Failed(_) => {
+                crate::sanitize::error(self.paths.id(), "PTY read failed");
+                self.reject(ErrorCode::Internal, "terminal read failed");
+                if self.stop.is_none() {
+                    self.stop = Some("the terminal failed");
+                }
+            }
         }
     }
 
@@ -1011,7 +1033,7 @@ impl Daemon {
             return;
         };
         // No PTY error ends the session, in either direction ([`Daemon::read_client`] states
-        // the rule). What this must *not* do is record the exit: `child_gone` drops the
+        // the rule). What this must *not* do is record the exit: `terminal_closed_at` drops the
         // master from the poll set, and the read side can still be holding everything the
         // child wrote on its way out.
         if nbio::drain_to(&mut self.pending_input, pty.master()).is_err() {
@@ -1029,10 +1051,10 @@ impl Daemon {
     /// Records that the child has let go of the terminal; the stamp starts no clock (§ 6.5).
     ///
     /// No status is collected here: end of file usually arrives first, for the reason
-    /// [`Daemon::collect_status`] gives, and it runs later this same pass.
-    fn on_child_exit(&mut self) {
-        if self.child_gone.is_none() {
-            self.child_gone = Some(Instant::now());
+    /// [`Daemon::collect_outcome`] gives, and it runs later this same pass.
+    fn on_terminal_closed(&mut self) {
+        if self.terminal_closed_at.is_none() {
+            self.terminal_closed_at = Some(Instant::now());
         }
         // The stamp above just took the master out of the poll set, so `write_pty` will
         // never run again to drain this — and a queue left at [`MAX_PENDING_INPUT`]
@@ -1051,10 +1073,11 @@ impl Daemon {
     /// [`Pty::pid_reissued`] load-bearing; whether the client is *told* is
     /// [`Daemon::pump_output`]'s decision.
     ///
-    /// The `waitpid` runs ahead of the `self.exited` test, that call being the reaping
-    /// itself: § 6.5's synthesised status names a child that may still be running, so
-    /// leaving on a status alone held its zombie for the rest of the session.
-    fn collect_status(&mut self) {
+    /// The `waitpid` runs ahead of the `self.outcome` test, that call being the reaping
+    /// itself: § 6.5's unknown outcome names a child that may still be running, so
+    /// stopping these asks after reporting it held the later zombie for the rest of the
+    /// session.
+    fn collect_outcome(&mut self) {
         let reaped = if self.worth_a_waitpid() {
             self.pty
                 .as_mut()
@@ -1065,18 +1088,19 @@ impl Daemon {
         // Spent whether or not anything came back, and after the ask: a `SIGCHLD` from here
         // on leaves its byte in the pipe [`Daemon::poll_once`] emptied, which is a wakeup.
         self.child_signalled = false;
-        if self.exited.is_some() {
+        if self.outcome.is_some() {
             return;
         }
         if let Some(status) = reaped {
-            self.exited = Some(pty::exit_parts(status));
+            self.outcome = Some(pty::exit_parts(status));
         } else if self
-            .child_gone
-            .is_some_and(|gone_at| gone_at.elapsed() >= STATUS_GRACE)
+            .terminal_closed_at
+            .is_some_and(|closed_at| closed_at.elapsed() >= OUTCOME_GRACE)
         {
             // The child closed the terminal without exiting — anything that daemonises
-            // itself — so no status is coming and the client is still owed an `Exit`.
-            self.exited = Some((0, ExitKind::Exited));
+            // itself — so no outcome is available by the transcript deadline. The
+            // client is still owed its end, explicitly without a process outcome.
+            self.outcome = Some((0, ExitKind::Unknown));
         }
     }
 
@@ -1085,16 +1109,17 @@ impl Daemon {
     ///
     /// A `SIGCHLD` is the strong condition rather than a hint: `exit_notify` sets the dying
     /// task `EXIT_ZOMBIE` before it queues the signal, so a byte in the child pipe is a
-    /// `waitpid` that will not come back empty. The second clause serves [`STATUS_GRACE`]
-    /// whether the signal arrived or not; the third is a host where the pipe could not be
-    /// armed, where the answer is always yes as every pass used to be.
+    /// `waitpid` that will not come back empty. The second clause serves [`OUTCOME_GRACE`]
+    /// whether the signal arrived or not; the third is the pipe-free unit fixture, where
+    /// the safe conservative answer is always yes as every pass used to be.
     ///
-    /// Deliberately *not* `child_gone.is_some()` on its own: past § 6.5's synthesised
-    /// status that stays true over a child that daemonised itself and may run for days —
-    /// the every-pass `waitpid` this exists to delete, back in the longest sessions.
+    /// Deliberately *not* `terminal_closed_at.is_some()` on its own: past § 6.5's
+    /// unknown outcome that stays true over a child that daemonised itself and may run
+    /// for days — the every-pass `waitpid` this exists to delete, back in the longest
+    /// sessions.
     const fn worth_a_waitpid(&self) -> bool {
         self.child_signalled
-            || (self.child_gone.is_some() && self.exited.is_none())
+            || (self.terminal_closed_at.is_some() && self.outcome.is_none())
             || self.child_pipe.is_none()
     }
 
@@ -1308,7 +1333,7 @@ impl Daemon {
     /// Asks the child to redraw after a gap, by whichever means this client chose;
     /// `IMPLEMENTATION.md` § 4.3 has why the choice belongs to the client.
     fn repaint(&mut self) {
-        if self.child_gone.is_some() {
+        if self.terminal_closed_at.is_some() {
             return;
         }
         if self
@@ -1338,8 +1363,8 @@ impl Daemon {
         if end > self.in_applied {
             // Only while there is a terminal to write to: past the child's exit `write_pty`
             // never runs again, so a client that kept sending would refill what
-            // `on_child_exit` emptied. `in_applied` moves either way (§ 3).
-            if self.child_gone.is_none() {
+            // `on_terminal_closed` emptied. `in_applied` moves either way (§ 3).
+            if self.terminal_closed_at.is_none() {
                 let skip = usize::try_from(self.in_applied - offset).unwrap_or(data.len());
                 self.pending_input.extend(data.get(skip..).unwrap_or(&[]));
             }
@@ -1355,8 +1380,9 @@ impl Daemon {
         let end = self.ring.end();
         // Both, a status often being collected long before the terminal is free. The
         // `Exit` frame promises the transcript is complete, so end of file on the master
-        // is what licenses it — and `since_exit_secs` is measured from that moment.
-        let exit = self.child_gone.zip(self.exited);
+        // is what licenses it — and `since_terminal_closed_secs` is measured from that
+        // moment.
+        let terminal_end = self.terminal_closed_at.zip(self.outcome);
         let Some(client) = self.client.as_mut() else {
             return;
         };
@@ -1388,16 +1414,17 @@ impl Daemon {
 
         // Last, and only once everything the child wrote is queued: § 6.5's ordering
         // promise, enforced in this one place.
-        if !client.exit_sent
+        if !client.terminal_end_sent
             && client.sent_through >= end
-            && let Some((gone, (status, kind))) = exit
+            && let Some((closed_at, (status, kind))) = terminal_end
         {
             client.conn.send(&Frame::Exit {
                 status,
                 kind,
-                since_exit_secs: u32::try_from(gone.elapsed().as_secs()).unwrap_or(u32::MAX),
+                since_terminal_closed_secs: u32::try_from(closed_at.elapsed().as_secs())
+                    .unwrap_or(u32::MAX),
             });
-            client.exit_sent = true;
+            client.terminal_end_sent = true;
         }
         // Coalesced onto the moment this client holds the whole ring rather than issued
         // per gap (§ 4.3).
@@ -1460,7 +1487,7 @@ impl Daemon {
                     client.conn.send_agent_data(generation, data);
                 }
             }
-            nbio::ReadOutcome::Eof => self.close_agent_channel(),
+            nbio::ReadOutcome::Eof | nbio::ReadOutcome::Failed(_) => self.close_agent_channel(),
             nbio::ReadOutcome::WouldBlock => {}
         }
     }
@@ -1487,7 +1514,7 @@ impl Daemon {
         // not been delivered through yet.
         let finished = client.conn.flush_some().is_err()
             || client.conn.queued() >= ABANDON_PENDING_WRITE
-            || (client.exit_sent && client.conn.is_eof() && client.conn.queued() == 0);
+            || (client.terminal_end_sent && client.conn.is_eof() && client.conn.queued() == 0);
         if finished {
             self.drop_client();
         }
@@ -1636,8 +1663,8 @@ mod tests {
             win: WinSize::default(),
             applied_win: None,
             child_signalled: false,
-            child_gone: None,
-            exited: None,
+            terminal_closed_at: None,
+            outcome: None,
             accept_retry: None,
             agent_accept_retry: None,
             last_detach: Instant::now(),
@@ -1910,16 +1937,16 @@ mod tests {
     ///
     /// Asked directly because the syscall it elides is not observable from out here: what
     /// a test can pin is the decision, and the decision is the change. The third state is
-    /// the one with a defect behind it — `child_gone` alone stays true for the rest of a
-    /// session whose child daemonised itself, so a gate written on it would put the
-    /// every-pass `waitpid` back in exactly the sessions most likely to last days.
+    /// the one with a defect behind it — `terminal_closed_at` alone stays true for the
+    /// rest of a session whose child daemonised itself, so a gate written on it would
+    /// put the every-pass `waitpid` back in exactly the sessions most likely to last days.
     #[test]
     fn a_waitpid_is_asked_for_only_where_something_says_it_may_be_ready() {
         let root = Scratch::new("waitpid-gate");
         let mut daemon = blank(&root, "gate");
         assert!(
             daemon.worth_a_waitpid(),
-            "a host with no child pipe has nothing else to go on, and must ask as every \
+            "a pipe-free fixture has nothing else to go on, and must ask as every \
              pass used to"
         );
 
@@ -1941,16 +1968,16 @@ mod tests {
              is a `waitpid` that will not come back empty"
         );
 
-        // End of file ahead of the exit, which is [`STATUS_GRACE`]'s whole subject: asked
+        // End of file ahead of the exit, which is [`OUTCOME_GRACE`]'s whole subject: asked
         // on every pass until the grace expires, whether the signal arrived or not.
         daemon.child_signalled = false;
-        daemon.child_gone = Some(Instant::now());
+        daemon.terminal_closed_at = Some(Instant::now());
         assert!(daemon.worth_a_waitpid());
 
-        daemon.exited = Some((0, ExitKind::Exited));
+        daemon.outcome = Some((0, ExitKind::Unknown));
         assert!(
             !daemon.worth_a_waitpid(),
-            "§ 6.5's synthesised status leaves `child_gone` set over a child that may run \
+            "§ 6.5's unknown outcome leaves `terminal_closed_at` set over a child that may run \
              for days, so the end of file cannot be the condition on its own"
         );
     }

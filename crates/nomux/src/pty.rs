@@ -903,6 +903,7 @@ mod tests {
                 ReadOutcome::Data(n) => seen.push_str(&String::from_utf8_lossy(&buf[..n])),
                 ReadOutcome::WouldBlock => std::thread::sleep(HANGUP_POLL_INTERVAL),
                 ReadOutcome::Eof => break,
+                ReadOutcome::Failed(err) => panic!("read the PTY output: {err}"),
             }
             for (at, _) in seen.match_indices(marker) {
                 let tail = &seen[at + marker.len()..];

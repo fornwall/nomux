@@ -31,7 +31,7 @@ pub use frame::{ErrorCode, ExitKind, Frame, Hello, HelloOk, Linger, RESUME_FROM_
 /// revision in force and nothing before it. `tests/codec.rs`'s `vectors` module holds the
 /// constant, the byte vectors and the document to each other, so a bump has to move all
 /// three.
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 9;
 
 /// Fixed frame header size: a reader sizes the payload from the first four bytes it has,
 /// and never has to scan for a boundary.
@@ -104,7 +104,7 @@ wire_enum! {
     Resize = 0x06,
     /// Output was discarded by ring overflow; the stream is discontinuous.
     Gap = 0x07,
-    /// The child process terminated.
+    /// The terminal stream ended, with the child outcome where it is known.
     Exit = 0x08,
     /// Client leaves without terminating the session.
     Detach = 0x09,

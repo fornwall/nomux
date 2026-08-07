@@ -100,9 +100,9 @@ stateDiagram-v2
   Spawning --> Attached: bind socket, fork, PTY on the first Hello
   Attached --> Detached: connection lost / explicit detach
   Detached --> Attached: attach, resume from offset
-  Attached --> Ended: child exits, Exit after the last output
-  Detached --> Ended: child exits, status held
-  Ended --> Ended: attach, replay then the status again
+  Attached --> Ended: terminal closes, Exit after the last output
+  Detached --> Ended: terminal closes, outcome held
+  Ended --> Ended: attach, replay then the outcome again
   Detached --> Reaping: idle timeout since the last detach
   Ended --> Reaping: idle timeout since the last detach
   Reaping --> [*]: signal whatever is left, unlink run files

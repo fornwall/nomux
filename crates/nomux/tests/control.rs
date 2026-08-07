@@ -991,6 +991,60 @@ fn kill_signals_what_the_pidfile_names_even_when_another_daemon_answers_on_the_s
 
 /// Regression: no run file can park the control surface in a syscall.
 ///
+/// The spawn lock is opened on every creation and collection path, so it needs the
+/// same nonblocking file-type boundary as the pidfile and label below. A FIFO at this
+/// name used to park before `flock` was even attempted: `open(O_RDONLY)` waits for a
+/// writer forever, outside every lock deadline. `list` may conservatively leave an
+/// entry it cannot serialise; `kill` and `spawn` must report the malformed lock.
+#[test]
+fn no_mode_parks_on_a_spawn_lock_that_is_a_fifo() {
+    let deadline = Instant::now() + PATIENCE;
+    let root = run_root("lock_fifo");
+    let dir = root.join("nomux");
+    fs::create_dir_all(&dir).expect("create the run directory");
+    let lock = dir.join("fifo_lock.lock");
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        &lock,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::from_bits_truncate(0o600),
+        0,
+    )
+    .expect("plant a FIFO where the spawn lock should be");
+
+    let run = |args: &[&str]| {
+        ran_by(&mut nomux(&root, args), deadline)
+            .unwrap_or_else(|| panic!("`nomux {args:?}` parked on a FIFO spawn lock"))
+    };
+    let listed = run(&["list"]);
+    let killed = run(&["kill", "fifo_lock"]);
+    let spawned = run(&["spawn", "fifo_lock"]);
+
+    succeeded(
+        &listed,
+        "list failed instead of conservatively skipping the entry",
+    );
+    for (mode, expected, output) in [("kill", 1, killed), ("spawn", 126, spawned)] {
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "{mode} accepted a FIFO as a spawn lock: {:?}",
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).contains("not a regular file"),
+            "{mode} did not identify the malformed lock: {:?}",
+            stderr(&output)
+        );
+    }
+    assert!(
+        lock.exists(),
+        "a mode unlinked the malformed lock without owning it"
+    );
+}
+
+/// Regression: no ordinary run file can park the control surface in a syscall.
+///
 /// A FIFO opened `O_RDONLY` without `O_NONBLOCK` blocks in `open(2)` until somebody
 /// opens it for writing, which for a file nobody is writing is for ever — so a FIFO
 /// at `<id>.pid` or `<id>.label` stopped the escape hatch dead. The 0700 directory
@@ -1053,6 +1107,38 @@ fn the_control_surface_does_not_park_on_a_run_file_that_is_a_fifo() {
     succeeded(
         &collected,
         "the session outlived the kill that was given a pidfile again",
+    );
+}
+
+/// Runtime diagnostics cross the same terminal boundary as argv diagnostics.
+///
+/// The run-directory path comes from the environment and is repeated in refusals. A
+/// newline could forge a second diagnostic and an escape sequence could drive the
+/// terminal unless the final reporting boundary escapes the complete error, not just
+/// command-line parsing errors.
+#[test]
+fn a_runtime_error_cannot_drive_the_terminal_it_is_printed_to() {
+    let root = run_root("runtime_escape").join("line\n\u{1b}]0;forged-title\u{7}");
+    fs::create_dir_all(&root).expect("create the hostile runtime root");
+    fs::write(root.join("nomux"), b"not a directory").expect("plant a bad run directory");
+
+    let listed = control(&root, &["list"]);
+    assert_eq!(
+        listed.status.code(),
+        Some(1),
+        "a bad run directory was accepted"
+    );
+    let complaint = stderr(&listed);
+    let body = complaint
+        .strip_suffix('\n')
+        .expect("a diagnostic ends in exactly its own line break");
+    assert!(
+        !body.contains('\n') && !body.contains('\u{1b}') && !body.contains('\u{7}'),
+        "a runtime-controlled path emitted terminal controls verbatim: {complaint:?}"
+    );
+    assert!(
+        complaint.contains("line\\n\\u{1b}]0;forged-title\\u{7}"),
+        "the escaped refusal no longer identifies the failing path: {complaint:?}"
     );
 }
 

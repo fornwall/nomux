@@ -964,160 +964,150 @@ fn a_session_that_ends_with_the_relays_input_unread_still_exits_clean() {
     );
 }
 
-/// Regression: a write to stdout that a signal cut short must not send the relay
-/// straight back into the kernel for the rest of it.
+/// Regression: a live stdout that stops draining must backpressure only session
+/// output, never the relay's independent stdin-to-session direction.
 ///
-/// `nbio::drain_to` used to write until the descriptor refused. That is safe against
-/// the daemon's non-blocking descriptors, but the relay points it at *stdout*, which
-/// is left blocking because it may be a terminal whose open file description the
-/// user's shell shares. There the second `writev` is a second block, and the relay
-/// sits inside it with the other direction unserved: `POLLOUT` promises only that
-/// *some* write will succeed, which is exactly what the loop read as more.
+/// `poll(POLLOUT)` promises that a write can make some progress, not that this relay's
+/// whole 16 KiB write will return. Linux makes the failure deterministic for a pipe:
+/// leave exactly `PIPE_BUF` bytes free, then a larger blocking write fills that space
+/// and sleeps until its entire remainder can be accepted. The unread-byte count below
+/// proves the write reached that sleep before the marker is sent.
 ///
-/// What makes it observable is a *short* write, and on Linux a blocking descriptor
-/// short-writes only when a signal ends the call after it has already transferred
-/// something. `SIGSTOP` cannot be caught, blocked or ignored, so it always reaches a
-/// task parked in a write; `SIGCONT` then puts the relay back exactly where the fix
-/// has to matter — one `drain_to` call, mid-queue, against a destination still full.
-///
-/// The destination is a socketpair with a shrunken send buffer, which is what makes
-/// that exact rather than probable: a unix socket blocks only once its buffer is at
-/// the limit, so the write made on `POLLOUT` always transfers at least one segment
-/// before it stops. Shrinking the buffer is what makes 16 KiB more than one segment;
-/// at the default 208 KiB the whole write is a single one, which either fits or is
-/// refused outright.
+/// With stdout in the main poll loop, the marker cannot move. The bounded stdout
+/// worker keeps the blocked write and the backpressure but leaves the main loop free
+/// to forward it. Reading the pipe only after that assertion releases the worker and
+/// also proves normal shutdown flushes every queued output byte.
 #[test]
-fn a_write_to_stdout_a_signal_cut_short_does_not_park_the_relay_again() {
-    use std::os::fd::OwnedFd;
+fn a_blocked_stdout_does_not_block_relay_input() {
+    use std::os::fd::AsRawFd;
 
-    /// Small enough that one of the relay's 16 KiB writes is several segments, so it
-    /// can stop partway rather than only at a boundary of its own.
-    const STDOUT_BUFFER: libc::c_int = 4096;
-    /// More than the shrunken socket and the relay's own 16 KiB buffer hold between
-    /// them, so the write it parks in cannot end by running out of bytes.
-    const PUSH: usize = 64 * 1024;
+    const PUSH: usize = 16 * 1024;
     /// Sent the other way, and nothing to do with the write above: this is the
     /// traffic the parked relay is failing to serve.
     const MARKER: &[u8] = b"NOMUX-OTHER-DIRECTION";
-    /// How long the marker is given to *not* arrive. A wall-clock negative, and safe
-    /// as one only because [`parked_in_a_write`] has already been observed true
-    /// below: what this has to outlast is a relay going round its loop, which takes
-    /// microseconds, and never a relay that has not reached the write yet.
-    const PARKED: Duration = Duration::from_millis(250);
 
-    // Never read from, which is what keeps the relay's stdout full; held to the end
-    // of the test, since a closed one would be an `EPIPE` rather than a block.
-    let (_unread, relay_stdout) = UnixStream::pair().expect("a socketpair for the relay's stdout");
-    shrink_send_buffer(&relay_stdout, STDOUT_BUFFER);
+    let (reader, mut relay_stdout) = std::io::pipe().expect("a pipe for relay stdout");
+    // SAFETY: `fcntl` is given the live pipe descriptor the borrow above keeps open.
+    let capacity = unsafe { libc::fcntl(relay_stdout.as_raw_fd(), libc::F_GETPIPE_SZ) };
+    assert!(
+        capacity > i32::try_from(libc::PIPE_BUF).expect("PIPE_BUF fits i32"),
+        "stdout pipe capacity is not larger than PIPE_BUF: {capacity}"
+    );
+    let capacity = usize::try_from(capacity).expect("a positive pipe capacity fits usize");
+    let prefilled = capacity - libc::PIPE_BUF;
+    relay_stdout
+        .write_all(&vec![b'p'; prefilled])
+        .expect("prefill stdout to one atomic write short of full");
+
     let (mut child, mut peer, _listener) = relay_onto_a_socket_over(
-        "relay_short_write",
+        "relay_blocked_stdout",
         Stdio::piped(),
-        Stdio::from(OwnedFd::from(relay_stdout)),
-        Stdio::null(),
+        Stdio::from(relay_stdout),
+        Stdio::piped(),
     );
     let mut stdin = child.stdin.take().expect("stdin");
-    let relay = child.id();
 
-    peer.write_all(&vec![b'x'; PUSH])
+    let pushed = vec![b'x'; PUSH];
+    peer.write_all(&pushed)
         .expect("write to the relay's socket");
-    // Short, because every look for the marker below reads through this and a relay
-    // that is parked has nothing to say.
-    peer.set_read_timeout(Some(Duration::from_millis(20)))
-        .expect("a peer the polls below must not wait on");
-
     assert!(
-        poll_until(Duration::from_secs(10), || parked_in_a_write(relay)),
-        "the relay never parked inside a write to its stdout, so there is no \
-         interrupted write below for either version of `drain_to` to answer"
+        poll_until(Duration::from_secs(10), || {
+            rustix::io::ioctl_fionread(&reader)
+                .ok()
+                .and_then(|held| usize::try_from(held).ok())
+                == Some(capacity)
+        }),
+        "the stdout write never filled the last PIPE_BUF and blocked"
     );
 
-    // Written only now, so that it cannot have been served before the relay stopped.
+    peer.set_read_timeout(Some(Duration::from_millis(20)))
+        .expect("marker probes must not wait");
     stdin.write_all(MARKER).expect("write to the relay's stdin");
     stdin.flush().expect("flush the relay's stdin");
     let mut seen = Vec::new();
     assert!(
-        !poll_until(PARKED, || marker_arrived(&mut peer, &mut seen, MARKER)),
-        "the relay served its stdin while it was supposed to be parked in a write, \
-         so the wait below would be satisfied by a marker that had already arrived"
-    );
-
-    // The stop is what ends the write; the continue is what makes what happens next
-    // the relay's own decision. Waited out rather than sent back to back: a `SIGCONT`
-    // generated before the stop has been taken discards it, and the write would then
-    // be restarted rather than cut short.
-    let pid = rustix::process::Pid::from_raw(relay.cast_signed()).expect("the relay's pid");
-    rustix::process::kill_process(pid, rustix::process::Signal::STOP).expect("stop the relay");
-    assert!(
-        poll_until(Duration::from_secs(10), || process_state(relay)
-            == Some('T')),
-        "the relay never took the stop, so the write it is in was never interrupted"
-    );
-    rustix::process::kill_process(pid, rustix::process::Signal::CONT).expect("continue the relay");
-
-    assert!(
         poll_until(Duration::from_secs(10), || marker_arrived(
             &mut peer, &mut seen, MARKER
         )),
-        "the relay went back into the kernel for the rest of a write the signal had \
-         already ended, leaving the other direction unserved"
+        "a blocked stdout stopped the independent stdin-to-session direction"
     );
-}
 
-/// Shrinks `socket`'s send buffer to `bytes`, so that a write larger than it cannot
-/// complete in one go.
-///
-/// A unix socket splits a write into segments of half its send buffer and waits for
-/// room for each in turn, so the size of that buffer is what decides whether a write
-/// bigger than the space available comes back short or blocks with nothing
-/// transferred. The default 208 KiB is larger than anything this suite writes in one
-/// call, which makes every write all-or-nothing; a small one is what puts a
-/// destination into the state § 7's relay has to survive.
-///
-/// Through `libc` because rustix's socket options live behind its `net` feature,
-/// which this tree does not enable — the same reason [`has_unread_bytes`] is written
-/// by hand.
-fn shrink_send_buffer(socket: &UnixStream, bytes: libc::c_int) {
-    use std::os::fd::AsRawFd;
-
-    // SAFETY: `setsockopt` is given the address and length of a `c_int` that
-    // outlives the call, on a descriptor the borrow keeps open for it.
-    let set = unsafe {
-        libc::setsockopt(
-            socket.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_SNDBUF,
-            std::ptr::from_ref(&bytes).cast::<libc::c_void>(),
-            u32::try_from(size_of::<libc::c_int>()).expect("the size of a c_int"),
-        )
-    };
+    let deadline = Instant::now() + RELAY_PATIENCE;
+    let drain = thread::spawn(move || {
+        let mut reader = reader;
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).expect("drain relay stdout");
+        got
+    });
+    drop(stdin);
+    drop(peer);
+    assert!(
+        poll_by(deadline, || !child.is_running()),
+        "the relay did not finish after its session and stdout both drained"
+    );
+    let finished = child
+        .into_exited()
+        .wait_with_output()
+        .expect("collect the relay");
+    let got = join_before(drain, deadline, "stdout drain");
+    assert!(
+        finished.status.success(),
+        "the recovered relay failed: {:?}",
+        stderr(&finished)
+    );
     assert_eq!(
-        set,
-        0,
-        "shrinking the send buffer failed: {}",
-        std::io::Error::last_os_error()
+        got.len(),
+        prefilled + pushed.len(),
+        "normal shutdown did not flush the whole bounded stdout queue"
+    );
+    assert!(
+        got[..prefilled].iter().all(|byte| *byte == b'p') && got[prefilled..] == pushed,
+        "stdout bytes changed order across the blocked write"
     );
 }
 
-/// Whether `pid` is inside a `writev(2)` at this moment, as `/proc` reports it.
+/// The stdout worker is allowed to block indefinitely, so it must not outlive a relay
+/// killed before the normal close-and-wait path can reap it.
 ///
-/// The relay makes exactly one kind of write — `nbio::drain_to`'s `writev` across the
-/// two halves of its queue — so the syscall number is the most direct statement of
-/// the state the test needs, and far cheaper than inferring it from what the relay
-/// has stopped doing. `/proc/<pid>/syscall` gives a number and its arguments, or
-/// `running`; anything that does not parse, including a kernel that does not offer
-/// the file, reads as "not parked" and fails the wait that asks for it rather than
-/// letting some other state pass for it.
-fn parked_in_a_write(pid: u32) -> bool {
-    fs::read_to_string(format!("/proc/{pid}/syscall"))
-        .ok()
-        .and_then(|reported| {
-            reported
-                .split_whitespace()
-                .next()?
-                .parse::<libc::c_long>()
-                .ok()
-        })
-        .is_some_and(|syscall| syscall == libc::SYS_writev)
+/// The private worker is otherwise idle in its channel read here. Killing only the
+/// relay pid exercises `PR_SET_PDEATHSIG`, not a shared process-group signal; a worker
+/// left sleeping is the orphan this test distinguishes from a killed, possibly briefly
+/// zombie, child.
+#[test]
+fn a_relay_killed_outright_leaves_no_live_stdout_worker() {
+    let (relay, _peer, _listener) = relay_onto_a_socket_over(
+        "relay_worker_parent",
+        Stdio::piped(),
+        Stdio::null(),
+        Stdio::null(),
+    );
+    let relay_pid = relay.id();
+    let children = format!("/proc/{relay_pid}/task/{relay_pid}/children");
+    let mut worker = None;
+    assert!(
+        poll_until(Duration::from_secs(10), || {
+            worker = fs::read_to_string(&children).ok().and_then(|pids| {
+                pids.split_whitespace()
+                    .find_map(|pid| pid.parse::<u32>().ok())
+            });
+            worker.is_some()
+        }),
+        "the relay never started its stdout worker"
+    );
+    let worker = worker.expect("the wait above found a worker");
+    let relay_pid = rustix::process::Pid::from_raw(relay_pid.cast_signed())
+        .expect("the relay has a positive pid");
+    rustix::process::kill_process(relay_pid, rustix::process::Signal::KILL)
+        .expect("kill only the relay parent");
+    drop(relay.into_exited().wait());
+
+    assert!(
+        poll_until(Duration::from_secs(10), || {
+            process_state(worker).is_none_or(|state| state == 'Z')
+        }),
+        "stdout worker {worker} remained live after relay {relay_pid} died: {:?}",
+        process_state(worker)
+    );
 }
 
 /// Whether `marker` has reached `peer` yet, keeping whatever else arrives on the way.

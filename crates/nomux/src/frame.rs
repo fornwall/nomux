@@ -22,13 +22,15 @@ pub struct WinSize {
 }
 
 wire_enum! {
-    /// How the child process terminated.
+    /// What is known about the child when its terminal stream ends.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     ExitKind: u8,
     /// Returned a status from `main` or `exit`.
     Exited = 0,
     /// Killed by a signal.
     Signalled = 1,
+    /// The terminal closed but the child had not exited by the reporting deadline.
+    Unknown = 2,
 }
 
 wire_enum! {
@@ -73,6 +75,16 @@ const HELLO_FLAG_BITS: u8 = HELLO_AGENT_FORWARD | HELLO_REPAINT_CTRL_L;
 fn checked_term(term: &str) -> Result<(), ProtoError> {
     if term.as_bytes().contains(&0) {
         return Err(ProtoError::Malformed("TERM contains a NUL byte"));
+    }
+    Ok(())
+}
+
+/// Keeps the sentinel carried with [`ExitKind::Unknown`] canonical.
+fn checked_exit(status: i32, kind: ExitKind) -> Result<(), ProtoError> {
+    if kind == ExitKind::Unknown && status != 0 {
+        return Err(ProtoError::Malformed(
+            "unknown exit outcome carries a nonzero status",
+        ));
     }
     Ok(())
 }
@@ -205,18 +217,19 @@ pub enum Frame<'a> {
         /// New oldest retained offset.
         new_base_offset: u64,
     },
-    /// The child terminated.
+    /// The terminal stream ended and all preceding output has been sent.
     Exit {
-        /// Exit status, or signal number when `kind` is [`ExitKind::Signalled`].
+        /// Exit status, or signal number when `kind` is [`ExitKind::Signalled`]. Always
+        /// zero when `kind` is [`ExitKind::Unknown`].
         status: i32,
-        /// How it terminated.
+        /// What is known about how the child terminated.
         kind: ExitKind,
         /// Whole seconds since the child let go of the terminal, saturating
         /// (`IMPLEMENTATION.md` § 2.2). Elapsed against a monotonic clock rather than
         /// a wall-clock stamp the two ends would have to agree on, and carried here
         /// rather than on [`HelloOk`], which goes out on every attach of every session
-        /// while this means anything only once the child has gone.
-        since_exit_secs: u32,
+        /// while this means anything only once the terminal has closed.
+        since_terminal_closed_secs: u32,
     },
     /// Client is leaving without ending the session.
     Detach,
@@ -352,11 +365,12 @@ impl<'a> Frame<'a> {
             Self::Exit {
                 status,
                 kind,
-                since_exit_secs,
+                since_terminal_closed_secs,
             } => {
+                checked_exit(status, kind)?;
                 out.extend_from_slice(&status.to_be_bytes());
                 out.push(kind.as_wire());
-                out.extend_from_slice(&since_exit_secs.to_be_bytes());
+                out.extend_from_slice(&since_terminal_closed_secs.to_be_bytes());
             }
             Self::Detach | Self::Ping | Self::Pong => {}
             Self::Error { code, message } => {
@@ -446,12 +460,18 @@ impl<'a> Frame<'a> {
             FrameType::Gap => Self::Gap {
                 new_base_offset: r.u64()?,
             },
-            FrameType::Exit => Self::Exit {
-                status: r.i32()?,
-                kind: ExitKind::from_wire(r.u8()?)
-                    .ok_or(ProtoError::Malformed("unknown exit kind"))?,
-                since_exit_secs: r.u32()?,
-            },
+            FrameType::Exit => {
+                let status = r.i32()?;
+                let kind = ExitKind::from_wire(r.u8()?)
+                    .ok_or(ProtoError::Malformed("unknown exit kind"))?;
+                let since_terminal_closed_secs = r.u32()?;
+                checked_exit(status, kind)?;
+                Self::Exit {
+                    status,
+                    kind,
+                    since_terminal_closed_secs,
+                }
+            }
             FrameType::Detach => Self::Detach,
             FrameType::Ping => Self::Ping,
             FrameType::Pong => Self::Pong,
@@ -631,6 +651,37 @@ mod tests {
             Frame::decode(FrameType::Error, &[0xff, 0xff]),
             Err(ProtoError::Malformed("unknown error code"))
         );
+    }
+
+    #[test]
+    fn an_unknown_outcome_has_one_canonical_status() {
+        let frame = Frame::Exit {
+            status: 1,
+            kind: ExitKind::Unknown,
+            since_terminal_closed_secs: 0,
+        };
+        let mut encoded = b"earlier frame".to_vec();
+        let before = encoded.clone();
+        assert_eq!(
+            frame.encode(&mut encoded),
+            Err(ProtoError::Malformed(
+                "unknown exit outcome carries a nonzero status"
+            ))
+        );
+        assert_eq!(encoded, before, "a rejected frame changed the output queue");
+
+        let payload = [0, 0, 0, 1, 2, 0, 0, 0, 0];
+        assert_eq!(
+            Frame::decode(FrameType::Exit, &payload),
+            Err(ProtoError::Malformed(
+                "unknown exit outcome carries a nonzero status"
+            ))
+        );
+        round_trip(Frame::Exit {
+            status: 0,
+            kind: ExitKind::Unknown,
+            since_terminal_closed_secs: u32::MAX,
+        });
     }
 
     #[test]

@@ -59,7 +59,10 @@ budgets and the pinned nightly are in [IMPLEMENTATION.md § 8](IMPLEMENTATION.md
 Complete and under test on Linux at the protocol revision
 [IMPLEMENTATION.md § 2.2](IMPLEMENTATION.md#22-messages) states.
 
-- **Platform** — Linux only; everywhere else, plain SSH ([DESIGN.md § 7](DESIGN.md#7-degradation)).
+- **Platform** — Linux with procfs and PTYs. Linux 5.3+ is required for the complete
+  control surface: on an older kernel `list` and sessions still work, but `kill` refuses
+  rather than signal a reusable bare pid without `pidfd_open`. Everywhere else, plain SSH
+  ([DESIGN.md § 7](DESIGN.md#7-degradation)).
 - **Suite** — layers and invariants in [IMPLEMENTATION.md § 9](IMPLEMENTATION.md#9-testing); CI adds `--run-ignored all`.
 - **Release** — both musl targets build reproducibly inside the size and growth gates, and a `v*` tag builds, checks and publishes them ([IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)).
 - **Client** — not started; every piece of it has a server-side contract already fixed in [IMPLEMENTATION.md](IMPLEMENTATION.md).

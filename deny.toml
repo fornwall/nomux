@@ -6,14 +6,12 @@
 # ship, so the windows crates errno pulls in are in scope — an advisory that surfaces
 # only on someone else's platform is one this repository would rather hear about.
 #
-# Out of scope: fuzz/, a workspace of its own that no cargo run from here reaches. Two of
-# the rules below would have to be loosened tree-wide to take it in, which is the argument
-# against — `allow` would need NCSA, libfuzzer-sys being `(MIT OR Apache-2.0) AND NCSA` for
-# the LLVM libFuzzer sources it vendors, and `wildcards` would need `allow-wildcard-paths`,
-# a path dependency carrying no version being a wildcard to cargo-deny. Both statements are
-# about object code the binary ships; a fuzz harness ships nothing, runs on a developer's
-# machine and reads bytes it generated itself. Weakening either here to say something about
-# a crate that never leaves the tree is the wrong trade.
+# Licensing and bans exclude fuzz/, a workspace of its own that no cargo run from here
+# reaches. Taking it into these rules would loosen them tree-wide: libfuzzer-sys vendors
+# NCSA-licensed LLVM sources, and the harness deliberately uses an unversioned path to the
+# codec under test. Both are object-code shipping rules, and the harness ships nothing.
+# `fuzz/deny.toml` still gates advisories and sources, because its build scripts execute on
+# developer and CI machines even though their output is not released.
 
 [advisories]
 # Deny by default. `ignore` stays empty: with two direct dependencies, an advisory is

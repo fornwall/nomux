@@ -28,7 +28,9 @@
 /// reaches by construction. The coverage-guided half is `fuzz/`, which reaches
 /// `Frame::decode` under a sanitiser and off a corpus it keeps
 /// ([IMPLEMENTATION.md § 9](../../../IMPLEMENTATION.md#9-testing)); neither replaces the
-/// other, and only this one runs in a gate. `decode_header` has no target of its own,
+/// other. Committed fuzz seeds are replayed below on stable, so any discovered regression
+/// becomes part of the publish gate even when the time-boxed sanitizer search is not.
+/// `decode_header` has no target of its own,
 /// [`generated::header_decode_is_total`] having closed that domain outright.
 ///
 /// The generator is a seeded [`generated::Rng`] rather than a property-testing crate. The
@@ -40,6 +42,8 @@
 /// `Rng::new(that)` replays it alone.
 mod generated {
     use std::collections::HashSet;
+    use std::path::Path;
+    use std::{fs, io};
 
     use nomux::{
         ErrorCode, ExitKind, Frame, FrameType, HEADER_LEN, Hello, HelloOk, Linger, MAX_PAYLOAD,
@@ -343,11 +347,18 @@ mod generated {
             6 => OwnedFrame::copied(Frame::Gap {
                 new_base_offset: rng.u64(),
             }),
-            7 => OwnedFrame::copied(Frame::Exit {
-                status: rng.i32(),
-                kind: rng.pick(&ExitKind::ALL, ExitKind::Exited),
-                since_exit_secs: rng.u32(),
-            }),
+            7 => {
+                let kind = rng.pick(&ExitKind::ALL, ExitKind::Exited);
+                OwnedFrame::copied(Frame::Exit {
+                    status: if kind == ExitKind::Unknown {
+                        0
+                    } else {
+                        rng.i32()
+                    },
+                    kind,
+                    since_terminal_closed_secs: rng.u32(),
+                })
+            }
             8 => OwnedFrame::copied(Frame::Detach),
             9 => OwnedFrame::copied(Frame::Ping),
             10 => OwnedFrame::copied(Frame::Pong),
@@ -630,6 +641,36 @@ mod generated {
             checked!(decode_as_every_type(&payload), seed);
         }
     }
+
+    /// Replays the durable part of fuzzing under the ordinary test gate.
+    ///
+    /// The sanitizer job is intentionally time-boxed and is not a publish dependency;
+    /// committed regression inputs must not inherit that exemption. Reading the target's seed directory here
+    /// makes every checked-in payload a deterministic, stable test without duplicating the
+    /// target's invariants or its corpus in a second location.
+    #[test]
+    fn every_committed_fuzz_seed_is_a_stable_regression() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/seeds/frame");
+        let mut paths = fs::read_dir(&dir)
+            .unwrap_or_else(|err| panic!("read {}: {err}", dir.display()))
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<io::Result<Vec<_>>>()
+            .unwrap_or_else(|err| panic!("enumerate {}: {err}", dir.display()));
+        paths.sort();
+        assert!(
+            !paths.is_empty(),
+            "{} has no committed seeds",
+            dir.display()
+        );
+
+        for path in paths {
+            let payload = fs::read(&path)
+                .unwrap_or_else(|err| panic!("read fuzz seed {}: {err}", path.display()));
+            if let Err(complaint) = decode_as_every_type(&payload) {
+                panic!("fuzz seed {}: {complaint}", path.display());
+            }
+        }
+    }
 }
 
 /// Byte-exact conformance to the frame table in `IMPLEMENTATION.md` § 2.2.
@@ -701,7 +742,7 @@ mod vectors {
             // them is even representable — §2.3's "no reserved space", made in bytes.
             Vector {
                 frame: Frame::Hello(Hello {
-                    protocol: 8,
+                    protocol: 9,
                     agent_forward: true,
                     repaint_ctrl_l: true,
                     out_offset: 0x0102_0304_0506_0708,
@@ -710,7 +751,7 @@ mod vectors {
                 }),
                 bytes: &[
                     0x01, 0x00, 0x00, 0x23, // header: type, u24 len = 35
-                    0x00, 0x08, // protocol
+                    0x00, 0x09, // protocol
                     0x03, // flags: bit 0 agent forward, bit 1 repaint ctrl-l
                     0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // out_offset
                     0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
@@ -724,7 +765,7 @@ mod vectors {
             // Carries `RESUME_FROM_START` as well, which no other vector shows.
             Vector {
                 frame: Frame::Hello(Hello {
-                    protocol: 8,
+                    protocol: 9,
                     agent_forward: true,
                     repaint_ctrl_l: false,
                     out_offset: RESUME_FROM_START,
@@ -733,7 +774,7 @@ mod vectors {
                 }),
                 bytes: &[
                     0x01, 0x00, 0x00, 0x1a, // header: type, u24 len = 26
-                    0x00, 0x08, // protocol
+                    0x00, 0x09, // protocol
                     0x01, // flags: bit 0 agent forward, bit 1 clear
                     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // RESUME_FROM_START
                     0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
@@ -745,7 +786,7 @@ mod vectors {
             // vectors above, so this is the only one that pins it clear.
             Vector {
                 frame: Frame::Hello(Hello {
-                    protocol: 8,
+                    protocol: 9,
                     agent_forward: false,
                     repaint_ctrl_l: false,
                     out_offset: 0x8182_8384_8586_8788,
@@ -754,7 +795,7 @@ mod vectors {
                 }),
                 bytes: &[
                     0x01, 0x00, 0x00, 0x19, // header: type, u24 len = 25
-                    0x00, 0x08, // protocol
+                    0x00, 0x09, // protocol
                     0x00, // flags: both bits clear
                     0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, // out_offset
                     0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
@@ -774,7 +815,7 @@ mod vectors {
             // above exists to make.
             Vector {
                 frame: Frame::Hello(Hello {
-                    protocol: 8,
+                    protocol: 9,
                     agent_forward: false,
                     repaint_ctrl_l: true,
                     out_offset: 0,
@@ -783,7 +824,7 @@ mod vectors {
                 }),
                 bytes: &[
                     0x01, 0x00, 0x00, 0x15, // header: type, u24 len = 21
-                    0x00, 0x08, // protocol
+                    0x00, 0x09, // protocol
                     0x02, // flags: bit 0 clear, bit 1 repaint ctrl-l
                     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // out_offset
                     0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
@@ -932,8 +973,8 @@ mod vectors {
     /// Session lifecycle and liveness.
     fn control_vectors() -> Vec<Vector> {
         vec![
-            // 0x08 Exit: i32 status, u8 kind (0 exited, 1 signalled), u32
-            // since_exit_secs. The kind byte sits *between* the two four-byte fields and
+            // 0x08 Exit: i32 status, u8 kind (0 exited, 1 signalled, 2 unknown), u32
+            // since_terminal_closed_secs. The kind byte sits *between* the two four-byte fields and
             // does not stop them being exchanged, so the pair are given values that
             // disagree in every byte here and are all-ones against all-zeros below —
             // which is the transposition this file exists to catch, at the one place on
@@ -942,13 +983,13 @@ mod vectors {
                 frame: Frame::Exit {
                     status: 130,
                     kind: ExitKind::Signalled,
-                    since_exit_secs: 0x0a0b_0c0d,
+                    since_terminal_closed_secs: 0x0a0b_0c0d,
                 },
                 bytes: &[
                     0x08, 0x00, 0x00, 0x09, //
                     0x00, 0x00, 0x00, 0x82, // status
                     0x01, // signalled
-                    0x0a, 0x0b, 0x0c, 0x0d, // since_exit_secs
+                    0x0a, 0x0b, 0x0c, 0x0d, // since_terminal_closed_secs
                 ],
             },
             // The only signed field on the wire, so its two's-complement encoding is
@@ -960,13 +1001,28 @@ mod vectors {
                 frame: Frame::Exit {
                     status: -1,
                     kind: ExitKind::Exited,
-                    since_exit_secs: 0,
+                    since_terminal_closed_secs: 0,
                 },
                 bytes: &[
                     0x08, 0x00, 0x00, 0x09, //
                     0xff, 0xff, 0xff, 0xff, // status
                     0x00, // exited
-                    0x00, 0x00, 0x00, 0x00, // since_exit_secs
+                    0x00, 0x00, 0x00, 0x00, // since_terminal_closed_secs
+                ],
+            },
+            // A closed terminal does not prove the child chose status zero. `Unknown`
+            // carries the one canonical sentinel status and preserves the elapsed time.
+            Vector {
+                frame: Frame::Exit {
+                    status: 0,
+                    kind: ExitKind::Unknown,
+                    since_terminal_closed_secs: 0x1020_3040,
+                },
+                bytes: &[
+                    0x08, 0x00, 0x00, 0x09, //
+                    0x00, 0x00, 0x00, 0x00, // canonical unknown status
+                    0x02, // unknown
+                    0x10, 0x20, 0x30, 0x40, // since_terminal_closed_secs
                 ],
             },
             // 0x09 Detach: no payload at all, so the frame is nothing but its header.
@@ -1364,7 +1420,7 @@ mod vectors {
                 FrameType::Exit => Frame::Exit {
                     status: self.decimal("status")?,
                     kind: self.enumerator("kind", &ExitKind::ALL)?,
-                    since_exit_secs: self.u32("since_exit_secs")?,
+                    since_terminal_closed_secs: self.u32("since_terminal_closed_secs")?,
                 },
                 FrameType::Detach => Frame::Detach,
                 FrameType::Ping => Frame::Ping,
@@ -1675,8 +1731,8 @@ mod vectors {
             (
                 "PROTOCOL_VERSION",
                 u64::from(PROTOCOL_VERSION),
-                8,
-                "§ 2.2 puts the current revision at 8",
+                9,
+                "§ 2.2 puts the current revision at 9",
             ),
             (
                 "MAX_PAYLOAD",
@@ -1700,6 +1756,6 @@ mod vectors {
             Internal = 5
         );
         frozen!(Linger, Unknown = 0, Disabled = 1, Enabled = 2);
-        frozen!(ExitKind, Exited = 0, Signalled = 1);
+        frozen!(ExitKind, Exited = 0, Signalled = 1, Unknown = 2);
     }
 }

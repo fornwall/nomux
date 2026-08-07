@@ -6,7 +6,7 @@
 //! never change.
 
 use std::io::{self, Write as _};
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -537,10 +537,10 @@ impl SessionPaths {
         self.acquire(FlockOperation::NonBlockingLockExclusive)
     }
 
-    /// [`Self::try_lock_spawn_or_refuse`] for a caller with nobody to report to: the two
-    /// opportunistic collections and a daemon publishing its own id, each of which answers
-    /// "somebody else holds it" and "nothing here can hold it" the same way, by touching
-    /// nothing. Whoever the user is actually waiting on says which it was.
+    /// [`Self::try_lock_spawn_or_refuse`] for the two opportunistic collections, which
+    /// have nobody to report a refusal to and answer every failure by touching nothing.
+    /// Daemon startup deliberately does not use this lossy spelling: it must either own
+    /// the lock or refuse the id.
     pub(crate) fn try_lock_spawn(&self) -> Option<SpawnLock> {
         self.try_lock_spawn_or_refuse().ok().flatten()
     }
@@ -572,16 +572,28 @@ impl SessionPaths {
             // leaving the mutex on an inode nothing else resolves to. `ELOOP` is not one of
             // the two refusals below, so that reads as "not this time" — a name somebody is
             // in the middle of replacing — rather than as a verdict on the host.
-            let reading = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+            // `NONBLOCK` is inert for regular files and load-bearing for a FIFO planted
+            // at this name: opening its read end without a writer otherwise sleeps before
+            // any caller's lock deadline can begin to help.
+            let reading = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK;
             let opened = with_umask(FILE_MODE, || {
-                rustix::fs::open(
+                match rustix::fs::open(
                     &path,
-                    OFlags::CREATE | reading,
+                    OFlags::CREATE | OFlags::EXCL | reading,
                     Mode::from_bits_truncate(FILE_MODE),
-                )
+                ) {
+                    Ok(fd) => Ok((fd, true)),
+                    // Open the inode that won the create race. Keeping this as a second
+                    // lookup is intentional: [`SpawnLock::locks_the_file_at`] below
+                    // rejects it if a collector replaces the name between the two.
+                    Err(rustix::io::Errno::EXIST) => {
+                        rustix::fs::open(&path, reading, Mode::empty()).map(|fd| (fd, false))
+                    }
+                    Err(err) => Err(err),
+                }
             });
-            let fd = match opened {
-                Ok(fd) => fd,
+            let (fd, created_name) = match opened {
+                Ok(opened) => opened,
                 // `EROFS` here means the name is *absent* and the mount will not create it,
                 // never that a `<id>.lock` already sitting there was refused for the flag:
                 // the kernel drops `O_CREAT` when it cannot take the write and reports the
@@ -598,6 +610,12 @@ impl SessionPaths {
                 // replacing — is about this attempt rather than about the file.
                 Err(_) => return Ok(None),
             };
+            let stat = rustix::fs::fstat(&fd).map_err(io::Error::from)?;
+            if rustix::fs::FileType::from_raw_mode(stat.st_mode)
+                != rustix::fs::FileType::RegularFile
+            {
+                return Err(self.not_a_lock_file(&path));
+            }
             loop {
                 match rustix::fs::flock(&fd, operation) {
                     // A signal landing on a blocking `flock` is not an answer; ask again.
@@ -618,7 +636,7 @@ impl SessionPaths {
                     Err(_) => return Ok(None),
                 }
             }
-            let lock = SpawnLock { fd };
+            let lock = SpawnLock { fd, created_name };
             if lock.locks_the_file_at(&path) {
                 return Ok(Some(lock));
             }
@@ -663,6 +681,65 @@ impl SessionPaths {
                 path = path.display(),
             ),
         )
+    }
+
+    /// Refuses a directory node that cannot serve as the spawn mutex.
+    ///
+    /// Opened non-blocking before this check, so a FIFO, device or socket cannot turn
+    /// `spawn` and the `kill` escape hatch into an unbounded syscall.
+    fn not_a_lock_file(&self, path: &Path) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "session {id}: spawn lock {path} is not a regular file",
+                id = self.id,
+                path = path.display(),
+            ),
+        )
+    }
+
+    /// Adopts the locked descriptor `spawn` inherited across its daemon exec.
+    ///
+    /// The descriptor is the capability proving startup authority. It is re-locked
+    /// non-blocking (which succeeds on the inherited open-file description), checked
+    /// against the current `<id>.lock` name, and put back under `CLOEXEC` before the
+    /// login shell can be spawned.
+    pub(crate) fn inherit_spawn_lock(&self, raw: i32) -> io::Result<SpawnLock> {
+        if raw <= libc::STDERR_FILENO {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "inherited spawn-lock descriptor is not usable",
+            ));
+        }
+        // SAFETY: `spawn` cleared `CLOEXEC` on this owned descriptor in the forked
+        // child and passed its number as an argument. This process has not opened or
+        // closed anything since exec that could reuse it, and taking ownership here
+        // makes this the one value that closes the inherited copy.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)?;
+        let stat = rustix::fs::fstat(&fd).map_err(io::Error::from)?;
+        if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::RegularFile {
+            return Err(self.not_a_lock_file(&self.lock()));
+        }
+        rustix::fs::flock(&fd, FlockOperation::NonBlockingLockExclusive)
+            .map_err(io::Error::from)?;
+        let lock = SpawnLock {
+            fd,
+            // The parent owns cleanup on a failed handoff. The daemon needs only the
+            // authority, not a second and necessarily racy guess at who made the name.
+            created_name: false,
+        };
+        if !lock.locks_the_file_at(&self.lock()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "session {}: inherited lock does not name {}",
+                    self.id,
+                    self.lock().display()
+                ),
+            ));
+        }
+        Ok(lock)
     }
 
     /// Removes every file belonging to this session, ignoring absences.
@@ -780,9 +857,28 @@ fn remove_node(path: &Path) -> io::Result<()> {
 pub(crate) struct SpawnLock {
     /// The locked descriptor: `close(2)` on it releases the lock, so it is held for that.
     fd: OwnedFd,
+    /// Whether this acquisition created the directory entry it locked.
+    ///
+    /// Established atomically with `O_EXCL`, rather than by an `exists` check before
+    /// the open. A startup failure may remove the name only in this case; otherwise it
+    /// may be a stale mutex another process still has standing on.
+    created_name: bool,
 }
 
 impl SpawnLock {
+    /// The descriptor whose open-file description carries this lock.
+    ///
+    /// `spawn` inherits this exact description into the daemon, so authority crosses
+    /// the exec boundary without a release/reacquire window.
+    pub(crate) fn raw_fd(&self) -> i32 {
+        self.fd.as_raw_fd()
+    }
+
+    /// Whether taking this lock created its directory entry.
+    pub(crate) const fn created_name(&self) -> bool {
+        self.created_name
+    }
+
     /// Whether this holds a lock on the file that is at `path` now — `flock` attaches to
     /// the inode rather than to the name ([`SpawnLock`]), so nothing else can tell a lock
     /// on the spawn mutex from a lock on what used to be it.
