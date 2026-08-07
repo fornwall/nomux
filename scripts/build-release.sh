@@ -45,9 +45,11 @@ update_baseline="${NOMUX_UPDATE_BASELINE:-0}"
 
 # Nightly, because the released std does not fit: rebuilding it with -Cpanic=immediate-abort
 # is the only configuration that ships. Dated rather than floating, because the SHA-256 the
-# client pins would drift under a name that moves. Named here and nowhere else, so a laptop
-# and the runner measure the same bytes by construction; editing it shows up in `git status`,
-# which an environment override would not.
+# client pins would drift under a name that moves. Named in the script rather than taken from
+# the environment, so a laptop and the runner measure the same bytes by construction; editing
+# it shows up in `git status`, which an override would not. fuzz/run.sh names the same date
+# for its own reason and argues there why the two lines are not one; either can move without
+# the other, so a bump here is this line and a refreshed baseline.
 nightly='nightly-2026-08-07'
 
 # The file holds one `target bytes` pair per line, # comments ignored; this prints nothing at

@@ -103,9 +103,9 @@ const PENDING_HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// because the figures are chosen against each other rather than one at a time: the two
 /// receive-side megabytes bound a connection's undecoded buffer against the queue it
 /// feeds, and the gap between the two output bounds is clear of the first plus a whole
-/// output chunk, so only the frames that *answer* a client can reach the second. Three
-/// of them are spent inside [`Conn`], which measures with [`Conn::queued`] and
-/// [`Conn::buffered`] and decides nothing.
+/// output chunk, so only the frames that *answer* a client can reach the second. Two of
+/// them are enforced in [`Conn`] rather than measured for the daemon: [`Conn::fill`]
+/// stops at [`MAX_PENDING_READ`], [`Conn::send_output`] at [`MAX_PENDING_WRITE`].
 const MAX_PENDING_INPUT: usize = 1 << 20;
 
 /// Stop queueing output once this much is already waiting for a slow client (§ 4.1).

@@ -247,8 +247,10 @@ one as a gap.
   ([IMPLEMENTATION.md § 6.1](IMPLEMENTATION.md#61-pty-and-child)) and each pass takes one
   64 KiB read. A *reattaching* client is served the same bytes either way — the ring holds
   the last `capacity` bytes however the reading is spelled — so what a drain buys is not
-  scrollback, and what it costs is fairness. `write_pty`, `read_client`, the stop-signal
-  check and `write_client` each run once a pass; a drain has no bound in the daemon and
+  scrollback, and what it costs is fairness. Every other step of a pass runs a bounded
+  number of times — the stop-signal check and `write_client` once, `write_pty` at most
+  twice and `read_client` at most three times, the extra calls being a keystroke decoded
+  this pass and a takeover's two drains — where a drain has no bound in the daemon and
   ends only when the producer pauses, which during a flood is never. Ctrl-C reaches the
   child through `write_pty` alone, so interrupt latency becomes the length of the drain, in
   exactly the situation a person is reaching for Ctrl-C — the hazard `Conn::fill` already

@@ -8,7 +8,8 @@
 //! What an outcome *means* is mostly not here: a closed peer ends the session for the
 //! PTY, one channel for the agent and one direction for the relay, so [`drain_to`]
 //! hands `EPIPE` back as it arrived rather than folded into a decision two of the three
-//! callers would get wrong. [`read_or_eof`] is the one fold they do agree on.
+//! callers would get wrong. [`read_or_eof`] is the one fold the PTY and the agent agree
+//! on; the relay folds its own in `attach.rs`'s `copy_in`.
 
 use std::collections::VecDeque;
 use std::io::IoSlice;
@@ -47,17 +48,16 @@ pub(crate) fn read(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<usize, Errno> {
 /// Linux fails master reads with `EIO`, rather than returning 0, once the last process
 /// holding the slave exits — so the kernel's own EOF is folded in here too. Nothing is
 /// propagated, which is why there is no `Result`: one `poll` pass reports several sources
-/// at once (`daemon.rs`, around `ACCEPT_BEFORE_READ`), and `daemon::Daemon::read_client`
-/// states the rule this is the other half of — a failure on one descriptor ends that
-/// connection and never the event loop. An errno this does not know is a descriptor nothing
-/// can be read from, and both callers answer [`ReadOutcome::Eof`] by dropping it out of the poll
-/// set, so nothing spins on one either.
+/// at once, and `daemon::Daemon::read_client` states the rule this is the other half of —
+/// a failure on one descriptor ends that connection and never the event loop. An errno this
+/// does not know is a descriptor nothing can be read from, and both callers answer
+/// [`ReadOutcome::Eof`] by dropping it out of the poll set, so nothing spins on one either.
 ///
 /// An empty `buf` answers [`ReadOutcome::WouldBlock`]: `read(fd, &mut [])` is `Ok(0)`, which every
 /// caller here reads as the peer having gone, and the caller that would act on it hardest
 /// (`daemon.rs`'s `on_child_exit`) would declare a session over with its child still alive.
-/// No call site passes one today — all three hand over the whole 64 KiB buffer — so this is
-/// the arm that keeps it that way rather than one anybody reaches.
+/// No call site passes one today — both callers hand over the whole 64 KiB buffer — so this
+/// is the arm that keeps it that way rather than one anybody reaches.
 pub(crate) fn read_or_eof(fd: BorrowedFd<'_>, buf: &mut [u8]) -> ReadOutcome {
     if buf.is_empty() {
         return ReadOutcome::WouldBlock;

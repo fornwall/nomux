@@ -29,8 +29,7 @@ is published ([DESIGN.md § 2](DESIGN.md#2-scope)).
 ### Environment
 
 An index and not a second statement of the behaviour: each row names the section that owns
-it, and what nomux *sets* is §6.1.1's. `NOMUX_DEBUG` and `NOMUX_UPDATE_BASELINE` are tested
-for exactly `1`.
+it, and what nomux *sets* is §6.1.1's. `NOMUX_UPDATE_BASELINE` is tested for exactly `1`.
 
 | Variable | Read by | Effect |
 | --- | --- | --- |
@@ -41,7 +40,6 @@ for exactly `1`.
 | `USER`, `LOGNAME` | daemon | Login name for the linger check (§6.2) |
 | `NOMUX_RING_BYTES` | daemon | Ring capacity in bytes (§4) |
 | `NOMUX_CHAOS_SEED` | the chaos suite | Disconnect-point seed; unset is a fixed default, so a failure reproduces (§9) |
-| `NOMUX_DEBUG` | `scripts/build-release.sh` | Also build the unstripped companions (§8) |
 | `NOMUX_UPDATE_BASELINE` | `scripts/build-release.sh` | Rewrite `scripts/size-baseline` from this build (§8) |
 
 Off the table, the toolchain's own. `scripts/build-release.sh` reads `CARGO_HOME` and
@@ -191,16 +189,23 @@ Four bounds, each enforced on its own queue:
 | `MAX_PENDING_READ` | 1 MiB | One connection's undecoded receive buffer, bounded by the daemon's own number rather than by whatever the peer set `SO_SNDBUF` to. Past it the socket is not read at all, so the overshoot is one read buffer. Slowest of the four to fill, a stock host's send buffer being a fifth of it: the megabyte only accumulates across the passes in which the decode loop stopped short of what the pass before had read |
 
 All four are chosen against each other and so live together in `daemon.rs`, which argues
-the arithmetic. `Conn::send_output` is the only writer that consults `MAX_PENDING_WRITE` at
-all: everything the daemon tells a client directly — `InputAck`, `Pong`, `Exit`, `HelloOk`,
-`AgentOpen`, `AgentClose` — queues past it unmeasured, and what keeps the 7 MiB between the
-two figures is that each of those is small and answers either a frame the client sent or an
-event of the session's own, not that the set is closed. The consequence a client author
-needs is that the input cap is enforced in the decode loop: **its own `Ping`, `Resize` and
-`Detach` queue behind its own stalled input**, and a takeover's final drain goes with the
-outgoing connection — accepted, since §3 has the client resending from `in_applied`. A new
-connection is polled as pending and never held back by it, so `list` and §6.3's spawn race
-are unaffected; `nomux kill` is a signal (§6.5).
+the arithmetic. `MAX_PENDING_WRITE` bites in three places: the output pump queues nothing
+at all above it, so the `Gap` opening a discontinuous replay is measured along with the
+`Output` frames behind it; `Conn::send_output` re-checks per chunk within the call, the
+ring being far larger than the budget; and the poll set drops `POLLIN` from the agent
+socket while the queue sits at the cap (§ 6.7). What the daemon tells a client directly —
+`InputAck`, `Pong`, `Exit`, `HelloOk`, `AgentOpen`, `AgentClose` — queues past it
+unmeasured, and what keeps the 7 MiB between the two figures is that each of those is small
+and answers either a frame the client sent or an event of the session's own, not that the
+set is closed. `AgentData` is unmeasured too and is the one of them carrying bulk: what
+bounds it is that third reader rather than its size, a client at the cap costing the agent
+socket its `POLLIN`, so the overshoot is the one 64 KiB read already in hand. The
+consequence a client author needs is that the input cap is enforced in the decode loop:
+**its own `Ping`, `Resize` and `Detach` queue behind its own stalled input**, and a
+takeover's final drain goes with the outgoing connection — accepted, since §3 has the
+client resending from `in_applied`. A new connection is polled as pending and never held
+back by it, so `list` and §6.3's spawn race are unaffected; `nomux kill` is a signal
+(§6.5).
 
 **A detaching client's send queue is dropped, not flushed**: everything in it is
 per-connection state a reattach recomputes from the ring (§4.2, §6.5). Only departures
@@ -371,7 +376,7 @@ ignore SIGHUP
 leads a session and holds no controlling terminal?  already detached; nothing to do
   else setsid            refused only if we lead a process group
     else fork → parent _exit, child setsid
-...                      re-listen, stop signals, <id>.pid, <id>.label, drop the lock
+...                      stop signals, <id>.pid, <id>.label, drop the lock
 chdir "/"
 0/1/2 → /dev/null
 ```
@@ -762,8 +767,8 @@ Targets:
 | `x86_64-unknown-linux-musl` | Most servers |
 | `aarch64-unknown-linux-musl` | ARM servers, Apple-silicon VMs, most SBCs |
 
-Two, and the rule for a third is that somebody asks for it: each one costs a build, a
-baseline entry and a companion for as long as it ships.
+Two, and the rule for a third is that somebody asks for it: each one costs a build and a
+baseline entry for as long as it ships.
 
 **Size**, because the cold upload happens over cellular. Two gates: **≤ 400 KiB per arch**,
 and growth past **3%** against the per-target figure in `scripts/size-baseline` — the
@@ -775,13 +780,14 @@ writes and the gate reads.
 `rustup target add` is the entire setup — no gcc, no zig, no sysroot — and the shipping
 build takes a nightly, without which both targets overrun the budget on panic machinery
 alone. It is pinned to a **dated** nightly, a floating one moving the bytes the published
-hash covers: `scripts/build-release.sh` names it and nothing else does, and the compiler
-that measured a baseline is written down beside it and deliberately **not** checked against
-the one building — a bump moves the figures by tenths of a percent against a 3% threshold,
-so a stamp that disagrees never means a delta anyone would act on, and refusing on one only
-taught people to reach for the escape hatch. That script argues all of that — the release
-profile, the `-Z build-std` case, the reproducibility flags, and the debug companions
-`NOMUX_DEBUG` asks for.
+hash covers: `scripts/build-release.sh` names it, the only other nightly in the tree being
+§ 9's fuzzing pin — dated against a different hazard, free to move without this one, and
+compared to it by nothing. The compiler that measured a baseline is written down beside it
+and deliberately **not** checked against the one building — a bump moves the figures by
+tenths of a percent against a 3% threshold, so a stamp that disagrees never means a delta
+anyone would act on, and refusing on one only taught people to reach for the escape hatch.
+That script argues all of that — the release profile, the `-Z build-std` case and the
+reproducibility flags.
 
 That script is the producing half of a check whose consuming half does not exist: **the
 client is meant to pin a SHA-256 per architecture and verify it after upload, and nothing
@@ -814,8 +820,11 @@ installs the nightly it names, as `scripts/build-release.sh` does for the releas
 over their seeds and is nowhere near a search.
 
 What the signal guards measure is the *decision* to signal, which is the only thing that
-can be measured: `pty::reach` is that module's one door to a signal, and a thread-local
-`REACHES` records every one that goes through it, in order.
+can be measured: `pty::reach` is that module's one door to a `kill(2)` it aims at a pid of
+its own choosing, and a thread-local `REACHES` records every one that goes through it, in
+order. `Pty::terminate`'s closing `Child::kill` is deliberately outside that door and so
+absent from `REACHES`: it is std's handle to the direct child, aimed at nobody the guards
+decide about.
 
 ## 10. Exit codes
 

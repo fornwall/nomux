@@ -51,9 +51,8 @@ cargo test      # unit and integration tests, plus the one doctest
 prek install    # once per clone: the commit gate, `.pre-commit-config.yaml`
 ```
 
-[prek](https://github.com/j178/prek) runs the same hooks CI does. Release builds,
-size budgets, the pinned nightly and the debug companions are in
-[IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build).
+[prek](https://github.com/j178/prek) runs the same hooks CI does. Release builds, size
+budgets and the pinned nightly are in [IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build).
 
 ## Status
 

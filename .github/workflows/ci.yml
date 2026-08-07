@@ -94,8 +94,11 @@ jobs:
           [ "$version" = "${GITHUB_REF_NAME#v}" ] ||
               { echo "tag $GITHUB_REF_NAME does not name Cargo.toml's $version" >&2; exit 1; }
 
-      # Bare `toolchain install` reads rust-toolchain.toml, so the 1.97.1 pin and
-      # its components stay stated in exactly one place.
+      # Bare `toolchain install` reads rust-toolchain.toml, so the version and its components
+      # are not restated here — a comment naming the pin was a second place to update it. That
+      # file is the only copy anything reads; the other five (README.md, IMPLEMENTATION.md,
+      # three `expect` reasons) are prose, so a stable bump is one edit that gates and five
+      # that only read wrong.
       - name: Install the pinned toolchain
         run: rustup toolchain install --profile minimal --no-self-update
 
