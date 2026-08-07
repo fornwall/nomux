@@ -19,7 +19,11 @@ on:
   pull_request:
   # cargo-deny's advisory database moves while this tree stands still, and dependabot bumps
   # monthly, so without a timer an advisory published on Tuesday waits for whoever pushes
-  # next. Weekly: two direct dependencies do not earn a daily run of anything.
+  # next. Weekly: two direct dependencies do not earn a daily run of anything. The whole
+  # workflow runs, rather than a cut-down advisories job beside it: `check` already runs
+  # `cargo deny check advisories`, and a second copy of a job's provisioning is two `if:`
+  # conditions that have to stay each other's complement. `publish` sits it out on its own
+  # `startsWith(github.ref, 'refs/tags/v')`.
   schedule:
     - cron: '17 4 * * 1'
   # The release job's artifacts expire, and it is the only producer of the
@@ -42,18 +46,16 @@ env:
   # backtrace in the log.
   RUST_BACKTRACE: 1
 
-# Third-party actions are pinned to a commit, not a tag: a tag is a mutable pointer in
-# someone else's repository, and the release job builds the binaries whose SHA-256 the client
-# pins. The version rides in the trailing comment. `actions/*` stay on their major tag —
-# GitHub's own, inside a trust boundary the job is already entirely within.
+# Every action is pinned to a commit, not a tag: a tag is a mutable pointer in someone else's
+# repository, and the release job builds the binaries whose SHA-256 the client pins. The
+# version rides in the trailing comment. `actions/*` are pinned too — being GitHub's own puts
+# them inside the trust boundary but leaves the pointer just as mutable, and `download-artifact`
+# feeds the one job holding `contents: write`. Dependabot's `github-actions` ecosystem updates
+# a SHA pin and its comment together, so this costs nothing after the first commit.
 jobs:
   # One job, so the workspace and its dependencies are compiled against a single cache.
   check:
     name: fmt, clippy, tests
-    # Nothing here has anything to say about a Monday morning: this job is about a commit,
-    # and the scheduled run is about the advisory database. `publish` follows through its
-    # `needs:`.
-    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     # The session tests spawn a real PTY, shells and unix sockets; a wedged child
     # would otherwise hold the runner for the six-hour default.
@@ -78,7 +80,7 @@ jobs:
       # `persist-credentials: false`: nothing in this workflow pushes, and the default
       # leaves the job token in .git/config while a step below executes `entry:` shell out
       # of the pull request's own .pre-commit-config.yaml.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -100,11 +102,14 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       # Prebuilt binaries; `cargo install` would build each from source on every
-      # cache miss. shellcheck too, so what fails a build is a pinned version rather than
-      # whatever the runner image happens to ship this week.
+      # cache miss. Every one pinned, so what fails a build is a version named here rather
+      # than whatever the tool released this week: a shellcheck or clippy-adjacent tool that
+      # lands a new check turns a green tree red with no commit behind it. Dependabot does
+      # not read these — the `github-actions` ecosystem updates the `uses:` SHA above and
+      # nothing inside `with:` — so they are bumped by hand, which is the point.
       - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
         with:
-          tool: cargo-nextest,cargo-deny,prek,shellcheck
+          tool: cargo-nextest@0.9.143,cargo-deny@0.20.2,prek@0.4.12,shellcheck@0.11.0
 
       # Advisories, because dependabot bumps monthly and a CVE does not wait; licences and
       # sources, because the binary ships other people's object code. `--locked`, and before
@@ -158,61 +163,53 @@ jobs:
   # cellular — and is the one thing the local hooks cannot check.
   release:
     name: musl release builds
-    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       # `persist-credentials: false`: the step below executes scripts/build-release.sh out of
       # the pull request's own tree, which is the same hazard the check job names.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # Read rather than repeated here, so this job and a laptop build use one compiler and
-      # their sizes are comparable (scripts/build-release.sh says why). A plain assignment
-      # rather than `echo "version=$(cat ...)"`, since the default `bash -e` has no
-      # `pipefail` and would leave the step green with an empty value. An output rather than
-      # $GITHUB_ENV, so it reaches only the step below.
-      #
-      # Validated here, before the value is written anywhere. The file is the pull request's
-      # and $GITHUB_OUTPUT is line-oriented, so a second line in it sets a second output —
-      # any output of this job, named by the contributor. The script performs the same check,
-      # but a check downstream of the value having been used is a check that has come too
-      # late; this one is upstream of everything that reads it.
-      - name: Read the pinned release nightly
-        id: nightly
-        run: |
-          nightly=$(cat scripts/nightly-version)
-          case "$nightly" in
-          '' | *[!A-Za-z0-9._-]*)
-              echo "scripts/nightly-version must hold one plain toolchain name:" >&2
-              echo "  $nightly" >&2
-              exit 1
-              ;;
-          esac
-          echo "version=$nightly" >> "$GITHUB_OUTPUT"
-
-      # No toolchain step here: scripts/build-release.sh installs the nightly, its sources,
-      # llvm-tools and both musl targets itself, in one idempotent `rustup toolchain install`.
-      # It used to be stated in both places and the two could drift — the script would detect
-      # what this step had failed to install and print the command this step already ran. The
-      # script owns the target list and the compiler, so it owns fetching them.
+      # No toolchain step here: scripts/build-release.sh installs the nightly it names, its
+      # sources, llvm-tools and both musl targets itself, in one idempotent `rustup toolchain
+      # install`. It used to be stated in both places and the two could drift — the script
+      # would detect what this step had failed to install and print the command this step had
+      # already run. The script owns the target list and the compiler, so it owns fetching
+      # them, and the cache key follows the file that names it.
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          key: musl-${{ steps.nightly.outputs.version }}
+          key: musl-${{ hashFiles('scripts/build-release.sh') }}
 
       # Owns the target list and the size budget; exits non-zero if a binary is over.
-      #
-      # Companions on a tag and nowhere else. Each is a second `-Zbuild-std` cross build —
-      # std recompiled from source, per target — which is the dominant cost of this job, and
-      # only the tag path publishes what it produces: on `main` they went to an artifact that
-      # expires in ninety days having been read by nobody. The build is reproducible by
-      # construction, which is what the path remapping and the dated nightly buy, so anyone
-      # holding the pinned compiler can derive a companion on demand. `0` rather than an
-      # unset value, because the script tests for exactly `1`.
       - run: sh scripts/build-release.sh
-        env:
-          NOMUX_DEBUG: ${{ startsWith(github.ref, 'refs/tags/v') && '1' || '0' }}
+
+      # The reproducibility claim, tested rather than approximated. `check_leaks` inside the
+      # script proves no *builder-specific path this script derived* survives in an artifact,
+      # which is a proxy: it cannot see a path rustc spelled differently from the environment
+      # the needles came out of. This builds the same commit a second time from a different
+      # checkout path, a different $CARGO_HOME and a different target directory, and requires
+      # the two SHA256SUMS to agree — which is the property the client actually depends on,
+      # since it pins those sums and a second machine has to arrive at them.
+      #
+      # `git archive HEAD` rather than a copy of the worktree: it is exactly the committed
+      # tree, and it leaves target/ behind so the rebuild is genuinely cold. RUSTUP_HOME is
+      # deliberately shared — the toolchain is an input both builds are meant to agree on,
+      # and it is $CARGO_HOME and the two paths that have to differ.
+      - name: Rebuild from another path and compare the checksums
+        run: |
+          rebuild="$RUNNER_TEMP/nomux-rebuild"
+          mkdir -p "$rebuild"
+          git archive --format=tar HEAD | tar -x -C "$rebuild"
+          CARGO_HOME="$RUNNER_TEMP/cargo-rebuild" sh "$rebuild/scripts/build-release.sh"
+          if ! diff -u target/dist/SHA256SUMS "$rebuild/target/dist/SHA256SUMS"; then
+              echo "the same commit built different bytes from a different path:" >&2
+              echo "  the remap flags in scripts/build-release.sh no longer cover" >&2
+              echo "  everything rustc records, so the checksums a client pins are" >&2
+              echo "  this machine's rather than this commit's." >&2
+              exit 1
+          fi
 
       # The only place the shipping configuration is ever executed on a commit that is not
       # a tag. Nothing in the check job builds `-Zbuild-std` with `-Cpanic=immediate-abort`,
@@ -231,7 +228,7 @@ jobs:
       # architecture — so they have to outlive the log they were printed to. On a tag
       # the release below is where they actually land; this keeps every other commit's
       # set reachable for the ninety days an artifact lasts.
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: musl-binaries
           path: target/dist/
@@ -253,7 +250,7 @@ jobs:
     steps:
       # No checkout: everything published is in the artifact, and the tag is named by
       # the ref rather than read out of the tree.
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: musl-binaries
           path: dist
@@ -264,9 +261,7 @@ jobs:
       # a manifest naming something the build did not emit stops here.
       - name: Verify the artifact against its own checksums
         working-directory: dist
-        run: |
-          sha256sum -c SHA256SUMS
-          sha256sum -c SHA256SUMS.debug
+        run: sha256sum -c SHA256SUMS
 
       # Artifacts do not carry the executable bit, and the step below runs one to ask its
       # version. No bearing on what is published — every install path chmods it anyway.
@@ -313,26 +308,13 @@ jobs:
               echo '```'
               cat dist/SHA256SUMS
               echo '```'
-              echo
-              echo "### Debug companions"
-              echo
-              echo "\`nomux-<target>.debug\` is the same build unstripped, for reading a"
-              echo "\`SIGQUIT\` core against — the shipping binaries carry no symbols and"
-              echo "abort without a message. Nothing needs them to run nomux. Their own"
-              echo "sums are in \`SHA256SUMS.debug\`."
-              echo
-              echo '```'
-              cat dist/SHA256SUMS.debug
-              echo '```'
           } > "$notes"
-          # Exactly what the two manifests name, rather than a `dist/nomux-*` glob that would
-          # sweep the companions in beside the binaries: the sets are checksummed separately
-          # and a glob does not know which is which. Counted, because `set -e` does not see
-          # into a process substitution — a failed awk would publish two manifests and no
-          # binaries, and a tag cannot be amended. Two architectures and companions is four.
-          mapfile -t assets < <(awk '{print "dist/" $2}' dist/SHA256SUMS dist/SHA256SUMS.debug)
-          if [ "${#assets[@]}" -ne 4 ]; then
-              echo "the manifests name ${#assets[@]} files, not the expected 4:" >&2
+          # Exactly what the manifest names, rather than a `dist/nomux-*` glob. Counted,
+          # because `set -e` does not see into a process substitution — a failed awk would
+          # publish a manifest and no binaries, and a tag cannot be amended.
+          mapfile -t assets < <(awk '{print "dist/" $2}' dist/SHA256SUMS)
+          if [ "${#assets[@]}" -ne 2 ]; then
+              echo "the manifest names ${#assets[@]} files, not the expected 2:" >&2
               printf '  %s\n' "${assets[@]}" >&2
               exit 1
           fi
@@ -340,33 +322,4 @@ jobs:
               --title "$GITHUB_REF_NAME" \
               --notes-file "$notes" \
               --verify-tag \
-              "${assets[@]}" dist/SHA256SUMS dist/SHA256SUMS.debug
-
-  # The one thing here that is not about a commit. Every other job answers "is this change
-  # sound"; this one answers "is what we already shipped still sound", which is a question
-  # the advisory database changes the answer to without anybody touching the tree. Advisories
-  # only, and not the licences, bans and sources the check job also runs: those three are
-  # facts about the lockfile and cannot change while it does not.
-  #
-  # No build of any kind — cargo-deny reads Cargo.lock and its own database. The toolchain
-  # install is there only so that cargo-deny's `cargo metadata` does not send the rustup shim
-  # to fetch a default profile on demand; `--profile minimal` is a download, not a compile.
-  advisories:
-    name: advisories
-    if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-
-      - name: Install the pinned toolchain
-        run: rustup toolchain install --profile minimal --no-self-update
-
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
-        with:
-          tool: cargo-deny
-
-      # `--locked`, and before the subcommand, for the reason the check job's copy gives.
-      - run: cargo deny --locked check advisories
+              "${assets[@]}" dist/SHA256SUMS

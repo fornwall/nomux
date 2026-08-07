@@ -1,21 +1,14 @@
 #!/bin/sh
-# Builds the two shipping binaries and the checksums the client pins them by; with
-# NOMUX_DEBUG=1, an unstripped companion per target for a core to be read against.
-# Runs from anywhere in the tree; artifacts land in target/dist/.
+# Builds the two shipping binaries and the checksums the client pins them by. Runs from
+# anywhere in the tree; artifacts land in target/dist/.
 #
-# nomux uploads itself over whatever link the user's ssh session is riding, so the binary
-# is on the critical path of every cold start and IMPLEMENTATION.md § 8 caps it at 400 KiB
-# per architecture. The cap alone is not enough — one commit grew armv7 46% back when it
-# shipped and nothing said a word, because the result still fitted — so scripts/size-baseline
-# holds a figure per target and growth past 3% fails too. A shrink never does, however large.
+# nomux uploads itself over whatever link the user's ssh session is riding, so the binary is
+# on the critical path of every cold start and IMPLEMENTATION.md § 8 caps it at 400 KiB per
+# architecture. The cap alone is not enough — one commit grew armv7 46% back when it shipped
+# and nothing said a word, because the result still fitted — so scripts/size-baseline holds a
+# figure per target and growth past 3% fails too. A shrink never does, however large.
 # NOMUX_UPDATE_BASELINE=1 rewrites the baseline and skips the gate, which puts an accepted
 # regression in a diff a reviewer reads.
-#
-# Nightly, because the released std does not fit: rebuilding it with -Cpanic=immediate-abort
-# is the only configuration that ships. scripts/nightly-version names the compiler, dated
-# rather than floating because the SHA-256 the client pins would drift under one that floats.
-# To build with another, edit that one-line file — `git status` then shows you did, which an
-# environment override would not.
 set -eu
 
 die() {
@@ -48,75 +41,31 @@ cd "$repo"
 
 dist="$repo/target/dist"
 baseline_file="$repo/scripts/size-baseline"
-nightly_file="$repo/scripts/nightly-version"
 update_baseline="${NOMUX_UPDATE_BASELINE:-0}"
-# The shipping build is `-Cpanic=immediate-abort` with `strip = "symbols"`, so an abort emits
-# no message, location or symbol; what is left is the `SIGQUIT` core of § 6.5, which names no
-# functions without the companion § 8 describes. Off unless asked for: it doubles the cross
-# builds, and only the publishing path keeps what they produce.
-companions="${NOMUX_DEBUG:-0}"
+
+# Nightly, because the released std does not fit: rebuilding it with -Cpanic=immediate-abort
+# is the only configuration that ships. Dated rather than floating, because the SHA-256 the
+# client pins would drift under a name that moves. Named here and nowhere else, so a laptop
+# and the runner measure the same bytes by construction; editing it shows up in `git status`,
+# which an environment override would not.
+nightly='nightly-2026-08-07'
 
 # The file holds one `target bytes` pair per line, # comments ignored; this prints nothing at
-# all for a target it has no usable figure for, which is the only thing either caller asks.
-# One reader for both of them — the pre-flight just below and the gate itself, hundreds of
-# lines apart — so a line the gate would silently skip cannot be one the pre-flight accepted.
+# all for a target it has no usable figure for. The gate below treats that as a failure rather
+# than as a first build, so a line dropped from an otherwise fine file cannot leave the gate
+# present, running, and unable to fail.
 baseline_for() {
     [ -r "$baseline_file" ] || return 0
     awk -v t="$1" '{ sub(/#.*/, "") }
         $1 == t && NF == 2 && $2 ~ /^[0-9]+$/ { print $2; exit }' "$baseline_file"
 }
 
-# Read before building: finding a typo here after the cross builds have run is finding it too
-# late. Missing, malformed, and a line dropped from an otherwise fine file are one condition —
-# the gate has no reference for some target — and all refused rather than reported as a first
-# build. The last is likeliest and worst: it parses, it passes, and it leaves the gate
-# present, running, and unable to fail.
-if [ "$update_baseline" != 1 ]; then
-    unknown=''
-    for target in $targets; do
-        [ -n "$(baseline_for "$target")" ] || unknown="$unknown $target"
-    done
-    [ -z "$unknown" ] ||
-        die "no usable entry in ${baseline_file#"$repo"/}, the growth gate's only reference," \
-            "  for:$unknown" \
-            "  It holds one \`target bytes\` pair per line, # comments ignored. Restore the" \
-            "  line if it was dropped or its target misspelled; if the architecture is new," \
-            "  rerun with NOMUX_UPDATE_BASELINE=1 and commit the recorded sizes."
-fi
-
-# Through RUSTUP_TOOLCHAIN rather than a `+toolchain` argument, so every rustc and cargo
-# call below agrees which one it is — including the `--print sysroot` whose answer gets
-# remapped, which would otherwise name the stable sysroot while nightly did the building.
-#
-# One file, read here and by CI, so a laptop and the runner measure the same bytes by
-# construction: a literal in ci.yml against a floating `nightly` here once meant the
-# documented local run measured whatever compiler the day handed it. It holds the name and
-# nothing else — this reader takes it verbatim while CI round-trips it through the
-# line-oriented $GITHUB_OUTPUT, so anything the two could read differently is rejected here.
-nightly=''
-if [ -r "$nightly_file" ]; then
-    nightly=$(cat "$nightly_file")
-fi
-if [ -z "$nightly" ]; then
-    die "no toolchain name in ${nightly_file#"$repo"/}, which names the release" \
-        "  compiler. Restore it: nothing else in the tree says which one ships."
-fi
-case "$nightly" in
-*[!A-Za-z0-9._-]*) die "${nightly_file#"$repo"/} must hold one plain toolchain name: '$nightly'" ;;
-esac
-
-# Installed rather than detected and complained about. Past the compiler this build needs std's
-# sources (-Zbuild-std compiles it here), both musl rust-std components (that build still links
-# their CRT objects and libc.a) and llvm-tools (the $readobj every run checks a binary with,
-# and the $objcopy a companion is checked with). Each used to be probed for separately, to
-# trade cargo's wall of linker errors for a `rustup` line to paste; running that line is
-# shorter, idempotent, and leaves nothing to be detected wrong. CI ran it as a step of its own
-# until this took it over, so a runner and a laptop now provision from one command.
-#
-# Ahead of every rustc call below, which run under RUSTUP_TOOLCHAIN=$nightly and would fail
-# outright without it; behind the charset check above, the name now reaching rustup as an
-# argument. The target list is joined out of $targets rather than restated, so what is
-# installed cannot drift from what is built. Chatter to stderr: stdout is the size table's.
+# Installed rather than detected and complained about: past the compiler this needs std's
+# sources (-Zbuild-std compiles it here), both musl rust-std components (that build still
+# links their CRT objects and libc.a) and llvm-tools (the $readobj every run checks a binary
+# with). One idempotent command, so a runner and a laptop provision identically. The target
+# list is joined out of $targets rather than restated, so what is installed cannot drift from
+# what is built. Chatter to stderr: stdout is the size table's.
 rustup toolchain install "$nightly" --profile minimal --no-self-update \
     --component rust-src,llvm-tools \
     --target "$(printf '%s' "$targets" | tr '\n' ',')" >&2
@@ -138,7 +87,7 @@ case "$version" in
 *-nightly* | *-dev*) ;;
 *) die "$toolchain is not a nightly toolchain: $version" \
         "  the shipping build rebuilds std with panics compiled out, which only" \
-        "  nightly accepts. Name a nightly in ${nightly_file#"$repo"/}." ;;
+        "  nightly accepts. Name a nightly in \$nightly at the top of this script." ;;
 esac
 
 # Joined by U+001F as CARGO_ENCODED_RUSTFLAGS, not a whitespace-split RUSTFLAGS: three of
@@ -159,21 +108,20 @@ sysroot=$(rustc --print sysroot)
 # which — and after the install above, which is what put them there.
 # `llvm-readobj` rather than `llvm-readelf`: llvm-tools ships only the former, and it is the
 # same program — readelf is that binary under another name, differing in default output style.
-objcopy="$(rustc --print target-libdir)/../bin/llvm-objcopy"
 readobj="$(rustc --print target-libdir)/../bin/llvm-readobj"
-# Its own target directory: the companion differs by one rustc flag, so sharing one would make
-# each build invalidate the other's cache and turn every one of them cold.
-# Resolved rather than taken as spelled: cargo accepts a *relative* $CARGO_TARGET_DIR and
-# reads it against this script's cwd, and both uses below need an absolute path — rustc
-# matches a remap prefix component-wise, and check_leaks greps the artifact for this
-# literal. A bare `t` would remap nothing and then fail every build on a byte that occurs
-# in any 175 KiB binary. `pwd -P` also settles a symlink and a trailing slash.
-target_root=$(unset CDPATH; cd -- "${CARGO_TARGET_DIR:-$repo/target}" 2>/dev/null && pwd -P) ||
-    target_root="${CARGO_TARGET_DIR:-$repo/target}"
-case "$target_root" in
-    /*) ;;
-    *) die "CARGO_TARGET_DIR must be an absolute path or an existing directory: $target_root" ;;
-esac
+# Resolved rather than taken as spelled: cargo accepts a *relative* $CARGO_TARGET_DIR and reads
+# it against this script's cwd, and both uses below need an absolute path — rustc matches a
+# remap prefix component-wise, and check_leaks greps the artifact for this literal. A bare `t`
+# would remap nothing and then fail every build on a byte that occurs in any 175 KiB binary.
+# `pwd -P` also settles a symlink and a trailing slash.
+#
+# Created first, so the `cd` cannot fail: a target directory that does not exist yet is the
+# ordinary case on a cold checkout, and the fallback this replaces used the *unresolved* path
+# as both a remap prefix and a check_leaks needle — the remap would then miss the physical
+# path rustc recorded and the grep would agree, which is the exact failure the remapping
+# exists to prevent.
+mkdir -p -- "${CARGO_TARGET_DIR:-$repo/target}"
+target_root=$(unset CDPATH; cd -- "${CARGO_TARGET_DIR:-$repo/target}" && pwd -P)
 
 # The `t` hazard above, which is not particular to $CARGO_TARGET_DIR: check_leaks searches each
 # artifact for these four paths as bare substrings, and a short one turns up in any 175 KiB
@@ -190,7 +138,6 @@ for leak in "${CARGO_HOME:-$HOME/.cargo}" "$sysroot" "$repo" "$target_root"; do
         "  \$CARGO_HOME or \$CARGO_TARGET_DIR a longer path."
 done
 
-companion_dir="$target_root/companion"
 remap="--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
 remap="$remap$us--remap-path-prefix=$sysroot=/rust"
 remap="$remap$us--remap-path-prefix=$repo=/nomux"
@@ -233,37 +180,16 @@ check_leaks() {
         fi
     done
 
-    # Those four are worth what the environment they were read out of is worth: they say what
-    # $CARGO_HOME, $HOME and rustup claim the paths are, which need not be how rustc spelled
-    # the ones it embedded — and a needle naming a path nothing was compiled through cannot
-    # match. A remap that never fired then reads exactly like one that worked.
-    #
-    # The textbook answer is a positive control — assert each artifact *does* carry the
-    # remapped `/cargo` and `/rust`. Measured here, it would fail every build: neither shipping
-    # binary nor either companion holds one occurrence of `/cargo`, `/rust`, `/nomux` or
-    # `/target`, there being no path left in them at all. [profile.release] sets no `debug`, so
-    # there is no DWARF even in the companion (`-Cstrip=none` restores the symbol table and
-    # nothing else), and -Cpanic=immediate-abort compiles out the `Location` strings that are
-    # the last paths an ordinary release binary carries. A control asserting what the build
-    # never emits is not a control but a gate that can only fail.
-    #
-    # What can be had is needles chosen by shape rather than by value: substrings that survive
-    # only in an *un*remapped path, however this machine spells $HOME, $CARGO_HOME or its
-    # sysroot, and that cannot occur in a correct one — every correct one reading `/cargo/…`,
-    # `/rust/…`, `/nomux/…` or `/target/…`. Being literals rather than paths this script
-    # derived, they cannot be defeated by its deriving one wrongly, which is the hole above.
-    #
-    #   .cargo/registry     remapped, a dependency path reads `/cargo/registry/src/…`: the byte
-    #                       before `cargo` is always `/`, never `.`. Bare `cargo/registry` is
-    #                       the needle that cannot be used, being a substring of that.
-    #   rustup/toolchains   the sysroot remaps to `/rust`, under which nothing is named
-    #                       `rustup`. No leading dot, so a $RUSTUP_HOME like /usr/local/rustup
-    #                       is caught as well as `~/.rustup`.
-    #
-    # `rustlib/src/rust` fails this test and is not usable: std's sources sit at
-    # $sysroot/lib/rustlib/src/rust/library/, so the correctly remapped path reads
-    # `/rust/lib/rustlib/src/rust/library/std/src/lib.rs` and contains it verbatim. A shape
-    # needle has to be held against the remapped form of the path, not only against the raw one.
+    # Those four say what this environment *claims* the paths are, which need not be how rustc
+    # spelled the ones it embedded — so a remap that never fired reads exactly like one that
+    # worked. These two are chosen by shape instead: substrings that survive only in an
+    # unremapped path, however this machine spells $HOME, $CARGO_HOME or its sysroot, and that
+    # cannot occur in a correct one — `/cargo/registry/src/…` never has a `.` before `cargo`,
+    # and nothing under the remapped `/rust` is named `rustup`. A positive control is not
+    # available: with no DWARF and -Cpanic=immediate-abort there is no path left in the binary
+    # at all, so asserting the remapped form is present is a gate that can only fail.
+    # `rustlib/src/rust` is unusable for the same reason in reverse — the correctly remapped
+    # std path contains it verbatim.
     for leak in .cargo/registry rustup/toolchains; do
         if LC_ALL=C grep -qaF -- "$leak" "$1"; then
             die "FAIL: ${1##*/} embeds an unremapped build path containing '$leak'" \
@@ -309,48 +235,11 @@ for target in $targets; do
     cp "$target_root/$target/release/nomux" "$dist/nomux-$target"
     check_leaks "$dist/nomux-$target"
     check_static "$dist/nomux-$target"
-
-    if [ "$companions" = 1 ]; then
-        echo "building $target debug companion..." >&2
-        # A second build with the strip turned off, not the shipping binary with symbols added
-        # back — there is no adding back, and stripping this one does not reproduce the shipping
-        # bytes either: rustc strips at link time and llvm-strip after it, and the two ELFs
-        # differ. Deriving one from the other would change what ships, and what ships is what
-        # the checksums and the baseline cover.
-        CARGO_TARGET_DIR="$companion_dir" CARGO_ENCODED_RUSTFLAGS="$rustflags$us-Cstrip=none" \
-            cargo build --locked --release --target "$target" --bin nomux \
-            -Zbuild-std=std,panic_abort >&2
-        cp "$companion_dir/$target/release/nomux" "$dist/nomux-$target.debug"
-        # Matters more here: DWARF is made of file paths, so a companion is where an
-        # unremapped sysroot or checkout surfaces first.
-        check_leaks "$dist/nomux-$target.debug"
-
-        # That the two line up is the whole of what makes a companion worth publishing, and it
-        # is an inference rather than a guarantee: `-Cstrip` is documented to drop sections, not
-        # to leave code alone, and a companion whose addresses have moved is worse than none —
-        # it names functions, and names the wrong ones. `.text` is what a core is read against;
-        # identical contents at an identical address is what "these symbols describe it" means.
-        "$objcopy" --dump-section .text="$dist/ship.text" "$dist/nomux-$target" /dev/null
-        "$objcopy" --dump-section .text="$dist/comp.text" "$dist/nomux-$target.debug" /dev/null
-        if ! cmp -s "$dist/ship.text" "$dist/comp.text"; then
-            die "FAIL: the $target companion's .text is not the shipping binary's." \
-                "      its symbols would name the wrong functions in a core."
-        fi
-        # Under $dist so the trap above owns them on every failure path, and gone from it
-        # before anything here is checksummed or uploaded.
-        rm -f "$dist/ship.text" "$dist/comp.text"
-    fi
 done
 
-# `sha256sum -c` format so a verifier needs no bespoke tooling, naming the shipping binaries and
-# nothing else: `sha256sum -c` fails on a file it cannot open, so folding the companions in
-# would break the check for everyone who downloaded only what they run. They get a file of
-# their own, read the same way. Listed target by target rather than by globbing `nomux-*`,
-# which would sweep the companions into both.
+# `sha256sum -c` format, so a verifier needs no bespoke tooling. Listed target by target rather
+# than by globbing, which would sweep in anything else that landed here.
 (cd "$dist" && for t in $targets; do sha256sum "nomux-$t"; done > SHA256SUMS)
-if [ "$companions" = 1 ]; then
-    (cd "$dist" && for t in $targets; do sha256sum "nomux-$t.debug"; done > SHA256SUMS.debug)
-fi
 
 # Complete from here, so the cleanup is disarmed: the gates below still have to be able to fail,
 # and a build that is over budget or has grown is exactly the one whose binaries someone will
@@ -384,6 +273,18 @@ for target in $targets; do
     # held against the baseline before the builds started.
     base=$(baseline_for "$target")
     delta=new
+    # A target with no usable figure is the gate's own failure, not a first build: missing,
+    # malformed and a line dropped from an otherwise fine file all reach here, and the last
+    # parses, passes, and would otherwise leave the gate running and unable to fail.
+    if [ -z "$base" ] && [ "$update_baseline" != 1 ]; then
+        verdict=' NO BASELINE'
+        failed=1
+        echo "FAIL: no usable entry for $target in ${baseline_file#"$repo"/}, the growth" >&2
+        echo "      gate's only reference. It holds one \`target bytes\` pair per line, #" >&2
+        echo "      comments ignored. Restore the line if it was dropped or its target" >&2
+        echo "      misspelled; if the architecture is new, rerun with" >&2
+        echo "      NOMUX_UPDATE_BASELINE=1 and commit the recorded sizes." >&2
+    fi
     if [ -n "$base" ]; then
         diff=$((bytes - base))
         delta=$(printf '%+d' "$diff")
@@ -402,11 +303,7 @@ for target in $targets; do
         "$(((bytes % 1024) * 10 / 1024))" "$delta" "$sha" "$verdict"
 done
 echo
-if [ "$companions" = 1 ]; then
-    echo "artifacts, companions and both SHA256SUMS in ${dist#"$repo"/}"
-else
-    echo "artifacts and SHA256SUMS in ${dist#"$repo"/} (NOMUX_DEBUG=1 adds companions)"
-fi
+echo "artifacts and SHA256SUMS in ${dist#"$repo"/}"
 
 if [ "$update_baseline" = 1 ]; then
     if [ -n "$failed" ]; then

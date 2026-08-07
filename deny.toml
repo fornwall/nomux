@@ -7,7 +7,6 @@
 # only on someone else's platform is one this repository would rather hear about.
 
 [advisories]
-version = 2
 # Deny by default. `ignore` stays empty: with two direct dependencies, an advisory is
 # something to fix rather than something to carry, and an entry here would need a date
 # and a reason beside it.
@@ -19,7 +18,6 @@ ignore = []
 yanked = "deny"
 
 [licenses]
-version = 2
 # Exactly what the tree resolves to today, and nothing held in reserve: an unmatched
 # entry here is a warning, and a licence that is not here is a decision someone makes
 # in a diff rather than one already made for them. rustix and linux-raw-sys offer
@@ -49,4 +47,3 @@ wildcards = "deny"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []

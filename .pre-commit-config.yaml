@@ -4,8 +4,10 @@
 #
 # This file is the gate. .github/workflows/ci.yml runs `prek run --all-files` rather
 # than restating these commands, so a hook and the CI step that enforces it cannot
-# drift apart; the three things CI adds on top — rustdoc, the workspace's one doctest and
-# the ignored test — are steps of their own because none belongs in a pre-commit hook.
+# drift apart. What CI adds on top is steps of its own, none of them belonging in a
+# pre-commit hook: rustdoc, the workspace's one doctest, the ignored tests, the tag and
+# version check a `v*` push makes, and `cargo deny check advisories` — the advisories
+# alone, because that one fetches a database over the network and a hook may not.
 #
 # Hooks are ordered cheapest-first so an obvious failure reports fast.
 # They trigger on Rust sources and on manifests, since the lint configuration
@@ -59,11 +61,12 @@ repos:
         language: system
         files: '\.sh$'
 
+      # Neither `Cargo.lock` nor a manifest can change formatting; `rustfmt.toml` can.
       - id: cargo-fmt
         name: cargo fmt --check
         entry: cargo fmt --all --check
         language: system
-        files: '(\.rs|\.toml)$|^Cargo\.lock$'
+        files: '\.rs$|^rustfmt\.toml$'
         pass_filenames: false
 
       # `-- -D warnings` rather than a deny in [workspace.lints], for the reason
@@ -80,4 +83,15 @@ repos:
         entry: cargo nextest run --locked --workspace
         language: system
         files: '(\.rs|\.toml)$|^Cargo\.lock$'
+        pass_filenames: false
+
+      # Bans, licences and sources, which are answered from the lockfile alone. The
+      # advisories are CI's: they need the RustSec database fetched over the network, and a
+      # commit hook that reaches the network fails on a train. Only the three files that can
+      # change the answer trigger it.
+      - id: cargo-deny
+        name: cargo deny check bans licenses sources
+        entry: cargo deny --locked check bans licenses sources
+        language: system
+        files: '^(Cargo\.(toml|lock)|deny\.toml)$'
         pass_filenames: false

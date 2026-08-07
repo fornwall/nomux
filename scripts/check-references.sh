@@ -98,6 +98,11 @@ function scan(f,   n, l, t, m, g, p, a, q, k, doc, num, prev) {
 }
 { if ($0 != "scripts/check-references.sh") list[++nf] = $0 }  # this one cites by example only
 END {
+    # An empty list is a broken invocation, not a clean tree: `#!/bin/sh` has no
+    # `pipefail`, so this pipeline exits on awk alone, and awk over no input would run
+    # this block, print the success line and exit 0 — the whole ~700-citation check
+    # passing vacuously because `git ls-files` was the thing that failed.
+    if (nf == 0) { print "no files to scan" > "/dev/stderr"; exit 1 }
     # Documents first: one that links to itself would otherwise have awk reopen the very
     # file it is in the middle of reading.
     for (i = 1; i <= nf; i++) if (list[i] ~ /\.md$/) load(list[i])
