@@ -6,9 +6,7 @@ and what a second implementation must obey: [IMPLEMENTATION.md](IMPLEMENTATION.m
 
 ## P1 — the client
 
-The largest open item in the project: it does not exist. This repository is the server
-half, and the server half is useless alone — the relay modes speak a binary frame protocol
-over stdio, so nothing here gets a shell out of a host by itself. Every piece below has a
+The largest open item in the project: it does not exist. Every piece below has a
 server-side contract already fixed, which is the whole of what this side owes it.
 
 - **Transport.** Open a `direct-streamlocal` channel straight to the session socket once a
@@ -25,12 +23,10 @@ server-side contract already fixed, which is the whole of what this side owes it
   release leaves another artifact in every user's home on every host they have touched.
   The client knows each session's version and is the only side that can tell a stale
   `nomux-*` from a live one.
-- **Verifying an upload.** The producing half exists — a `v*` tag publishes `SHA256SUMS`
-  per architecture — and nothing reads it. See P2, which is the same gap from the release
-  side.
-- **The session ceiling.** Eight per host ([DESIGN.md § 5.1](DESIGN.md#51-identity)). The
-  daemon's 64 is a backstop under it; only the side that knows a tab was opened can hold
-  the real one.
+- **Verifying an upload.** Nothing on this side reads the `SHA256SUMS` a `v*` tag
+  publishes; P2 is the same gap from the release side.
+- **The session ceiling.** Eight per host, and the client is the only side that can hold it
+  ([DESIGN.md § 5.1](DESIGN.md#51-identity)).
 - **Gaps, repaint and agent forwarding.** Reset the emulator on a `Gap`
   ([IMPLEMENTATION.md § 4.3](IMPLEMENTATION.md#43-gap-handling)); choose the repaint policy
   per attach, since only the client knows whether an editor or a prompt is on screen; and
@@ -56,11 +52,13 @@ server-side contract already fixed, which is the whole of what this side owes it
 ## P2 — release process
 
 - Decide when the pinned nightly moves: `scripts/nightly-version` names it once and
-  `scripts/size-baseline` records the compiler that measured the bytes, so a disagreeing
-  compiler is refused; undecided is the policy for taking a newer one.
+  `scripts/size-baseline` records the compiler that measured the bytes — recorded for a
+  reader working out why a number moved, deliberately not checked against the one building
+  (`scripts/build-release.sh` argues why). Undecided is the policy for taking a newer one.
 - Decide what the client does when a host holds a binary whose hash it no longer knows.
   A `v*` tag already publishes `SHA256SUMS`, but nothing in the client reads it, so
-  [DESIGN.md § 8](DESIGN.md#8-security-model)'s "verify it after upload" is unwritten.
+  [IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)'s "verify it after upload" is
+  unwritten.
 
 ## P3 — test depth
 
@@ -75,32 +73,16 @@ server-side contract already fixed, which is the whole of what this side owes it
   nothing drives a peer into the cap itself: the kernel's send buffer is tighter than 1 MiB
   on a stock host, and forcing it with `SO_SNDBUF` is a test that silently cannot fail.
 
-## P4 — optimisations already tried
+## P4 — two the code argues against, and what is still open in them
 
-Both of these were written, found to break a named guard, and reverted. Both still look
-free from a distance, and neither is: what each costs is recorded here so the next person
-to see it finds the reason rather than the diff.
+Both were written and reverted, and `daemon.rs` and `session.rs` now carry the reason
+beside the code that holds it. What those comments do *not* settle is left here.
 
-- **Reap on `SIGCHLD` instead of polling for it.** `collect_status` spends a
-  `waitpid(WNOHANG)` on every pass for the whole life of a running child, because
-  `Child::try_wait` caches nothing until it has reaped. Gating it on `child_gone.is_some()`
-  breaks `lifecycle::a_shell_that_exits_behind_a_background_job_is_still_reaped`, and so
-  does every interval variant, for one reason: that test runs `sleep 300 & exit`, and the
-  job holds the slave open, so the master never reports end of file and `child_gone` is
-  never set. The whole of what the test gives the daemon is a single pass, supplied by a
-  `Ping`, on which the shell must already have been collected — an interval has nothing to
-  have elapsed. The fix that works is not a cheaper predicate but a different shape: a
-  `SIGCHLD` handler writing into the stop pipe `startup.rs` already arms, which makes
-  reaping event-driven and deletes the per-pass syscall rather than skipping it.
-- **Drain the PTY to `EAGAIN` instead of one bufferful a pass.** `read_pty` takes 64 KiB and
-  returns, so 100 MB of output is some 1600 poll round trips. Looping to `WouldBlock` breaks
-  `session::an_overflow_that_outruns_an_attached_client_is_reported_as_a_gap_mid_stream`,
-  whose 128 KiB ring is sized *against* the per-pass figure so that a client keeping up
-  cannot be gapped by a single read — the premise the test's determinism rests on. Resizing
-  the ring does not rescue it: with an unbounded drain one pass can take more than any ring,
-  so the test would have to be restructured to have the client consume part of the stream
-  before it stalls. **And the user-visible half is the one that decides it**: today a burst
-  larger than the ring still delivers the client its first ~1 MiB and gaps after; drained to
-  `EAGAIN` it would gap at once and serve only the tail. That is a change to what a person
-  sees on reattach, and it wants judging on its own merits before any test is rewritten to
-  permit it.
+- **Reaping on `SIGCHLD`.** `collect_status` spends a `waitpid` every pass for a running
+  child's whole life; the comment there says why the cheap gate fails. Open is the shape
+  that works: a handler writing into the stop pipe `startup.rs` already arms, which deletes
+  the syscall rather than skipping it.
+- **Draining the PTY to `EAGAIN`.** Open on its merits, not on the test it breaks. Today a
+  burst larger than the ring still delivers the client its first ~1 MiB and gaps after;
+  drained to `EAGAIN` it would gap at once and serve only the tail. That is a change to what
+  a person sees on reattach, and it wants deciding before any test is rewritten to allow it.

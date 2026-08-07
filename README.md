@@ -1,12 +1,3 @@
-> [!WARNING]
-> **There is nothing to run yet.** This repository is the server half; the SSH client and
-> terminal emulator that drive it are a separate, unreleased project. Without that client
-> there is no way to get a shell out of this — the relay modes speak a binary frame
-> protocol over stdio rather than driving a terminal, and what works standalone today is
-> `nomux list` and `nomux kill`.
->
-> **Experimental.** This project is AI-generated and has not seen real world usage.
-
 # nomux
 
 A single static Linux binary that runs on an SSH server and keeps a terminal
@@ -15,6 +6,14 @@ session alive across the loss of the SSH connection that created it.
 Persistence without a multiplexer: no prefix key, no panes, no status bar, no
 rewritten `TERM`. Byte-exact passthrough, so sixel, OSC 52, hyperlinks, mouse
 reporting and scrollback all work unchanged.
+
+> [!WARNING]
+> **There is nothing to run yet, and none of it has seen real world usage.** This
+> repository is the server half; the SSH client and terminal emulator that drive it are a
+> separate, unreleased project, and without that client there is no way to get a shell out
+> of this — the relay modes speak a binary frame protocol over stdio rather than driving a
+> terminal, so `nomux list` and `nomux kill` are what works standalone. AI-generated, and
+> experimental.
 
 `nomux <mode> [session-id] [--label <text>]`. The modes are `daemon`, `spawn` and
 `attach`; `list` and `kill` are the control surface, frozen across versions.
@@ -32,11 +31,13 @@ Four properties drive it, and two of them are held on this side. What each one c
 - **Resume over a fresh SSH connection, not a side channel** — inherits ProxyJump, certificates, 2FA, agent forwarding. *The client's.*
 - **Zero server-side install** — the client carries the binary and pushes it on first use. *The client's.*
 
-Three documents, and none of them repeats another:
+Five files, held to a rule that none of them repeats another:
 
 - [DESIGN.md](DESIGN.md) — problem, properties, architecture, security model, prior art, rejected alternatives.
 - [IMPLEMENTATION.md](IMPLEMENTATION.md) — wire protocol, ring buffer, PTY handling, bootstrap, build.
 - [PLAN.md](PLAN.md) — what is open, the client above it.
+- [SECURITY.md](SECURITY.md) — how to report a vulnerability, and what gets fixed.
+- [LICENSE](LICENSE) — Apache-2.0.
 
 ## Build
 
