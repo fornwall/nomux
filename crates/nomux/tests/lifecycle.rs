@@ -581,8 +581,8 @@ fn a_daemon_that_leads_a_process_group_detaches_by_forking() {
     let mut starter = Spawned::spawn(&mut command);
     let original_pid = starter.id();
 
-    let pid_file = root.join("nomux").join("grouped.pid");
-    wait_for(&root.join("nomux").join("grouped.sock"));
+    let pid_file = root.join("nomux/run").join("grouped.pid");
+    wait_for(&root.join("nomux/run").join("grouped.sock"));
     wait_for(&pid_file);
 
     // Bounded rather than a bare `wait`: if the fork never happened then the process
@@ -647,7 +647,7 @@ fn a_daemon_that_leads_a_process_group_detaches_by_forking() {
 /// first would be excluded from the second's count as its own.
 fn refusals_at_the_session_ceiling_leave_nothing_behind(name: &str, mode: &str, refusal: i32) {
     let root = run_root(name);
-    let dir = root.join("nomux");
+    let dir = root.join("nomux/run");
     fs::create_dir_all(&dir).expect("create the run directory");
     for n in 0..MAX_SESSIONS {
         fs::write(dir.join(format!("full{n}.sock")), b"").expect("plant a session");
@@ -743,7 +743,7 @@ fn a_relay_refused_at_the_session_ceiling_leaves_no_lock_behind() {
 #[test]
 fn a_spawn_whose_socket_cannot_be_bound_leaves_no_lock_behind() {
     let root = run_root("bind_lock");
-    let dir = root.join("nomux");
+    let dir = root.join("nomux/run");
     fs::create_dir_all(&dir).expect("create the run directory");
     fs::create_dir(dir.join("wedged.sock")).expect("plant a name no bind can take");
     let before = entries(&dir);
@@ -784,7 +784,7 @@ fn a_spawn_whose_socket_cannot_be_bound_leaves_no_lock_behind() {
 #[test]
 fn a_daemon_that_inherits_a_pending_stop_signal_still_runs_its_shutdown() {
     let root = run_root("pending_term");
-    let dir = root.join("nomux");
+    let dir = root.join("nomux/run");
     fs::create_dir_all(&dir).expect("create the run directory");
     let before = entries(&dir);
 
@@ -854,7 +854,7 @@ fn a_daemon_refused_by_a_live_session_leaves_that_session_its_lock() {
     let session = Session::start("dup_id");
     let lock = session
         .root
-        .join("nomux")
+        .join("nomux/run")
         .join(format!("{}.lock", session.id));
     assert!(
         lock.exists(),
@@ -909,7 +909,7 @@ fn a_daemon_refused_by_a_live_session_leaves_that_session_its_lock() {
 fn a_spawn_re_takes_a_spawn_lock_that_was_collected() {
     let deadline = Instant::now() + PATIENCE;
     let root = run_root("collected_lock");
-    let dir = root.join("nomux");
+    let dir = root.join("nomux/run");
     fs::create_dir_all(&dir).expect("create the run directory");
     let lock_path = dir.join("collected.lock");
     let lock = HeldLock::take(&lock_path);
@@ -970,7 +970,7 @@ fn a_spawn_re_takes_a_spawn_lock_that_was_collected() {
 fn a_daemon_holds_the_spawn_lock_while_it_claims_the_id() {
     let deadline = Instant::now() + PATIENCE;
     let root = run_root("claimed_lock");
-    let dir = root.join("nomux");
+    let dir = root.join("nomux/run");
     fs::create_dir_all(&dir).expect("create the run directory");
     // Created here so the wait below has an inode to name; the daemon opens this same
     // path, and `SpawnLock` checks that what it locked is still the file at it.
@@ -1008,7 +1008,7 @@ fn a_daemon_holds_the_spawn_lock_while_it_claims_the_id() {
 fn a_direct_daemon_refuses_an_id_whose_spawn_lock_is_held() {
     let deadline = Instant::now() + PATIENCE;
     let root = run_root("contended_direct_lock");
-    let dir = root.join("nomux");
+    let dir = root.join("nomux/run");
     fs::create_dir_all(&dir).expect("create the run directory");
     let socket = dir.join("contended.sock");
     drop(UnixListener::bind(&socket).expect("plant a stale session socket"));

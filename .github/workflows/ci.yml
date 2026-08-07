@@ -153,8 +153,8 @@ jobs:
   # still compiles and still passes over its committed seeds, which is what rots in a workspace
   # sitting outside the root one and so outside every hook but `cargo fmt`. No corpus is carried
   # between runs — a cache restored from the last green commit would make what this job covers a
-  # function of what happened to be cached. Deliberately absent from `publish`'s `needs`: a tag
-  # must not depend on how many execs a runner managed, and a crash still turns the run red.
+  # function of what happened to be cached. Release-gating: the time budget changes how much is
+  # explored, not whether a crash already found in this run is safe to publish alongside.
   fuzz:
     name: fuzz targets
     runs-on: ubuntu-latest
@@ -252,8 +252,9 @@ jobs:
       # the check job builds `-Zbuild-std` with `-Cpanic=immediate-abort`, so a binary that does
       # not start at all — a miscompiled std — would pass every pull request and first fail on the
       # tag publishing it. Both architectures must execute; on native x86_64 the shipped binary
-      # also creates, lists and kills a real PTY session, so release-only startup, signal and
-      # run-directory behavior is exercised rather than inferred from `--version`.
+      # also greets a real PTY, drives a shell, detaches, replays through a second relay, checks
+      # Exit, then lists and kills it. Release-only protocol, startup, signal and run-directory
+      # behavior is therefore exercised rather than inferred from `--version`.
       - name: Run the binaries that ship
         run: |
           sudo apt-get update -qq && sudo apt-get install -y qemu-user
@@ -276,7 +277,7 @@ jobs:
           if-no-files-found: ignore
 
   # The checksums need a permanent, public home; a workflow artifact expires after ninety days
-  # and sits behind a login. Its own job because it `needs` both jobs above — so a
+  # and sits behind a login. Its own job because it needs every test and artifact job — so a
   # tag cannot publish a release whose tests failed — and because it is the only one that wants a
   # write token, which is why the others keep the read-only one the header grants. Rehearsed by
   # nothing: no pull request reaches the download, the checksum check or `gh release create`. Nor
@@ -285,7 +286,7 @@ jobs:
   publish:
     name: publish the release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [check, release]
+    needs: [check, fuzz, release]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

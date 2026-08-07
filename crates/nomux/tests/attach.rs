@@ -61,7 +61,7 @@ use harness::{
 #[test]
 fn a_daemon_that_cannot_publish_its_pidfile_refuses_to_start() {
     let root = run_root("nopid");
-    let run_dir = root.join("nomux");
+    let run_dir = root.join("nomux/run");
     fs::create_dir_all(run_dir.join("nopid.pid"))
         .expect("plant a directory where the pidfile goes");
 
@@ -121,7 +121,7 @@ fn a_daemon_that_cannot_publish_its_pidfile_refuses_to_start() {
 #[test]
 fn spawn_reports_a_session_it_could_not_start_as_no_such_session() {
     let root = run_root("spawn_nostart");
-    fs::create_dir_all(root.join("nomux").join("nostart.sock"))
+    fs::create_dir_all(root.join("nomux/run").join("nostart.sock"))
         .expect("plant a directory where the session socket goes");
 
     let refused = collect(
@@ -258,7 +258,7 @@ fn spawn_refuses_a_wedged_session_without_unlinking_the_lock_it_took() {
     use std::os::unix::fs::PermissionsExt;
 
     let root = run_root("spawn_wedged");
-    let dir = root.join("nomux");
+    let dir = root.join("nomux/run");
     fs::create_dir_all(&dir).expect("create the run directory");
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
         .expect("tighten the run directory");
@@ -309,7 +309,7 @@ fn attach_refuses_an_id_nothing_answers_for_rather_than_inventing_a_session() {
     use std::os::unix::fs::PermissionsExt;
 
     let root = run_root("attach_ghost");
-    let dir = root.join("nomux");
+    let dir = root.join("nomux/run");
 
     for expect_dir in [false, true] {
         if expect_dir {
@@ -513,7 +513,7 @@ fn spawn_starts_the_binary_it_is_running_not_the_one_now_at_its_path() {
     use std::os::unix::fs::PermissionsExt;
 
     let root = run_root("spawn_swapped_exe");
-    let dir = root.join("nomux");
+    let dir = root.join("nomux/run");
     fs::create_dir_all(&dir).expect("create the run directory");
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
         .expect("tighten the run directory");
@@ -541,7 +541,8 @@ fn spawn_starts_the_binary_it_is_running_not_the_one_now_at_its_path() {
     let relay = Spawned::spawn(
         Command::new(&installed)
             .args(["spawn", "swapped"])
-            .env("XDG_RUNTIME_DIR", &root)
+            .env("XDG_STATE_HOME", &root)
+            .env_remove("HOME")
             .env("SHELL", "/bin/sh")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -1152,7 +1153,7 @@ fn relay_onto_a_socket_over(
     use std::os::unix::fs::PermissionsExt;
 
     let root = run_root(id);
-    let dir = root.join("nomux");
+    let dir = root.join("nomux/run");
     fs::create_dir_all(&dir).expect("create run directory");
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("tighten run dir");
     let listener = UnixListener::bind(dir.join(format!("{id}.sock"))).expect("bind session socket");

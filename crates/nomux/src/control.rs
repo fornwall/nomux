@@ -94,7 +94,7 @@ pub(crate) fn list() -> io::Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
     let mut listening = true;
-    for id in session_ids(&dir) {
+    for id in session_ids(&dir)? {
         // Against the directory already resolved above rather than one per entry: it is the
         // directory these names came out of, so re-reading the environment could only
         // disagree with the `read_dir` this is iterating.

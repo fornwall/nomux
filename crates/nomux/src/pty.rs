@@ -15,6 +15,7 @@ use std::process::{Child, Command, Stdio};
 
 use nomux::WinSize;
 use rustix::fs::{Mode, OFlags};
+use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
 use rustix::pty::{OpenptFlags, openpt, ptsname, unlockpt};
 use rustix::termios::{Winsize, tcsetwinsize};
 
@@ -211,7 +212,7 @@ impl Pty {
     /// [`Pty::pid_reissued`].
     pub(crate) fn terminate(&mut self) {
         let raw = as_pid(self.child.id());
-        if let Some(pid) = rustix::process::Pid::from_raw(raw)
+        if let Some(pid) = Pid::from_raw(raw)
             && !self.pid_reissued(raw)
         {
             // `group_alive` carries each probe's answer forward, so no signal below goes
@@ -219,8 +220,8 @@ impl Pty {
             let mut group_alive = rustix::process::test_kill_process_group(pid).is_ok();
             let mut settled = !group_alive && session_is_empty(raw);
             if !settled {
-                reach(pid, rustix::process::Signal::HUP, true);
-                signal_session(raw, rustix::process::Signal::HUP);
+                reach(Reach::Group(pid), Signal::HUP);
+                signal_session(raw, Signal::HUP);
 
                 // Real grace, not a formality: checking microseconds after the signal
                 // finds everything still running, so `SIGKILL` would follow at once and
@@ -251,9 +252,9 @@ impl Pty {
             // the *child's* group is already gone.
             if !settled && !self.pid_reissued(raw) {
                 if group_alive {
-                    reach(pid, rustix::process::Signal::KILL, true);
+                    reach(Reach::Group(pid), Signal::KILL);
                 }
-                signal_session(raw, rustix::process::Signal::KILL);
+                signal_session(raw, Signal::KILL);
             }
         }
         drop(self.child.kill());
@@ -310,40 +311,48 @@ fn start_time(pid: i32) -> Option<u64> {
 /// negative-pid form means a process *group*, and the point here is precisely the
 /// groups job control created that nobody is tracking.
 ///
-/// Sent from inside the walk rather than over a set collected by it, which is as narrow as
-/// this gets without a pidfd: nothing re-checks a member between its `stat` line claiming
-/// the session and the `kill`, and [`Pty::pid_reissued`] guards the child's own pid and no
-/// member's, so a member that exits in that window takes the signal on a number somebody
-/// else now holds. Collecting first stretched that window to the rest of the walk plus every
-/// signal ahead of this one, and entries going mid-walk is already the ordinary case — the
-/// process-group reach precedes it.
-fn signal_session(sid: i32, signal: rustix::process::Signal) {
-    walk_session(sid, |member| {
-        if let Some(pid) = rustix::process::Pid::from_raw(member) {
-            reach(pid, signal, false);
+/// Each member is pinned before its `stat` line is read and signalled through that pidfd.
+/// Opening after the membership check would retain the same reuse window as a numeric
+/// `kill(2)`; collecting numbers first would stretch it across the rest of the walk.
+fn signal_session(sid: i32, signal: Signal) {
+    walk_session(sid, true, |_, pinned| {
+        // A missing pidfd is ambiguity, not licence to fall back to the number: on a
+        // pre-5.3 kernel, under a restrictive seccomp profile, or after a racing exit,
+        // signalling nothing is safer than reaching a process that inherited the number
+        // between `/proc` and `kill(2)`. The child's own process-group reach above remains.
+        if let Some(pidfd) = pinned {
+            reach(Reach::Pinned(pidfd), signal);
         }
         true
     });
 }
 
-/// Sends one signal, to `pid`'s process group where `group` and to `pid` alone otherwise.
+/// One stable destination for a signal this module sends.
+#[derive(Clone, Copy)]
+enum Reach<'a> {
+    /// The direct child's process group, guarded by [`Pty::pid_reissued`].
+    Group(Pid),
+    /// A session member held across the `/proc` membership check.
+    Pinned(&'a OwnedFd),
+}
+
+/// Sends one signal to a guarded process group or a pinned process.
 ///
 /// This is the module's only door to a signal: nothing else in this file may call
-/// `kill_process` or `kill_process_group`, or a later path could reach a process without
-/// `REACHES` recording it — the invariant the two regression tests below rest on. What they
-/// measure is the *decision* to signal, the only thing that can be: where the guard skips,
-/// what it skips would have landed nowhere by construction.
+/// `kill_process_group` or `pidfd_send_signal`, or a later path could reach a process
+/// without `REACHES` recording it — the invariant the regression tests below rest on.
+/// What they measure is the *decision* to signal, the only thing that can be: where a
+/// guard skips, what it skips would have landed nowhere by construction.
 ///
 /// The outcome is dropped throughout. A process that took the first signal and died answers
 /// the second with `ESRCH`, which is this working rather than failing.
-fn reach(pid: rustix::process::Pid, signal: rustix::process::Signal, group: bool) {
+fn reach(target: Reach<'_>, signal: Signal) {
     #[cfg(test)]
     REACHES.with_borrow_mut(|sent| sent.push(signal));
-    let _ = if group {
-        rustix::process::kill_process_group(pid, signal)
-    } else {
-        rustix::process::kill_process(pid, signal)
-    };
+    match target {
+        Reach::Group(pid) => drop(rustix::process::kill_process_group(pid, signal)),
+        Reach::Pinned(pidfd) => drop(pidfd_send_signal(pidfd, signal)),
+    }
 }
 
 #[cfg(test)]
@@ -353,7 +362,7 @@ thread_local! {
     /// Per thread rather than process-wide, so the two tests that read it need nothing
     /// between them: [`Pty::terminate`] signals on the thread that called it, and two tests
     /// can share a thread only by running one after the other.
-    static REACHES: std::cell::RefCell<Vec<rustix::process::Signal>> =
+    static REACHES: std::cell::RefCell<Vec<Signal>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -366,12 +375,17 @@ thread_local! {
 /// and counting it would keep the caller's grace loop spinning for its whole budget over the
 /// child it is about to reap.
 ///
+/// With `pin` set, a pidfd is opened **before** the stat line that establishes membership and
+/// borrowed into `visit`. The descriptor keeps the check and any signal about one process even
+/// if it exits in between; a member that cannot be pinned is still visible to the emptiness
+/// check, but is never safe to signal individually.
+///
 /// One path buffer and one read buffer for the whole walk, rather than a `format!` and a
 /// `Vec` per process: [`Pty::terminate`]'s grace loop reaches here every
 /// [`HANGUP_POLL_INTERVAL`] once the child's own group has gone, so on a busy host the
 /// per-process pair would be tens of thousands of allocations inside a shutdown that has
 /// [`HANGUP_GRACE`] to finish in.
-fn walk_session(sid: i32, mut visit: impl FnMut(i32) -> bool) {
+fn walk_session(sid: i32, pin: bool, mut visit: impl FnMut(i32, Option<&OwnedFd>) -> bool) {
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return;
     };
@@ -386,6 +400,13 @@ fn walk_session(sid: i32, mut visit: impl FnMut(i32) -> bool) {
         if pid == self_pid {
             continue;
         }
+        // Before the membership read below: opening it afterwards leaves the exact reuse
+        // window this descriptor exists to close. Failure is carried as `None`; only the
+        // signalling caller requires a hold, while `session_is_empty` still needs to see
+        // members on kernels without pidfds.
+        let pinned = pin
+            .then(|| Pid::from_raw(pid).and_then(|pid| pidfd_open(pid, PidfdFlags::empty()).ok()))
+            .flatten();
         path.push(&name);
         path.push("stat");
         stat.clear();
@@ -396,7 +417,7 @@ fn walk_session(sid: i32, mut visit: impl FnMut(i32) -> bool) {
             continue;
         }
         if stat_session(&stat).is_some_and(|(session, zombie)| session == sid && !zombie)
-            && !visit(pid)
+            && !visit(pid, pinned.as_ref())
         {
             return;
         }
@@ -410,7 +431,7 @@ fn walk_session(sid: i32, mut visit: impl FnMut(i32) -> bool) {
 /// [`Pty::terminate`]'s grace loop asks this every [`HANGUP_POLL_INTERVAL`].
 fn session_is_empty(sid: i32) -> bool {
     let mut empty = true;
-    walk_session(sid, |_| {
+    walk_session(sid, false, |_, _| {
         empty = false;
         false
     });
@@ -607,7 +628,7 @@ mod tests {
     fn the_walk_never_returns_this_process() {
         let sid = rustix::process::getsid(None)
             .expect("this process's own session id, which the kernel cannot refuse");
-        let sid = rustix::process::Pid::as_raw(Some(sid));
+        let sid = Pid::as_raw(Some(sid));
         let members = session_members(sid);
         let self_pid = as_pid(std::process::id());
         assert!(
@@ -713,7 +734,7 @@ mod tests {
         rustix::io::write(pty.master(), b"exit\n").expect("ask the shell to leave");
         assert!(reaped_within(&mut pty), "the shell never exited");
         let raw = as_pid(pty.child.id());
-        let pid = rustix::process::Pid::from_raw(raw).expect("the reaped child's pid");
+        let pid = Pid::from_raw(raw).expect("the reaped child's pid");
         // Deterministic rather than hopeful: a pid stays reserved while anything still
         // names it as a session.
         assert!(
@@ -761,7 +782,7 @@ mod tests {
     fn terminate_ends_a_settled_session_without_reaching_for_sigkill() {
         let mut pty = shell("terminate_quiet");
         let raw = as_pid(pty.child.id());
-        let pid = rustix::process::Pid::from_raw(raw).expect("the child's pid");
+        let pid = Pid::from_raw(raw).expect("the child's pid");
         rustix::io::write(pty.master(), b"exit\n").expect("ask the shell to leave");
 
         // Watched through `/proc`, not through `try_wait`, which would perform the very
@@ -785,12 +806,12 @@ mod tests {
         pty.terminate();
         let sent = reaches_since();
         assert!(
-            sent.contains(&rustix::process::Signal::HUP),
+            sent.contains(&Signal::HUP),
             "the shutdown sent no SIGHUP, so the assertion below is about an instrument \
              that measures nothing: {sent:?}"
         );
         assert!(
-            !sent.contains(&rustix::process::Signal::KILL),
+            !sent.contains(&Signal::KILL),
             "terminate reached for SIGKILL over a session whose last member was the \
              zombie it had been handed to reap: {sent:?}"
         );
@@ -801,7 +822,7 @@ mod tests {
     /// at the first member.
     fn session_members(sid: i32) -> Vec<i32> {
         let mut members = Vec::new();
-        walk_session(sid, |pid| {
+        walk_session(sid, false, |pid, _| {
             members.push(pid);
             true
         });
@@ -809,7 +830,7 @@ mod tests {
     }
 
     /// The signals [`reach`] has sent since this was last asked, and none from here on.
-    fn reaches_since() -> Vec<rustix::process::Signal> {
+    fn reaches_since() -> Vec<Signal> {
         REACHES.with_borrow_mut(std::mem::take)
     }
 

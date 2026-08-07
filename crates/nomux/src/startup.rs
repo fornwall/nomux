@@ -141,9 +141,13 @@ pub(crate) fn arm_child_signal() -> io::Result<OwnedFd> {
     Ok(read)
 }
 
-/// Puts the daemon in a session of its own *and* without a controlling terminal, which is
-/// what lets it outlive the connection that started it (§ 6.2 for the order, the two shapes
-/// that need the fork, and the `SIGHUP` ignored ahead of all of it).
+/// Puts the daemon in a POSIX session of its own *and* without a controlling terminal
+/// (§ 6.2 for the order, the two shapes that need the fork, and the `SIGHUP` ignored ahead
+/// of all of it).
+///
+/// This prevents a terminal or SSH-channel hangup from reaching the daemon. It deliberately
+/// makes no stronger systemd claim: `setsid` and `fork` do not move a process out of its
+/// `session-*.scope`, so host policy may still terminate that scope at logout.
 ///
 /// `TIOCNOTTY` would drop the terminal without a fork and is deliberately not used — § 6.2
 /// delegates the argument here. Issued by a session leader it sends `SIGHUP` and `SIGCONT`
@@ -152,7 +156,7 @@ pub(crate) fn arm_child_signal() -> io::Result<OwnedFd> {
 /// this program's to take.
 ///
 /// Failures are not propagated: sharing a session makes for a worse daemon, not a broken one.
-pub(crate) fn leave_login_session() {
+pub(crate) fn detach_from_controlling_terminal() {
     // SAFETY: `signal` with SIG_IGN on a single-threaded process with no handler installed;
     // reset in the child before `exec` (`pty::Pty::spawn`), so it still dies on hangup.
     unsafe {

@@ -27,12 +27,13 @@
 use std::fmt::Write as _;
 use std::io::{ErrorKind, Read, Write};
 use std::ops::{Deref, DerefMut};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{PoisonError, RwLock};
 use std::time::{Duration, Instant};
-use std::{fs, thread};
+use std::{env, fs, thread};
 
 use nomux::{
     ErrorCode, Frame, FrameType, HEADER_LEN, Hello, PROTOCOL_VERSION, RESUME_FROM_START, WinSize,
@@ -233,7 +234,7 @@ impl Session {
         )
         .expect("spawn daemon");
 
-        let socket = root.join("nomux").join(format!("{id}.sock"));
+        let socket = root.join("nomux/run").join(format!("{id}.sock"));
         wait_until_answering(&socket);
         Self {
             child,
@@ -315,7 +316,7 @@ impl Session {
 
     /// The directory the daemon publishes its five files in.
     fn run_dir(&self) -> PathBuf {
-        self.root.join("nomux")
+        self.root.join("nomux/run")
     }
 
     /// The pidfile `nomux kill` reads to find out what to signal.
@@ -444,9 +445,10 @@ pub(crate) fn run_root(name: &str) -> PathBuf {
     /// rather than about the names.
     const ID_HEADROOM: usize = 32;
 
-    sweep_finished_runs();
+    let base = integration_tmpdir();
+    sweep_finished_runs(&base);
     let owned = format!("{}-{}", intern(name), std::process::id());
-    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(owned);
+    let root = base.join(owned);
     // A pid is reused eventually, and a run that crashed hard leaves its directory
     // behind, so the wipe stays even though the name is this process's own.
     drop(fs::remove_dir_all(&root));
@@ -456,8 +458,8 @@ pub(crate) fn run_root(name: &str) -> PathBuf {
     // which names the cause. `sun_path` is 108 bytes with room for the NUL, and the
     // longest name a session can put under this root is a maximum-length id plus the
     // longest extension the run directory uses.
-    // `<root>/nomux/<id>.agent` is the longest name a session puts here.
-    let fixed = root.join("nomux").join(".agent").as_os_str().len();
+    // `<root>/nomux/run/<id>.agent` is the longest name a session puts here.
+    let fixed = root.join("nomux/run").join(".agent").as_os_str().len();
     assert!(
         fixed + ID_HEADROOM <= 107,
         "this run root leaves {} bytes for a session id, and the suite needs {ID_HEADROOM}: \
@@ -470,16 +472,46 @@ pub(crate) fn run_root(name: &str) -> PathBuf {
     root
 }
 
+/// A short, owner-only base under the platform temporary directory.
+///
+/// Production refuses an unprotected writable ancestor. The checkout containing
+/// `CARGO_TARGET_TMPDIR` may itself be group-writable, so using it would make every
+/// integration test assert on the developer's directory policy rather than nomux. A
+/// uid-named child of sticky `/tmp` is protected by the kernel and matches a valid runtime
+/// fallback. An entry another uid planted first is refused, never followed or repaired.
+fn integration_tmpdir() -> PathBuf {
+    let us = rustix::process::getuid().as_raw();
+    let base = env::temp_dir().join(format!("nomux-it-{us}"));
+    match fs::DirBuilder::new().mode(0o700).create(&base) {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+        Err(err) => panic!("create integration-test base {}: {err}", base.display()),
+    }
+    let metadata = fs::symlink_metadata(&base)
+        .unwrap_or_else(|err| panic!("examine integration-test base {}: {err}", base.display()));
+    assert!(
+        metadata.is_dir()
+            && !metadata.file_type().is_symlink()
+            && metadata.uid() == us
+            && metadata.mode() & 0o022 == 0,
+        "integration-test base {} is not an unshared real directory owned by uid {us}",
+        base.display()
+    );
+    fs::set_permissions(&base, fs::Permissions::from_mode(0o700))
+        .unwrap_or_else(|err| panic!("secure integration-test base {}: {err}", base.display()));
+    base
+}
+
 /// Removes the run directories of test processes that have exited.
 ///
 /// The pid in the name is what lets two runs proceed at once, and it is equally
 /// what stops a run from reusing what the last one left: without this,
-/// `CARGO_TARGET_TMPDIR` would grow by a directory per test per run, for ever. A
+/// the integration-test base would grow by a directory per test per run, for ever. A
 /// directory goes only once `/proc` says its process is gone — a live pid is either
 /// this one or a run in flight, and taking either away is the exact fault the naming
 /// exists to prevent.
-fn sweep_finished_runs() {
-    let Ok(entries) = fs::read_dir(env!("CARGO_TARGET_TMPDIR")) else {
+fn sweep_finished_runs(base: &Path) {
+    let Ok(entries) = fs::read_dir(base) else {
         return;
     };
     for entry in entries.flatten() {
@@ -554,12 +586,18 @@ pub(crate) fn while_nothing_forks<T>(f: impl FnOnce() -> T) -> T {
 /// A `nomux` invocation against the run directory under `root`, ready for whatever
 /// stdio and tuning the caller wants on top.
 ///
-/// The run directory is the whole of what the frozen control surface is told (§ 6.6),
-/// and nothing else is added here: that is a claim about the surface rather than a
-/// convenience, and an invocation handed more is no longer the thing § 6.6 describes.
+/// The run-directory environment is the whole of what the control surface is told
+/// (§ 6.6), and nothing else is added here: that is a claim about the surface rather
+/// than a convenience.
 pub(crate) fn nomux(root: &Path, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_nomux"));
-    command.args(args).env("XDG_RUNTIME_DIR", root);
+    // Production prefers persistent state (§ 6.3), and the general integration path
+    // exercises that choice. Pinning it explicitly keeps an inherited developer HOME out
+    // of the result; a test may still set HOME for the shell without moving the socket.
+    command
+        .args(args)
+        .env("XDG_STATE_HOME", root)
+        .env("XDG_RUNTIME_DIR", root);
     command
 }
 
@@ -600,7 +638,7 @@ pub(crate) fn nomux_with_shell(root: &Path, args: &[&str]) -> Command {
 /// Runs `nomux` against the run directory under `root`, and waits for it to finish.
 ///
 /// `list` and `kill` reach a session only through the files on disk (§ 6.6), so
-/// pointing `XDG_RUNTIME_DIR` at the right place is the whole of what they need to
+/// pointing `XDG_STATE_HOME` at the right place is the whole of what they need to
 /// be told — as it is for any other mode expected to refuse before it starts
 /// anything. A mode that would go on to serve must not come through here: waiting
 /// for it is waiting for ever.
@@ -671,7 +709,7 @@ pub(crate) fn wait_for(path: &Path) {
 /// run directory for the whole first-attach timeout, while the *next* run's
 /// [`sweep_finished_runs`] deletes that directory out from under it.
 pub(crate) fn daemon_reaper(root: &Path, id: &str) -> (u32, Reaper) {
-    let pid_file = root.join("nomux").join(format!("{id}.pid"));
+    let pid_file = root.join("nomux/run").join(format!("{id}.pid"));
     wait_for(&pid_file);
     let pid: u32 = fs::read_to_string(&pid_file)
         .expect("read the pidfile")
@@ -933,7 +971,7 @@ fn is_flock(line: &str, state: Flock, dev: u64, ino: u64) -> bool {
 ///
 /// The kernel prints it as `%02x:%02x:%llu` — the device in hex, the inode in
 /// decimal — and all three are checked. Inode numbers are unique only within a
-/// filesystem, and `CARGO_TARGET_TMPDIR` need not be on the same one as anything
+/// filesystem, and the run root need not be on the same one as anything
 /// else this process has open, so matching the inode alone would match a stranger's
 /// lock on a stranger's file.
 fn names_the_file(field: &str, dev: u64, ino: u64) -> bool {

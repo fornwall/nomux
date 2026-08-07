@@ -33,9 +33,9 @@ it, and what nomux *sets* is §6.1.1's. `NOMUX_UPDATE_BASELINE` is tested for ex
 
 | Variable | Read by | Effect |
 | --- | --- | --- |
-| `XDG_RUNTIME_DIR` | every mode | First choice of run directory (§6.3) |
-| `XDG_STATE_HOME` | every mode | Second choice (§6.3) |
-| `HOME` | every mode | Third choice (§6.3), and the child's working directory (§6.1.1) |
+| `XDG_STATE_HOME` | every mode | First choice of run directory (§6.3) |
+| `HOME` | every mode | Second choice (§6.3), and the child's working directory (§6.1.1) |
+| `XDG_RUNTIME_DIR` | every mode | Login-scoped fallback run directory (§6.3) |
 | `SHELL` | daemon | The child's login shell (§6.1.1) |
 | `USER`, `LOGNAME` | daemon | Login name for the linger check (§6.2) |
 | `NOMUX_RING_BYTES` | daemon | Ring capacity in bytes (§4) |
@@ -48,8 +48,9 @@ Off the table, the toolchain's own. `scripts/build-release.sh` reads `CARGO_HOME
 it interpolates (§8) — which is also why the job-wide `RUSTFLAGS` deny CI sets on its
 `check` job is *not* set on the release one, `CARGO_ENCODED_RUSTFLAGS` making cargo ignore
 `RUSTFLAGS` outright and a deny there silently absent. The
-unit tests site scratch directories under `TMPDIR` via `env::temp_dir()`, the integration
-tests under `CARGO_TARGET_TMPDIR` (§9).
+unit tests site scratch directories under `TMPDIR` via `env::temp_dir()`, and the integration
+tests use an owner-only `nomux-it-<uid>` child there (§9); the sticky parent protects that
+entry in the same way a valid runtime-directory fallback is protected.
 
 ## 2. Wire protocol
 
@@ -179,7 +180,9 @@ Fixed capacity, allocated once, with `Ring::base()` the oldest offset still reta
 `Ring::end()` one **past** the newest byte written — the total ever written, and the open
 end of every range below. Capacity defaults to 4 MiB, overridable per daemon with
 `NOMUX_RING_BYTES` (§1): an unparseable or zero value falls back to the default instead of
-refusing to start, and one past 1 GiB is clamped there.
+refusing to start, and one past 1 GiB is clamped there. The whole allocation is attempted
+before the socket, pidfile or daemon process is published; allocator refusal is a normal
+startup error and cannot strand a half-created session.
 
 - The daemon always drains the PTY, attached or not. If the ring is full it advances the base, discarding the oldest bytes; a write larger than the whole ring discards everything retained as well as its own head, so the base accounts for both.
 - A client is served `[max(from, base()) .. end()]`.
@@ -268,9 +271,9 @@ weighs the `libvterm` snapshot).
 
 ```sh
 p=${XDG_DATA_HOME:-$HOME/.local/share}/nomux
-r=; case ${XDG_RUNTIME_DIR-} in /*) r=${XDG_RUNTIME_DIR%/}/nomux ;; *)
-case ${XDG_STATE_HOME-} in /*) r=${XDG_STATE_HOME%/}/nomux/run ;; *)
-case ${HOME-} in /*) r=${HOME%/}/.local/state/nomux/run ;; esac ;; esac ;; esac
+r=; case ${XDG_STATE_HOME-} in /*) r=${XDG_STATE_HOME%/}/nomux/run ;; *)
+case ${HOME-} in /*) r=${HOME%/}/.local/state/nomux/run ;; *)
+case ${XDG_RUNTIME_DIR-} in /*) r=${XDG_RUNTIME_DIR%/}/nomux ;; esac ;; esac ;; esac
 case $r in /*) printf 'NOMUX-RUNDIR %s\n' "$r" >&2 ;; esac
 [ -x "$p/nomux-$VER" ] && exec "$p/nomux-$VER" "$MODE" "$ID" 2>/dev/null
 echo "NOMUX-BOOTSTRAP $(uname -s) $(uname -m) $p"
@@ -316,8 +319,8 @@ Each source counts **only where it names an absolute path**, `rundir::absolute_e
 nothing else — so unset, empty and relative are one answer and not three, and a `~/run` no
 shell expanded is relative like the rest, which is why `${VAR-}` and a `case` do the work
 where a `${VAR:-default}` would silently promote the relative ones. `$HOME` substitutes for
-`$XDG_STATE_HOME` and then takes the *same* `nomux/run`, under `.local/state`: a branch of
-one precedence, not a third directory. `${VAR%/}/` is the join — `PathBuf::push` adds a
+`$XDG_STATE_HOME` takes the *same* `nomux/run`, under `.local/state`: a branch of one
+precedence, not a third directory. `${VAR%/}/` is the join — `PathBuf::push` adds a
 separator only where the last byte is not one, and stripping one to put one back is that
 rule to the byte, down to `XDG_RUNTIME_DIR=/` giving `/nomux` and not the `//nomux` POSIX
 leaves implementation-defined. What the shell reads is what the `exec` inherits, so a login
@@ -335,15 +338,15 @@ escape.
 
 ```sh
 p=${XDG_DATA_HOME:-$HOME/.local/share}/nomux
-r=; case ${XDG_RUNTIME_DIR-} in /*) r=${XDG_RUNTIME_DIR%/}/nomux ;; *)
-case ${XDG_STATE_HOME-} in /*) r=${XDG_STATE_HOME%/}/nomux/run ;; *)
-case ${HOME-} in /*) r=${HOME%/}/.local/state/nomux/run ;; esac ;; esac ;; esac
+r=; case ${XDG_STATE_HOME-} in /*) r=${XDG_STATE_HOME%/}/nomux/run ;; *)
+case ${HOME-} in /*) r=${HOME%/}/.local/state/nomux/run ;; *)
+case ${XDG_RUNTIME_DIR-} in /*) r=${XDG_RUNTIME_DIR%/}/nomux ;; esac ;; esac ;; esac
 case $r in /*) printf 'NOMUX-RUNDIR %s\n' "$r" >&2 ;; esac
 mkdir -p -m 700 "$p" && set -C && cat > "$p/.up.$$" && chmod 755 "$p/.up.$$" \
   && mv -f "$p/.up.$$" "$p/nomux-$VER" && exec "$p/nomux-$VER" "$MODE" "$ID"
 ```
 
-- **`NOMUX-RUNDIR` is repeated verbatim from §5.1 rather than inherited from it.** The two commands do not always both run — a version bump reaches this one with a host profile already cached — and the answer can move on a host that has not: `$XDG_RUNTIME_DIR` lives as long as a login session and is gone at last logout without linger (§6.3), so the same host resolves the tmpfs directory while somebody is logged in and the `$HOME` fallback when nobody is. A field re-established on every cold command cannot quietly name last week's directory. It sits before the `cat`, so the client has it without waiting out the upload, and before the `mkdir`, so a host that refuses the install still says where its sessions would be.
+- **`NOMUX-RUNDIR` is repeated verbatim from §5.1 rather than inherited from it.** The two commands do not always both run — a version bump reaches this one with a host profile already cached — and server-side XDG variables can change between invocations. A field re-established on every cold command cannot quietly name last week's directory. It sits before the `cat`, so the client has it without waiting out the upload, and before the `mkdir`, so a host that refuses the install still says where its sessions would be.
 - Temp-then-`mv` is atomic within one filesystem and avoids `ETXTBSY` — you cannot write over a running binary.
 - Version in the filename: an upgraded client cannot break sessions an older daemon still holds.
 - Transfer over an **exec channel with `cat`**, not SFTP. `Subsystem sftp` gets disabled on hardened hosts, and modern `scp` is SFTP underneath. SSH channels are 8-bit clean, so no base64 tax.
@@ -386,8 +389,8 @@ daemon's own code and so needs none of this.
 negative is cached per-host so a hardened box is not re-probed on each reconnect. Three
 conditions off the tree reach the same fallback: a restricted shell with no `uname` is
 plain SSH; `AllowStreamLocalForwarding no` costs only the warm path, leaving the exec
-relay; and `KillUserProcesses=yes` without linger kills the daemon at logout, which the
-daemon detects and reports (§6.2) rather than works around.
+relay; and systemd may kill the SSH session scope at logout, which this release reports as
+an explicit limitation (§6.2) rather than pretending a double-fork or linger marker fixes.
 
 ## 6. Daemon
 
@@ -438,7 +441,7 @@ That environment is a snapshot of the connection that *created* the session, fro
 lifetime ([DESIGN.md § 5.3](DESIGN.md#53-transparency)). Indirection through the run
 directory (§ 6.6) is the only fix, and only for variables that name a path.
 
-### 6.2 Detachment from the login session
+### 6.2 Terminal detachment and logout policy
 
 The `daemon` mode holds this itself instead of trusting whoever started it:
 
@@ -453,7 +456,7 @@ chdir "/"
 ```
 
 The test is **no controlling terminal**, not "leads a session": a session leader may still
-hold one. `startup::leave_login_session` carries the rest. The fork happens after the socket
+hold one. `startup::detach_from_controlling_terminal` carries the rest. The fork happens after the socket
 is bound and before the pidfile is written, so an id already taken is reported with an exit
 status somebody sees, and `nomux kill` (§ 6.6) reads the pid of the survivor. That second
 gap is § 6.6's publish window.
@@ -475,15 +478,21 @@ after: `exec` preserves a pending signal as well as a blocked one, so a signal b
 pending arrives the instant the mask clears, and a handler armed behind that is one it
 missed.
 
-`systemd-logind` with `KillUserProcesses=yes` kills the daemon at logout; the only fix is
-`loginctl enable-linger $USER`. The daemon reports the state in `HelloOk.linger` (§ 2.3),
-reading what `logind` reads: `/run/systemd/system`, then `/var/lib/systemd/linger/<user>`.
-A missing marker is a definite *disabled*; only a lookup that fails otherwise is *unknown*,
-and **the client must not warn on unknown**. The login name is `$USER`, then `$LOGNAME`, and
-nothing else. **The test is applied to each source in turn, not to the answer**: a name that
-is empty or holds `/`, NUL, `.` or `..` is not a single filename component, and one that
-fails is skipped rather than fatal — a malformed `$USER` falls through to `$LOGNAME`, which
-is what "in that order" has to mean. Only both failing is *unknown*.
+This is POSIX terminal detachment, not escape from a service manager. On systemd, `setsid`
+and `fork` leave the process in the SSH `session-*.scope`; with `KillUserProcesses=yes`,
+logout stops that scope and the daemon with it. `loginctl enable-linger` keeps the user's
+manager alive but does not move an already-running session process into a manager unit, so
+it is not a workaround for this release. Reliable survival under that policy requires a
+user-manager-backed scope or service and remains a release gate in [PLAN.md](PLAN.md).
+
+`HelloOk.linger` (§ 2.3) therefore reports only the advisory marker that a future launch
+path can use, reading `/run/systemd/system` and then `/var/lib/systemd/linger/<user>`. It is
+never a survival guarantee. A missing marker is definite *disabled*; only a lookup that
+fails otherwise is *unknown*. The login name is `$USER`, then `$LOGNAME`, and nothing else.
+**The test is applied to each source in turn, not to the answer**: a name that is empty or
+holds `/`, NUL, `.` or `..` is not a single filename component, and one that fails is
+skipped rather than fatal — a malformed `$USER` falls through to `$LOGNAME`, which is what
+"in that order" has to mean. Only both failing is *unknown*.
 
 ### 6.3 Socket
 
@@ -500,9 +509,10 @@ invalid id is a hard error, never sanitised into something valid.
 
 Path precedence, first **absolute** one winning:
 
-1. `$XDG_RUNTIME_DIR/nomux/<id>.sock` — tmpfs, but removed on last logout unless linger is on.
-2. `$XDG_STATE_HOME/nomux/run/<id>.sock`.
-3. `$HOME/.local/state/nomux/run/<id>.sock`.
+1. `$XDG_STATE_HOME/nomux/run/<id>.sock`.
+2. `$HOME/.local/state/nomux/run/<id>.sock`.
+3. `$XDG_RUNTIME_DIR/nomux/<id>.sock` — a last fallback, removed after the final logout on
+   ordinary `pam_systemd` systems and therefore unable to provide logout persistence.
 
 A source naming a relative or empty path is skipped; where none names an absolute one,
 every mode fails with that — 126 from the relay, 1 from the rest (§ 10).
@@ -525,7 +535,8 @@ The precedence is therefore written twice: here, in Rust, and in a shell the dae
 runs. The shell mirrors `absolute_env` and not the three-item list above — a source counts
 **only where it names an absolute path**, so unset, empty and relative are one answer;
 `$HOME` is a substitute for `$XDG_STATE_HOME` that takes the *same* `nomux/run` under
-`.local/state` rather than a directory of its own; and where nothing qualifies it prints
+`.local/state` rather than a directory of its own; the runtime directory is only the
+fallback when neither persistent source is usable; and where nothing qualifies it prints
 nothing, which is this section's refusal rather than a silence. Two copies can still drift,
 and that is affordable for one reason only: a wrong directory is a `direct-streamlocal` sshd
 refuses, and § 5.3 answers a refusal with the exec relay, which resolves the path in the
@@ -542,9 +553,14 @@ unlink.
 
 **Directory `0700`, everything in it `0600`, exact modes and not upper bounds.** This is
 where those two numbers live; everywhere else in the tree that names them cites here.
-Filesystem
-sockets only, never abstract ones ([DESIGN.md § 8](DESIGN.md#8-security-model)). Every mode
-checks the run directory — owner, type and mode — before it resolves the first name in it.
+Filesystem sockets only, never abstract ones ([DESIGN.md § 8](DESIGN.md#8-security-model)).
+Every mode checks the run directory — owner, type and mode — before it resolves the first
+name in it. It also refuses a symlink, a non-directory, a non-root/non-user owner, or an
+unprotected group/other write bit on every ancestor. A sticky shared directory such as
+`/tmp` is accepted only where the child entry belongs to this uid or root, which is the
+condition under which the kernel forbids another uid to rename it. The later bind and unlink
+operations are path-based (`bindat` does not exist), so these checks prevent another uid from
+redirecting the checked directory between validation and use.
 An `AF_UNIX` `connect` to a full backlog blocks instead of being refused, so every connect
 is bounded: 2 s for `kill` and the relay, 1 s for the daemon's stale-socket probe, none for
 `list`. `rundir.rs` has the rest.
@@ -685,10 +701,12 @@ exactly what nothing is tracking. The child's own number is guarded against reus
 start time, read at spawn and compared before either reach; where spawn took none, an
 unreaped child passes on the strength of still holding that number — `try_wait` answering
 `Ok(None)` — and only a *collected* one is left alone rather than signalled on a recycled
-number. A session **member** gets no such guard: `signal_session` signals from inside the
-walk, on a number the member's own `stat` line claimed one instant earlier and nothing
-re-checks between the two. Narrowed to that instant rather than closed, which is as far as
-this goes without a pidfd per member.
+number. Every other session member is held by a pidfd opened before its `stat` line is read,
+and the signal goes through that descriptor rather than through the number. A member that
+cannot be pinned — on a pre-5.3 kernel, under a restrictive seccomp profile, or because it
+exited during the walk — is skipped rather than signalled ambiguously; the direct child's
+process-group reach still runs. This makes an individual signal conservative on older kernels
+instead of letting the `/proc`-to-`kill(2)` race reach an unrelated process.
 
 `SIGQUIT` is left at its default: a core dump is the only way to get a snapshot out of a
 wedged daemon (§ 8), and `SIGKILL` already means "go away now". The child has it restored
@@ -818,7 +836,9 @@ Three tab-separated columns per session, one line each, no header:
 - **`<label>` is empty** where there is no label or it could not be read. Bytes that are not valid UTF-8 arrive as U+FFFD instead of emptying the field, since a read cut at the bound can split a character the daemon wrote whole. The trailing tab is still written, so a line always has three fields and a consumer can split on the count.
 - **Dead sessions are collected, not printed.** The sweep above unlinks them, so what `list` prints is the live set.
 - **An id this run directory cannot address is named on stderr**, never in the columns, and the exit stays 0. Its files are here and § 6.3 can form no socket address for them, so it is neither probed nor collected — and every id printed above is one a client may hand straight back to `attach`.
-- **Exit 0 is not "sessions exist."** No run directory, an empty one, or one `read_dir` could not open prints nothing and exits 0 (§ 10 has the rest of the table).
+- **Exit 0 is not "sessions exist."** No run directory or an empty one prints nothing and
+  exits 0; failure to enumerate an existing directory is an error, never a partial-success
+  listing (§ 10 has the rest of the table).
 - `EPIPE` on stdout — `nomux list | head` — stops the printing but **not** the sweep, so a stale session is never left behind because the reader went away.
 
 #### `<id>.label`
@@ -828,7 +848,7 @@ that has lost its state would otherwise see only UUIDs. Written once at session 
 advisory — never parsed, never used for lookup, and a missing or malformed one degrades
 `list` and nothing else. It arrives as `nomux spawn <id> --label <text>` or
 `nomux daemon <id> --label <text>`, `--label=<text>` accepted too and a second of either
-refused (§ 10). `attach` *refuses* it instead of ignoring it; `kill` parses and ignores one.
+refused (§ 10). `attach` and `kill` refuse it rather than silently dropping intent.
 A command-line flag and not a `Hello` field, the writer belonging to a layout that outlives
 the protocol.
 

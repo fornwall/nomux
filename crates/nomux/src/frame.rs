@@ -124,19 +124,18 @@ impl Hello<'_> {
 }
 
 wire_enum! {
-    /// Whether the daemon's session outlives the user's last logout.
+    /// The user's systemd linger-marker state.
     ///
-    /// Reported rather than worked around, and a byte of [`HelloOk`] in its own right
-    /// rather than bits inside its flags (`IMPLEMENTATION.md` § 6.2, § 2.3).
+    /// Advisory only: it says whether systemd keeps the user manager alive, not whether
+    /// this session-scoped daemon survives logout (`IMPLEMENTATION.md` § 6.2, § 2.3).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     Linger: u8,
-    /// Not determined: no `systemd`, or its state is unreadable. Do not warn —
-    /// on a host without `logind` there is nothing to warn about.
+    /// Not determined: no `systemd`, or its state is unreadable.
     Unknown = 0,
-    /// `logind` is running and lingering is off for this user. The session dies at
-    /// logout if the host also sets `KillUserProcesses=yes`.
+    /// `logind` is running and lingering is off for this user.
     Disabled = 1,
-    /// Lingering is on; the session survives logout.
+    /// Lingering is on, so systemd keeps the user's manager alive after logout. This
+    /// daemon still remains in the SSH session scope unless a manager-backed launch moves it.
     Enabled = 2,
 }
 
@@ -151,7 +150,7 @@ pub struct HelloOk {
     pub resume_from: u64,
     /// Authoritative input offset; the client fast-forwards to this.
     pub in_applied: u64,
-    /// Whether this session survives the user's logout.
+    /// Advisory systemd linger-marker state; not a survival guarantee.
     pub linger: Linger,
     /// Whether an agent socket is being served, so the client knows to expect
     /// [`Frame::AgentOpen`]. False when it was not asked for, and equally when the

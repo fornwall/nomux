@@ -40,19 +40,19 @@ const EXIT_UNATTACHABLE: u8 = 126;
 const EXIT_NO_SESSION: u8 = 127;
 
 const USAGE: &str = "\
-usage: nomux <mode> [session-id] [--label <text>]
+usage: nomux <mode> [session-id] [options]
 
-modes:
-  daemon <session-id>   Own a PTY session (normally spawned by `spawn`)
-  spawn <session-id>    Create a session and relay stdio to it; fails if it exists
-  attach <session-id>   Relay stdio to an existing session; fails if it does not
+binary-protocol modes (normally driven by a matching client):
+  daemon <session-id>   Own a PTY session (normally started by `spawn`)
+  spawn <session-id>    Create a session and relay framed stdio; fails if it exists
+  attach <session-id>   Relay framed stdio to an existing session; fails if absent
 
-control surface (frozen across versions, see IMPLEMENTATION.md 6.6):
-  list                  List sessions in the run directory
+human control modes:
+  list                  List live sessions and collect stale run files
   kill <session-id>     Terminate a session and unlink its run files
 
 options:
-  --label <text>        Display name for `list`, recorded when the session is created
+  --label <text>        Display name for `list` (daemon and spawn only)
   --version, -V         Print version and protocol revision
   --help, -h            Print this usage
 ";
@@ -95,9 +95,7 @@ fn main() -> ExitCode {
                 return internal_option_error(word);
             }
             // Refused rather than dropped on the floor: a `--label` on `attach` is a
-            // caller that still believes `attach` might create the session. `kill`
-            // parses and ignores one, `IMPLEMENTATION.md` § 6.6 having frozen what it
-            // accepts.
+            // caller that still believes `attach` might create the session.
             if label.is_some() {
                 return usage_error(Some(
                     "`attach` takes no `--label`: a label is recorded when the session \
@@ -106,9 +104,14 @@ fn main() -> ExitCode {
             }
             report_relay(attach::run(session, attach::Intent::Resume))
         }),
-        Some(word @ "kill") => with_session(word, args, |session, _, lock_fd| {
+        Some(word @ "kill") => with_session(word, args, |session, label, lock_fd| {
             if lock_fd.is_some() {
                 return internal_option_error(word);
+            }
+            if label.is_some() {
+                return usage_error(Some(
+                    "`kill` takes no `--label`: labels are recorded only when a session is created",
+                ));
             }
             report(control::kill(session))
         }),

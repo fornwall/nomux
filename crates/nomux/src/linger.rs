@@ -1,8 +1,8 @@
-//! Whether this session survives the user's last logout.
+//! The user's advisory systemd linger-marker state.
 //!
-//! `IMPLEMENTATION.md` § 6.2 has the rest. What it does not say is why nothing here can
-//! do more than report: `KillUserProcesses=yes` kills every process in the user's
-//! *slice* at logout, daemon included, and no amount of double-forking evades it.
+//! `IMPLEMENTATION.md` § 6.2 has the rest. Enabling linger keeps the user manager alive;
+//! it does not move this daemon out of the SSH `session-*.scope`. Nothing here therefore
+//! claims that the current session survives logout.
 
 use std::fs;
 use std::io;
@@ -16,18 +16,18 @@ const SYSTEMD_MARKER: &str = "/run/systemd/system";
 /// Directory holding one empty file per lingering user.
 const LINGER_DIR: &str = "/var/lib/systemd/linger";
 
-/// Reports whether this user's processes outlive their session.
+/// Reports whether systemd's linger marker is present for this user.
 ///
 /// Two file lookups rather than `loginctl show-user -p Linger`, which is a D-Bus round
 /// trip: on a bus that is wedged it blocks for its full 25-second timeout, and this runs
 /// with the client that asked for the session waiting on the answer.
 ///
-/// Called per greeting rather than once at startup, and cheap enough to be: a session can
-/// outlive the answer by a week, and a user who runs `loginctl enable-linger` on being
-/// warned would otherwise be warned again on every attach for the rest of its life.
+/// Called per greeting rather than once at startup, and cheap enough to be: the marker can
+/// change while a session exists. It is useful to a future user-manager-backed launcher,
+/// but is not evidence that this session-scoped process has escaped logout policy.
 pub(crate) fn detect() -> Linger {
     if !Path::new(SYSTEMD_MARKER).is_dir() {
-        // No `logind`, so nothing kills the daemon at logout and nothing to warn about.
+        // No systemd classification is available; another init may still impose policy.
         return Linger::Unknown;
     }
     let Some(user) = username() else {

@@ -26,7 +26,7 @@ use crate::nbio;
 use crate::pty::{self, Pty};
 use crate::rundir::{SessionPaths, ensure_run_dir, session_ids};
 use crate::startup::{
-    arm_child_signal, arm_stop_signals, leave_login_session, release_startup_state,
+    arm_child_signal, arm_stop_signals, detach_from_controlling_terminal, release_startup_state,
 };
 use crate::usock::{Liveness, liveness};
 
@@ -38,19 +38,30 @@ const DEFAULT_RING_CAPACITY: usize = 4 << 20;
 const RING_BYTES_ENV: &str = "NOMUX_RING_BYTES";
 
 /// Largest ring this daemon will honour, whatever [`RING_BYTES_ENV`] asks for (§ 4). A
-/// policy ceiling and not an allocation guard: a gigabyte is already more than many hosts
-/// will hand over, and one that refuses aborts here whatever this number is.
+/// policy ceiling; allocation refusal is reported before the session is published.
 const MAX_RING_CAPACITY: usize = 1 << 30;
 
 /// Resolves the ring capacity from what [`RING_BYTES_ENV`] asked for; nothing here
 /// refuses (`IMPLEMENTATION.md` § 4). Zero is filtered rather than passed on, since
-/// `Ring::new` clamps it to one byte and a ring that makes every write a gap is no
+/// `Ring::try_new` clamps it to one byte and a ring that makes every write a gap is no
 /// tuning choice.
 fn ring_capacity(requested: Option<&str>) -> usize {
     requested
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|bytes| *bytes > 0)
         .map_or(DEFAULT_RING_CAPACITY, |bytes| bytes.min(MAX_RING_CAPACITY))
+}
+
+/// Reserves this session's one large allocation while startup can still report failure
+/// and before any socket or pidfile says the session exists.
+fn allocate_ring(session_id: &str) -> io::Result<crate::ring::Ring> {
+    let requested = ring_capacity(std::env::var(RING_BYTES_ENV).ok().as_deref());
+    crate::ring::Ring::try_new(requested).map_err(|err| {
+        io::Error::other(format!(
+            "could not reserve the {requested}-byte output ring before starting session \
+             {session_id}: {err}"
+        ))
+    })
 }
 
 /// Most sessions a run directory may already hold before this daemon refuses to add
@@ -254,6 +265,7 @@ pub(crate) fn run(
 /// The body of [`run`], separated so that every way out of it is logged once.
 fn start(session_id: &str, label: Option<&str>, inherited_lock_fd: Option<i32>) -> io::Result<()> {
     let paths = SessionPaths::new(session_id)?;
+    let ring = allocate_ring(session_id)?;
     ensure_run_dir(paths.dir())?;
 
     // The authority to probe, replace and bind this id. `spawn` hands its already-locked
@@ -280,7 +292,23 @@ fn start(session_id: &str, label: Option<&str>, inherited_lock_fd: Option<i32>) 
     // `<id>.lock`, which `session_id_of` counts as a session, so a refusal that left it
     // behind would ratchet this backstop against itself.
     let dir = paths.dir();
-    if at_session_ceiling(dir, paths.id()) {
+    let at_ceiling = match at_session_ceiling(dir, paths.id()) {
+        Ok(at_ceiling) => at_ceiling,
+        Err(err) => {
+            if scrub_lock {
+                drop(fs::remove_file(paths.lock()));
+            }
+            return Err(io::Error::new(
+                err.kind(),
+                format!(
+                    "{} could not be enumerated before starting session {}: {err}",
+                    dir.display(),
+                    paths.id()
+                ),
+            ));
+        }
+    };
+    if at_ceiling {
         if scrub_lock {
             drop(fs::remove_file(paths.lock()));
         }
@@ -339,7 +367,7 @@ fn start(session_id: &str, label: Option<&str>, inherited_lock_fd: Option<i32>) 
         stop_pipe,
         child_pipe,
         stop: None,
-        ring: crate::ring::Ring::new(ring_capacity(std::env::var(RING_BYTES_ENV).ok().as_deref())),
+        ring,
         pty: None,
         client: None,
         pending: None,
@@ -382,10 +410,10 @@ fn publish(
 ) -> io::Result<(Option<OwnedFd>, Option<OwnedFd>)> {
     // Before the pidfile, so the pid `nomux kill` reads belongs to the process that
     // survives.
-    leave_login_session();
+    detach_from_controlling_terminal();
     // No second `listen` here. `UnixListener::bind` already issues one at the maximum
     // depth on Linux, and a backlog belongs to the socket's open file description, so
-    // `leave_login_session`'s fork shares it rather than resetting it.
+    // `detach_from_controlling_terminal`'s fork shares it rather than resetting it.
 
     // Both between the fork and the pidfile: arming after the pidfile `nomux kill` reads
     // (§ 6.6) leaves a window where its signal lands on the default disposition, and arming
@@ -458,12 +486,12 @@ fn bind_socket(paths: &SessionPaths) -> io::Result<UnixListener> {
 /// discovers sessions with (§ 6.6). Every contender has created its locked name before
 /// this call, so those names are reservations and two different ids cannot both observe
 /// the same final slot as free.
-fn at_session_ceiling(dir: &Path, mine: &str) -> bool {
-    session_ids(dir)
+fn at_session_ceiling(dir: &Path, mine: &str) -> io::Result<bool> {
+    Ok(session_ids(dir)?
         .iter()
         .filter(|id| id.as_str() != mine)
         .count()
-        >= MAX_SESSIONS
+        >= MAX_SESSIONS)
 }
 
 /// What one entry of the poll set belongs to.
@@ -1313,8 +1341,9 @@ impl Daemon {
         let ok = HelloOk {
             resume_from,
             in_applied: self.in_applied,
-            // Read here rather than held from startup: a session outlives the answer,
-            // and a user who enables lingering on being warned must stop being warned.
+            // Read here rather than held from startup: this advisory systemd marker can
+            // change over a session's life, even though it does not by itself move this
+            // daemon out of the login scope (§ 6.2).
             linger: linger::detect(),
             agent: self.agent.is_some(),
         };
@@ -2084,7 +2113,7 @@ mod tests {
         fs::write(dir.join("notes"), b"").expect("plant a name with no extension");
         fs::write(dir.join("s0.journal"), b"").expect("plant a name from a later version");
         assert!(
-            !at_session_ceiling(dir, "mine"),
+            !at_session_ceiling(dir, "mine").expect("enumerate the run directory"),
             "{} sessions is below the ceiling",
             MAX_SESSIONS - 1
         );
@@ -2093,18 +2122,18 @@ mod tests {
         // time the count is taken.
         fs::write(dir.join("mine.lock"), b"").expect("plant this session's own lock");
         assert!(
-            !at_session_ceiling(dir, "mine"),
+            !at_session_ceiling(dir, "mine").expect("enumerate the run directory"),
             "a session that is starting must not count against itself"
         );
 
         fs::write(dir.join("last.sock"), b"").expect("plant the session that fills it");
         assert!(
-            at_session_ceiling(dir, "mine"),
+            at_session_ceiling(dir, "mine").expect("enumerate the run directory"),
             "{MAX_SESSIONS} sessions besides this one is the ceiling"
         );
         assert!(
-            !at_session_ceiling(&root.join("never-created"), "mine"),
-            "a directory that cannot be read is not a reason to refuse a session"
+            at_session_ceiling(&root.join("never-created"), "mine").is_err(),
+            "a directory that was not read cannot honestly be reported below the ceiling"
         );
     }
 
