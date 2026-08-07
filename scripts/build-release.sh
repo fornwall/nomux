@@ -78,7 +78,7 @@ toolchain="$nightly"
 # a day apart can both answer to that name and disagree about every figure below.
 version=$(rustc --version)
 
-# -Zbuild-std and -Cpanic=immediate-abort are nightly-only, and scripts/nightly-version is the
+# -Zbuild-std and -Cpanic=immediate-abort are nightly-only, and the `nightly` pin above is the
 # one place a stable toolchain can now get in: rustup installs one just as willingly as a
 # nightly, and nothing after this point looks at the channel — so unchecked it would die
 # minutes into the first cross build, nowhere near the cause. Asked of rustc rather than

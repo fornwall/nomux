@@ -1,7 +1,8 @@
 version: 2
 
 # Two pins here are covered by no ecosystem below and by no gate anywhere:
-# `rust-toolchain.toml`'s stable channel and `scripts/nightly-version`'s dated release. That
+# `rust-toolchain.toml`'s stable channel and the dated release `scripts/build-release.sh`
+# names. That
 # is accepted rather than automated, and the reason is that neither is a version number a bot
 # could move on its own. The nightly decides the bytes of a binary whose SHA-256 a client
 # pins, so a bump is only correct alongside a `scripts/size-baseline` refresh someone has

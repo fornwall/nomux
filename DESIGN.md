@@ -142,7 +142,7 @@ frozen for the session's lifetime and a later reconnect's `DISPLAY` or `AcceptEn
 invisible to the child: inherent to persistence, `tmux`'s too, and §5.4 is the one case
 worth solving. It wants solving on *both* sides of the opt-in: with §5.4 off, a session
 created over `ForwardAgent` freezes a path sshd will unlink, and that warning is the
-client's ([PLAN.md § P1](PLAN.md#p1--the-client)).
+client's.
 
 ### 5.4 Agent forwarding
 
@@ -243,10 +243,39 @@ one as a gap.
   6–8 KiB of binary and costs 21× on the PTY push path, 2.8 ms a MiB on the x86_64 the
   throughput was taken on. It trades memory for CPU, and a larger default ring buys the
   same scrollback for neither.
+- **Draining the PTY to `EAGAIN`.** The master is non-blocking
+  ([IMPLEMENTATION.md § 6.1](IMPLEMENTATION.md#61-pty-and-child)) and each pass takes one
+  64 KiB read. A *reattaching* client is served the same bytes either way — the ring holds
+  the last `capacity` bytes however the reading is spelled — so what a drain buys is not
+  scrollback, and what it costs is fairness. `write_pty`, `read_client`, the stop-signal
+  check and `write_client` each run once a pass; a drain has no bound in the daemon and
+  ends only when the producer pauses, which during a flood is never. Ctrl-C reaches the
+  child through `write_pty` alone, so interrupt latency becomes the length of the drain, in
+  exactly the situation a person is reaching for Ctrl-C — the hazard `Conn::fill` already
+  argues, answered there by `MAX_PENDING_READ`
+  ([IMPLEMENTATION.md § 4.1](IMPLEMENTATION.md#41-backpressure)) and against the master by
+  nothing at all. The syscalls it would amortise are mostly the per-pass `poll` and
+  `wait4`, which reaping on `SIGCHLD` deletes outright and changes no behaviour doing it. A
+  bounded drain of N reads is coherent but relocates the cost rather than paying it:
+  bounded by the ring it admits 4 MiB between two `write_pty` calls at the default capacity
+  ([IMPLEMENTATION.md § 4](IMPLEMENTATION.md#4-ring-buffer)), so the fairness cost is worst
+  on the configuration nobody chose. What reopens it: a measurement showing the per-pass
+  `poll` and `wait4` are a material fraction of flood throughput, together with a bound
+  below both `MAX_PENDING_WRITE` and the ring capacity.
 - **A server-side screen snapshot on overflow.** This is the second, lossier emulator §3
   rejects: deterministic but not exact, and the visible screen only. `libvterm` would
   also be the first C object in a tree whose musl targets build from `rustup target add`
   alone ([IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)).
+- **Scrubbing `SSH_AUTH_SOCK` in the child.** With §5.4 off, a session created over
+  `ForwardAgent` inherits a path sshd unlinks when that connection ends, and clearing it
+  looks like the server-side fix. The daemon cannot tell sshd's forwarded socket from a
+  stable local one — `gpg-agent --enable-ssh-support`, gnome-keyring, `keychain` — so
+  scrubbing would break exactly the users whose agent lives on the server and survives
+  every reconnect, and a child's environment cannot be mutated after `exec` anyway (§5.3).
+  It is inherited untouched
+  ([IMPLEMENTATION.md § 6.1.1](IMPLEMENTATION.md#611-what-the-child-runs)). Only the client
+  can tell the two apart, knowing both what it forwarded and what it asked nomux for —
+  §5.3 leaves the warning there.
 - **Cross-device handover.** Takeover is the right primitive
   ([IMPLEMENTATION.md § 6.4](IMPLEMENTATION.md#64-multiple-clients)), but handover needs
   an input offset in `Hello`, a client that never auto-reconnects after

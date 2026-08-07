@@ -367,10 +367,16 @@ mod tests {
         wire
     }
 
+    /// What the daemon's event loop carries for the whole pass, and so the most a single
+    /// read can take. Named because one test's bound on how far [`Conn::fill`] may
+    /// overshoot the read cap is exactly this, and a helper that quietly used another
+    /// size would loosen that bound without saying so.
+    const READ_CHUNK: usize = 64 * 1024;
+
     /// Fills through a buffer of the caller's, as the daemon's event loop does with the
     /// one it carries for the whole pass.
     fn fill(conn: &mut Conn) -> io::Result<()> {
-        let mut chunk = vec![0u8; 64 * 1024];
+        let mut chunk = vec![0u8; READ_CHUNK];
         conn.fill(&mut chunk)
     }
 
@@ -503,6 +509,114 @@ mod tests {
         );
         assert_eq!(take(&mut conn, &mut scratch), Some(frame));
         assert_eq!(&scratch[..], &wire[HEADER_LEN..]);
+    }
+
+    /// A peer that goes on writing is stopped at [`MAX_PENDING_READ`] with the rest of
+    /// what it wrote still in the kernel — the runtime half of what `daemon.rs` argues
+    /// the constant for, where the static assert above covers only the arithmetic.
+    ///
+    /// What is asserted is that [`Conn::fill`] stops *while the socket still holds
+    /// bytes*, that being the whole of the difference: capped or not, the loop returns,
+    /// and only one of the two leaves the undelivered bytes with the peer. The
+    /// decode-and-fill at the end is what says the socket really did still hold them,
+    /// and so that the fills before it stopped on the cap rather than on an `EAGAIN`.
+    ///
+    /// The megabyte is accumulated over many reads rather than staged for one, because a
+    /// stock host's send buffer is a fifth of it and no single write can put a whole one
+    /// in front of a single `fill`. Forcing that with `SO_SNDBUF` would pin the test to
+    /// `net.core.wmem_max` — 4 MiB on the machine this was written on, 208 KiB by
+    /// default — so wherever that number was the smaller one the cap would go unreached
+    /// and the test would pass regardless, which is the one shape a guard must not have.
+    /// Only the read that crosses the cap has to find the socket full, and that one is
+    /// staged.
+    ///
+    /// Accumulating is also how the daemon gets there. `rx` survives every pass in which
+    /// the input cap stopped the decode loop short of what the pass before had read
+    /// (§ 4.1), so it climbs a read buffer at a time: a client blasting at a child taking
+    /// 4 KiB every 50 ms was measured crossing the cap in about ten seconds. Ten seconds
+    /// paced by a shell loop is not a gate, which is why this is here rather than in
+    /// `flow.rs`.
+    #[test]
+    fn a_peer_that_keeps_writing_is_stopped_at_the_read_cap() {
+        // One byte short of the cap, so exactly one read crosses it and the overshoot
+        // below is one buffer rather than however many reads it took to get there.
+        let preload = MAX_PENDING_READ - 1;
+        // 60 KiB payloads, as `flow.rs` blasts and well inside `MAX_PAYLOAD`. Whole
+        // frames, so the release at the end has something to decode.
+        let payload = bulk(60 * 1024);
+        let mut wire = Vec::new();
+        let mut offset = 0;
+        while wire.len() < preload + 8 * READ_CHUNK {
+            Frame::Input {
+                offset,
+                data: &payload,
+            }
+            .encode(&mut wire)
+            .expect("a valid frame");
+            offset += payload.len() as u64;
+        }
+
+        let (mut peer, mut conn) = pair();
+        feed(&mut peer, &mut conn, &wire[..preload]);
+        assert_eq!(conn.buffered(), preload, "every byte given must be kept");
+        assert!(
+            conn.buffered() < MAX_PENDING_READ,
+            "a byte short of the cap is not the cap"
+        );
+
+        // Written at the socket with nothing draining it, which is the peer that has
+        // gone on writing while this side was busy. It ends refused, that being what the
+        // cap leaves a peer doing.
+        let mut staged = 0;
+        while let Some(rest) = wire.get(preload + staged..) {
+            match peer.write(rest) {
+                Ok(0) => break,
+                Ok(n) => staged += n,
+                Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+                Err(err) => panic!("the peer could not write: {err}"),
+            }
+        }
+        assert!(
+            staged > READ_CHUNK,
+            "the socket took {staged} bytes, which one read empties — so a `fill` with no \
+             cap in it would stop here too and the bound below would prove nothing"
+        );
+
+        fill(&mut conn).expect("a fill");
+        let taken = conn.buffered() - preload;
+        assert!(
+            conn.buffered() >= MAX_PENDING_READ,
+            "the fill stopped short of the cap"
+        );
+        assert!(
+            taken <= READ_CHUNK,
+            "the fill took {taken} of the {staged} bytes waiting: past the cap it goes on \
+             reading for as long as the peer goes on writing"
+        );
+
+        // And goes on declining. Nothing empties this buffer while the caller has stopped
+        // decoding, so every later pass finds the same wall.
+        fill(&mut conn).expect("a fill");
+        assert_eq!(
+            conn.buffered() - preload,
+            taken,
+            "a fill that starts at the cap must take nothing"
+        );
+
+        let mut scratch = Vec::new();
+        while conn.buffered() >= MAX_PENDING_READ {
+            assert!(
+                take(&mut conn, &mut scratch).is_some(),
+                "the cap must leave room for a whole frame, or nothing here ever completes"
+            );
+        }
+        let under_cap = conn.buffered();
+        fill(&mut conn).expect("a fill");
+        assert!(
+            conn.buffered() > under_cap,
+            "nothing was left for this fill to take, so the two above stopped on an empty \
+             socket rather than on the cap"
+        );
     }
 
     /// `send_output` chunks at exactly [`MAX_PAYLOAD`], so the production path emits

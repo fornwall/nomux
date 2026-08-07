@@ -188,7 +188,7 @@ Four bounds, each enforced on its own queue:
 | `MAX_PENDING_WRITE` | 1 MiB | Past this queued to the client, output stops being queued; the ring absorbs the PTY regardless |
 | `ABANDON_PENDING_WRITE` | 8 MiB | Past this the client is not slow but gone, and is dropped; reattaching replays from the ring. The gap between the two figures is clear of the first plus one output chunk |
 | `MAX_PENDING_INPUT` | 1 MiB | Past this queued for a child that is not reading, the daemon stops **accepting** input: it stops decoding `Input` frames and stops asking the socket for more. Dropping is not available, `in_applied` being exactly-once (§3), and `Error{INPUT_GAP}` would accuse a client that had done nothing wrong. The bytes wait in the kernel's buffer, where the peer blocks on them — §6.7's argument for a saturated agent connection |
-| `MAX_PENDING_READ` | 1 MiB | One connection's undecoded receive buffer, bounded by the daemon's own number rather than by whatever the peer set `SO_SNDBUF` to. On a stock host it never binds; [PLAN.md § P3](PLAN.md#p3--test-depth) has why no test pins it |
+| `MAX_PENDING_READ` | 1 MiB | One connection's undecoded receive buffer, bounded by the daemon's own number rather than by whatever the peer set `SO_SNDBUF` to. Past it the socket is not read at all, so the overshoot is one read buffer. Slowest of the four to fill, a stock host's send buffer being a fifth of it: the megabyte only accumulates across the passes in which the decode loop stopped short of what the pass before had read |
 
 All four are chosen against each other and so live together in `daemon.rs`, which argues
 the arithmetic. `Conn::send_output` is the only writer that consults `MAX_PENDING_WRITE` at
@@ -280,7 +280,7 @@ mkdir -p -m 700 "$p" && set -C && cat > "$p/.up.$$" && chmod 755 "$p/.up.$$" \
 - **`-m 700` rather than the ambient umask**, since a bare `mkdir -p` creates at `0777 & ~umask` and `umask 002` is the Debian-derived default: without the mode, the directory every later connection `exec`s out of is group-writable with nobody having pointed `$XDG_DATA_HOME` anywhere. It binds only where this call *creates* the directory.
 - **`set -C` before the redirect**, `.up.$$` being a predictable name. Under noclobber `>` is `O_CREAT | O_EXCL`, which refuses a symlink — dangling or not — where a plain `cat >` follows it. In a directory another user can write to, that is the difference between one failed bootstrap and choosing where the uploaded bytes land: `~/.ssh/authorized_keys`, `~/.bashrc`, anything this uid can write.
 - **The install directory is still created, not checked** — materially weaker than what §6.3 gives the *run* directory. [DESIGN.md § 8](DESIGN.md#8-security-model) states what the two lines above do and do not close, and to whom.
-- **Nothing here ever unlinks an uploaded binary.** Every release therefore leaves another artifact in every user's home on every host they have ever touched, and only the client — which knows each session's version — can tell a `nomux-*` that is neither current nor holding a live session from one that is ([PLAN.md § P1](PLAN.md#p1--the-client)).
+- **Nothing here ever unlinks an uploaded binary.** Every release therefore leaves another artifact in every user's home on every host they have ever touched, and only the client — which knows each session's version — can tell a `nomux-*` that is neither current nor holding a live session from one that is.
 
 ### 5.3 Decision tree
 
@@ -751,18 +751,17 @@ writes and the gate reads.
 `rustup target add` is the entire setup — no gcc, no zig, no sysroot — and the shipping
 build takes a nightly, without which both targets overrun the budget on panic machinery
 alone. It is pinned to a **dated** nightly, a floating one moving the bytes the published
-hash covers: `scripts/nightly-version` names it and nothing else does, and the compiler
+hash covers: `scripts/build-release.sh` names it and nothing else does, and the compiler
 that measured a baseline is written down beside it and deliberately **not** checked against
 the one building — a bump moves the figures by tenths of a percent against a 3% threshold,
 so a stamp that disagrees never means a delta anyone would act on, and refusing on one only
-taught people to reach for the escape hatch. `scripts/build-release.sh` argues all of that
-— the release profile, the `-Z build-std` case, the reproducibility flags, and the debug
-companions `NOMUX_DEBUG` asks for.
+taught people to reach for the escape hatch. That script argues all of that — the release
+profile, the `-Z build-std` case, the reproducibility flags, and the debug companions
+`NOMUX_DEBUG` asks for.
 
 That script is the producing half of a check whose consuming half does not exist: **the
 client is meant to pin a SHA-256 per architecture and verify it after upload, and nothing
-does that today** ([PLAN.md § P2](PLAN.md#p2--release-process)). A `v*` tag publishes
-`SHA256SUMS` in the format `sha256sum -c` reads.
+does that today**. A `v*` tag publishes `SHA256SUMS` in the format `sha256sum -c` reads.
 
 ## 9. Testing
 
