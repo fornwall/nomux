@@ -20,11 +20,11 @@ const REMOVABLE: u32 = 0o700;
 
 /// Serialises everything in this process whose result depends on the umask.
 ///
-/// `rundir::with_umask` sets a process-wide umask for the length of one call, which
-/// was sound while nothing in the crate was multi-threaded. `cargo test` is: two of
-/// those calls interleave and the second restores the *first's* mask, leaving the
-/// process at `0177` for good. `cargo nextest` gives each test a process and never
-/// sees it.
+/// `rundir::with_umask` sets a process-wide umask for the length of one call — sound in
+/// a shipped build, where nothing runs threads while it is in effect, but `cargo test`
+/// runs tests as threads: two of those calls interleave and the second restores the
+/// *first's* mask, leaving the process at `0177` for good. `cargo nextest` gives each
+/// test a process and never sees it.
 ///
 /// Held by `with_umask` and by every directory this module creates, which is the
 /// whole of what a test process creates whose mode it does not set itself.
@@ -51,7 +51,7 @@ fn create_dir(dir: &Path) {
 /// A directory of this process's own, emptied and removed however the test ends.
 ///
 /// On drop rather than at the end of the test body, which is the whole point: an
-/// assertion that fires is exactly the case that used to leave one behind.
+/// assertion that fires must not leave one behind.
 pub(crate) struct Scratch(PathBuf);
 
 impl Scratch {

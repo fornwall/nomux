@@ -118,8 +118,7 @@ pub(crate) fn arm_stop_signals() -> io::Result<OwnedFd> {
 /// Called *before* [`arm_stop_signals`], which is the call that clears an inherited mask, so
 /// § 6.2's rule about arming ahead of that clear is what fixes the order. What it costs here
 /// is the milder half, `SIGCHLD`'s default being to ignore: not a daemon that dies but a
-/// notification dropped, and a dropped one is a reap nobody makes now that `collect_outcome`
-/// has stopped asking on every pass.
+/// notification dropped — and `collect_outcome` reaps only when notified.
 pub(crate) fn arm_child_signal() -> io::Result<OwnedFd> {
     // `CLOEXEC` and the leaked write end are [`arm_stop_signals`]'s, for its reasons.
     let (read, write) = rustix::pipe::pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK)?;

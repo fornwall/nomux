@@ -408,8 +408,7 @@ mod tests {
         (peer, generation)
     }
 
-    /// Regression: the old peak was `MAX_CHANNEL_QUEUE + MAX_PAYLOAD`, twice what the
-    /// constant's own comment sizes the session against.
+    /// The peak is the cap, never the cap plus a payload.
     #[test]
     fn a_channel_queue_is_bounded_before_the_bytes_are_taken() {
         let root = Scratch::new("agent-queue");
@@ -604,13 +603,9 @@ mod tests {
         );
     }
 
-    /// Regression: a frame that reached the queue and got no further is not traffic.
-    ///
-    /// `deliver` touched for bytes it had only *queued*, so the one connection the clock
-    /// exists to end — a peer that has stopped reading, with a client still sending at it
-    /// — had its window refreshed by every frame that arrived and lived to
-    /// [`MAX_CHANNEL_QUEUE`] instead of to [`AGENT_IDLE_TIMEOUT`]. `flush` touches
-    /// whenever the queue actually moved, which is the healthy case and covers it.
+    /// A frame that reached the queue and got no further is not traffic: refreshing the
+    /// deadline for merely *queued* bytes would keep the one connection the clock exists
+    /// to end — a peer that has stopped reading — alive to [`MAX_CHANNEL_QUEUE`].
     #[test]
     fn a_queue_that_cannot_be_written_does_not_push_the_deadline_out() {
         let root = Scratch::new("agent-queued");
