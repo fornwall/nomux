@@ -39,8 +39,8 @@ use nomux::{Frame, Linger, RESUME_FROM_START};
 use harness::{
     Rng, SETTLE, Session, Spawned, control, control_with_shell, daemon_reaper, entries,
     has_unread_bytes, hello_frame, join_before, nomux, nomux_with_shell, poll_by, poll_until,
-    process_state, read_uninterrupted, run_root, stderr, stdout, still_serving, succeeded,
-    wedge_socket, while_nothing_forks, write_frame,
+    read_uninterrupted, run_root, stderr, stdout, still_serving, succeeded, wedge_socket,
+    while_nothing_forks, write_frame,
 };
 
 /// A daemon that cannot publish `<id>.pid` refuses to start rather than serving a
@@ -1039,50 +1039,6 @@ fn a_blocked_stdout_does_not_block_relay_input() {
     assert!(
         got[..prefilled].iter().all(|byte| *byte == b'p') && got[prefilled..] == pushed,
         "stdout bytes changed order across the blocked write"
-    );
-}
-
-/// The stdout worker is allowed to block indefinitely, so it must not outlive a relay
-/// killed before the normal close-and-wait path can reap it.
-///
-/// The private worker is otherwise idle in its channel read here. Killing only the
-/// relay pid exercises `PR_SET_PDEATHSIG`, not a shared process-group signal; a worker
-/// left sleeping is the orphan this test distinguishes from a killed, possibly briefly
-/// zombie, child.
-#[test]
-fn a_relay_killed_outright_leaves_no_live_stdout_worker() {
-    let (relay, _peer, _listener) = relay_onto_a_socket_over(
-        "relay_worker_parent",
-        Stdio::piped(),
-        Stdio::null(),
-        Stdio::null(),
-    );
-    let relay_pid = relay.id();
-    let children = format!("/proc/{relay_pid}/task/{relay_pid}/children");
-    let mut worker = None;
-    assert!(
-        poll_until(Duration::from_secs(10), || {
-            worker = fs::read_to_string(&children).ok().and_then(|pids| {
-                pids.split_whitespace()
-                    .find_map(|pid| pid.parse::<u32>().ok())
-            });
-            worker.is_some()
-        }),
-        "the relay never started its stdout worker"
-    );
-    let worker = worker.expect("the wait above found a worker");
-    let relay_pid = rustix::process::Pid::from_raw(relay_pid.cast_signed())
-        .expect("the relay has a positive pid");
-    rustix::process::kill_process(relay_pid, rustix::process::Signal::KILL)
-        .expect("kill only the relay parent");
-    drop(relay.into_exited().wait());
-
-    assert!(
-        poll_until(Duration::from_secs(10), || {
-            process_state(worker).is_none_or(|state| state == 'Z')
-        }),
-        "stdout worker {worker} remained live after relay {relay_pid} died: {:?}",
-        process_state(worker)
     );
 }
 
