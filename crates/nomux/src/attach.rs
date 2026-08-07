@@ -463,7 +463,12 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
             // Half-close propagation (§ 7).
             drop(stream.shutdown(Shutdown::Write));
         }
-        if socket_events.intersects(readable) && !to_stdout.fill_from(sock_fd, &mut chunk)? {
+        // `HUP` and `ERR` arrive unrequested, so an `OUT`-only pass reaches here too:
+        // without `wants_source` that would read a second chunk into a full pump.
+        if socket_events.intersects(readable)
+            && to_stdout.wants_source()
+            && !to_stdout.fill_from(sock_fd, &mut chunk)?
+        {
             socket_open = false;
         }
         // Speculative on a non-empty buffer as well as on `POLLOUT`, which stdout below

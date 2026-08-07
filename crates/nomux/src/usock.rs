@@ -9,8 +9,9 @@
 //! Through `libc` rather than rustix, whose sockets sit behind a `net` feature § 8's
 //! budget is why this crate does not enable.
 
+use std::ffi::OsStr;
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::thread;
@@ -62,6 +63,9 @@ const PROBE_RETRY: Duration = Duration::from_millis(10);
 /// drained — neither death nor an answer, and licence for no unlink.
 pub(crate) fn connect_within(path: &Path, within: Duration) -> io::Result<UnixStream> {
     let addr = unix_address(path)?;
+    // The `<id>` of `<id>.sock`, which is all the refusal below needs a name for; an id is
+    // a `String` (§ 6.3), so the fallback is for a path no `SessionPaths` can produce.
+    let id = path.file_stem().and_then(OsStr::to_str).unwrap_or_default();
     let deadline = Instant::now() + within;
     loop {
         match connect_once(&addr) {
@@ -72,6 +76,14 @@ pub(crate) fn connect_within(path: &Path, within: Duration) -> io::Result<UnixSt
                     err.kind(),
                     io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                 ) => {}
+            // A listener weighing its peer is one wall of the room: on the host
+            // `DESIGN.md` § 8 keeps that check for, whoever won the race to bind
+            // `<id>.sock` is handed the keystrokes this stream goes on to carry.
+            // `EACCES` because [`nothing_is_listening`] already reads that errno as
+            // neither death nor an answer, so the refusal licenses no unlink.
+            Ok(stream) if !peer_is_ours(stream.as_fd(), id) => {
+                return Err(io::Error::from_raw_os_error(libc::EACCES));
+            }
             outcome => return outcome,
         }
         if Instant::now() >= deadline {
@@ -250,7 +262,6 @@ const fn uid_is_ours(peer: &io::Result<u32>, ours: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::fd::AsFd as _;
 
     /// § 6.3's peer-credential rule at the three edges a suite running as one uid
     /// cannot put in front of a live daemon: another user, root, and an answer the

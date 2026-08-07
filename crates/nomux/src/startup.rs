@@ -61,32 +61,37 @@ extern "C" fn note_child_signal(_signum: libc::c_int) {
 /// Fails only if the pipe cannot be created.
 pub(crate) fn arm_stop_signals() -> io::Result<OwnedFd> {
     // `CLOEXEC` so the session's child never inherits either end.
-    let (read, write) = rustix::pipe::pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK)?;
+    let read =
+        rustix::pipe::pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).map(|(read, write)| {
+            // The write end is leaked on purpose: a signal can arrive at any point up to
+            // process exit, including after the `Daemon` has been dropped, and a handler
+            // holding a closed descriptor would write its byte into whatever was opened next.
+            STOP_PIPE.store(write.into_raw_fd(), Ordering::Relaxed);
 
-    // The write end is leaked on purpose: a signal can arrive at any point up to
-    // process exit, including after the `Daemon` has been dropped, and a handler
-    // holding a closed descriptor would write its byte into whatever was opened next.
-    STOP_PIPE.store(write.into_raw_fd(), Ordering::Relaxed);
-
-    // `sighandler_t` is an integer wide enough for a pointer, and a function item
-    // has to be laundered through one to reach it.
-    let handler = note_stop_signal as *const () as libc::sighandler_t;
-    for signum in STOP_SIGNALS {
-        // SAFETY: `signal` on a single-threaded process with an async-signal-safe
-        // handler, installed before any thread or child exists. `exec` resets
-        // handled dispositions, so the session's child is unaffected.
-        //
-        // The result is not checked because there is nothing it can report:
-        // `signal(2)` fails only on an invalid signum or on `SIGKILL`/`SIGSTOP`, and
-        // [`STOP_SIGNALS`] is a compile-time constant that is neither.
-        unsafe { libc::signal(signum, handler) };
-    }
+            // `sighandler_t` is an integer wide enough for a pointer, and a function item
+            // has to be laundered through one to reach it.
+            let handler = note_stop_signal as *const () as libc::sighandler_t;
+            for signum in STOP_SIGNALS {
+                // SAFETY: `signal` on a single-threaded process with an async-signal-safe
+                // handler, installed before any thread or child exists. `exec` resets
+                // handled dispositions, so the session's child is unaffected.
+                //
+                // The result is not checked because there is nothing it can report:
+                // `signal(2)` fails only on an invalid signum or on `SIGKILL`/`SIGSTOP`, and
+                // [`STOP_SIGNALS`] is a compile-time constant that is neither.
+                unsafe { libc::signal(signum, handler) };
+            }
+            read
+        });
 
     // Strictly after the loop above: `exec` preserves pending signals as well as the
     // mask, so a parent holding `SIGTERM` blocked *and pending* delivers it the
     // instant this returns. Unblocking first would deliver it at `SIG_DFL` — the
     // daemon dying with `<id>.sock` bound, `<id>.pid` unwritten and § 6.5's shutdown
-    // unrun, which is the failure this whole function exists to prevent.
+    // unrun, which is the failure this whole function exists to prevent. Unconditional
+    // even so: with no pipe there is no handler, and a pending `SIGTERM` at `SIG_DFL` is
+    // what the next `nomux kill` produces anyway, where a mask left set is one nothing
+    // can ever clear.
     //
     // A disposition is nothing without delivery, and the mask is the half that survives
     // `exec`: a daemon started from a parent holding `SIGTERM` blocked — § 6.2's
@@ -112,7 +117,7 @@ pub(crate) fn arm_stop_signals() -> io::Result<OwnedFd> {
         libc::sigprocmask(libc::SIG_SETMASK, empty.as_ptr(), std::ptr::null_mut());
     }
 
-    Ok(read)
+    read.map_err(io::Error::from)
 }
 
 /// Routes `SIGCHLD` into a descriptor of its own for the poll set, and hands back its

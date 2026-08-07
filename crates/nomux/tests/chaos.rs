@@ -159,6 +159,7 @@ fn an_escape_heavy_stream_is_byte_exact_across_random_disconnects() {
     let mut seen: Vec<u8> = Vec::new();
     let mut disconnects = 0u32;
     let mut since_disconnect = 0usize;
+    let mut next_at = 4 * 1024 + usize::try_from(rng.below(12 * 1024)).unwrap_or(0);
 
     while find(&seen, b"CHAOS-END").is_none() {
         let (ty, payload) = frame_by(&mut client, deadline, chaos_seed, "emitter never finished");
@@ -179,8 +180,9 @@ fn an_escape_heavy_stream_is_byte_exact_across_random_disconnects() {
 
         // By volume rather than frame count: one frame carries anything from a few
         // bytes to `MAX_PAYLOAD`, so counting frames would make the disconnect rate
-        // depend on how fast the machine happens to be.
-        if since_disconnect >= 4 * 1024 + usize::try_from(rng.below(12 * 1024)).unwrap_or(0) {
+        // depend on how fast the machine happens to be; and the threshold is drawn
+        // once per disconnect rather than per frame, so the seed replays the run.
+        if since_disconnect >= next_at {
             drop(client);
             client = session.connect();
             client.waits_by(deadline);
@@ -199,6 +201,7 @@ fn an_escape_heavy_stream_is_byte_exact_across_random_disconnects() {
             );
             disconnects += 1;
             since_disconnect = 0;
+            next_at = 4 * 1024 + usize::try_from(rng.below(12 * 1024)).unwrap_or(0);
         }
     }
 
