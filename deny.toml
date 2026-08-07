@@ -18,6 +18,9 @@
 # something to fix rather than something to carry, and an entry here would need a date
 # and a reason beside it.
 ignore = []
+# The default considers unsoundness only in direct dependencies. A transitive crate executes in
+# the same process and gets no smaller trust boundary, so every occurrence is release-blocking.
+unsound = "all"
 # Not the default, which is `warn`. A yank is a decision the crate's author has already
 # made and this lockfile has not heard about — and the lockfile is not a suggestion here:
 # its bytes decide the binary whose SHA-256 a client pins. A warning would scroll past in

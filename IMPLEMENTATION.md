@@ -940,14 +940,15 @@ Chaos seeds come from `NOMUX_CHAOS_SEED`, and every failure message carries the 
 produced it.
 
 The one thing a peer chooses outright is the bytes it sends, so the codec is fuzzed as well
-as generated against. `fuzz/` is a workspace of its own; libFuzzer reaches neither the
-shipped binary nor any gate but `cargo fmt`. One target, `frame`, points every frame type at
-one payload and holds `Frame::decode` to three assertions: a frame decodes as the type it
-was asked for, the header `encode` writes describes the bytes behind it, and an accepted
-payload is the only encoding of what it decoded to. `sh fuzz/run.sh frame` runs it and
-installs the shared nightly named in `scripts/nightly-version` — the same pin the release
-build takes (§ 8). CI gives it sixty seconds, which checks that it still builds and still
-passes over its seeds and is nowhere near a search.
+as generated against. `fuzz/` is a workspace of its own, outside the shipped binary and the
+root workspace's gates; CI gives it separate format, Clippy, advisory and seeded-fuzz passes.
+One target, `frame`, points every frame type at one payload and holds `Frame::decode` to three
+assertions: a frame decodes as the type it was asked for, the header `encode` writes describes
+the bytes behind it, and an accepted payload is the only encoding of what it decoded to. `sh
+fuzz/run.sh frame` runs it and installs the shared nightly named in
+`scripts/nightly-version` — the same pin the release build takes (§ 8). CI gives it sixty
+seconds, which checks that it still builds and still passes over its seeds and is nowhere near
+a search.
 
 What the signal guards measure is the *decision* to signal, which is the only thing that
 can be measured: `pty::reach` is that module's one door to a `kill(2)` it aims at a pid of

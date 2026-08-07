@@ -5,6 +5,9 @@
 
 [advisories]
 ignore = []
+# Build scripts and the harness execute locally even though no fuzz artifact ships; unsoundness
+# anywhere in their graph therefore has the same answer as it does in the release workspace.
+unsound = "all"
 yanked = "deny"
 
 [sources]
