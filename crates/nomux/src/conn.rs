@@ -283,7 +283,7 @@ mod tests {
     use std::time::Instant;
 
     use nomux::{
-        ErrorCode, Hello, HelloOk, Linger, PROTOCOL_VERSION, ProtoError, RESUME_FROM_START, WinSize,
+        ErrorCode, Hello, HelloOk, PROTOCOL_VERSION, ProtoError, RESUME_FROM_START, WinSize,
     };
 
     use super::*;
@@ -320,7 +320,6 @@ mod tests {
             Frame::HelloOk(HelloOk {
                 resume_from: 9,
                 in_applied: 4,
-                linger: Linger::Enabled,
                 agent: true,
             }),
             Frame::Hello(Hello {

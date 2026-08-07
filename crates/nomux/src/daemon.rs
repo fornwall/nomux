@@ -21,7 +21,6 @@ use rustix::event::{PollFd, PollFlags, Timespec};
 
 use crate::agent::{self, Agent};
 use crate::conn::Conn;
-use crate::linger;
 use crate::nbio;
 use crate::pty::{self, Pty};
 use crate::rundir::{SessionPaths, ensure_run_dir, session_ids};
@@ -1274,10 +1273,6 @@ impl Daemon {
         let ok = HelloOk {
             resume_from,
             in_applied: self.in_applied,
-            // Read here rather than held from startup: this advisory systemd marker can
-            // change over a session's life, even though it does not by itself move this
-            // daemon out of the login scope (§ 6.2).
-            linger: linger::detect(),
             agent: self.agent.is_some(),
         };
         // Not a field on the wire: both ends compute it, through the one helper (§ 4.2).

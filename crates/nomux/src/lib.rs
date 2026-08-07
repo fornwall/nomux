@@ -24,8 +24,8 @@
 mod frame;
 
 pub use frame::{
-    ErrorCode, ExitKind, Frame, Hello, HelloOk, Linger, MAX_AGENT_DATA, MAX_OUTPUT_DATA,
-    RESUME_FROM_START, WinSize,
+    ErrorCode, ExitKind, Frame, Hello, HelloOk, MAX_AGENT_DATA, MAX_OUTPUT_DATA, RESUME_FROM_START,
+    WinSize,
 };
 
 /// Protocol revision. Bumped on any wire change, including compatible ones.
@@ -34,7 +34,7 @@ pub use frame::{
 /// revision in force and nothing before it. `tests/codec.rs`'s `vectors` module holds the
 /// constant, the byte vectors and the document to each other, so a bump has to move all
 /// three.
-pub const PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = 10;
 
 /// Fixed frame header size: a reader sizes the payload from the first four bytes it has,
 /// and never has to scan for a boundary.
@@ -48,7 +48,7 @@ pub const MAX_PAYLOAD: u32 = 256 * 1024;
 // generated, so the four cannot drift apart. A hand-written `from_wire` ending in a
 // catch-all `_ => None` leaves an end that can *send* a new frame but never
 // *receives* one. `IMPLEMENTATION.md` § 2.3 applies the same closed-set rule to
-// `Error.code`, `Exit.kind` and the linger field.
+// `Error.code` and `Exit.kind`.
 macro_rules! wire_enum {
     (
         $(#[$enum_meta:meta])*

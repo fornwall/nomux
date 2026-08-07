@@ -29,12 +29,11 @@ mod harness;
 
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
-use nomux::{Frame, Linger, RESUME_FROM_START};
+use nomux::{Frame, RESUME_FROM_START};
 
 use harness::{
     Rng, SETTLE, Session, Spawned, control, control_with_shell, daemon_reaper, entries,
@@ -160,55 +159,8 @@ fn spawn_refuses_an_id_something_is_already_serving() {
     );
 
     let mut client = session.connect();
-    let ok = client.hello(RESUME_FROM_START);
-    // Riding on the greeting this test already makes, this file's only one. § 6.2 has
-    // the daemon carry `linger::detect`'s answer in this field so a client can warn a
-    // user whose session dies at logout, and nothing in the tree had ever read it off a
-    // daemon: every other mention of `linger` is a codec fixture or a frame a test wrote
-    // itself, so a daemon that had stopped calling `detect` passed the whole suite.
-    assert_eq!(
-        ok.linger,
-        linger_of_this_host(),
-        "the greeting must report what § 6.2 says about *this* host, which is the whole \
-         of what a client has to warn its user with"
-    );
+    client.hello(RESUME_FROM_START);
     still_serving(&mut client, "NOMUX-SURVIVED");
-}
-
-/// The linger state `IMPLEMENTATION.md` § 6.2 owes a client greeting a daemon on this
-/// host, worked out from the same files the daemon's own `linger::detect` reads.
-///
-/// Read rather than called: `detect` is the binary crate's, where an integration test
-/// cannot reach it — which is the reason the wiring needs asserting from out here at
-/// all. Falsifiable on any host, and in both directions: on one running `logind` this
-/// answers `Enabled` or `Disabled` and refuses the `Unknown` a daemon that had stopped
-/// asking would send, and on one without it answers `Unknown` and refuses the other two.
-///
-/// § 6.2's lookups in § 6.2's order and no third: whether `logind` is the running init,
-/// then whether this user has a marker file under it. `$USER` before `$LOGNAME`, and a
-/// name that is not a single path component decides nothing — the daemon will not join
-/// one onto a system directory, so an environment saying something strange gets
-/// `Unknown` from both sides rather than a disagreement. The daemon a test starts
-/// inherits this process's environment but for the handful the harness sets, none of
-/// which are these.
-fn linger_of_this_host() -> Linger {
-    if !Path::new("/run/systemd/system").is_dir() {
-        return Linger::Unknown;
-    }
-    let named = ["USER", "LOGNAME"]
-        .into_iter()
-        .filter_map(|variable| std::env::var(variable).ok())
-        .find(|name| {
-            !name.is_empty() && !name.contains(['/', '\0']) && name != "." && name != ".."
-        });
-    let Some(user) = named else {
-        return Linger::Unknown;
-    };
-    match fs::metadata(Path::new("/var/lib/systemd/linger").join(user)) {
-        Ok(_) => Linger::Enabled,
-        Err(err) if err.kind() == ErrorKind::NotFound => Linger::Disabled,
-        Err(_) => Linger::Unknown,
-    }
 }
 
 /// Regression: a session whose backlog is full is a session, so `spawn` must report it

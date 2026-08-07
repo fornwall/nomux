@@ -32,8 +32,8 @@
 //! The seeds in `fuzz/seeds/frame` are § 2.2's frame table with each four-byte header cut
 //! off — one payload per vector, taken from `crates/nomux/tests/wire-vectors.txt`, which is
 //! the document's bytes rather than this codec's. Per vector rather than per type because
-//! the vectors are where the discriminants and the flag bits differ — `Linger`'s three
-//! values, `Hello`'s two bits, `Exit`'s kind, a negative status — which is precisely what a
+//! the vectors are where the discriminants and the flag bits differ — `Hello`'s two bits,
+//! `HelloOk`'s agent flag, `Exit`'s kind, a negative status — which is precisely what a
 //! byte mutator would otherwise have to guess; `-2` onwards name that type's later records
 //! in the file. `Detach`, `Ping` and `Pong` are left out: their payload is the empty input,
 //! which libFuzzer tries first regardless.

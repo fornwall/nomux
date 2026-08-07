@@ -46,8 +46,8 @@ mod generated {
     use std::{fs, io};
 
     use nomux::{
-        ErrorCode, ExitKind, Frame, FrameType, HEADER_LEN, Hello, HelloOk, Linger, MAX_PAYLOAD,
-        ProtoError, WinSize, decode_header,
+        ErrorCode, ExitKind, Frame, FrameType, HEADER_LEN, Hello, HelloOk, MAX_PAYLOAD, ProtoError,
+        WinSize, decode_header,
     };
 
     /// Base seed for every generated case in this module. Fixed, so a run either always
@@ -323,7 +323,6 @@ mod generated {
             1 => OwnedFrame::copied(Frame::HelloOk(HelloOk {
                 resume_from: rng.u64(),
                 in_applied: rng.u64(),
-                linger: rng.pick(&Linger::ALL, Linger::Unknown),
                 agent: rng.bool(),
             })),
             2 => OwnedFrame::with_bytes(
@@ -680,7 +679,7 @@ mod vectors {
     use std::{cell::Cell, fmt::Debug};
 
     use nomux::{
-        ErrorCode, ExitKind, Frame, FrameType, HEADER_LEN, Hello, HelloOk, Linger, MAX_PAYLOAD,
+        ErrorCode, ExitKind, Frame, FrameType, HEADER_LEN, Hello, HelloOk, MAX_PAYLOAD,
         PROTOCOL_VERSION, RESUME_FROM_START, WinSize,
     };
 
@@ -712,11 +711,11 @@ mod vectors {
     ///
     /// Both handshake frames appear more than once, because distinct values catch a swap
     /// between two fields and do nothing about a swap *inside* one: each repeat disagrees
-    /// with the ones before it on every bit and every enumerator that has one. Three apiece
-    /// is what [`the_vectors_pin_every_value_of_every_closed_set`] insists on — [`Linger`]
-    /// has three values, and two `Hello` vectors cannot both show the flag bits set together
-    /// and show each of them clear. `Hello`'s fourth answers to no closed set, and says
-    /// where it stands what it is for.
+    /// with the ones before it on every bit. `Hello`'s first three are what
+    /// [`the_vectors_pin_every_value_of_every_closed_set`] insists on — two vectors cannot
+    /// both show the flag bits set together and show each of them clear — and its fourth
+    /// answers to no closed set, saying where it stands what it is for; `HelloOk`'s two
+    /// show its one flag at both states.
     fn vectors() -> Vec<Vector> {
         let mut all = hello_vectors();
         all.extend(hello_ok_vectors());
@@ -735,7 +734,7 @@ mod vectors {
             // them is even representable — §2.3's "no reserved space", made in bytes.
             Vector {
                 frame: Frame::Hello(Hello {
-                    protocol: 9,
+                    protocol: 10,
                     agent_forward: true,
                     repaint_ctrl_l: true,
                     out_offset: 0x0102_0304_0506_0708,
@@ -744,7 +743,7 @@ mod vectors {
                 }),
                 bytes: &[
                     0x01, 0x00, 0x00, 0x23, // header: type, u24 len = 35
-                    0x00, 0x09, // protocol
+                    0x00, 0x0a, // protocol
                     0x03, // flags: bit 0 agent forward, bit 1 repaint ctrl-l
                     0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // out_offset
                     0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
@@ -758,7 +757,7 @@ mod vectors {
             // Carries `RESUME_FROM_START` as well, which no other vector shows.
             Vector {
                 frame: Frame::Hello(Hello {
-                    protocol: 9,
+                    protocol: 10,
                     agent_forward: true,
                     repaint_ctrl_l: false,
                     out_offset: RESUME_FROM_START,
@@ -767,7 +766,7 @@ mod vectors {
                 }),
                 bytes: &[
                     0x01, 0x00, 0x00, 0x1a, // header: type, u24 len = 26
-                    0x00, 0x09, // protocol
+                    0x00, 0x0a, // protocol
                     0x01, // flags: bit 0 agent forward, bit 1 clear
                     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // RESUME_FROM_START
                     0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
@@ -779,7 +778,7 @@ mod vectors {
             // vectors above, so this is the only one that pins it clear.
             Vector {
                 frame: Frame::Hello(Hello {
-                    protocol: 9,
+                    protocol: 10,
                     agent_forward: false,
                     repaint_ctrl_l: false,
                     out_offset: 0x8182_8384_8586_8788,
@@ -788,7 +787,7 @@ mod vectors {
                 }),
                 bytes: &[
                     0x01, 0x00, 0x00, 0x19, // header: type, u24 len = 25
-                    0x00, 0x09, // protocol
+                    0x00, 0x0a, // protocol
                     0x00, // flags: both bits clear
                     0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, // out_offset
                     0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
@@ -808,7 +807,7 @@ mod vectors {
             // above exists to make.
             Vector {
                 frame: Frame::Hello(Hello {
-                    protocol: 9,
+                    protocol: 10,
                     agent_forward: false,
                     repaint_ctrl_l: true,
                     out_offset: 0,
@@ -817,7 +816,7 @@ mod vectors {
                 }),
                 bytes: &[
                     0x01, 0x00, 0x00, 0x15, // header: type, u24 len = 21
-                    0x00, 0x09, // protocol
+                    0x00, 0x0a, // protocol
                     0x02, // flags: bit 0 clear, bit 1 repaint ctrl-l
                     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // out_offset
                     0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
@@ -827,62 +826,36 @@ mod vectors {
         ]
     }
 
-    /// The daemon's answer, at all three linger states and both agent states.
+    /// The daemon's answer, at both agent states.
     fn hello_ok_vectors() -> Vec<Vector> {
         vec![
-            // 0x02 HelloOk: u64 resume_from, u64 in_applied, u8 linger, u8 flags. It
-            // carries neither a revision nor a winsize (§ 2.2) — both would only repeat
-            // what the client just sent — and the last two bytes are one byte each,
-            // `linger` being a field of its own rather than two bits inside the flags
-            // (§ 2.3).
+            // 0x02 HelloOk: u64 resume_from, u64 in_applied, u8 flags. It carries
+            // neither a revision nor a winsize (§ 2.2) — both would only repeat what
+            // the client just sent.
             Vector {
                 frame: Frame::HelloOk(HelloOk {
                     resume_from: 0x2122_2324_2526_2728,
                     in_applied: 0x3132_3334_3536_3738,
-                    linger: Linger::Enabled,
                     agent: true,
                 }),
                 bytes: &[
-                    0x02, 0x00, 0x00, 0x12, // header: type, u24 len = 18
+                    0x02, 0x00, 0x00, 0x11, // header: type, u24 len = 17
                     0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, // resume_from
                     0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, // in_applied
-                    0x02, // linger = 2 (enabled)
                     0x01, // flags: bit 0 agent
                 ],
             },
-            // 0x02 HelloOk again, at linger unknown with the agent still served. The two
-            // trailing bytes differ from each other in every vector here, which is what
-            // pins their order: exchange the pair and each of the three moves.
+            // 0x02 HelloOk again, with the agent bit clear.
             Vector {
                 frame: Frame::HelloOk(HelloOk {
                     resume_from: 0x4142_4344_4546_4748,
                     in_applied: 0x5152_5354_5556_5758,
-                    linger: Linger::Unknown,
-                    agent: true,
-                }),
-                bytes: &[
-                    0x02, 0x00, 0x00, 0x12, // header: type, u24 len = 18
-                    0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, // resume_from
-                    0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, // in_applied
-                    0x00, // linger = 0 (unknown)
-                    0x01, // flags: bit 0 agent
-                ],
-            },
-            // 0x02 HelloOk a third time, for the one linger value the other two leave
-            // out: reading `Disabled` off them as the number left over is a deduction
-            // rather than a test. Also the only vector with the agent bit clear.
-            Vector {
-                frame: Frame::HelloOk(HelloOk {
-                    resume_from: 0x6162_6364_6566_6768,
-                    in_applied: 0x7172_7374_7576_7778,
-                    linger: Linger::Disabled,
                     agent: false,
                 }),
                 bytes: &[
-                    0x02, 0x00, 0x00, 0x12, // header: type, u24 len = 18
-                    0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, // resume_from
-                    0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, // in_applied
-                    0x01, // linger = 1 (disabled)
+                    0x02, 0x00, 0x00, 0x11, // header: type, u24 len = 17
+                    0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, // resume_from
+                    0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, // in_applied
                     0x00, // flags: agent clear
                 ],
             },
@@ -1392,7 +1365,6 @@ mod vectors {
                 FrameType::HelloOk => Frame::HelloOk(HelloOk {
                     resume_from: self.u64("resume_from")?,
                     in_applied: self.u64("in_applied")?,
-                    linger: self.enumerator("linger", &Linger::ALL)?,
                     agent: self.flag("agent")?,
                 }),
                 FrameType::Input => Frame::Input {
@@ -1563,7 +1535,7 @@ mod vectors {
     /// Every closed set on this wire is written down in bytes above, at every value it has,
     /// and the handshake vectors are written at the revision this build speaks.
     ///
-    /// The four sets are [`FrameType`], [`ExitKind`], [`Linger`] and [`ErrorCode`] — the last
+    /// The three sets are [`FrameType`], [`ExitKind`] and [`ErrorCode`] — the last
     /// being the one a table like this most easily leaves half-written, its five values
     /// riding on a frame nobody reaches on the happy path, so a fixture pinning `Takeover`
     /// alone reads complete and lets another implementation number the rest as it likes.
@@ -1582,7 +1554,6 @@ mod vectors {
     fn the_vectors_pin_every_value_of_every_closed_set() {
         let mut types = Vec::new();
         let mut kinds = Vec::new();
-        let mut lingers = Vec::new();
         let mut codes = Vec::new();
         let mut hello_flags = Vec::new();
         let mut agent_flags = Vec::new();
@@ -1608,12 +1579,8 @@ mod vectors {
                 Frame::HelloOk(HelloOk {
                     resume_from: _,
                     in_applied: _,
-                    linger,
                     agent,
-                }) => {
-                    lingers.push(linger);
-                    agent_flags.push(agent);
-                }
+                }) => agent_flags.push(agent),
                 Frame::Exit { kind, .. } => kinds.push(kind),
                 Frame::Error { code, .. } => codes.push(code),
                 _ => {}
@@ -1625,9 +1592,6 @@ mod vectors {
         }
         for kind in ExitKind::ALL {
             assert!(kinds.contains(&kind), "{kind:?} has no wire vector");
-        }
-        for linger in Linger::ALL {
-            assert!(lingers.contains(&linger), "{linger:?} has no wire vector");
         }
         for code in ErrorCode::ALL {
             assert!(codes.contains(&code), "{code:?} has no wire vector");
@@ -1724,8 +1688,8 @@ mod vectors {
             (
                 "PROTOCOL_VERSION",
                 u64::from(PROTOCOL_VERSION),
-                9,
-                "§ 2.2 puts the current revision at 9",
+                10,
+                "§ 2.2 puts the current revision at 10",
             ),
             (
                 "MAX_PAYLOAD",
@@ -1748,7 +1712,6 @@ mod vectors {
             InputGap = 4,
             Internal = 5
         );
-        frozen!(Linger, Unknown = 0, Disabled = 1, Enabled = 2);
         frozen!(ExitKind, Exited = 0, Signalled = 1, Unknown = 2);
     }
 }

@@ -106,22 +106,6 @@ impl Hello<'_> {
     }
 }
 
-wire_enum! {
-    /// The user's systemd linger-marker state.
-    ///
-    /// Advisory only: it says whether systemd keeps the user manager alive, not whether
-    /// this session-scoped daemon survives logout (`IMPLEMENTATION.md` § 6.2, § 2.3).
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    Linger: u8,
-    /// Not determined: no `systemd`, or its state is unreadable.
-    Unknown = 0,
-    /// `logind` is running and lingering is off for this user.
-    Disabled = 1,
-    /// Lingering is on, so systemd keeps the user's manager alive after logout. This
-    /// daemon still remains in the SSH session scope unless a manager-backed launch moves it.
-    Enabled = 2,
-}
-
 /// The only bit defined in [`HelloOk`]'s flags byte: this session is serving an agent
 /// socket. Anything else set is a protocol error.
 const HELLOOK_AGENT: u8 = 1 << 0;
@@ -133,8 +117,6 @@ pub struct HelloOk {
     pub resume_from: u64,
     /// Authoritative input offset; the client fast-forwards to this.
     pub in_applied: u64,
-    /// Advisory systemd linger-marker state; not a survival guarantee.
-    pub linger: Linger,
     /// Whether an agent socket is being served, so the client knows to expect
     /// [`Frame::AgentOpen`]. False when it was not asked for, and equally when the
     /// socket could not be bound.
@@ -331,7 +313,6 @@ impl<'a> Frame<'a> {
             Self::HelloOk(ok) => {
                 out.extend_from_slice(&ok.resume_from.to_be_bytes());
                 out.extend_from_slice(&ok.in_applied.to_be_bytes());
-                out.push(ok.linger.as_wire());
                 out.push(ok.flags());
             }
             Self::Input { offset, data } | Self::Output { offset, data } => {
@@ -405,8 +386,6 @@ impl<'a> Frame<'a> {
             FrameType::HelloOk => {
                 let resume_from = r.u64()?;
                 let in_applied = r.u64()?;
-                let linger = Linger::from_wire(r.u8()?)
-                    .ok_or(ProtoError::Malformed("unknown linger state"))?;
                 let flags = r.u8()?;
                 if flags & !HELLOOK_AGENT != 0 {
                     return Err(ProtoError::Malformed("undefined HelloOk flag bits"));
@@ -414,7 +393,6 @@ impl<'a> Frame<'a> {
                 Self::HelloOk(HelloOk {
                     resume_from,
                     in_applied,
-                    linger,
                     agent: flags & HELLOOK_AGENT != 0,
                 })
             }
@@ -649,27 +627,17 @@ mod tests {
         Frame::HelloOk(HelloOk {
             resume_from: 0,
             in_applied: 0,
-            linger: Linger::Unknown,
             agent: false,
         })
         .encode(&mut ok)
         .unwrap();
-        // The payload ends `.., u8 linger, u8 flags`: reserved bit 1 of the flags
-        // byte, then the reserved linger encoding 3 in the byte before it.
+        // The payload ends in the flags byte, whose bit 1 is reserved.
         let flags = ok.len() - 1;
-        for (at, byte, complaint) in [
-            (flags, 0b10, "undefined HelloOk flag bits"),
-            (flags - 1, 3, "unknown linger state"),
-        ] {
-            let mut mutated = ok.clone();
-            mutated[at] = byte;
-            assert_eq!(
-                Frame::decode(FrameType::HelloOk, &mutated[HEADER_LEN..]),
-                Err(ProtoError::Malformed(complaint)),
-                "byte {byte:#b} at payload offset {} should be refused",
-                at - HEADER_LEN
-            );
-        }
+        ok[flags] = 0b10;
+        assert_eq!(
+            Frame::decode(FrameType::HelloOk, &ok[HEADER_LEN..]),
+            Err(ProtoError::Malformed("undefined HelloOk flag bits"))
+        );
     }
 
     /// § 4.2's `gap = resume_from > out_offset`, at the one offset where the sentinel
@@ -680,7 +648,6 @@ mod tests {
             HelloOk {
                 resume_from,
                 in_applied: 0,
-                linger: Linger::Unknown,
                 agent: false,
             }
             .gap(out_offset)
