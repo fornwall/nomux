@@ -11,7 +11,9 @@ on:
   pull_request:
   # The advisory database moves while this tree stands still and dependabot bumps monthly, so
   # without a timer an advisory published on Tuesday waits for whoever pushes next. Weekly, two
-  # direct dependencies not earning a daily run of anything.
+  # direct dependencies not earning a daily run of anything. The timer exists for `cargo deny
+  # check advisories` alone: `fuzz` and `release` skip scheduled runs below, `publish` is
+  # tag-gated already.
   schedule:
     - cron: '17 4 * * 1'
   # The release job's artifacts expire and nothing else produces the per-architecture binaries or
@@ -100,9 +102,9 @@ jobs:
       - run: cargo deny --locked check advisories
 
       # fuzz/ is a separate workspace with deliberately different licence and path-dependency
-      # rules, but its build scripts execute here. Its narrow policy keeps advisories and source
-      # provenance in the publish-gating check job without weakening the shipping policy above.
-      - run: cargo deny --locked --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check advisories sources
+      # rules, but its build scripts execute here. Advisories alone: the cargo-deny-fuzz hook,
+      # run by prek below, already checks sources against the same manifest and config.
+      - run: cargo deny --locked --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check advisories
 
       # The released binary, by checksum: from source it needs a Go toolchain, and the image's Go
       # is an unpinned input — a release raising its Go floor would break hook *installation* and
@@ -158,6 +160,8 @@ jobs:
   fuzz:
     name: fuzz targets
     runs-on: ubuntu-latest
+    # The weekly schedule exists for the advisory check alone; see the trigger comment above.
+    if: github.event_name != 'schedule'
     # Behind the gate rather than beside it, alone among the jobs here: the slowest thing in the
     # workflow per unit of what it is likely to catch, and a tree that cannot pass clippy has
     # nothing worth fuzzing.
@@ -211,6 +215,8 @@ jobs:
   release:
     name: musl release builds
     runs-on: ubuntu-latest
+    # The weekly schedule exists for the advisory check alone; see the trigger comment above.
+    if: github.event_name != 'schedule'
     timeout-minutes: 30
     steps:
       # `persist-credentials: false`, for the reason the check job gives.
@@ -233,8 +239,11 @@ jobs:
       # checkout path, $CARGO_HOME and target directory and requires the two SHA256SUMS to agree,
       # which is the property a client pinning them depends on. `git archive HEAD` is exactly the
       # committed tree and leaves target/ behind, so the rebuild is cold; RUSTUP_HOME is shared on
-      # purpose, the toolchain being an input both builds are meant to agree on.
+      # purpose, the toolchain being an input both builds are meant to agree on. Skipped on pull
+      # requests — the cold rebuild roughly doubles this job — but every main push and tag still
+      # runs it, so a regression surfaces before any tag publishes.
       - name: Rebuild from another path and compare the checksums
+        if: github.event_name != 'pull_request'
         run: |
           rebuild="$RUNNER_TEMP/nomux-rebuild"
           mkdir -p "$rebuild"

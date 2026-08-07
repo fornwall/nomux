@@ -3,8 +3,8 @@
 # in the tree; artifacts land in target/dist/.
 #
 # nomux uploads itself over whatever link the user's ssh session is riding, so IMPLEMENTATION.md
-# § 8 caps it at 400 KiB per architecture. The cap alone is not enough — one commit grew armv7 46%
-# and nothing said a word, because the result still fitted — so scripts/size-baseline holds a
+# § 8 caps it at 400 KiB per architecture. The cap alone is not enough — one commit grew a target
+# 46% and nothing said a word, because the result still fitted — so scripts/size-baseline holds a
 # figure per target and growth past 3% fails too. A shrink never does, however large.
 # NOMUX_UPDATE_BASELINE=1 rewrites the baseline and skips the gate, which puts an accepted
 # regression in a diff a reviewer reads.
@@ -47,9 +47,7 @@ update_baseline="${NOMUX_UPDATE_BASELINE:-0}"
 # so advancing either workflow advances both and shows up in `git status`; an environment override
 # would do neither. A bump is that file and, if its size review accepts material growth, a refreshed
 # baseline.
-nightly=$(awk 'NF { if (++seen > 1 || NF != 1) exit 1; value = $1 }
-    END { if (seen != 1) exit 1; print value }' "$nightly_file") ||
-    die "$nightly_file must contain exactly one toolchain name"
+read -r nightly < "$nightly_file" || die "could not read a toolchain name from $nightly_file"
 case "$nightly" in
 nightly-[0-9][0-9][0-9][0-9]-[01][0-9]-[0-3][0-9]) ;;
 *) die "$nightly_file must name a dated nightly toolchain" ;;

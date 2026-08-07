@@ -23,10 +23,6 @@ strip = "symbols"
 # .pre-commit-config.yaml, so a toolchain bump is a red gate rather than a tree that will
 # not build. No rustc *group* is named: a level applies to a group's members downwards.
 [workspace.lints.rust]
-# No `unexpected_cfgs` entry: it existed only to declare the three `nomux_fault_*` cfgs the
-# fault-injection guards compiled under, and both the cfgs and the guards are gone — what
-# they demonstrated is asserted by unit tests now. The lint is on by default, so nothing was
-# lost by dropping the declaration, and a cfg nobody declared warns again as it should.
 missing_docs = "warn"
 missing_debug_implementations = "warn"
 unreachable_pub = "warn"

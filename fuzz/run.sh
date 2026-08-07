@@ -23,9 +23,8 @@ cd "$repo"
 # green tree red with no commit behind it, and read from the release build's tracked pin so
 # the two workflows always exercise one compiler version.
 nightly_file="$repo/scripts/nightly-version"
-nightly=$(awk 'NF { if (++seen > 1 || NF != 1) exit 1; value = $1 }
-    END { if (seen != 1) exit 1; print value }' "$nightly_file") || {
-    echo "$nightly_file must contain exactly one toolchain name" >&2
+read -r nightly < "$nightly_file" || {
+    echo "could not read a toolchain name from $nightly_file" >&2
     exit 1
 }
 case "$nightly" in
