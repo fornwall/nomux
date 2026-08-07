@@ -77,10 +77,6 @@ fn main() -> ExitCode {
             print!("{USAGE}");
             ExitCode::SUCCESS
         }),
-        // Private half of the relay's bounded stdout boundary. `attach` gives it the
-        // worker channel as stdin and interprets this errno-shaped status; it is kept
-        // out of `USAGE` because it is not a user or client mode.
-        Some(word @ "__relay-stdout") => only(args, word, stdout_worker),
         Some(word @ "daemon") => with_session(word, args, true, |session, label, lock_fd| {
             report(daemon::run(session, label, lock_fd))
         }),
@@ -107,22 +103,6 @@ fn main() -> ExitCode {
             report(control::kill(session))
         }),
         _ => usage_error(Some(&format!("unknown mode `{}`", mode.display()))),
-    }
-}
-
-/// Runs the private relay worker, preserving an ordinary Linux errno in its exit code.
-///
-/// `EPIPE` is already a successful closed-stdout outcome inside the copy. 255 is the
-/// sentinel for a failure without a representable errno; Linux errnos fit below it.
-fn stdout_worker() -> ExitCode {
-    match attach::copy_stdin_to_stdout() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => ExitCode::from(
-            err.raw_os_error()
-                .and_then(|raw| u8::try_from(raw).ok())
-                .filter(|raw| *raw != 0 && *raw != u8::MAX)
-                .unwrap_or(u8::MAX),
-        ),
     }
 }
 
