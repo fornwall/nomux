@@ -33,14 +33,6 @@ Four properties drive it, and two of them are held on this side. What each one c
 - **Resume over a fresh SSH connection, not a side channel** — inherits ProxyJump, certificates, 2FA, agent forwarding. *The client's.*
 - **Zero server-side install** — the client carries the binary and pushes it on first use. *The client's.*
 
-Five files, held to a rule that none of them repeats another:
-
-- [DESIGN.md](DESIGN.md) — problem, properties, architecture, security model, prior art, rejected alternatives.
-- [IMPLEMENTATION.md](IMPLEMENTATION.md) — wire protocol, ring buffer, PTY handling, bootstrap, build.
-- [PLAN.md](PLAN.md) — what is open on this side.
-- [SECURITY.md](SECURITY.md) — how to report a vulnerability, and what gets fixed.
-- [LICENSE](LICENSE) — Apache-2.0.
-
 ## Build
 
 The Rust toolchain is pinned in `rust-toolchain.toml`, and rustup fetches it on the first
