@@ -88,12 +88,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-      # Prebuilt; `cargo install` would build each from source on every cache miss. Pinned, so a
-      # tool that lands a new check cannot turn a green tree red with no commit behind it;
-      # dependabot does not read inside `with:`, so these move by hand.
+      # Scheduled runs only need the advisory checker.
       - uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9
         with:
-          tool: cargo-nextest@0.9.143,cargo-deny@0.20.2,prek@0.4.12,shellcheck@0.11.0
+          tool: ${{ github.event_name == 'schedule' && 'cargo-deny@0.20.2' || 'cargo-nextest@0.9.143,cargo-deny@0.20.2,prek@0.4.12,shellcheck@0.11.0' }}
 
       # Advisories alone — bans, licences and sources are the cargo-deny hook's, run by prek
       # below; this one fetches a database over the network where a hook may not. `--locked`
