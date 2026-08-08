@@ -86,10 +86,10 @@ jobs:
       - name: Install the pinned toolchain
         run: rustup toolchain install --profile minimal --no-self-update
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # Scheduled runs only need the advisory checker.
-      - uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9
+      - uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2.85.10
         with:
           tool: ${{ github.event_name == 'schedule' && 'cargo-deny@0.20.2' || 'cargo-nextest@0.9.143,cargo-deny@0.20.2,prek@0.4.12,shellcheck@0.11.0' }}
 
@@ -182,7 +182,7 @@ jobs:
 
       # `workspaces: fuzz`, fuzz/ being a workspace of its own: its lock file and target directory
       # are both under there, and the default `.` would key this cache on one it never builds.
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: fuzz-${{ hashFiles('fuzz/run.sh', 'scripts/nightly-version') }}
           workspaces: fuzz
@@ -229,7 +229,7 @@ jobs:
       # llvm-tools and both musl targets itself, in one idempotent `rustup toolchain install`. It
       # owns the target list and the compiler, so it owns fetching them, and the cache key follows
       # both the script and the file that names the compiler.
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: musl-${{ hashFiles('scripts/build-release.sh', 'scripts/nightly-version') }}
 
