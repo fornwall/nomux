@@ -64,21 +64,25 @@ whose permissions are the whole of the authentication (§8).
 ```mermaid
 flowchart LR
   subgraph client["Client — separate project"]
-    APP["SSH client<br/>terminal emulator<br/>protocol state"]
+    APP["SSH client<br/>terminal emulator + protocol"]
   end
 
   subgraph server["SSH server"]
     SSHD["sshd"]
-    RELAY["nomux spawn / attach<br/>byte relay"]
-    DAEMON["nomux daemon<br/>PTY master + ring buffer"]
-    CHILD["shell / TUI"]
+    RELAY["nomux spawn / attach<br/>byte-blind relay"]
+    SYSTEMD["systemd user manager<br/>transient nomux scope"]
+    DAEMON["nomux daemon<br/>protocol + PTY + output ring"]
+    CHILD["login shell / TUI"]
   end
 
-  APP -- "SSH transport" --> SSHD
-  SSHD -- "direct-streamlocal (warm)" --> DAEMON
-  SSHD -- "exec channel (fallback)" --> RELAY
-  RELAY -- "unix socket" --> DAEMON
-  DAEMON -- "PTY master" --> CHILD
+  APP <-->|"SSH transport"| SSHD
+  SSHD <-->|"direct-streamlocal<br/>warm resume"| DAEMON
+  SSHD <-->|"exec stdio<br/>bootstrap / fallback"| RELAY
+  RELAY <-->|"session unix socket"| DAEMON
+  RELAY -.->|"spawn: direct fallback"| DAEMON
+  RELAY -.->|"spawn: systemd-run --user --scope"| SYSTEMD
+  SYSTEMD -.->|"place daemon in scope"| DAEMON
+  DAEMON <-->|"PTY"| CHILD
 ```
 
 Five modes of one binary, in three groups:
@@ -96,16 +100,17 @@ the relay parses no frame and is never bumped.
 
 ```mermaid
 stateDiagram-v2
-  [*] --> Spawning: spawn, no live socket
-  Spawning --> Attached: bind socket, fork, PTY on the first Hello
+  [*] --> AwaitingHello: spawn starts daemon, bind socket
+  AwaitingHello --> Attached: first Hello, start PTY
+  AwaitingHello --> Reaping: no Hello for 30 s
   Attached --> Detached: connection lost / explicit detach
-  Detached --> Attached: attach, resume from offset
-  Attached --> Ended: terminal closes, Exit after the last output
-  Detached --> Ended: terminal closes, outcome held
-  Ended --> Ended: attach, replay then the outcome again
-  Detached --> Reaping: idle timeout since the last detach
-  Ended --> Reaping: idle timeout since the last detach
-  Reaping --> [*]: signal whatever is left, unlink run files
+  Detached --> Attached: Hello, resume from offset
+  Attached --> Ended: PTY closes, drain output then Exit
+  Detached --> Ended: PTY closes, retain output and outcome
+  Ended --> Ended: Hello, replay output then Exit
+  Detached --> Reaping: clientless for 7 days
+  Ended --> Reaping: 7 days after the last client leaves
+  Reaping --> [*]: stop remaining processes, unlink run files
 ```
 
 The daemon keeps draining the PTY while detached — otherwise the child blocks on write
