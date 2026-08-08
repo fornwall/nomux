@@ -275,7 +275,11 @@ weighs the `libvterm` snapshot).
 
 ## 5. Bootstrap
 
-### 5.1 Probe and attach in one round trip
+Send each recipe through a correctly quoted, single-line `/bin/sh -c` wrapper. `sshd`
+invokes an exec command through the account's login shell, which need not understand POSIX `sh`,
+and `tcsh` can reject a multiline quoted argument before `/bin/sh` receives it.
+
+### 5.1 Probe and launch in one round trip
 
 ```sh
 p=${XDG_DATA_HOME:-$HOME/.local/share}/nomux
@@ -343,7 +347,7 @@ warm path here.
 backslash, a path can, and `echo`'s treatment of one is unspecified — in `dash` it is an
 escape.
 
-### 5.2 Upload and attach in one round trip
+### 5.2 Upload and launch in one round trip
 
 ```sh
 p=${XDG_DATA_HOME:-$HOME/.local/share}/nomux
@@ -362,44 +366,23 @@ mkdir -p -m 700 "$p" && set -C && cat > "$p/.up.$$" && chmod 755 "$p/.up.$$" \
 - Enable `zlib@openssh.com` on this channel: a static binary compresses well, and it needs nothing on the remote.
 - **`-m 700` rather than the ambient umask**, since a bare `mkdir -p` creates at `0777 & ~umask` and `umask 002` is the Debian-derived default: without the mode, the directory every later connection `exec`s out of is group-writable with nobody having pointed `$XDG_DATA_HOME` anywhere. It binds only where this call *creates* the directory.
 - **`set -C` before the redirect**, `.up.$$` being a predictable name. Under noclobber `>` is `O_CREAT | O_EXCL`, which refuses a symlink — dangling or not — where a plain `cat >` follows it. In a directory another user can write to, that is the difference between one failed bootstrap and choosing where the uploaded bytes land: `~/.ssh/authorized_keys`, `~/.bashrc`, anything this uid can write.
-- **The install directory is still created, not checked** — materially weaker than what §6.3 gives the *run* directory. [DESIGN.md § 8](DESIGN.md#8-security-model) states what the two lines above do and do not close, and to whom.
+- **The install path is trusted as part of the account environment.** Shell bootstrapping
+  cannot validate a path and later execute through it without a rename race. A host where
+  another uid can replace an ancestor is outside the boundary; §8 states that limitation.
 - **Nothing here ever unlinks an uploaded binary.** Every release therefore leaves another artifact in every user's home on every host they have ever touched, and only the client — which knows each session's version — can tell a `nomux-*` that is neither current nor holding a live session from one that is.
 
-### 5.3 Decision tree
+### 5.3 Client decisions
 
-```mermaid
-flowchart TD
-  A["Cached host profile with a run directory?"] -- yes --> W["direct-streamlocal to socket"]
-  W -- refused --> X["exec: attach relay"]
-  W -- ok --> DONE["session"]
-  A -- no --> P["probe + attach (5.1)"]
-  P -- "exec succeeded" --> DONE
-  P -- "NOMUX-BOOTSTRAP" --> Q{"uname -s == Linux?"}
-  Q -- no --> F["plain SSH, cache negative"]
-  Q -- yes --> R{"arch supported?"}
-  R -- no --> F
-  R -- yes --> U["upload + attach (5.2)"]
-  U -- ok --> DONE
-  U -- "ENOEXEC" --> V["retry next-best arch, once"]
-  V -- fail --> F
-  U -- "EACCES / noexec / EROFS" --> F
-  X -- fail --> F
-```
+A cached run directory permits `direct-streamlocal`; a refused channel falls back to the
+`attach` relay. Without one, §5.1 probes and §5.2 uploads with the caller's original `$MODE`
+unchanged. `ENOEXEC` permits one next-best architecture retry because `uname -m` can describe
+a 64-bit kernel over a 32-bit userland.
 
-The run directory is a *field of the profile*, which is why the first node asks for it and
-not merely for a profile: the socket the warm branch opens is `$RUNDIR/<id>.sock` and that
-branch runs no process to resolve it (§6.3). Both cold commands emit it (§5.1, §5.2), so
-the cold path is what establishes the warm one, and a profile without the field has no warm
-branch to take — the client goes straight to the exec relay, which resolves the path in the
-daemon's own code and so needs none of this.
-
-`uname -m` lies on a 32-bit userland over a 64-bit kernel, hence the one ENOEXEC retry. A
-`noexec` or read-only home is detected by exec failing, never by parsing mounts, and every
-negative is cached per-host so a hardened box is not re-probed on each reconnect. Three
-conditions off the tree reach the same fallback: a restricted shell with no `uname` is
-plain SSH; `AllowStreamLocalForwarding no` costs only the warm path, leaving the exec
-relay; and a host without §6.2's persistent user-manager conditions uses direct daemon
-startup, which makes no promise against a service manager that kills the SSH session scope.
+Only creation, before a persistent session exists, may visibly fall back to plain SSH.
+Recovery never substitutes a new shell: relay failures are classified by §10's record and
+the original mode. Unsupported systems, architectures, restricted shells and noexec or
+read-only install paths are host-scoped negatives. `AllowStreamLocalForwarding no` disables
+only the warm channel; the exec relay remains available.
 
 ## 6. Daemon
 
@@ -473,8 +456,8 @@ gap is § 6.6's publish window.
 Signal dispositions: `SIGHUP` ignored, and restored in the child with four others before
 `exec` (§ 6.1). `SIGTERM` and `SIGINT` handled, not ignored (§ 6.5), armed before the
 pidfile so the pid `kill` reads does not name a process on the default disposition —
-best-effort, the arming resting on a `pipe2` whose failure the daemon swallows rather than
-refuse a session over. `SIGCHLD` handled too, down a **second** self-pipe (§ 6.5), and
+failure to create that signal path refuses startup. `SIGCHLD` is handled too, down a
+**second** self-pipe (§ 6.5), and
 handled rather than ignored for a reason of the child's: `SIG_IGN` survives `exec` and takes
 with it the kernel's own reaping, so the login shell would inherit a session where the kernel
 reaps its children out from under it and every `wait` it makes fails `ECHILD`, for the
@@ -599,8 +582,8 @@ client's ([DESIGN.md § 5.1](DESIGN.md#51-identity)).
 ### 6.4 Multiple clients
 
 Exactly one attached client. By default, a second `Hello` on a live session takes over;
-the previous connection receives `Error{TAKEOVER}` and closes. Its queued output is dropped
-first (§ 4.1) and the final write is bounded by § 6.5's 500 ms. A `Hello` with
+the previous connection receives `Error{TAKEOVER}` after its queued frames and closes, with
+the final write bounded by § 6.5's 500 ms. A `Hello` with
 `if_detached` set instead receives `Error{ALREADY_ATTACHED}` and closes when the slot is
 occupied, leaving the incumbent, its queued output, the agent channel and every session
 setting untouched. The client may use that refusal to ask before retrying without the flag.
@@ -952,9 +935,10 @@ of a percent against a 3% threshold, so a stamp that disagrees never means a del
 act on, and refusing on one only taught people to reach for the escape hatch. The build script
 argues the rest — the release profile, the `-Z build-std` case and the reproducibility flags.
 
-That script is the producing half of a check whose consuming half does not exist: **the
-client is meant to pin a SHA-256 per architecture and verify it after upload, and nothing
-does that today**. A `v*` tag publishes `SHA256SUMS` in the format `sha256sum -c` reads.
+A `v*` tag publishes `SHA256SUMS` in the format `sha256sum -c` reads. Clients pin the asset
+before upload; SSH authenticates the transfer, and `--version` plus the handshake proves
+executable compatibility. A remote hash is optional corruption detection, not protection
+from a compromised account or host, and is not required.
 
 ## 9. Testing
 

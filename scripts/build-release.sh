@@ -130,6 +130,16 @@ rustflags="$rustflags$us-Zunstable-options$us-Cpanic=immediate-abort"
 rm -rf "$dist"
 mkdir -p "$dist"
 
+# `-pie` alone leaves AArch64 on crt1.o, producing ET_DYN with no self-relocator. Change the
+# pinned compiler's target decision so it selects rcrt1.o; the library path supplies the bundled
+# musl objects that a custom target name cannot find in its own sysroot directory.
+aarch_build=nomux-aarch64-static-pie
+aarch_pie_spec="$target_root/$aarch_build.json"
+rustc --print target-spec-json -Z unstable-options --target aarch64-unknown-linux-musl |
+    awk '/"target-pointer-width":/ { print "  \"static-position-independent-executables\": true," }
+         { print }' > "$aarch_pie_spec"
+aarch_libdir=$(rustc --print target-libdir --target aarch64-unknown-linux-musl)
+
 # Between here and the checksums, target/dist holds some of the binaries and no SHA256SUMS, and
 # nothing in it says which. Cleared on a signal as well as on a failed command: these are cross
 # builds, Ctrl-C is an ordinary way to end one, and a shell killed by a signal need not run its
@@ -174,7 +184,7 @@ check_leaks() {
 # PT_INTERP segment naming a loader nor a DT_NEEDED entry naming a library. Read into a variable
 # first, so a readobj that fails is `set -e` rather than a grep that calls the binary clean.
 check_static() {
-    elf=$("$readobj" --program-headers --dynamic-table "$1")
+    elf=$("$readobj" --file-headers --program-headers --dynamic-table "$1")
     # That the output was parsed at all, before any weight is put on its silence: the verdict below
     # is drawn from two patterns *not* matching, which is equally what an empty output or a future
     # release renaming these fields would produce. Every ELF that runs has at least one PT_LOAD.
@@ -183,6 +193,10 @@ check_static() {
     *) die "FAIL: could not read the program headers of ${1##*/}: $readobj reported no" \
             "      PT_LOAD, so it did not parse the file, and its silence about PT_INTERP" \
             "      and NEEDED says nothing about what this binary needs at runtime." ;;
+    esac
+    case "$elf" in
+    *'Type: SharedObject'*) ;;
+    *) die "FAIL: ${1##*/} is static but not position-independent." ;;
     esac
     if printf '%s\n' "$elf" | grep -qE 'PT_INTERP|NEEDED'; then
         die "FAIL: ${1##*/} is dynamically linked:" \
@@ -193,10 +207,20 @@ check_static() {
 
 for target in $targets; do
     echo "building $target ($toolchain)..." >&2
-    CARGO_ENCODED_RUSTFLAGS="$rustflags" \
-        cargo build --locked --release --target "$target" --bin nomux \
-        -Zbuild-std=std,panic_abort >&2
-    cp "$target_root/$target/release/nomux" "$dist/nomux-$target"
+    target_rustflags=$rustflags
+    build_target=$target
+    build_dir=$target
+    case "$target" in
+    aarch64-*)
+        build_target=$aarch_pie_spec
+        build_dir=$aarch_build
+        target_rustflags="$target_rustflags$us-Clinker=rust-lld$us-Lnative=$aarch_libdir/self-contained"
+        ;;
+    esac
+    CARGO_ENCODED_RUSTFLAGS="$target_rustflags" \
+        cargo build --locked --release --target "$build_target" --bin nomux \
+        -Zbuild-std=std,panic_abort -Zjson-target-spec >&2
+    cp "$target_root/$build_dir/release/nomux" "$dist/nomux-$target"
     check_leaks "$dist/nomux-$target"
     check_static "$dist/nomux-$target"
 done

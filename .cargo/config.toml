@@ -1,16 +1,5 @@
-# Cross-linking for the two shipping targets. Why `rust-lld` needs no gcc, no zig and
-# no sysroot is IMPLEMENTATION.md § 8; rustc resolves the bare name out of its own
-# sysroot, so it does not have to be on $PATH.
-#
-# x86_64 is listed too, though the host `cc` would link it: `cc` drags in whatever gcc
-# and binutils the host happens to have, and their version then lands in the bytes we
-# ask the client to pin a SHA-256 of.
-#
-# Only `linker` belongs in this file. A `rustflags` key here would be silently discarded
-# the moment anything sets $CARGO_ENCODED_RUSTFLAGS or $RUSTFLAGS — either environment
-# variable replaces these tables rather than appending to them — and scripts/build-release.sh
-# sets the encoded form, so that a space in a remapped path cannot split a flag. Link flags
-# that must not go missing are passed from there instead.
+# Keep both release targets independent of the host linker; build flags live in
+# scripts/build-release.sh.
 
 [target.x86_64-unknown-linux-musl]
 linker = "rust-lld"

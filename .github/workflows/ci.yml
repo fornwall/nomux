@@ -83,22 +83,15 @@ jobs:
           [ "$version" = "${GITHUB_REF_NAME#v}" ] ||
               { echo "tag $GITHUB_REF_NAME does not name Cargo.toml's $version" >&2; exit 1; }
 
-      # Bare `toolchain install` reads rust-toolchain.toml, so the version and its components
-      # are not restated here — a comment naming the pin was a second place to update it. That
-      # file is the only copy anything reads; the other five (README.md, IMPLEMENTATION.md,
-      # three `expect` reasons) are prose, so a stable bump is one edit that gates and five
-      # that only read wrong.
       - name: Install the pinned toolchain
         run: rustup toolchain install --profile minimal --no-self-update
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-      # Prebuilt; `cargo install` would build each from source on every cache miss. Pinned, so a
-      # tool that lands a new check cannot turn a green tree red with no commit behind it;
-      # dependabot does not read inside `with:`, so these move by hand.
+      # Scheduled runs only need the advisory checker.
       - uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9
         with:
-          tool: cargo-nextest@0.9.143,cargo-deny@0.20.2,prek@0.4.12,shellcheck@0.11.0
+          tool: ${{ github.event_name == 'schedule' && 'cargo-deny@0.20.2' || 'cargo-nextest@0.9.143,cargo-deny@0.20.2,prek@0.4.12,shellcheck@0.11.0' }}
 
       # Advisories alone — bans, licences and sources are the cargo-deny hook's, run by prek
       # below; this one fetches a database over the network where a hook may not. `--locked`
@@ -133,10 +126,7 @@ jobs:
       - if: github.event_name != 'schedule'
         run: prek run --all-files --skip cargo-nextest
 
-      # rustdoc's lints are a namespace of their own, reached by neither the clippy hook nor
-      # RUSTFLAGS, and a renamed item turns a link into nothing rather than into an error.
-      # `--document-private-items` because the binary is almost entirely private; `--lib --bins`
-      # because a bare `cargo doc` documents only the lib when both share a name.
+      # rustdoc has its own lints; include private binary modules and both targets.
       - if: github.event_name != 'schedule'
         run: cargo doc --locked --workspace --no-deps --document-private-items --lib --bins
 

@@ -1,27 +1,11 @@
-# A workspace of its own, which is the whole argument for `libfuzzer-sys` living in a tree
-# that carries two runtime dependencies and a note on each. The root manifest names its one
-# member, so `cargo build`, `cargo clippy --all-targets`, `cargo nextest run --workspace`
-# and `cargo deny` all stop there: libFuzzer's C++ runtime is absent from the shipped
-# binary, from ../Cargo.lock, and from the root workspace's gates. CI reaches this workspace
-# explicitly with its own format, Clippy, advisory and seeded-fuzz passes. What the separation
-# costs is that ../Cargo.toml's lint wall does not reach here either; see the note in
-# fuzz_targets/frame.rs on why that wall is the wrong one for a fuzz target.
-#
-# It also settles the release profile, which is read from the workspace root and nowhere
-# else — so the root's is not in force here and the one below is. What that is worth is
-# `strip = "symbols"` rather than the `panic = "abort"` beside it, both measured under a
-# deliberate `assert!`: the panic message survives an aborting profile, but a stripped
-# binary reports the stack as bare addresses, and a crash nobody can read is a crash nobody
-# reproduces.
+# Keep libFuzzer and its release profile outside the shipping workspace.
 [workspace]
 
 [package]
 name = "nomux-fuzz"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.97.1"
 license = "Apache-2.0"
-# Nothing here is a library, and the crate it fuzzes is not published either.
 publish = false
 
 [package.metadata]
@@ -29,13 +13,9 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4.13"
-# By path, so the codec under test is the one in this checkout rather than a release of
-# it. `nomux`'s lib target is the whole wire protocol and `decode_header` and
-# `Frame::decode` are both `pub` in it, so nothing has to be widened to fuzz them.
-nomux = { path = "../crates/nomux" }
+nomux_protocol = { package = "nomux", path = "../crates/nomux" }
 
-# The line numbers the note at the top is about. `1` rather than full debuginfo, line
-# tables being all a stack trace reads.
+# Preserve line tables in fuzz crash reports.
 [profile.release]
 debug = 1
 

@@ -154,8 +154,7 @@ pub(crate) fn arm_child_signal() -> io::Result<OwnedFd> {
 /// strips the controlling terminal from every other process in the session too, which is not
 /// this program's to take.
 ///
-/// Failures are not propagated: sharing a session makes for a worse daemon, not a broken one.
-pub(crate) fn detach_from_controlling_terminal() {
+pub(crate) fn detach_from_controlling_terminal() -> io::Result<()> {
     // SAFETY: `signal` with SIG_IGN on a single-threaded process with no handler installed;
     // reset in the child before `exec` (`pty::Pty::spawn`), so it still dies on hangup.
     unsafe {
@@ -165,17 +164,17 @@ pub(crate) fn detach_from_controlling_terminal() {
     let leads_session =
         rustix::process::getsid(None).is_ok_and(|sid| sid == rustix::process::getpid());
     if leads_session && !has_controlling_terminal() {
-        return;
+        return Ok(());
     }
     if rustix::process::setsid().is_ok() {
-        return;
+        return Ok(());
     }
 
     // SAFETY: this process is still single-threaded — no thread started and no child
     // spawned — so the copy holds no lock and no half-initialised runtime state.
     let forked = unsafe { libc::fork() };
     if forked < 0 {
-        return;
+        return Err(io::Error::last_os_error());
     }
     if forked > 0 {
         // SAFETY: the only correct exit for a forked parent. `exit` would run the atexit
@@ -183,7 +182,7 @@ pub(crate) fn detach_from_controlling_terminal() {
         // has inherited and not yet written itself.
         unsafe { libc::_exit(0) }
     }
-    let _ = rustix::process::setsid();
+    rustix::process::setsid().map(|_| ()).map_err(Into::into)
 }
 
 /// Whether this process has a controlling terminal. `O_NOCTTY` so that asking never

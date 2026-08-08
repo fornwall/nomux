@@ -13,7 +13,7 @@ use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use nomux::{
+use nomux_protocol::{
     ErrorCode, ExitKind, Frame, FrameType, Hello, HelloOk, PROTOCOL_VERSION, RESUME_FROM_START,
     WinSize,
 };
@@ -68,7 +68,7 @@ fn allocate_ring(session_id: &str) -> io::Result<crate::ring::Ring> {
 /// the child is still running (`IMPLEMENTATION.md` § 6.5).
 #[expect(
     clippy::duration_suboptimal_units,
-    reason = "Duration::from_days is unstable on the pinned 1.97.1 toolchain"
+    reason = "Duration::from_days is unstable on the pinned toolchain"
 )]
 const IDLE_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
@@ -79,7 +79,7 @@ const OUTCOME_GRACE: Duration = Duration::from_secs(2);
 /// Longest the poll loop sleeps with nothing else pending.
 #[expect(
     clippy::duration_suboptimal_units,
-    reason = "Duration::from_hours is unstable on the pinned 1.97.1 toolchain"
+    reason = "Duration::from_hours is unstable on the pinned toolchain"
 )]
 const IDLE_TICK: Duration = Duration::from_secs(60 * 60);
 
@@ -182,7 +182,7 @@ struct Daemon {
     /// deadline by which it must. Usually a liveness probe from `list`.
     pending: Option<(Conn, Instant)>,
     /// Agent socket and the connection it is serving, once a session created with
-    /// [`nomux::Hello::agent_forward`] has bound one.
+    /// [`nomux_protocol::Hello::agent_forward`] has bound one.
     agent: Option<Agent>,
     /// Where the child starts, captured before the daemon moved to `/`.
     child_dir: PathBuf,
@@ -256,7 +256,6 @@ fn start(
         restore_scope_environment(original_invocation_id);
     }
     let paths = SessionPaths::new(session_id)?;
-    let ring = allocate_ring(session_id)?;
     ensure_run_dir(paths.dir())?;
 
     // The authority to probe, replace and bind this id. `spawn` hands its already-locked
@@ -275,6 +274,11 @@ fn start(
             )
         })?,
     };
+    let ring = allocate_ring(session_id).inspect_err(|_| {
+        if publishing.created_name() {
+            drop(fs::remove_file(paths.lock()));
+        }
+    })?;
     // The bind is whole before § 6.2's fork: past it the caller has already been
     // answered, so every errno after it reads as success. One `Err` exit, so `<id>.lock`
     // is scrubbed in a single place.
@@ -375,12 +379,11 @@ fn restore_scope_environment(original: OriginalInvocationId) {
 ///
 /// # Errors
 ///
-/// Propagates failures to arm either required signal path or write `<id>.pid`. Detachment
-/// and the advisory label remain best effort: neither can make the event loop unsafe.
+/// Propagates detachment, signal setup and pidfile failures. The label remains advisory.
 fn publish(paths: &SessionPaths, label: Option<&str>) -> io::Result<(OwnedFd, OwnedFd)> {
     // Before the pidfile, so the pid `nomux kill` reads belongs to the process that
     // survives.
-    detach_from_controlling_terminal();
+    detach_from_controlling_terminal()?;
     // No second `listen` here. `UnixListener::bind` already issues one at the maximum
     // depth on Linux, and a backlog belongs to the socket's open file description, so
     // `detach_from_controlling_terminal`'s fork shares it rather than resetting it.
@@ -441,9 +444,7 @@ fn bind_socket(paths: &SessionPaths) -> io::Result<UnixListener> {
     paths.clear_pid();
     paths.clear_label();
 
-    let listener = crate::rundir::bind_socket_private(&path)?;
-    listener.set_nonblocking(true)?;
-    Ok(listener)
+    crate::rundir::bind_socket_private(&path)
 }
 
 /// What one entry of the poll set belongs to.
@@ -1736,7 +1737,12 @@ mod tests {
         assert_eq!(
             evicted,
             {
-                let mut wire = nomux::SERVER_PREAMBLE.to_vec();
+                let mut wire = nomux_protocol::SERVER_PREAMBLE.to_vec();
+                Frame::InputAck {
+                    applied_through: TYPED.len() as u64,
+                }
+                .encode(&mut wire)
+                .expect("a valid frame");
                 Frame::Error {
                     code: ErrorCode::Takeover,
                     message: "another client attached",
@@ -1745,7 +1751,7 @@ mod tests {
                 .expect("a valid frame");
                 wire
             },
-            "the evicted connection was told something other than why it was evicted"
+            "the evicted connection was not acknowledged and told why it was evicted"
         );
         assert_eq!(
             applied,
@@ -1805,7 +1811,7 @@ mod tests {
         assert_eq!(
             greeting,
             {
-                let mut wire = nomux::SERVER_PREAMBLE.to_vec();
+                let mut wire = nomux_protocol::SERVER_PREAMBLE.to_vec();
                 Frame::HelloOk(HelloOk {
                     resume_from: 0,
                     in_applied: 0,
@@ -1843,7 +1849,7 @@ mod tests {
         }
         .encode(&mut wire)
         .expect("a valid frame");
-        peer.write_all(&wire[..=nomux::HEADER_LEN])
+        peer.write_all(&wire[..=nomux_protocol::HEADER_LEN])
             .expect("deliver an incomplete frame");
         peer.shutdown(std::net::Shutdown::Write)
             .expect("close only the input half");
@@ -1859,7 +1865,7 @@ mod tests {
         assert_eq!(
             collect(&mut peer),
             {
-                let mut expected = nomux::SERVER_PREAMBLE.to_vec();
+                let mut expected = nomux_protocol::SERVER_PREAMBLE.to_vec();
                 Frame::Error {
                     code: ErrorCode::Protocol,
                     message: "truncated frame at end of input",

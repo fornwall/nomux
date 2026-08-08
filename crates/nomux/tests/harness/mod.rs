@@ -35,7 +35,7 @@ use std::sync::{PoisonError, RwLock};
 use std::time::{Duration, Instant};
 use std::{env, fs, thread};
 
-use nomux::{
+use nomux_protocol::{
     ErrorCode, Frame, FrameType, HEADER_LEN, Hello, PROTOCOL_VERSION, RESUME_FROM_START,
     SERVER_PREAMBLE, WinSize, decode_header,
 };
@@ -299,7 +299,7 @@ impl Session {
     /// kills it on drop, so the caller has to bind it for as long as the client is
     /// used — `let (_session, ..)`, never `let (_, ..)`, which would end the session
     /// on the spot.
-    pub(crate) fn attached(name: &str) -> (Self, Client, nomux::HelloOk) {
+    pub(crate) fn attached(name: &str) -> (Self, Client, nomux_protocol::HelloOk) {
         Self::attached_with(name, false, false)
     }
 
@@ -309,7 +309,7 @@ impl Session {
         name: &str,
         agent_forward: bool,
         repaint_ctrl_l: bool,
-    ) -> (Self, Client, nomux::HelloOk) {
+    ) -> (Self, Client, nomux_protocol::HelloOk) {
         let session = Self::start(name);
         let mut client = session.connect();
         let ok = client.hello_with(agent_forward, repaint_ctrl_l, RESUME_FROM_START);
@@ -409,7 +409,7 @@ pub(crate) fn reconnect_until_gap(
     deadline: Instant,
     repaint_ctrl_l: bool,
     out_offset: u64,
-) -> (Client, nomux::HelloOk) {
+) -> (Client, nomux_protocol::HelloOk) {
     loop {
         let mut client = session.connect_by(deadline);
         let resumed = client.hello_with(false, repaint_ctrl_l, out_offset);
@@ -1084,14 +1084,14 @@ impl Client {
         self.send(&Frame::Input { offset, data });
     }
 
-    pub(crate) fn hello(&mut self, out_offset: u64) -> nomux::HelloOk {
+    pub(crate) fn hello(&mut self, out_offset: u64) -> nomux_protocol::HelloOk {
         self.hello_with(false, false, out_offset)
     }
 
     /// Greets only if the daemon has no attached client, for the lifecycle test of the
     /// third `Hello` flag. Unlike [`Client::hello`], this is deliberately not used by
     /// general setup: unconditional takeover remains the protocol default.
-    pub(crate) fn hello_if_detached(&mut self, out_offset: u64) -> nomux::HelloOk {
+    pub(crate) fn hello_if_detached(&mut self, out_offset: u64) -> nomux_protocol::HelloOk {
         self.send(&Frame::Hello(Hello {
             protocol: PROTOCOL_VERSION,
             agent_forward: false,
@@ -1110,14 +1110,14 @@ impl Client {
         agent_forward: bool,
         repaint_ctrl_l: bool,
         out_offset: u64,
-    ) -> nomux::HelloOk {
+    ) -> nomux_protocol::HelloOk {
         self.send(&hello_frame(agent_forward, repaint_ctrl_l, out_offset));
         let greeting = self.frame_owed("a HelloOk from the daemon");
         self.take_hello_ok(greeting)
     }
 
     /// Decodes the greeting and moves this client's two offsets onto it.
-    fn take_hello_ok(&mut self, (ty, payload): (FrameType, Vec<u8>)) -> nomux::HelloOk {
+    fn take_hello_ok(&mut self, (ty, payload): (FrameType, Vec<u8>)) -> nomux_protocol::HelloOk {
         assert_eq!(ty, FrameType::HelloOk, "expected HelloOk, got {ty:?}");
         match Frame::decode(ty, &payload).expect("decode HelloOk") {
             Frame::HelloOk(ok) => {

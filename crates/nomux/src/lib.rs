@@ -205,13 +205,13 @@ pub(crate) const fn encode_header(ty: FrameType, len: u32) -> Result<[u8; HEADER
 /// three that follow.
 ///
 /// ```
-/// use nomux::{FrameType, Header, decode_header};
+/// use nomux_protocol::{FrameType, Header, decode_header};
 ///
 /// assert_eq!(
 ///     decode_header(&[0x05, 0x00, 0x10, 0x00])?,
 ///     Header { ty: FrameType::Output, len: 4096 }
 /// );
-/// # Ok::<(), nomux::ProtoError>(())
+/// # Ok::<(), nomux_protocol::ProtoError>(())
 /// ```
 pub fn decode_header(bytes: &[u8; HEADER_LEN]) -> Result<Header, ProtoError> {
     let [ty, a, b, c] = *bytes;

@@ -97,8 +97,9 @@ fn send(priority: u8, session_id: &str, message: &str) {
     if let Ok(socket) = UnixDatagram::unbound() {
         // A full collector must not park the daemon inside a `send`. Dropping the
         // line is the right answer to a log nobody is draining.
-        let _ = socket.set_nonblocking(true);
-        let _ = socket.send_to(line.as_bytes(), SOCKET);
+        if socket.set_nonblocking(true).is_ok() {
+            let _ = socket.send_to(line.as_bytes(), SOCKET);
+        }
     }
 }
 

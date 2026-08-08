@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use nomux::PROTOCOL_VERSION;
+use nomux_protocol::PROTOCOL_VERSION;
 
 use harness::{
     Flock, HeldLock, Reaper, Session, Spawned, collect, control, control_with_shell, daemon_reaper,

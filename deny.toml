@@ -1,60 +1,18 @@
-# cargo-deny, run in two halves: .pre-commit-config.yaml's hook checks bans, licences and
-# sources from the lockfile alone, and .github/workflows/ci.yml adds `advisories`, which
-# fetches a database over the network where a commit hook may not.
-#
-# No `[graph] targets`, deliberately: every target is checked rather than the two that
-# ship, so the windows crates errno pulls in are in scope — an advisory that surfaces
-# only on someone else's platform is one this repository would rather hear about.
-#
-# Licensing and bans exclude fuzz/, a workspace of its own that no cargo run from here
-# reaches. Taking it into these rules would loosen them tree-wide: libfuzzer-sys vendors
-# NCSA-licensed LLVM sources, and the harness deliberately uses an unversioned path to the
-# codec under test. Both are object-code shipping rules, and the harness ships nothing.
-# `fuzz/deny.toml` still gates advisories and sources, because its build scripts execute on
-# developer and CI machines even though their output is not released.
+# Offline policy runs in the commit gate; CI also checks the advisory database.
 
 [advisories]
-# Deny by default. `ignore` stays empty: with two direct dependencies, an advisory is
-# something to fix rather than something to carry, and an entry here would need a date
-# and a reason beside it.
 ignore = []
-# The default considers unsoundness only in direct dependencies. A transitive crate executes in
-# the same process and gets no smaller trust boundary, so every occurrence is release-blocking.
 unsound = "all"
-# Not the default, which is `warn`. A yank is a decision the crate's author has already
-# made and this lockfile has not heard about — and the lockfile is not a suggestion here:
-# its bytes decide the binary whose SHA-256 a client pins. A warning would scroll past in
-# a CI log that is green; this is worth stopping for.
 yanked = "deny"
 
 [licenses]
-# Exactly what the tree resolves to today, and nothing held in reserve: an unmatched
-# entry here is a warning, and a licence that is not here is a decision someone makes
-# in a diff rather than one already made for them. rustix and linux-raw-sys offer
-# `Apache-2.0 WITH LLVM-exception` as well; the plain Apache-2.0 in their `OR` is what
-# is taken, so the exception does not need listing.
-#
-# `cargo deny list` re-derives this from the lockfile and is how to check the claim. It
-# was last checked against the eight crates the lock now holds, which between them declare
-# these two and nothing else.
 allow = ["Apache-2.0", "MIT"]
 
 [bans]
-# `warn` is the usual answer, and `cargo deny check` exits zero on one — which would leave
-# `wildcards` below the only rule this section actually enforces. Affordable here because the
-# lockfile holds eight crates and no duplicate among them: the first one to arrive lands in a
-# diff someone reads rather than in a line that scrolls past in a green log.
 multiple-versions = "deny"
-# A `*` requirement resolves to whatever crates.io was holding on the day the lock was
-# written, which is the one thing this tree is arranged not to do: the compiler is pinned by
-# date, the actions by commit, and the binary is fetched against a checksum. Nothing declares
-# a wildcard today, so this is free — it refuses the first one to arrive rather than the
-# hundredth, and `[sources]` below already refuses the other way of getting a moving version.
 wildcards = "deny"
 
 [sources]
-# crates.io and nothing else. A git dependency would put a moving ref inside a binary
-# whose SHA-256 the client pins.
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]

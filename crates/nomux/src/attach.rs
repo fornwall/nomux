@@ -328,7 +328,8 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> Result<UnixStream, Failu
     // A collector may unlink `<id>.lock` while this call is blocked on it, which
     // `rundir::SpawnLock` has: the lock that comes back is the one on the file now at
     // the path.
-    let spawn_lock = paths.lock_spawn().map_err(|err| {
+    let deadline = Instant::now() + SPAWN_TIMEOUT;
+    let spawn_lock = paths.lock_spawn_until(deadline).map_err(|err| {
         let class = if err.kind() == io::ErrorKind::ResourceBusy {
             FailureClass::Retryable
         } else {
@@ -363,7 +364,6 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> Result<UnixStream, Failu
         }
     };
 
-    let deadline = Instant::now() + SPAWN_TIMEOUT;
     loop {
         match liveness(&socket, CONNECT_TIMEOUT) {
             Liveness::Alive(stream) => {
@@ -378,10 +378,10 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> Result<UnixStream, Failu
                         |said| format!("daemon for session {id} did not start: {said}"),
                     );
                     let refusal = Failure::new(
-                        FailureClass::StartupFailure,
+                        FailureClass::Uncertain,
                         io::Error::new(io::ErrorKind::TimedOut, complaint),
                     );
-                    return Err(released(paths, refusal));
+                    return Err(refusal);
                 }
                 std::thread::sleep(SPAWN_POLL_INTERVAL);
             }
@@ -393,14 +393,7 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> Result<UnixStream, Failu
     }
 }
 
-/// Gives back the `<id>.lock` this call created and hands `err` on, a leftover name being
-/// one `session_id_of` reads as a session and `list` reports until it is collected.
-///
-/// Called from the two exits that established the id is nobody's and from nowhere else,
-/// § 6.6 forbidding an exit that established neither death nor life to unlink over a live
-/// session. This remains an explicit call rather than cleanup attached to a failure class:
-/// classification says what the client does next, while only the observation at the call
-/// site licenses unlinking the name.
+/// Removes the lock only when daemon launch failed before a child could exist.
 fn released(paths: &SessionPaths, err: Failure) -> Failure {
     drop(fs::remove_file(paths.lock()));
     err
@@ -554,11 +547,12 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
         }
         // Speculative on a non-empty buffer as well as on `POLLOUT`: this descriptor was
         // made non-blocking at the top, so an optimistic write costs at worst one
-        // `EAGAIN`. The answer is dropped rather than read as an ending — an `EPIPE`
-        // towards the socket is a client that has gone, and that same departure arrives
-        // as EOF from its *read* side above.
-        if socket_events.contains(PollFlags::OUT) || to_socket.has_data() {
-            let _ = to_socket.drain_to(sock_fd)?;
+        // `EAGAIN`. An `EPIPE` ends only this upload direction; the peer may still have
+        // output to deliver.
+        if (socket_events.contains(PollFlags::OUT) || to_socket.has_data())
+            && !to_socket.drain_to(sock_fd)?
+        {
+            stdin_open = false;
         }
         // The destination here is the worker channel, not inherited stdout. It is
         // non-blocking, and its peer closing is how a stdout failure wakes this loop

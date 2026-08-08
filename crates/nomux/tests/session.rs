@@ -25,7 +25,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
-use nomux::{
+use nomux_protocol::{
     ErrorCode, Frame, FrameType, HEADER_LEN, Hello, PROTOCOL_VERSION, RESUME_FROM_START,
     SERVER_PREAMBLE, WinSize, decode_header,
 };
@@ -644,7 +644,7 @@ fn refusals_a_connection_can_earn() -> [Refused; 9] {
         Refused {
             what: "a HelloOk, which is the daemon's own answer coming back at it",
             write: |client| {
-                client.send(&Frame::HelloOk(nomux::HelloOk {
+                client.send(&Frame::HelloOk(nomux_protocol::HelloOk {
                     resume_from: 0,
                     in_applied: 0,
                     agent: false,

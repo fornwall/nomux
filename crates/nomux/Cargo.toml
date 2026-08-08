@@ -1,36 +1,21 @@
 [package]
 name = "nomux"
 description = "Persistent PTY sessions that survive SSH disconnects, with zero server-side install"
-# Not published. A crates.io version is a semver promise about an API, and the lib
-# target's API *is* the wire format — which DESIGN.md § 2 says is private, unstable and
-# spoken by exactly one client, shipped in lockstep. `PROTOCOL_VERSION` is the real
-# compatibility axis, and it answers a peer rather than a resolver. The binary reaches a
-# host by upload against a SHA-256 the client pins, which is not a registry either.
+# The library exposes a private, unstable wire protocol (DESIGN.md § 2).
 publish = false
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[lib]
+name = "nomux_protocol"
+
 [dependencies]
 rustix = { version = "1.1.4", features = ["pty", "termios", "process", "event", "fs", "pipe", "stdio"] }
-# The declarations and syscalls rustix does not wrap, or puts in its `runtime` module
-# and documents as unusable in a process that has a libc — which this one does, via
-# std. In the shipped binary that is the signal handlers and the signal mask
-# (`signal`/`sigprocmask`), `fork`/`_exit`, and the raw AF_UNIX calls
-# `socket`/`connect`/`listen` and `SO_PEERCRED`, whose sockets rustix puts behind a `net`
-# feature § 8's budget is why this crate does not enable. The suite reaches for more of it
-# still — `prlimit`, `umask`, `recv` with `MSG_PEEK`. `grep -r 'libc::'` for the current
-# set rather than trusting this list to have kept up.
+# Raw signal, fork, and AF_UNIX calls that rustix does not expose with these features.
 libc = "0.2.189"
-
-# No dev-dependencies: the suite is std, and the codec's generated coverage runs off a
-# seeded generator in `tests/codec.rs` rather than a property-testing crate. See the note
-# there for why — fifteen transitive crates and three proc-macro compiles, rebuilt cold by
-# every `RUSTFLAGS` change the gates make, for shrinking that cases this small have
-# nothing left to give.
 
 [lints]
 workspace = true

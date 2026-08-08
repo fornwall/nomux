@@ -52,7 +52,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use nomux::{Frame, FrameType, HEADER_LEN, decode_header};
+use nomux_protocol::{Frame, FrameType, HEADER_LEN, decode_header};
 
 fuzz_target!(|payload: &[u8]| {
     // One buffer for the whole sweep: `encode` appends, so clearing is the rewind.

@@ -10,6 +10,7 @@ use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use std::{env, fs};
 
 use rustix::fs::{FlockOperation, Mode, OFlags};
@@ -32,6 +33,7 @@ const FILE_MODE: u32 = 0o600;
 /// How many times an acquirer takes the lock before giving up — the first attempt and
 /// one re-take, for finding that the file it locked is no longer the file at the path.
 const LOCK_ATTEMPTS: usize = 2;
+const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Runs `f` with the umask suppressed, so a node created at `mode` gets exactly `mode`.
 ///
@@ -69,9 +71,15 @@ fn write_private(path: &Path, body: &[u8]) -> io::Result<()> {
     fs::File::from(file).write_all(body)
 }
 
-/// Binds a unix socket at exactly [`SOCKET_MODE`], never briefly wider ([`with_umask`]).
+/// Binds a non-blocking unix socket at exactly [`SOCKET_MODE`].
 pub(crate) fn bind_socket_private(path: &Path) -> io::Result<UnixListener> {
-    with_umask(SOCKET_MODE, || UnixListener::bind(path))
+    let listener = with_umask(SOCKET_MODE, || UnixListener::bind(path))?;
+    if let Err(err) = listener.set_nonblocking(true) {
+        drop(listener);
+        drop(fs::remove_file(path));
+        return Err(err);
+    }
+    Ok(listener)
 }
 
 /// Longest `<id>.pid` body anything reads (§ 6.6). A pid and its newline are eleven
@@ -489,26 +497,25 @@ impl SessionPaths {
     }
 
     /// `ssh-agent` socket, served for a session created with
-    /// [`nomux::Hello::agent_forward`].
+    /// [`nomux_protocol::Hello::agent_forward`].
     pub(crate) fn agent(&self) -> PathBuf {
         self.with_extension("agent")
     }
 
-    /// Takes the spawn lock, waiting for whoever holds it. [`Self::acquire`]'s refusals, and
-    /// its `Ok(None)` as [`io::ErrorKind::ResourceBusy`]: a caller that has already waited
-    /// and still came back empty has not been told the lock is free.
-    pub(crate) fn lock_spawn(&self) -> io::Result<SpawnLock> {
-        self.acquire(FlockOperation::LockExclusive)?.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::ResourceBusy,
-                format!(
-                    "the spawn lock for session {} could not be taken: it kept being \
-                     removed, or the descriptors and lock records it takes to hold one \
-                     have run out",
-                    self.id
-                ),
-            )
-        })
+    /// Takes the spawn lock without letting a stuck creator block every later command.
+    pub(crate) fn lock_spawn_until(&self, deadline: Instant) -> io::Result<SpawnLock> {
+        loop {
+            if let Some(lock) = self.try_lock_spawn_or_refuse()? {
+                return Ok(lock);
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::ResourceBusy,
+                    format!("timed out waiting for session {}'s spawn lock", self.id),
+                ));
+            }
+            std::thread::sleep(LOCK_POLL_INTERVAL);
+        }
     }
 
     /// Takes the spawn lock if it is free this instant, for callers with better things to do
@@ -723,7 +730,7 @@ impl SessionPaths {
     /// else has to reach `kill`.
     pub(crate) fn unlink_all_locked(&self, _lock: &SpawnLock) -> io::Result<()> {
         let mut failure = Ok(());
-        for path in self.removal_order() {
+        for path in self.removal_order(&mut failure) {
             if let Err(err) = remove_node(&path)
                 && err.kind() != io::ErrorKind::NotFound
                 && failure.is_ok()
@@ -747,20 +754,44 @@ impl SessionPaths {
     /// The named files lead and are attempted whatever the directory says: a `read_dir`
     /// this call could not make is not a session with nothing left to remove (§ 6.6).
     /// The scan adds every *other* name sharing the id.
-    fn removal_order(&self) -> Vec<PathBuf> {
+    fn removal_order(&self, failure: &mut io::Result<()>) -> Vec<PathBuf> {
         /// The extensions the named paths already cover.
         const ALREADY: [&str; 5] = ["sock", "pid", "label", "agent", "lock"];
 
         let mut order = vec![self.socket(), self.pid(), self.label(), self.agent()];
-        if let Ok(entries) = fs::read_dir(&self.dir) {
-            order.extend(entries.filter_map(Result::ok).filter_map(|entry| {
-                let path = entry.path();
-                // No `session_id_of` validation: this compares against an id checked when
-                // the `SessionPaths` was built.
-                let mine = split_run_name(&path)
-                    .is_some_and(|(id, extension)| id == self.id && !ALREADY.contains(&extension));
-                mine.then_some(path)
-            }));
+        let scan_failure = |err: io::Error| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "session {}: {} could not be scanned: {err}",
+                    self.id,
+                    self.dir.display()
+                ),
+            )
+        };
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(entries) => Some(entries),
+            Err(err) => {
+                *failure = Err(scan_failure(err));
+                None
+            }
+        };
+        for entry in entries.into_iter().flatten() {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    if failure.is_ok() {
+                        *failure = Err(scan_failure(err));
+                    }
+                    continue;
+                }
+            };
+            let path = entry.path();
+            if split_run_name(&path)
+                .is_some_and(|(id, extension)| id == self.id && !ALREADY.contains(&extension))
+            {
+                order.push(path);
+            }
         }
         // `<id>.lock` last (§ 6.3), load-bearing: unlinks after it would land on a
         // session somebody else has legitimately brought up.
@@ -1084,7 +1115,9 @@ mod tests {
             fs::write(dir.join(name), b"").unwrap();
         }
 
-        let order = paths.removal_order();
+        let mut scanned = Ok(());
+        let order = paths.removal_order(&mut scanned);
+        scanned.expect("scan the run directory");
         assert_eq!(
             order.last(),
             Some(&paths.lock()),
@@ -1184,9 +1217,10 @@ mod tests {
             fs::read_dir(&dir).is_err(),
             "the fixture must take, or this asserts nothing"
         );
-        paths
+        let err = paths
             .unlink_all_locked(&lock)
-            .expect("the named files are removable whatever the scan could do");
+            .expect_err("an incomplete scan must be reported");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(
             !dir.join("tab_7.sock").exists(),
@@ -1227,6 +1261,23 @@ mod tests {
             "and the spelling with nobody to report to gives the id up rather than \
              inventing a standing it does not have"
         );
+    }
+
+    #[test]
+    fn waiting_for_a_held_spawn_lock_is_bounded() {
+        let root = Scratch::new("rundir-lock-timeout");
+        let paths = SessionPaths::in_dir(root.path(), "tab_7").expect("resolve paths");
+        let held = paths.try_lock_spawn().expect("hold the lock");
+
+        let err = paths
+            .lock_spawn_until(Instant::now() + Duration::from_millis(20))
+            .expect_err("a held lock must time out");
+        assert_eq!(err.kind(), io::ErrorKind::ResourceBusy);
+
+        drop(held);
+        paths
+            .lock_spawn_until(Instant::now() + Duration::from_secs(1))
+            .expect("take the released lock");
     }
 
     /// The leading `-` belongs with the traversal cases because it is the same kind of

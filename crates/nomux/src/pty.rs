@@ -13,7 +13,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-use nomux::WinSize;
+use nomux_protocol::WinSize;
 use rustix::fs::{Mode, OFlags};
 use rustix::process::{
     Pid, PidfdFlags, Signal, WaitId, WaitIdOptions, pidfd_open, pidfd_send_signal, waitid,
@@ -191,7 +191,7 @@ impl Pty {
     }
 
     /// Observes the child's outcome without releasing its process identity.
-    pub(crate) fn try_outcome(&mut self) -> io::Result<Option<(i32, nomux::ExitKind)>> {
+    pub(crate) fn try_outcome(&mut self) -> io::Result<Option<(i32, nomux_protocol::ExitKind)>> {
         if self.observed || self.reaped {
             return Ok(None);
         }
@@ -214,10 +214,10 @@ impl Pty {
             || {
                 (
                     status.terminating_signal().unwrap_or(0),
-                    nomux::ExitKind::Signalled,
+                    nomux_protocol::ExitKind::Signalled,
                 )
             },
-            |code| (code, nomux::ExitKind::Exited),
+            |code| (code, nomux_protocol::ExitKind::Exited),
         );
 
         Ok(Some(outcome))

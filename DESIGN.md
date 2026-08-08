@@ -201,7 +201,7 @@ rejecting a mismatched `Hello.protocol`.
 
 The feature must be invisible when unavailable: every terminal failure falls back to a plain
 SSH session, cached per host where the failure describes a host boundary, on the conditions
-in [IMPLEMENTATION.md § 5.3](IMPLEMENTATION.md#53-decision-tree). Relay stderr supplies the
+in [IMPLEMENTATION.md § 5.3](IMPLEMENTATION.md#53-client-decisions). Relay stderr supplies the
 stable class needed to make that decision without parsing prose: collision, safe-to-retry,
 unsafe host, uncertain presence, missing session, startup failure, or failure after a
 successful connection ([IMPLEMENTATION.md § 10](IMPLEMENTATION.md#10-exit-codes)).
@@ -209,7 +209,7 @@ successful connection ([IMPLEMENTATION.md § 10](IMPLEMENTATION.md#10-exit-codes
 ## 8. Security model
 
 - **No new *network* attack surface** (§3). The local surface is what follows: a unix socket per session, an optional agent socket, and a process outliving the login. The uploaded binary is not part of it — anyone who can write `~/.local/share/nomux/` can already edit `.bashrc`.
-- **That equivalence holds for the same user only.** The run directory and every ancestor are held to this uid before use, since another uid able to write anywhere along the path can redirect path-based binds and unlinks after the final directory is checked; [IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket) has the rules. The install directory is only created ([§ 5.2](IMPLEMENTATION.md#52-upload-and-attach-in-one-round-trip)), so another user able to write there replaces the binary every connection on the exec path runs: code execution as the victim. The published command line holds `mkdir -p -m 700` and `set -C`, and the client must check a directory that already exists and refuse a parent that is not the user's.
+- **That equivalence holds for the same user only.** The run directory and every ancestor are held to this uid before use; [IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket) has the rules. The install path is part of the account's trusted environment ([§ 5.2](IMPLEMENTATION.md#52-upload-and-launch-in-one-round-trip)): shell bootstrap cannot check it and later execute through it without a rename race. A host where another uid can replace an ancestor is unsupported, not repaired by a client-side path check.
 - **No new secrets** (§3). `SO_PEERCRED` is checked in both directions besides: the daemon refuses an accepted connection whose uid is not its own, and a `connect` refuses a socket bound by anybody else ([IMPLEMENTATION.md § 6.3](IMPLEMENTATION.md#63-socket)) — defence in depth for a host whose modes do not hold, rather than a second authenticator.
 - **No abstract sockets.** They are namespace-scoped, not permission-scoped, and would be reachable by any local user.
 - **Agent forwarding is a real capability expansion — the only one here**, and the only item on this list that reaches past what the login already had (§5.4).

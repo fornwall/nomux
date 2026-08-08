@@ -61,7 +61,7 @@ fn main() -> ExitCode {
             println!(
                 "nomux {} (protocol {})",
                 env!("CARGO_PKG_VERSION"),
-                nomux::PROTOCOL_VERSION
+                nomux_protocol::PROTOCOL_VERSION
             );
             ExitCode::SUCCESS
         }),
