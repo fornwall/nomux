@@ -547,11 +547,12 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
         }
         // Speculative on a non-empty buffer as well as on `POLLOUT`: this descriptor was
         // made non-blocking at the top, so an optimistic write costs at worst one
-        // `EAGAIN`. The answer is dropped rather than read as an ending — an `EPIPE`
-        // towards the socket is a client that has gone, and that same departure arrives
-        // as EOF from its *read* side above.
-        if socket_events.contains(PollFlags::OUT) || to_socket.has_data() {
-            let _ = to_socket.drain_to(sock_fd)?;
+        // `EAGAIN`. An `EPIPE` ends only this upload direction; the peer may still have
+        // output to deliver.
+        if (socket_events.contains(PollFlags::OUT) || to_socket.has_data())
+            && !to_socket.drain_to(sock_fd)?
+        {
+            stdin_open = false;
         }
         // The destination here is the worker channel, not inherited stdout. It is
         // non-blocking, and its peer closing is how a stdout failure wakes this loop
