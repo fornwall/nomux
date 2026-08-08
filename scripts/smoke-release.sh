@@ -59,11 +59,12 @@ emit_header() {
     emit_byte $((payload_length % 256))
 }
 
-# Protocol 10, no agent, replay from the ring's beginning, 80x24, TERM=dumb.
+# Protocol 11, no agent, unconditional attach, replay from the ring's beginning, 80x24,
+# TERM=dumb.
 emit_hello() {
     emit_header 1 25
     for byte in \
-        0 10 0 \
+        0 11 0 \
         255 255 255 255 255 255 255 255 \
         0 80 0 24 0 0 0 0 \
         0 4 100 117 109 98
@@ -94,6 +95,7 @@ inspect_transcript() {
     od -An -v -tu1 "$1" | awk -v mode="$2" '
         BEGIN {
             marker_count = split("78 79 77 85 88 45 82 69 76 69 65 83 69 45 83 77 79 75 69", marker, " ")
+            preamble_count = split("0 110 111 109 117 120 45 115 121 110 99 255", preamble, " ")
         }
         function clear_payload( key) {
             for (key in first) delete first[key]
@@ -122,6 +124,11 @@ inspect_transcript() {
         {
             for (column = 1; column <= NF; column++) {
                 byte = $column + 0
+                if (preamble_bytes < preamble_count) {
+                    if (byte != preamble[preamble_bytes + 1]) malformed = 1
+                    preamble_bytes++
+                    continue
+                }
                 if (header_bytes < 4) {
                     header[header_bytes++] = byte
                     if (header_bytes == 4) {
@@ -141,7 +148,8 @@ inspect_transcript() {
             }
         }
         END {
-            failed = malformed || saw_error || !saw_hello_ok || !found_marker
+            failed = malformed || preamble_bytes != preamble_count || saw_error ||
+                !saw_hello_ok || !found_marker
             if (mode == "before" && saw_exit) failed = 1
             if (mode == "complete" && (header_bytes != 0 || !clean_exit)) failed = 1
             exit failed

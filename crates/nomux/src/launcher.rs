@@ -6,7 +6,6 @@
 //! unlike a transient service, it preserves the caller's environment and arbitrary inherited
 //! descriptors, including the already-held spawn lock.
 
-use std::borrow::Cow;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -165,14 +164,14 @@ fn daemon_args(
         ));
     }
     if let Some(label) = label {
-        // systemd-run expands `$NAME` and `${NAME}` in scope command arguments. `$$` is its
-        // documented literal-dollar spelling. The direct launcher must receive the original.
-        let label = if systemd_scope {
-            escape_systemd_dollars(label)
+        // systemd-run releases disagree about whether command arguments undergo environment
+        // expansion. An ASCII hex handoff contains nothing either behavior can reinterpret;
+        // the daemon decodes it only when the private scope marker accompanies it.
+        if systemd_scope {
+            command.arg("--label").arg(encode_hex(label.as_bytes()));
         } else {
-            Cow::Borrowed(label)
-        };
-        command.arg("--label").arg(label.as_ref());
+            command.arg("--label").arg(label);
+        }
     }
 }
 
@@ -180,7 +179,10 @@ fn encode_invocation_id(value: Option<&OsStr>) -> String {
     let Some(value) = value else {
         return "-".to_owned();
     };
-    let bytes = value.as_bytes();
+    encode_hex(value.as_bytes())
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
     let mut encoded = String::with_capacity(1usize.saturating_add(bytes.len().saturating_mul(2)));
     encoded.push('x');
     for byte in bytes {
@@ -201,6 +203,18 @@ pub(crate) fn decode_invocation_id(value: &str) -> Result<OriginalInvocationId, 
     if value == "-" {
         return Ok(OriginalInvocationId::Absent);
     }
+    decode_hex(value)
+        .map(OsString::from_vec)
+        .map(OriginalInvocationId::Value)
+}
+
+/// Restores a label protected from systemd-run's version-dependent argument expansion.
+pub(crate) fn decode_scope_label(value: &str) -> Result<String, &'static str> {
+    let bytes = decode_hex(value).map_err(|_| "invalid systemd scope label")?;
+    String::from_utf8(bytes).map_err(|_| "invalid systemd scope label")
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>, &'static str> {
     let Some(hex) = value.strip_prefix('x') else {
         return Err("invalid `--systemd-scope` value");
     };
@@ -220,7 +234,7 @@ pub(crate) fn decode_invocation_id(value: &str) -> Result<OriginalInvocationId, 
         };
         decoded.push((high << 4) | low);
     }
-    Ok(OriginalInvocationId::Value(OsString::from_vec(decoded)))
+    Ok(decoded)
 }
 
 const fn hex_nibble(byte: u8) -> Option<u8> {
@@ -228,14 +242,6 @@ const fn hex_nibble(byte: u8) -> Option<u8> {
         b'0'..=b'9' => Some(byte - b'0'),
         b'a'..=b'f' => Some(byte - b'a' + 10),
         _ => None,
-    }
-}
-
-fn escape_systemd_dollars(value: &str) -> Cow<'_, str> {
-    if value.contains('$') {
-        Cow::Owned(value.replace('$', "$$"))
-    } else {
-        Cow::Borrowed(value)
     }
 }
 
@@ -326,12 +332,11 @@ mod tests {
     }
 
     #[test]
-    fn dollar_escaping_changes_only_arguments_systemd_would_expand() {
-        assert_eq!(escape_systemd_dollars("work"), "work");
-        assert_eq!(
-            escape_systemd_dollars("$HOME/${USER}/$$"),
-            "$$HOME/$${USER}/$$$$"
-        );
+    fn scope_labels_are_insulated_from_argument_expansion() {
+        let label = "$HOME/${USER}/$$";
+        let encoded = encode_hex(label.as_bytes());
+        assert_eq!(encoded, "x24484f4d452f247b555345527d2f2424");
+        assert_eq!(decode_scope_label(&encoded).as_deref(), Ok(label));
     }
 
     #[test]
@@ -365,7 +370,7 @@ mod tests {
                     encode_invocation_id(env::var_os("INVOCATION_ID").as_deref())
                 ),
                 "--label".to_owned(),
-                "cost $$5".to_owned(),
+                "x636f7374202435".to_owned(),
             ]
         );
     }

@@ -502,8 +502,9 @@ may stop it at logout. `spawn` therefore selects its launcher before starting an
 - The scope is manager-owned, named `nomux-<id>-<relay-pid>.scope`, and collected after it
   empties. The already-held spawn-lock descriptor crosses `systemd-run`; the final command
   resolves `/proc/<relay-pid>/exe`, retaining the exact running nomux inode across an atomic
-  upgrade. Labels escape systemd-run's dollar expansion. Its replacement `INVOCATION_ID`
-  is restored to the creator's raw value or absence before the PTY child is created, so the
+  upgrade. Labels cross that command line as ASCII hex, insulating them from systemd-run
+  releases that disagree about environment expansion. Its replacement `INVOCATION_ID` is
+  restored to the creator's raw value or absence before the PTY child is created, so the
   launch policy does not otherwise rewrite the shell environment.
 
 Automatic direct fallback is intentionally honest rather than optimistic: it supports hosts

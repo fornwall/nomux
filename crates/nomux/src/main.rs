@@ -234,6 +234,11 @@ fn parse_session_args(
             return Err("`--label` is given once: a second would replace the first".to_owned());
         }
     }
+    if scope_invocation_id.is_some() {
+        label = label
+            .map(|encoded| launcher::decode_scope_label(&encoded).map_err(str::to_owned))
+            .transpose()?;
+    }
     Ok(SessionArgs {
         session,
         label,
@@ -330,10 +335,20 @@ mod tests {
 
     #[test]
     fn scope_marker_is_a_daemon_only_startup_handoff() {
-        let parsed = session_args(&["session", "--lock-fd", "19", "--systemd-scope=-"], true)
-            .expect("parse the daemon handoff");
+        let parsed = session_args(
+            &[
+                "session",
+                "--lock-fd",
+                "19",
+                "--systemd-scope=-",
+                "--label=x636f7374202435",
+            ],
+            true,
+        )
+        .expect("parse the daemon handoff");
         assert_eq!(parsed.session.as_deref(), Some("session"));
         assert_eq!(parsed.lock_fd, Some(19));
+        assert_eq!(parsed.label.as_deref(), Some("cost $5"));
         assert_eq!(
             parsed.scope_invocation_id,
             Some(launcher::OriginalInvocationId::Absent)
