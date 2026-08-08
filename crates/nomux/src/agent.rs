@@ -40,7 +40,7 @@ const MAX_CHANNEL_QUEUE: usize = 256 * 1024;
 /// figure survives. A slot nothing else can use is the cheaper thing to spend.
 #[expect(
     clippy::duration_suboptimal_units,
-    reason = "Duration::from_mins is unstable on the pinned 1.97.1 toolchain"
+    reason = "Duration::from_mins is unstable on the pinned toolchain"
 )]
 const AGENT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 

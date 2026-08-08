@@ -68,7 +68,7 @@ fn allocate_ring(session_id: &str) -> io::Result<crate::ring::Ring> {
 /// the child is still running (`IMPLEMENTATION.md` § 6.5).
 #[expect(
     clippy::duration_suboptimal_units,
-    reason = "Duration::from_days is unstable on the pinned 1.97.1 toolchain"
+    reason = "Duration::from_days is unstable on the pinned toolchain"
 )]
 const IDLE_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
@@ -79,7 +79,7 @@ const OUTCOME_GRACE: Duration = Duration::from_secs(2);
 /// Longest the poll loop sleeps with nothing else pending.
 #[expect(
     clippy::duration_suboptimal_units,
-    reason = "Duration::from_hours is unstable on the pinned 1.97.1 toolchain"
+    reason = "Duration::from_hours is unstable on the pinned toolchain"
 )]
 const IDLE_TICK: Duration = Duration::from_secs(60 * 60);
 
