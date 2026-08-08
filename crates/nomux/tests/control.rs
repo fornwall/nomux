@@ -43,6 +43,20 @@ use harness::{
     while_nothing_forks,
 };
 
+/// Asserts the one versioned relay record without parsing the human diagnostic beside it.
+fn has_relay_class(out: &Output, class: &str, what: &str) {
+    let said = stderr(out);
+    let records = said
+        .lines()
+        .filter(|line| line.starts_with("NOMUX-RELAY-ERROR "))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        records,
+        [format!("NOMUX-RELAY-ERROR 1 {class}")],
+        "{what} carried the wrong machine-readable relay outcome: {said:?}"
+    );
+}
+
 /// How long any one test here may spend waiting, across every wait it makes.
 ///
 /// One figure per test rather than one per wait, for `harness::poll_by`'s reason.
@@ -197,6 +211,7 @@ fn nothing_parks_on_a_socket_whose_backlog_is_full() {
          this host will say so: {:?}",
         stderr(&attached)
     );
+    has_relay_class(&attached, "retryable", "attach on a full session backlog");
     assert!(
         session.socket().exists(),
         "a probe that timed out is not evidence of death, so nothing was kill's to \
@@ -1013,6 +1028,9 @@ fn no_mode_parks_on_a_spawn_lock_that_is_a_fifo() {
             "{mode} did not identify the malformed lock: {:?}",
             stderr(&output)
         );
+        if mode == "spawn" {
+            has_relay_class(&output, "unsafe-host", "spawn with a FIFO lock");
+        }
     }
     assert!(
         lock.exists(),
@@ -1418,6 +1436,13 @@ fn a_run_directory_this_user_does_not_own_is_refused_by_every_mode_that_resolves
                 "{name}: {mode:?} printed a planted entry: {:?}",
                 stdout(&out)
             );
+            if matches!(mode[0], "spawn" | "attach") {
+                has_relay_class(
+                    &out,
+                    "unsafe-host",
+                    &format!("{name}: {mode:?} on an untrusted run directory"),
+                );
+            }
         }
 
         assert!(
@@ -1525,6 +1550,13 @@ fn invalid_session_ids_are_refused() {
         assert!(
             stderr(&output).contains(says),
             "id {id:?} should be rejected by name, saying {says:?}: {:?}",
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output)
+                .lines()
+                .all(|line| !line.starts_with("NOMUX-RELAY-ERROR ")),
+            "command usage is outside the runtime relay-error set: {:?}",
             stderr(&output)
         );
         assert!(

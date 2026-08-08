@@ -34,7 +34,16 @@ pub use frame::{
 /// revision in force and nothing before it. `tests/codec.rs`'s `vectors` module holds the
 /// constant, the byte vectors and the document to each other, so a bump has to move all
 /// three.
-pub const PROTOCOL_VERSION: u16 = 10;
+pub const PROTOCOL_VERSION: u16 = 11;
+
+/// Fixed bytes a daemon writes immediately before its first response frame.
+///
+/// An attach relay is transparent, so a remote login shell's startup output can precede
+/// these bytes. Clients scan for the complete sequence, discard everything through it,
+/// and decode a frame header from the following byte. The value is independent of the
+/// protocol revision so that a client can also synchronize to a version-mismatch
+/// [`Frame::Error`].
+pub const SERVER_PREAMBLE: &[u8; 12] = b"\0nomux-sync\xff";
 
 /// Fixed frame header size: a reader sizes the payload from the first four bytes it has,
 /// and never has to scan for a boundary.

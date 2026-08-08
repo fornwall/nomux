@@ -166,15 +166,17 @@ could not do anyway, running no process on the server.
 
 Steady state, run on every network change, and always a resume: the socket *is* the
 session, so a `direct-streamlocal` channel opened straight to it finds one or finds
-nothing — creation needs a process, and this path runs none. `Hello` in, `HelloOk` and
-the replay out; no process spawned, no shell parsed.
+nothing — creation needs a process, and this path runs none. `Hello` in, the fixed server
+preamble followed by `HelloOk` and the replay out; no process spawned, no shell parsed.
 
 ### 6.2 Cold bootstrap
 
 First contact with a host, or after a version bump: a probe `exec` that runs the binary
 where it is already present, then an upload and a second `exec` where it is not. Two
 round trips cold, zero extra warm; `$MODE` is `spawn` or `attach` and the client always
-knows which ([IMPLEMENTATION.md § 5](IMPLEMENTATION.md#5-bootstrap)).
+knows which. The relay remains byte-blind: the client discards any login-shell stdout
+before the fixed server preamble, then decodes the response frames
+([IMPLEMENTATION.md § 5](IMPLEMENTATION.md#5-bootstrap)).
 
 ### 6.3 Gap
 
@@ -197,9 +199,12 @@ rejecting a mismatched `Hello.protocol`.
 
 ## 7. Degradation
 
-The feature must be invisible when unavailable: every failure falls back to a plain SSH
-session, cached per host so it is not re-probed, on the conditions in
-[IMPLEMENTATION.md § 5.3](IMPLEMENTATION.md#53-decision-tree).
+The feature must be invisible when unavailable: every terminal failure falls back to a plain
+SSH session, cached per host where the failure describes a host boundary, on the conditions
+in [IMPLEMENTATION.md § 5.3](IMPLEMENTATION.md#53-decision-tree). Relay stderr supplies the
+stable class needed to make that decision without parsing prose: collision, safe-to-retry,
+unsafe host, uncertain presence, missing session, startup failure, or failure after a
+successful connection ([IMPLEMENTATION.md § 10](IMPLEMENTATION.md#10-exit-codes)).
 
 ## 8. Security model
 
@@ -264,8 +269,8 @@ one as a gap.
   client knows both what it forwarded and what it asked nomux for, which is why §5.3 leaves
   the warning there; the variable is inherited untouched
   ([IMPLEMENTATION.md § 6.1.1](IMPLEMENTATION.md#611-what-the-child-runs)).
-- **Cross-device handover.** Takeover is the right primitive
-  ([IMPLEMENTATION.md § 6.4](IMPLEMENTATION.md#64-multiple-clients)), but handover needs
-  an input offset in `Hello`, a client that never auto-reconnects after
-  `Error{TAKEOVER}`, and replay conditioned on geometry. That is a wire change and a
-  revision bump whenever it lands, so nothing is reserved for it now (§2).
+- **Automatic cross-device handover.** The wire now supplies the two safe primitives:
+  unconditional takeover and `Hello.if_detached`, whose occupied-slot refusal lets a client
+  ask the user before retrying. Automating a handover still needs product policy for when to
+  displace a peer; `Error{TAKEOVER}` remains terminal so two clients cannot reconnect-fight
+  each other ([IMPLEMENTATION.md § 6.4](IMPLEMENTATION.md#64-multiple-clients)).

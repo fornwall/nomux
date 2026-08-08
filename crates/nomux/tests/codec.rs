@@ -314,6 +314,7 @@ mod generated {
                     protocol: rng.u16(),
                     agent_forward: rng.bool(),
                     repaint_ctrl_l: rng.bool(),
+                    if_detached: rng.bool(),
                     out_offset: rng.u64(),
                     win: rng.win(),
                     term: "",
@@ -680,7 +681,7 @@ mod vectors {
 
     use nomux::{
         ErrorCode, ExitKind, Frame, FrameType, HEADER_LEN, Hello, HelloOk, MAX_PAYLOAD,
-        PROTOCOL_VERSION, RESUME_FROM_START, WinSize,
+        PROTOCOL_VERSION, RESUME_FROM_START, SERVER_PREAMBLE, WinSize,
     };
 
     /// The language-neutral transcription of the table below, compiled in rather than opened:
@@ -695,6 +696,18 @@ mod vectors {
         xpixel: 960,
         ypixel: 640,
     };
+
+    /// This marker belongs to the response stream rather than to any frame, so it has
+    /// its own byte-exact pin beside the frame vectors.
+    #[test]
+    fn the_server_preamble_is_pinned() {
+        assert_eq!(
+            SERVER_PREAMBLE,
+            &[
+                0x00, 0x6e, 0x6f, 0x6d, 0x75, 0x78, 0x2d, 0x73, 0x79, 0x6e, 0x63, 0xff
+            ]
+        );
+    }
 
     /// One frame and the exact bytes § 2.2 says it is.
     struct Vector {
@@ -711,11 +724,9 @@ mod vectors {
     ///
     /// Both handshake frames appear more than once, because distinct values catch a swap
     /// between two fields and do nothing about a swap *inside* one: each repeat disagrees
-    /// with the ones before it on every bit. `Hello`'s first three are what
-    /// [`the_vectors_pin_every_value_of_every_closed_set`] insists on — two vectors cannot
-    /// both show the flag bits set together and show each of them clear — and its fourth
-    /// answers to no closed set, saying where it stands what it is for; `HelloOk`'s two
-    /// show its one flag at both states.
+    /// with the ones before it on every bit. `Hello`'s four jointly show all bits set,
+    /// bit 0 alone, all bits clear and bit 1 alone; that pins both states and the position
+    /// of each of its three bits. `HelloOk`'s two show its one flag at both states.
     fn vectors() -> Vec<Vector> {
         let mut all = hello_vectors();
         all.extend(hello_ok_vectors());
@@ -726,7 +737,7 @@ mod vectors {
         all
     }
 
-    /// The client's opening frame, at all four of its flag words.
+    /// The client's opening frame, at four flag words that pin all three bits.
     fn hello_vectors() -> Vec<Vector> {
         vec![
             // 0x01 Hello: u16 proto, u8 flags, u64 out_offset, winsize, u16 term_len,
@@ -734,17 +745,18 @@ mod vectors {
             // them is even representable — §2.3's "no reserved space", made in bytes.
             Vector {
                 frame: Frame::Hello(Hello {
-                    protocol: 10,
+                    protocol: 11,
                     agent_forward: true,
                     repaint_ctrl_l: true,
+                    if_detached: true,
                     out_offset: 0x0102_0304_0506_0708,
                     win: WIN,
                     term: "xterm-256color",
                 }),
                 bytes: &[
                     0x01, 0x00, 0x00, 0x23, // header: type, u24 len = 35
-                    0x00, 0x0a, // protocol
-                    0x03, // flags: bit 0 agent forward, bit 1 repaint ctrl-l
+                    0x00, 0x0b, // protocol
+                    0x07, // flags: agent forward, repaint ctrl-l, if detached
                     0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // out_offset
                     0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
                     0x00, 0x0e, // term_len = 14
@@ -752,21 +764,22 @@ mod vectors {
                     b'r',
                 ],
             },
-            // 0x01 Hello again, with bit 0 alone, which is what pins *which* bit is
-            // which: above, both are set, so exchanging the two leaves 0x03 unchanged.
+            // 0x01 Hello again, with bit 0 alone, which starts pinning *which* bit is
+            // which: above, all are set, so exchanging them leaves 0x07 unchanged.
             // Carries `RESUME_FROM_START` as well, which no other vector shows.
             Vector {
                 frame: Frame::Hello(Hello {
-                    protocol: 10,
+                    protocol: 11,
                     agent_forward: true,
                     repaint_ctrl_l: false,
+                    if_detached: false,
                     out_offset: RESUME_FROM_START,
                     win: WIN,
                     term: "vt100",
                 }),
                 bytes: &[
                     0x01, 0x00, 0x00, 0x1a, // header: type, u24 len = 26
-                    0x00, 0x0a, // protocol
+                    0x00, 0x0b, // protocol
                     0x01, // flags: bit 0 agent forward, bit 1 clear
                     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // RESUME_FROM_START
                     0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
@@ -774,21 +787,22 @@ mod vectors {
                     b'v', b't', b'1', b'0', b'0',
                 ],
             },
-            // 0x01 Hello a third time, with both bits clear. Bit 0 is set in both of the
+            // 0x01 Hello a third time, with all bits clear. Bit 0 is set in both of the
             // vectors above, so this is the only one that pins it clear.
             Vector {
                 frame: Frame::Hello(Hello {
-                    protocol: 10,
+                    protocol: 11,
                     agent_forward: false,
                     repaint_ctrl_l: false,
+                    if_detached: false,
                     out_offset: 0x8182_8384_8586_8788,
                     win: WIN,
                     term: "dumb",
                 }),
                 bytes: &[
                     0x01, 0x00, 0x00, 0x19, // header: type, u24 len = 25
-                    0x00, 0x0a, // protocol
-                    0x00, // flags: both bits clear
+                    0x00, 0x0b, // protocol
+                    0x00, // flags: all bits clear
                     0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, // out_offset
                     0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
                     0x00, 0x04, // term_len = 4
@@ -807,16 +821,17 @@ mod vectors {
             // above exists to make.
             Vector {
                 frame: Frame::Hello(Hello {
-                    protocol: 10,
+                    protocol: 11,
                     agent_forward: false,
                     repaint_ctrl_l: true,
+                    if_detached: false,
                     out_offset: 0,
                     win: WIN,
                     term: "",
                 }),
                 bytes: &[
                     0x01, 0x00, 0x00, 0x15, // header: type, u24 len = 21
-                    0x00, 0x0a, // protocol
+                    0x00, 0x0b, // protocol
                     0x02, // flags: bit 0 clear, bit 1 repaint ctrl-l
                     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // out_offset
                     0x00, 0x78, 0x00, 0x28, 0x03, 0xc0, 0x02, 0x80, // winsize
@@ -1010,14 +1025,14 @@ mod vectors {
     }
 
     /// 0x0c `Error`: u16 code, UTF-8 message with no length prefix — it runs to the end of
-    /// the payload. All five codes, one vector each.
+    /// the payload. All six codes, one vector each.
     ///
     /// A group of its own because it is the one most easily left half-written. `Error` is
     /// the last frame a connection ever carries (§ 6.4), so it is what a client mishandles
     /// exactly when the session is being torn down and the user is watching: a code read as
     /// the wrong number is a takeover reported as an internal fault, or a version mismatch
     /// retried forever. The set is closed (§ 2.3), so a code the peer does not know is a
-    /// protocol error rather than something to skip past, and deducing four of the five from
+    /// protocol error rather than something to skip past, and deducing five of the six from
     /// `Takeover` is arithmetic rather than a test.
     ///
     /// The messages differ in length on purpose — the field has no count in front of it and
@@ -1078,6 +1093,18 @@ mod vectors {
                 bytes: &[
                     0x0c, 0x00, 0x00, 0x02, // header: len = 2 + 0
                     0x00, 0x05, // Internal, and nothing behind it
+                ],
+            },
+            Vector {
+                frame: Frame::Error {
+                    code: ErrorCode::AlreadyAttached,
+                    message: "already attached",
+                },
+                bytes: &[
+                    0x0c, 0x00, 0x00, 0x12, // header: len = 2 + 16
+                    0x00, 0x06, // AlreadyAttached
+                    b'a', b'l', b'r', b'e', b'a', b'd', b'y', b' ', b'a', b't', b't', b'a', b'c',
+                    b'h', b'e', b'd',
                 ],
             },
         ]
@@ -1358,6 +1385,7 @@ mod vectors {
                     protocol: self.u16("protocol")?,
                     agent_forward: self.flag("agent_forward")?,
                     repaint_ctrl_l: self.flag("repaint_ctrl_l")?,
+                    if_detached: self.flag("if_detached")?,
                     out_offset: self.u64("out_offset")?,
                     win: self.win()?,
                     term: self.text("term")?,
@@ -1536,7 +1564,7 @@ mod vectors {
     /// and the handshake vectors are written at the revision this build speaks.
     ///
     /// The three sets are [`FrameType`], [`ExitKind`] and [`ErrorCode`] — the last
-    /// being the one a table like this most easily leaves half-written, its five values
+    /// being the one a table like this most easily leaves half-written, its six values
     /// riding on a frame nobody reaches on the happy path, so a fixture pinning `Takeover`
     /// alone reads complete and lets another implementation number the rest as it likes.
     ///
@@ -1545,7 +1573,7 @@ mod vectors {
     /// bytes have no `ALL` and are destructured exhaustively instead, for the same property
     /// reached the other way round: a bool added to either stops this file compiling. Both
     /// states of each, because a bit exercised at one value is pinned only against being
-    /// renumbered wholesale — give `Hello` both of its flags at once and the two can trade
+    /// renumbered wholesale — give `Hello` all of its flags at once and they can trade
     /// places without moving a byte. The revision rides along because the `Hello` vectors
     /// write it out as a literal, which is what makes them a check on the document and
     /// equally what would let them pass at one the daemon refuses; `HelloOk` carries none
@@ -1565,6 +1593,7 @@ mod vectors {
                     protocol,
                     agent_forward,
                     repaint_ctrl_l,
+                    if_detached,
                     out_offset: _,
                     win: _,
                     term: _,
@@ -1574,7 +1603,7 @@ mod vectors {
                         "a handshake vector is written at a revision the daemon would \
                          refuse: {frame:?}"
                     );
-                    hello_flags.push([agent_forward, repaint_ctrl_l]);
+                    hello_flags.push([agent_forward, repaint_ctrl_l, if_detached]);
                 }
                 Frame::HelloOk(HelloOk {
                     resume_from: _,
@@ -1597,7 +1626,11 @@ mod vectors {
             assert!(codes.contains(&code), "{code:?} has no wire vector");
         }
         for (state, verb) in [(true, "sets"), (false, "clears")] {
-            for (bit, name) in [(0, "agent_forward"), (1, "repaint_ctrl_l")] {
+            for (bit, name) in [
+                (0, "agent_forward"),
+                (1, "repaint_ctrl_l"),
+                (2, "if_detached"),
+            ] {
                 let pinned = hello_flags.iter().any(|flags| flags[bit] == state);
                 assert!(pinned, "no Hello vector {verb} {name}");
             }
@@ -1688,8 +1721,8 @@ mod vectors {
             (
                 "PROTOCOL_VERSION",
                 u64::from(PROTOCOL_VERSION),
-                10,
-                "§ 2.2 puts the current revision at 10",
+                11,
+                "§ 2.2 puts the current revision at 11",
             ),
             (
                 "MAX_PAYLOAD",
@@ -1710,7 +1743,8 @@ mod vectors {
             Takeover = 2,
             Version = 3,
             InputGap = 4,
-            Internal = 5
+            Internal = 5,
+            AlreadyAttached = 6
         );
         frozen!(ExitKind, Exited = 0, Signalled = 1, Unknown = 2);
     }

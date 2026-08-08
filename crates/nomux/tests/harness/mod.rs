@@ -36,8 +36,8 @@ use std::time::{Duration, Instant};
 use std::{env, fs, thread};
 
 use nomux::{
-    ErrorCode, Frame, FrameType, HEADER_LEN, Hello, PROTOCOL_VERSION, RESUME_FROM_START, WinSize,
-    decode_header,
+    ErrorCode, Frame, FrameType, HEADER_LEN, Hello, PROTOCOL_VERSION, RESUME_FROM_START,
+    SERVER_PREAMBLE, WinSize, decode_header,
 };
 
 pub(crate) const WIN: WinSize = WinSize {
@@ -260,6 +260,7 @@ impl Session {
         Client {
             stream,
             pending: Vec::new(),
+            preamble_seen: false,
             in_offset: 0,
             out_offset: 0,
             deadline: Instant::now() + FRAME_PATIENCE,
@@ -1006,6 +1007,8 @@ fn names_the_file(field: &str, dev: u64, ino: u64) -> bool {
 pub(crate) struct Client {
     stream: UnixStream,
     pending: Vec<u8>,
+    /// Whether the one server-to-client synchronization sequence has been consumed.
+    preamble_seen: bool,
     /// Where this client stands on each stream: one past the last byte it has sent,
     /// and one past the last it has read. Kept so that [`still_serving`] can ask the
     /// session a question without being handed the two offsets to ask it at.
@@ -1083,6 +1086,23 @@ impl Client {
 
     pub(crate) fn hello(&mut self, out_offset: u64) -> nomux::HelloOk {
         self.hello_with(false, false, out_offset)
+    }
+
+    /// Greets only if the daemon has no attached client, for the lifecycle test of the
+    /// third `Hello` flag. Unlike [`Client::hello`], this is deliberately not used by
+    /// general setup: unconditional takeover remains the protocol default.
+    pub(crate) fn hello_if_detached(&mut self, out_offset: u64) -> nomux::HelloOk {
+        self.send(&Frame::Hello(Hello {
+            protocol: PROTOCOL_VERSION,
+            agent_forward: false,
+            repaint_ctrl_l: false,
+            if_detached: true,
+            out_offset,
+            win: WIN,
+            term: "xterm-256color",
+        }));
+        let greeting = self.frame_owed("a conditional HelloOk from the daemon");
+        self.take_hello_ok(greeting)
     }
 
     pub(crate) fn hello_with(
@@ -1201,6 +1221,15 @@ impl Client {
 
     /// The next whole frame already in the receive buffer, if there is one.
     fn take_pending_frame(&mut self) -> Option<(FrameType, Vec<u8>)> {
+        if !self.preamble_seen {
+            let preamble = self.pending.get(..SERVER_PREAMBLE.len())?;
+            assert_eq!(
+                preamble, SERVER_PREAMBLE,
+                "the daemon's first response must start with the synchronization preamble"
+            );
+            self.pending.drain(..SERVER_PREAMBLE.len());
+            self.preamble_seen = true;
+        }
         let head: [u8; HEADER_LEN] = self.pending.get(..HEADER_LEN)?.try_into().unwrap();
         let header = decode_header(&head).expect("decode header");
         let total = HEADER_LEN + header.len as usize;
@@ -1721,6 +1750,7 @@ pub(crate) const fn hello_frame(
         protocol: PROTOCOL_VERSION,
         agent_forward,
         repaint_ctrl_l,
+        if_detached: false,
         out_offset,
         win: WIN,
         term: "xterm-256color",

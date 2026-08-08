@@ -36,7 +36,7 @@ use std::{fs, thread};
 use nomux::{Frame, RESUME_FROM_START};
 
 use harness::{
-    Rng, SETTLE, Session, Spawned, control, control_with_shell, daemon_reaper, entries,
+    Rng, SETTLE, Session, Spawned, collect, control, control_with_shell, daemon_reaper, entries,
     has_unread_bytes, hello_frame, join_before, nomux, nomux_with_shell, poll_by, poll_until,
     read_uninterrupted, run_root, stderr, stdout, still_serving, succeeded, wedge_socket,
     while_nothing_forks, write_frame,
@@ -70,7 +70,13 @@ fn a_daemon_that_cannot_publish_its_pidfile_refuses_to_start() {
     let refused = control_with_shell(&root, &["daemon", "nopid"]);
     // No phrase to look for: `write_pid` propagates the bare `io::Error` from
     // `fs::write`, so the line names no path.
-    refuses(&refused, 1, "", "a daemon that cannot publish its pidfile");
+    refuses(
+        &refused,
+        1,
+        None,
+        "",
+        "a daemon that cannot publish its pidfile",
+    );
 
     let listed = control(&root, &["list"]);
     succeeded(
@@ -123,8 +129,33 @@ fn spawn_reports_a_session_it_could_not_start_as_no_such_session() {
     refuses(
         &refused,
         127,
+        Some("startup-failure"),
         "",
         "spawn on a session that could not be started",
+    );
+}
+
+/// A launcher failure happens after the id was proved free but before a daemon exists.
+///
+/// Its underlying `InvalidInput` describes launcher configuration, not malformed session
+/// input, so it must not leak through as exit 64 or omit the runtime classification.
+#[test]
+fn spawn_classifies_a_launcher_failure_as_startup_failure() {
+    let root = run_root("spawn_launcher_failure");
+    let refused = collect(
+        nomux_with_shell(&root, &["spawn", "launcher_failure"])
+            .env("NOMUX_LAUNCHER", "not-a-launcher")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
+
+    refuses(
+        &refused,
+        127,
+        Some("startup-failure"),
+        "NOMUX_LAUNCHER",
+        "spawn whose configured launcher could not be selected",
     );
 }
 
@@ -154,6 +185,7 @@ fn spawn_refuses_an_id_something_is_already_serving() {
     refuses(
         &refused,
         126,
+        Some("collision"),
         "already exists",
         "spawn on an id something already answers for",
     );
@@ -209,6 +241,7 @@ fn spawn_refuses_a_wedged_session_without_unlinking_the_lock_it_took() {
     refuses(
         &refused,
         126,
+        Some("uncertain"),
         "backlog is full",
         "spawn on an id something is holding but will not answer",
     );
@@ -268,6 +301,7 @@ fn attach_refuses_an_id_nothing_answers_for_rather_than_inventing_a_session() {
         refuses(
             &refused,
             127,
+            Some("missing-session"),
             "no session",
             &format!("attach on {describing}"),
         );
@@ -298,7 +332,7 @@ fn attach_refuses_an_id_nothing_answers_for_rather_than_inventing_a_session() {
 /// `what` names the invocation, so a failure inside a loop over cases says which case it
 /// was. An empty `must_say` asks only that it said something, which is all a refusal
 /// carrying a bare `io::Error` can promise.
-fn refuses(out: &Output, code: i32, must_say: &str, what: &str) {
+fn refuses(out: &Output, code: i32, class: Option<&str>, must_say: &str, what: &str) {
     let (said, wrote) = (stderr(out), stdout(out));
     assert_eq!(
         out.status.code(),
@@ -308,6 +342,18 @@ fn refuses(out: &Output, code: i32, must_say: &str, what: &str) {
     assert!(
         !said.is_empty() && said.contains(must_say),
         "{what} must say so, naming {must_say:?}: {said:?}"
+    );
+    let records = said
+        .lines()
+        .filter(|line| line.starts_with("NOMUX-RELAY-ERROR "))
+        .collect::<Vec<_>>();
+    let expected = class
+        .map(|class| vec![format!("NOMUX-RELAY-ERROR 1 {class}")])
+        .unwrap_or_default();
+    assert_eq!(
+        records,
+        expected.iter().map(String::as_str).collect::<Vec<_>>(),
+        "{what} carried the wrong machine-readable relay outcome: {said:?}"
     );
     assert!(
         wrote.is_empty(),
@@ -407,6 +453,149 @@ fn spawn_starts_a_daemon_for_a_session_that_does_not_exist_yet() {
         "spawn did not start a daemon and relay its output; saw {:?}",
         String::from_utf8_lossy(&seen)
     );
+}
+
+fn reachable_systemd_run() -> Option<&'static str> {
+    let systemd_run = ["/usr/bin/systemd-run", "/bin/systemd-run"]
+        .into_iter()
+        .find(|path| std::path::Path::new(path).is_file())?;
+    let probe = collect(
+        Command::new(systemd_run)
+            .args(["--user", "--scope", "--quiet", "--collect", "true"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    );
+    probe.status.success().then_some(systemd_run)
+}
+
+fn use_real_runtime_dir(command: &mut Command) {
+    match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(runtime) => {
+            command.env("XDG_RUNTIME_DIR", runtime);
+        }
+        None => {
+            command.env_remove("XDG_RUNTIME_DIR");
+        }
+    }
+}
+
+/// The optional systemd launcher changes only cgroup ownership, not the startup capability,
+/// label, or environment that the creating SSH connection gave the session.
+///
+/// Skipped on hosts with no reachable user manager. Linger is deliberately not required here:
+/// forced mode exercises the same scope handoff without changing the developer's login policy.
+#[test]
+fn a_systemd_scope_preserves_the_spawn_boundary() {
+    use std::sync::mpsc;
+
+    if reachable_systemd_run().is_none() {
+        return;
+    }
+
+    let root = run_root("systemd_scope");
+    let id = "systemd_scope";
+    let mut scoped = nomux_with_shell(&root, &["spawn", id, "--label", "cost $5"]);
+    scoped
+        .env("NOMUX_LAUNCHER", "systemd")
+        .env("INVOCATION_ID", "NOMUX-ORIGINAL")
+        // These are ordinary inherited names despite looking like an implementation
+        // detail; a wholesale environment must not reserve and overwrite either one.
+        .env("NOMUX_ORIGINAL_INVOCATION_ID", "keep-original-private")
+        .env(
+            "NOMUX_ORIGINAL_INVOCATION_ID_PRESENT",
+            "keep-present-private",
+        )
+        .env("PS1", "")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // The harness normally makes XDG_RUNTIME_DIR another isolated run-file source. Here
+    // systemd-run also needs its real value to find the already-probed user bus; state home
+    // still keeps every nomux file under `root`.
+    use_real_runtime_dir(&mut scoped);
+    let mut child = Spawned::spawn(&mut scoped);
+    let mut stdin = child.stdin.take().expect("relay stdin");
+    let mut relay_stdout = child.stdout.take().expect("relay stdout");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let pump = thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match relay_stdout.read(&mut chunk) {
+                Err(err) if err.kind() == ErrorKind::Interrupted => {}
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send(chunk[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    write_frame(&mut stdin, &hello_frame(false, false, RESUME_FROM_START));
+    let ready = b"stty -echo; printf 'NOMUX-SCOPE-%s\\n' READY\n";
+    write_frame(
+        &mut stdin,
+        &Frame::Input {
+            offset: 0,
+            data: ready,
+        },
+    );
+    stdin.flush().expect("flush the greeting and setup");
+
+    let (pid, _reaper) = daemon_reaper(&root, id);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut seen = Vec::new();
+    let became_ready = poll_by(deadline, || {
+        while let Ok(bytes) = rx.try_recv() {
+            seen.extend_from_slice(&bytes);
+        }
+        String::from_utf8_lossy(&seen).contains("NOMUX-SCOPE-READY")
+    });
+
+    let check = b"if [ \"$INVOCATION_ID\" = NOMUX-ORIGINAL ] && [ \"$NOMUX_ORIGINAL_INVOCATION_ID\" = keep-original-private ] && [ \"$NOMUX_ORIGINAL_INVOCATION_ID_PRESENT\" = keep-present-private ]; then printf 'NOMUX-SCOPE-%s-CLEAN\\n' \"$((6*9))\"; else printf 'NOMUX-SCOPE-ENV-BAD\\n'; fi\n";
+    write_frame(
+        &mut stdin,
+        &Frame::Input {
+            offset: ready.len() as u64,
+            data: check,
+        },
+    );
+    stdin.flush().expect("flush the environment check");
+    let answered = poll_by(deadline, || {
+        while let Ok(bytes) = rx.try_recv() {
+            seen.extend_from_slice(&bytes);
+        }
+        let seen = String::from_utf8_lossy(&seen);
+        seen.contains("NOMUX-SCOPE-54-CLEAN") || seen.contains("NOMUX-SCOPE-ENV-BAD")
+    });
+
+    let cgroup =
+        fs::read_to_string(format!("/proc/{pid}/cgroup")).expect("read the scoped daemon's cgroup");
+    let listed = control(&root, &["list"]);
+    drop(stdin);
+    drop(child);
+    drop(pump.join());
+    let killed = control(&root, &["kill", id]);
+
+    assert!(became_ready, "the scoped shell never became ready");
+    assert!(answered, "the scoped shell never answered: {seen:?}");
+    assert!(
+        String::from_utf8_lossy(&seen).contains("NOMUX-SCOPE-54-CLEAN"),
+        "systemd changed the shell environment: {seen:?}"
+    );
+    assert!(
+        cgroup.contains(&format!("/nomux-{id}-")) && cgroup.contains(".scope"),
+        "daemon was not moved into its nomux scope: {cgroup:?}"
+    );
+    succeeded(&listed, "list the scoped session");
+    assert!(
+        stdout(&listed).contains("\tcost $5\n"),
+        "systemd changed the label: {:?}",
+        stdout(&listed)
+    );
+    succeeded(&killed, "kill the scoped session");
 }
 
 /// `spawn` starts the binary it is running, not whatever is at the path it was
@@ -808,6 +997,13 @@ fn a_relay_that_fails_mid_stream_is_not_a_host_the_client_gives_up_on() {
         stderr(&finished).contains("relaying to the session failed"),
         "the line has to say the relay failed rather than name a session that was \
          never in doubt: {:?}",
+        stderr(&finished)
+    );
+    assert!(
+        stderr(&finished)
+            .lines()
+            .any(|line| line == "NOMUX-RELAY-ERROR 1 post-connect"),
+        "the relay failure needs its stable post-connect record: {:?}",
         stderr(&finished)
     );
 }

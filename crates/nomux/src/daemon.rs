@@ -21,6 +21,7 @@ use rustix::event::{PollFd, PollFlags, Timespec};
 
 use crate::agent::{self, Agent};
 use crate::conn::Conn;
+use crate::launcher::OriginalInvocationId;
 use crate::nbio;
 use crate::pty::{self, Pty};
 use crate::rundir::{SessionPaths, ensure_run_dir};
@@ -233,8 +234,9 @@ pub(crate) fn run(
     session_id: &str,
     label: Option<&str>,
     inherited_lock_fd: Option<i32>,
+    scope_invocation_id: Option<OriginalInvocationId>,
 ) -> io::Result<()> {
-    let result = start(session_id, label, inherited_lock_fd);
+    let result = start(session_id, label, inherited_lock_fd, scope_invocation_id);
     if let Err(err) = &result {
         // Also to syslog, not only through the `Err` the caller prints: past
         // `release_startup_state` there is no stderr left to reach anybody through.
@@ -244,7 +246,15 @@ pub(crate) fn run(
 }
 
 /// The body of [`run`], separated so that every way out of it is logged once.
-fn start(session_id: &str, label: Option<&str>, inherited_lock_fd: Option<i32>) -> io::Result<()> {
+fn start(
+    session_id: &str,
+    label: Option<&str>,
+    inherited_lock_fd: Option<i32>,
+    scope_invocation_id: Option<OriginalInvocationId>,
+) -> io::Result<()> {
+    if let Some(original_invocation_id) = scope_invocation_id {
+        restore_scope_environment(original_invocation_id);
+    }
     let paths = SessionPaths::new(session_id)?;
     let ring = allocate_ring(session_id)?;
     ensure_run_dir(paths.dir())?;
@@ -335,6 +345,28 @@ fn start(session_id: &str, label: Option<&str>, inherited_lock_fd: Option<i32>) 
     crate::sanitize::info(session_id, &format!("exiting: {reason}"));
     daemon.shutdown();
     result
+}
+
+/// Restores the SSH session's invocation id after systemd-run replaced it.
+///
+/// A transient scope receives its own `INVOCATION_ID`; allowing that to reach the PTY child
+/// would make the scope launcher observable in the shell environment. The parent encoded the
+/// original raw value, including absence, in the daemon command line.
+fn restore_scope_environment(original: OriginalInvocationId) {
+    match original {
+        OriginalInvocationId::Absent => {
+            // SAFETY: daemon startup is single-threaded and no user code can run yet.
+            unsafe {
+                std::env::remove_var("INVOCATION_ID");
+            }
+        }
+        OriginalInvocationId::Value(value) => {
+            // SAFETY: daemon startup is single-threaded and no user code can run yet.
+            unsafe {
+                std::env::set_var("INVOCATION_ID", value);
+            }
+        }
+    }
 }
 
 /// Hands the id to the process that will actually serve it: § 6.2's detachment, the
@@ -873,8 +905,9 @@ impl Daemon {
 
     /// Reads from the connection that has not attached yet.
     ///
-    /// Its first frame decides everything: a `Hello` promotes it and evicts whoever held
-    /// the session, anything else is a protocol error, and an EOF was a liveness probe.
+    /// Its first frame decides everything: a `Hello` promotes it, conditionally refusing
+    /// or evicting whoever held the session, anything else is a protocol error, and an EOF
+    /// was a liveness probe.
     fn read_pending(&mut self, read_buf: &mut [u8], scratch: &mut Vec<u8>) {
         // Separate from `scratch`, which the outgoing client's final drain below needs
         // while the `Hello` is still borrowed.
@@ -921,6 +954,17 @@ impl Daemon {
         // about the same rule one step earlier.
         if self.client.is_some() {
             self.read_client(read_buf, scratch);
+        }
+        // Asked and answered only after the final drain: input already delivered by the
+        // incumbent belongs to the session, while a `Detach` already behind that input
+        // frees the slot in time for this greeting. Refusing the pending connection changes
+        // none of the incumbent's session state.
+        if hello.if_detached && self.client.is_some() {
+            self.reject_pending(
+                ErrorCode::AlreadyAttached,
+                "another client is already attached",
+            );
+            return;
         }
         // Hands the session over (§ 6.4) by the same door as any other refusal, which also
         // drops the agent connection the arriving client knows nothing of. With nobody
@@ -1661,6 +1705,7 @@ mod tests {
                 protocol: PROTOCOL_VERSION,
                 agent_forward: false,
                 repaint_ctrl_l: false,
+                if_detached: false,
                 out_offset: RESUME_FROM_START,
                 win: WinSize::default(),
                 term: "dumb",
@@ -1691,7 +1736,7 @@ mod tests {
         assert_eq!(
             evicted,
             {
-                let mut wire = Vec::new();
+                let mut wire = nomux::SERVER_PREAMBLE.to_vec();
                 Frame::Error {
                     code: ErrorCode::Takeover,
                     message: "another client attached",
@@ -1709,6 +1754,68 @@ mod tests {
              connection: the arriving one resumes from {applied}, so they are typed into \
              nothing and nobody will resend them",
             TYPED.len()
+        );
+    }
+
+    /// A conditional greeting decides against the attached slot after the incumbent's
+    /// final read, not against the readiness snapshot that woke the pass. A `Detach`
+    /// already in that connection therefore gives the session up before the newcomer asks,
+    /// and the newcomer may attach without ever producing a takeover.
+    #[test]
+    fn a_detach_in_the_same_wakeup_frees_the_slot_for_a_conditional_hello() {
+        let root = Scratch::new("if-detached-order");
+        let mut daemon = blank(&root, "if-detached");
+        daemon.pty = Some(shell("if-detached-order"));
+
+        let mut leaving = attach_peer(|conn| daemon.client = Some(Attached::greeting(conn)));
+        deliver(&mut leaving, &Frame::Detach);
+
+        let mut arriving = attach_peer(|conn| {
+            daemon.pending = Some((conn, Instant::now() + PENDING_HELLO_TIMEOUT));
+        });
+        deliver(
+            &mut arriving,
+            &Frame::Hello(Hello {
+                protocol: PROTOCOL_VERSION,
+                agent_forward: false,
+                repaint_ctrl_l: false,
+                if_detached: true,
+                out_offset: RESUME_FROM_START,
+                win: WinSize::default(),
+                term: "dumb",
+            }),
+        );
+
+        let mut ready = [PollFlags::empty(); POLL_SLOTS];
+        ready[Source::Client as usize] = PollFlags::IN;
+        ready[Source::Pending as usize] = PollFlags::IN;
+        daemon.poll_once(&ready, &mut vec![0u8; 64 * 1024], &mut Vec::new());
+
+        let old_reply = collect(&mut leaving);
+        let greeting = collect(&mut arriving);
+        if let Some(mut pty) = daemon.pty.take() {
+            pty.terminate();
+        }
+
+        assert!(old_reply.is_empty(), "Detach must close without a refusal");
+        assert!(
+            daemon.pending.is_none() && daemon.client.is_some(),
+            "the conditional newcomer was not promoted after the Detach"
+        );
+        assert_eq!(
+            greeting,
+            {
+                let mut wire = nomux::SERVER_PREAMBLE.to_vec();
+                Frame::HelloOk(HelloOk {
+                    resume_from: 0,
+                    in_applied: 0,
+                    agent: false,
+                })
+                .encode(&mut wire)
+                .expect("a valid greeting");
+                wire
+            },
+            "the newcomer was refused even though the incumbent had detached"
         );
     }
 
@@ -1752,7 +1859,7 @@ mod tests {
         assert_eq!(
             collect(&mut peer),
             {
-                let mut expected = Vec::new();
+                let mut expected = nomux::SERVER_PREAMBLE.to_vec();
                 Frame::Error {
                     code: ErrorCode::Protocol,
                     message: "truncated frame at end of input",

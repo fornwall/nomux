@@ -23,52 +23,56 @@
 # two's-complement pattern being a reinterpretation this file should not ask for.
 
 frame Hello
-protocol 0x000a
+protocol 0x000b
 agent_forward true
 repaint_ctrl_l true
+if_detached true
 out_offset 0x0102030405060708
 cols 0x0078
 rows 0x0028
 xpixel 0x03c0
 ypixel 0x0280
 term 0x787465726d2d323536636f6c6f72
-bytes 0x01000023000a0301020304050607080078002803c00280000e787465726d2d323536636f6c6f72
+bytes 0x01000023000b0701020304050607080078002803c00280000e787465726d2d323536636f6c6f72
 
 frame Hello
-protocol 0x000a
+protocol 0x000b
 agent_forward true
 repaint_ctrl_l false
+if_detached false
 out_offset 0xffffffffffffffff
 cols 0x0078
 rows 0x0028
 xpixel 0x03c0
 ypixel 0x0280
 term 0x7674313030
-bytes 0x0100001a000a01ffffffffffffffff0078002803c0028000057674313030
+bytes 0x0100001a000b01ffffffffffffffff0078002803c0028000057674313030
 
 frame Hello
-protocol 0x000a
+protocol 0x000b
 agent_forward false
 repaint_ctrl_l false
+if_detached false
 out_offset 0x8182838485868788
 cols 0x0078
 rows 0x0028
 xpixel 0x03c0
 ypixel 0x0280
 term 0x64756d62
-bytes 0x01000019000a0081828384858687880078002803c00280000464756d62
+bytes 0x01000019000b0081828384858687880078002803c00280000464756d62
 
 frame Hello
-protocol 0x000a
+protocol 0x000b
 agent_forward false
 repaint_ctrl_l true
+if_detached false
 out_offset 0x0000000000000000
 cols 0x0078
 rows 0x0028
 xpixel 0x03c0
 ypixel 0x0280
 term 0x
-bytes 0x01000015000a0200000000000000000078002803c002800000
+bytes 0x01000015000b0200000000000000000078002803c002800000
 
 frame HelloOk
 resume_from 0x2122232425262728
@@ -163,6 +167,11 @@ frame Error
 code Internal
 message 0x
 bytes 0x0c0000020005
+
+frame Error
+code AlreadyAttached
+message 0x616c7265616479206174746163686564
+bytes 0x0c0000120006616c7265616479206174746163686564
 
 frame AgentOpen
 generation 0x11121314

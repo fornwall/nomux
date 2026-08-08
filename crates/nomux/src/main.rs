@@ -12,6 +12,7 @@ mod attach;
 mod conn;
 mod control;
 mod daemon;
+mod launcher;
 mod nbio;
 mod pty;
 mod ring;
@@ -30,14 +31,6 @@ use std::process::ExitCode;
 /// the only one shared by every mode — `IMPLEMENTATION.md` § 10 has both tables and
 /// says why the rest of that range is left alone.
 const EXIT_USAGE: u8 = 64;
-/// The session is there but this mode cannot have it: `spawn` found the id already
-/// taken, or `attach` found a session it could not join. The shell's "found but not
-/// executable", for the reason § 10 gives.
-const EXIT_UNATTACHABLE: u8 = 126;
-/// No such session — `attach` on an id nothing answers for, or a `spawn` whose daemon
-/// never started. The shell's "not found", for the reason above.
-const EXIT_NO_SESSION: u8 = 127;
-
 const USAGE: &str = "\
 usage: nomux <mode> [session-id] [options]
 
@@ -76,13 +69,18 @@ fn main() -> ExitCode {
             print!("{USAGE}");
             ExitCode::SUCCESS
         }),
-        Some(word @ "daemon") => with_session(word, args, true, |session, label, lock_fd| {
-            report(daemon::run(session, label, lock_fd))
-        }),
-        Some(word @ "spawn") => with_session(word, args, false, |session, label, _| {
+        Some(word @ "daemon") => with_session(
+            word,
+            args,
+            true,
+            |session, label, lock_fd, scope_invocation_id| {
+                report(daemon::run(session, label, lock_fd, scope_invocation_id))
+            },
+        ),
+        Some(word @ "spawn") => with_session(word, args, false, |session, label, _, _| {
             report_relay(attach::run(session, attach::Intent::Create(label)))
         }),
-        Some(word @ "attach") => with_session(word, args, false, |session, label, _| {
+        Some(word @ "attach") => with_session(word, args, false, |session, label, _, _| {
             // Refused rather than dropped on the floor: a `--label` on `attach` is a
             // caller that still believes `attach` might create the session.
             if label.is_some() {
@@ -93,7 +91,7 @@ fn main() -> ExitCode {
             }
             report_relay(attach::run(session, attach::Intent::Resume))
         }),
-        Some(word @ "kill") => with_session(word, args, false, |session, label, _| {
+        Some(word @ "kill") => with_session(word, args, false, |session, label, _, _| {
             if label.is_some() {
                 return usage_error(Some(
                     "`kill` takes no `--label`: labels are recorded only when a session is created",
@@ -135,26 +133,32 @@ fn usage_error(message: Option<&str>) -> ExitCode {
 /// The command line the four modes that take a session id share, parsed once and handed
 /// to whichever of them `main` matched.
 ///
-/// `word` is that mode, carried only so a refusal can name it. `lock_fd_ok` is passed by
-/// the daemon arm alone: everywhere else `--lock-fd` is an unknown option.
+/// `word` is that mode, carried only so a refusal can name it. `private_options_ok` is
+/// passed by the daemon arm alone: everywhere else the startup handoff options are unknown.
 fn with_session(
     word: &str,
     args: impl Iterator<Item = OsString>,
-    lock_fd_ok: bool,
-    run: impl FnOnce(&str, Option<&str>, Option<i32>) -> ExitCode,
+    private_options_ok: bool,
+    run: impl FnOnce(
+        &str,
+        Option<&str>,
+        Option<i32>,
+        Option<launcher::OriginalInvocationId>,
+    ) -> ExitCode,
 ) -> ExitCode {
     let SessionArgs {
         session,
         label,
         lock_fd,
-    } = match parse_session_args(args, lock_fd_ok) {
+        scope_invocation_id,
+    } = match parse_session_args(args, private_options_ok) {
         Ok(parsed) => parsed,
         Err(message) => return usage_error(Some(&message)),
     };
     let Some(session) = session else {
         return usage_error(Some(&format!("`{word}` requires a session id")));
     };
-    run(&session, label.as_deref(), lock_fd)
+    run(&session, label.as_deref(), lock_fd, scope_invocation_id)
 }
 
 /// The shared command line of every mode that names a session.
@@ -164,32 +168,46 @@ struct SessionArgs {
     label: Option<String>,
     /// Private startup capability passed only from `spawn` to `daemon`.
     lock_fd: Option<i32>,
+    /// The original invocation id if systemd-run inserted a transient scope.
+    ///
+    /// The option says whether scope mode is active; its value preserves an absent
+    /// `INVOCATION_ID` distinctly from scope mode not being used.
+    scope_invocation_id: Option<launcher::OriginalInvocationId>,
 }
 
 /// Splits a session-mode command line into its id and optional label — and, only where
-/// `lock_fd_ok`, the private `--lock-fd` handoff.
+/// `private_options_ok`, the startup handoff options.
 ///
 /// Deliberately minimal — no argument parser, no abbreviations, no `--` handling.
 /// The only caller is the client, which builds this command line itself.
 fn parse_session_args(
     mut args: impl Iterator<Item = OsString>,
-    lock_fd_ok: bool,
+    private_options_ok: bool,
 ) -> Result<SessionArgs, String> {
     let mut session = None;
     let mut label = None;
     let mut lock_fd = None;
+    let mut scope_invocation_id = None;
 
     while let Some(arg) = args.next() {
         let text = arg
             .to_str()
             .ok_or_else(|| format!("argument `{}` must be valid UTF-8", arg.display()))?;
         let value = match text.split_once('=') {
-            Some(("--lock-fd", value)) if lock_fd_ok => {
+            Some(("--lock-fd", value)) if private_options_ok => {
                 parse_lock_fd(value, &mut lock_fd)?;
                 continue;
             }
+            Some(("--systemd-scope", value)) if private_options_ok => {
+                if scope_invocation_id.is_some() {
+                    return Err("`--systemd-scope` is given once".to_owned());
+                }
+                scope_invocation_id =
+                    Some(launcher::decode_invocation_id(value).map_err(str::to_owned)?);
+                continue;
+            }
             Some(("--label", value)) => value.to_owned(),
-            _ if lock_fd_ok && text == "--lock-fd" => {
+            _ if private_options_ok && text == "--lock-fd" => {
                 let value = args
                     .next()
                     .ok_or_else(|| "missing `--lock-fd` value".to_owned())?;
@@ -216,10 +234,16 @@ fn parse_session_args(
             return Err("`--label` is given once: a second would replace the first".to_owned());
         }
     }
+    if scope_invocation_id.is_some() {
+        label = label
+            .map(|encoded| launcher::decode_scope_label(&encoded).map_err(str::to_owned))
+            .transpose()?;
+    }
     Ok(SessionArgs {
         session,
         label,
         lock_fd,
+        scope_invocation_id,
     })
 }
 
@@ -252,30 +276,26 @@ fn report(result: std::io::Result<()>) -> ExitCode {
     reported(result, |_| ExitCode::FAILURE)
 }
 
-/// [`report`] for the two modes that relay, which § 10 scores on a table of their own:
-/// `spawn` and `attach` distinguish a session that is not there from one they may not
-/// have, because their client acts on the difference.
-fn report_relay(result: std::io::Result<()>) -> ExitCode {
-    reported(result, |kind| match kind {
-        // A failure *during* the relay, which `attach::relay_failed` renames to this
-        // kind and nothing else in the crate constructs. The one row here that says
-        // nothing about the session: `nomux attach work > /var/log/big` on a filesystem
-        // that fills had the session for an hour and then could not write to its own
-        // stdout. Scored 126, that takes a working host out of the client's rotation as
-        // unattachable; 1 says what happened, which is that this attempt failed.
-        std::io::ErrorKind::ConnectionAborted => ExitCode::FAILURE,
-        // `NotFound` is the session `attach` refused to invent; `TimedOut` is a daemon
-        // `spawn` started that never bound — the same "not found", reached by waiting.
-        // The other wait that runs out is a `connect` to a socket somebody bound and
-        // stopped accepting on, which is a session and not a missing one; that this
-        // line cannot tell the two apart is why both modes rename it first, through
-        // `attach::may_be_running` and `attach::unattachable`, and never leave it as
-        // `TimedOut`.
-        std::io::ErrorKind::NotFound | std::io::ErrorKind::TimedOut => {
-            ExitCode::from(EXIT_NO_SESSION)
+/// Reports the relay modes' versioned machine record and legacy exit status.
+///
+/// The record is a separate complete stderr line with no caller-controlled bytes. A client
+/// can therefore find it among login-shell chatter without parsing the human diagnostic.
+/// Command usage remains outside the record's closed set and keeps the ordinary reporter.
+fn report_relay(result: Result<(), attach::RunError>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(attach::RunError::Usage(err)) => reported(Err(err), |_| {
+            // `RunError::Usage` is constructed only from `InvalidInput`; keeping an
+            // explicit fallback makes that invariant harmless if its internals change.
+            ExitCode::from(EXIT_USAGE)
+        }),
+        Err(attach::RunError::Classified(failure)) => {
+            let class = failure.class();
+            eprintln!("NOMUX-RELAY-ERROR 1 {}", class.token());
+            eprintln!("nomux: {}", failure.to_string().escape_debug());
+            ExitCode::from(class.exit_code())
         }
-        _ => ExitCode::from(EXIT_UNATTACHABLE),
-    })
+    }
 }
 
 /// The half the two share: success, the message on stderr, and § 10's one reserved kind.
@@ -299,5 +319,59 @@ fn reported(
                 failed(kind)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session_args(args: &[&str], private_options_ok: bool) -> Result<SessionArgs, String> {
+        parse_session_args(
+            args.iter().map(|argument| OsString::from(*argument)),
+            private_options_ok,
+        )
+    }
+
+    #[test]
+    fn scope_marker_is_a_daemon_only_startup_handoff() {
+        let parsed = session_args(
+            &[
+                "session",
+                "--lock-fd",
+                "19",
+                "--systemd-scope=-",
+                "--label=x636f7374202435",
+            ],
+            true,
+        )
+        .expect("parse the daemon handoff");
+        assert_eq!(parsed.session.as_deref(), Some("session"));
+        assert_eq!(parsed.lock_fd, Some(19));
+        assert_eq!(parsed.label.as_deref(), Some("cost $5"));
+        assert_eq!(
+            parsed.scope_invocation_id,
+            Some(launcher::OriginalInvocationId::Absent)
+        );
+
+        assert_eq!(
+            session_args(&["session", "--systemd-scope=-"], false)
+                .expect_err("reject a private option on public modes"),
+            "unknown option `--systemd-scope=-`"
+        );
+    }
+
+    #[test]
+    fn scope_marker_cannot_be_repeated_or_take_a_value() {
+        assert_eq!(
+            session_args(&["session", "--systemd-scope=-", "--systemd-scope=-"], true,)
+                .expect_err("reject a repeated marker"),
+            "`--systemd-scope` is given once"
+        );
+        assert_eq!(
+            session_args(&["session", "--systemd-scope=yes"], true)
+                .expect_err("reject a marker value"),
+            "invalid `--systemd-scope` value"
+        );
     }
 }

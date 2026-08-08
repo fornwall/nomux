@@ -45,6 +45,8 @@ wire_enum! {
     InputGap = 4,
     /// Daemon-side failure.
     Internal = 5,
+    /// The client asked not to displace the client already attached.
+    AlreadyAttached = 6,
 }
 
 /// Sentinel for [`Hello::out_offset`] meaning "I have no state; send everything
@@ -60,8 +62,11 @@ const HELLO_AGENT_FORWARD: u8 = 1 << 0;
 /// Wire bit for [`Hello::repaint_ctrl_l`] (`IMPLEMENTATION.md` § 2.3).
 const HELLO_REPAINT_CTRL_L: u8 = 1 << 1;
 
+/// Wire bit for [`Hello::if_detached`] (`IMPLEMENTATION.md` § 2.3).
+const HELLO_IF_DETACHED: u8 = 1 << 2;
+
 /// Bits defined in `Hello`'s flags byte. Anything else set is a protocol error.
-const HELLO_FLAG_BITS: u8 = HELLO_AGENT_FORWARD | HELLO_REPAINT_CTRL_L;
+const HELLO_FLAG_BITS: u8 = HELLO_AGENT_FORWARD | HELLO_REPAINT_CTRL_L | HELLO_IF_DETACHED;
 
 /// Refuses a [`Hello::term`] carrying an interior NUL, on the way *out* as well as in,
 /// for the reason `IMPLEMENTATION.md` § 2.2 gives.
@@ -84,6 +89,9 @@ pub struct Hello<'a> {
     pub agent_forward: bool,
     /// Whether to repaint after a gap with `Ctrl-L` rather than a `SIGWINCH` pair.
     pub repaint_ctrl_l: bool,
+    /// Whether to refuse this connection instead of displacing an attached client.
+    /// False preserves unconditional takeover.
+    pub if_detached: bool,
     /// Next output byte the client wants, or [`RESUME_FROM_START`].
     pub out_offset: u64,
     /// Terminal dimensions.
@@ -101,6 +109,9 @@ impl Hello<'_> {
         }
         if self.repaint_ctrl_l {
             flags |= HELLO_REPAINT_CTRL_L;
+        }
+        if self.if_detached {
+            flags |= HELLO_IF_DETACHED;
         }
         flags
     }
@@ -383,6 +394,7 @@ impl<'a> Frame<'a> {
                     protocol,
                     agent_forward: flags & HELLO_AGENT_FORWARD != 0,
                     repaint_ctrl_l: flags & HELLO_REPAINT_CTRL_L != 0,
+                    if_detached: flags & HELLO_IF_DETACHED != 0,
                     out_offset,
                     win,
                     term,
@@ -615,6 +627,7 @@ mod tests {
             protocol: PROTOCOL_VERSION,
             agent_forward: false,
             repaint_ctrl_l: false,
+            if_detached: false,
             out_offset: 0,
             win: WIN,
             term: "",
@@ -719,6 +732,7 @@ mod tests {
             protocol: PROTOCOL_VERSION,
             agent_forward: false,
             repaint_ctrl_l: false,
+            if_detached: false,
             out_offset: 0,
             win: WIN,
             term: &long,
@@ -734,6 +748,7 @@ mod tests {
             protocol: PROTOCOL_VERSION,
             agent_forward: false,
             repaint_ctrl_l: false,
+            if_detached: false,
             out_offset: 0,
             win: WIN,
             term: &exact,
@@ -750,6 +765,7 @@ mod tests {
             protocol: PROTOCOL_VERSION,
             agent_forward: false,
             repaint_ctrl_l: false,
+            if_detached: false,
             out_offset: 0,
             win: WIN,
             term: "xt\0rm",
@@ -766,6 +782,7 @@ mod tests {
             protocol: PROTOCOL_VERSION,
             agent_forward: false,
             repaint_ctrl_l: false,
+            if_detached: false,
             out_offset: 0,
             win: WIN,
             term: "xt_rm",
