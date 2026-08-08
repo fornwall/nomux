@@ -378,10 +378,10 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> Result<UnixStream, Failu
                         |said| format!("daemon for session {id} did not start: {said}"),
                     );
                     let refusal = Failure::new(
-                        FailureClass::StartupFailure,
+                        FailureClass::Uncertain,
                         io::Error::new(io::ErrorKind::TimedOut, complaint),
                     );
-                    return Err(released(paths, refusal));
+                    return Err(refusal);
                 }
                 std::thread::sleep(SPAWN_POLL_INTERVAL);
             }
@@ -393,14 +393,7 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> Result<UnixStream, Failu
     }
 }
 
-/// Gives back the `<id>.lock` this call created and hands `err` on, a leftover name being
-/// one `session_id_of` reads as a session and `list` reports until it is collected.
-///
-/// Called from the two exits that established the id is nobody's and from nowhere else,
-/// § 6.6 forbidding an exit that established neither death nor life to unlink over a live
-/// session. This remains an explicit call rather than cleanup attached to a failure class:
-/// classification says what the client does next, while only the observation at the call
-/// site licenses unlinking the name.
+/// Removes the lock only when daemon launch failed before a child could exist.
 fn released(paths: &SessionPaths, err: Failure) -> Failure {
     drop(fs::remove_file(paths.lock()));
     err

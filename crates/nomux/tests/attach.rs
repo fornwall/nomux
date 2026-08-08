@@ -95,31 +95,11 @@ fn a_daemon_that_cannot_publish_its_pidfile_refuses_to_start() {
     );
 }
 
-/// The other half of the relay's exit table: a session that is not there and could
-/// not be started is 127, the shell's "not found" (`IMPLEMENTATION.md` § 10).
-///
-/// The set matters more than any one number. `DESIGN.md` § 7 has the client cache a
-/// host as *unattachable* on 126, go on trying on 127, and read 1 as this attempt alone
-/// having failed — "stop", "try again", and "nothing follows about the session" — so
-/// the three arms of `main::report_relay`'s match are three different things a client
-/// does next. Until these tests, nothing in the suite would have noticed any two of
-/// them swapped, or all three collapsed into whichever arm that match reached first.
-/// The third is
-/// [`a_relay_that_fails_mid_stream_is_not_a_host_the_client_gives_up_on`].
-///
-/// `spawn`'s now that `attach` starts nothing, and the row it exercises is the one
-/// only `spawn` can reach: `TimedOut`, a daemon that never came up. § 10 puts that on
-/// the same number as the session `attach` refuses to invent, which is the whole of
-/// what the two have in common — one "not found" about a session and one about
-/// bringing a session into being, and a client that has to try again either way.
-///
 /// A directory where the socket goes is a daemon that cannot start rather than one
-/// that is slow: `connect` to a non-socket is refused, which `spawn` reads as an id
-/// nobody is serving and answers by spawning, and the daemon's own `bind_socket` then
-/// finds something at the path it cannot remove. So the timeout below is reached with
-/// the daemon's complaint in hand rather than by waiting out a race.
+/// that is slow. The relay still cannot prove the child will never publish after its
+/// deadline, so it retains the lock name and reports uncertainty.
 #[test]
-fn spawn_reports_a_session_it_could_not_start_as_no_such_session() {
+fn spawn_timeout_does_not_claim_the_session_is_absent() {
     let root = run_root("spawn_nostart");
     fs::create_dir_all(root.join("nomux/run").join("nostart.sock"))
         .expect("plant a directory where the session socket goes");
@@ -128,10 +108,14 @@ fn spawn_reports_a_session_it_could_not_start_as_no_such_session() {
     // No phrase: the number is the row under test, the wording being the failure's own.
     refuses(
         &refused,
-        127,
-        Some("startup-failure"),
+        126,
+        Some("uncertain"),
         "",
         "spawn on a session that could not be started",
+    );
+    assert!(
+        root.join("nomux/run/nostart.lock").exists(),
+        "a late daemon must not inherit an unlinked lock"
     );
 }
 
