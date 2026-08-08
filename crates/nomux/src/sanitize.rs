@@ -35,26 +35,14 @@ pub(crate) fn sanitize_text(text: &str) -> String {
     text.chars().filter(|ch| !is_deceptive(*ch)).collect()
 }
 
-/// Whether `ch` can make a run of text read as something other than its contents.
-///
-/// `char::is_control` is category `Cc` alone, and every addition here is `Cf`, so all of
-/// them pass it: the bidi overrides, one of which reverses the whole run after it (the
-/// Trojan Source class); the tag characters, a copy of printable ASCII that renders as
-/// nothing; and the zero-width spellings — a byte-order mark, a zero-width space, the
-/// invisible operators, a Mongolian vowel separator, the deprecated shaping selectors —
-/// which occupy no width at all, so two labels carrying different ones draw identically
-/// in the column a human reads to decide what to kill.
-///
-/// The intent is narrow: invisible `Cf` goes, *except* § 6.6's ZWJ and ZWNJ (U+200C and
-/// U+200D), with U+200B sitting directly beside them while being none of that. Spelled as a
-/// named set rather than as that sentence because std has no general-category test to write
-/// it with, so a codepoint missing from the set is a gap rather than a decision.
+/// Whether `ch` can forge terminal layout or render invisibly. ZWJ and ZWNJ are retained
+/// because they are part of ordinary emoji and Indic text.
 const fn is_deceptive(ch: char) -> bool {
     ch.is_control()
         || matches!(ch,
-            '\u{61c}' | '\u{180e}' | '\u{200b}' | '\u{200e}' | '\u{200f}'
-            | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{206a}'..='\u{206f}'
-            | '\u{2066}'..='\u{2069}' | '\u{feff}' | '\u{e0000}'..='\u{e007f}')
+            '\u{ad}' | '\u{61c}' | '\u{180e}' | '\u{200b}' | '\u{200e}' | '\u{200f}'
+            | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}'
+            | '\u{feff}' | '\u{e0000}'..='\u{e007f}')
 }
 
 /// Trims a client-supplied label to what the frozen layout permits: one line of printable
@@ -159,8 +147,8 @@ mod tests {
     #[test]
     fn labels_lose_the_zero_width_characters_that_occupy_no_column() {
         for sneaky in [
-            '\u{180e}', '\u{200b}', '\u{2060}', '\u{2061}', '\u{2062}', '\u{2063}', '\u{2064}',
-            '\u{feff}',
+            '\u{ad}', '\u{180e}', '\u{200b}', '\u{2060}', '\u{2061}', '\u{2062}', '\u{2063}',
+            '\u{2064}', '\u{feff}',
         ] {
             assert!(
                 !sneaky.is_control(),
@@ -224,10 +212,10 @@ mod tests {
     }
 
     #[test]
-    fn control_characters_cannot_forge_a_second_line() {
+    fn deceptive_characters_cannot_forge_layout() {
         assert_eq!(
-            sanitize_text("one\nfeb 30 host sshd[1]: two\r\tthree"),
-            "onefeb 30 host sshd[1]: twothree",
+            sanitize_text("one\nfeb 30 host sshd[1]: two\r\tthree\u{2028}four\u{2029}five"),
+            "onefeb 30 host sshd[1]: twothreefourfive",
             "a newline in a message is how one datagram becomes two log entries"
         );
     }

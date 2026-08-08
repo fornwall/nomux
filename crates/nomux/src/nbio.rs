@@ -146,4 +146,13 @@ mod tests {
             "a failed descriptor was mistaken for a peer that closed cleanly"
         );
     }
+
+    #[test]
+    fn an_empty_buffer_is_not_reported_as_end_of_file() {
+        let (read_end, _write_end) = rustix::pipe::pipe().expect("pipe");
+        assert_eq!(
+            read_or_eof(read_end.as_fd(), &mut []),
+            ReadOutcome::WouldBlock
+        );
+    }
 }

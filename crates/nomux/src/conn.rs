@@ -179,7 +179,10 @@ impl Conn {
             return Ok(());
         }
         while self.buffered() < MAX_PENDING_READ {
-            match self.stream.read(chunk) {
+            let room = MAX_PENDING_READ - self.buffered();
+            let read_len = chunk.len().min(room);
+            let read_buf = chunk.get_mut(..read_len).unwrap_or_default();
+            match self.stream.read(read_buf) {
                 Ok(0) => {
                     self.eof = true;
                     return Ok(());
@@ -373,9 +376,7 @@ mod tests {
         wire
     }
 
-    /// What the daemon's event loop carries for the whole pass, and so the most a single
-    /// read can take. Named because it is exactly one test's bound on how far
-    /// [`Conn::fill`] may overshoot the read cap.
+    /// What the daemon's event loop carries for the whole pass.
     const READ_CHUNK: usize = 64 * 1024;
 
     /// Fills through a buffer of the caller's, as the daemon's event loop does with the
@@ -498,18 +499,11 @@ mod tests {
         }
     }
 
-    /// A peer that goes on writing is stopped at [`MAX_PENDING_READ`] with the rest of
-    /// what it wrote still in the kernel — the runtime half of what `daemon.rs` argues
-    /// the constant for. What is asserted is that [`Conn::fill`] stops *while the socket
-    /// still holds bytes*; the decode-and-fill at the end proves the fills stopped on
-    /// the cap rather than on an `EAGAIN`. The megabyte is accumulated over many reads —
-    /// as the daemon accumulates it under § 4.1's stopped decode loop — because no
-    /// single write can stage one; only the read that crosses the cap has to find the
-    /// socket full, and that one is staged.
+    /// A peer that keeps writing is stopped exactly at [`MAX_PENDING_READ`]. Staged
+    /// excess proves the cap, rather than `EAGAIN`, stopped the read.
     #[test]
     fn a_peer_that_keeps_writing_is_stopped_at_the_read_cap() {
-        // One byte short of the cap, so exactly one read crosses it and the overshoot
-        // below is one buffer rather than however many reads it took to get there.
+        // One byte short of the cap, so the next read must take exactly one byte.
         let preload = MAX_PENDING_READ - 1;
         // 60 KiB payloads, as `flow.rs` blasts and well inside `MAX_PAYLOAD`. Whole
         // frames, so the release at the end has something to decode.
@@ -554,15 +548,8 @@ mod tests {
 
         fill(&mut conn).expect("a fill");
         let taken = conn.buffered() - preload;
-        assert!(
-            conn.buffered() >= MAX_PENDING_READ,
-            "the fill stopped short of the cap"
-        );
-        assert!(
-            taken <= READ_CHUNK,
-            "the fill took {taken} of the {staged} bytes waiting: past the cap it goes on \
-             reading for as long as the peer goes on writing"
-        );
+        assert_eq!(conn.buffered(), MAX_PENDING_READ);
+        assert_eq!(taken, 1, "the read cap was exceeded");
 
         // And goes on declining. Nothing empties this buffer while the caller has stopped
         // decoding, so every later pass finds the same wall.

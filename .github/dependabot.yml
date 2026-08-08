@@ -1,15 +1,7 @@
 version: 2
 
-# Dependabot cannot update the pinned stable and nightly toolchains; those stay manual. CI's
-# weekly advisory check covers dependency risk while the tree is otherwise idle.
 updates:
-  # The executable actions are commit-pinned, so Dependabot is what moves each pin. Daily checks
-  # keep that supply chain current; grouping keeps the resulting pull-request stream small.
-  #
-  # The two artifact actions are grouped because one hands its output to the other, and
-  # ungrouped they arrive as separate pull requests: the `download-artifact` half goes green
-  # on its own, `publish` being tag-gated, so a major that no longer reads what the other
-  # wrote is not discovered until the tag that needed it.
+  # Keep the artifact producer and consumer compatible across major updates.
   - package-ecosystem: github-actions
     directory: /
     schedule:
@@ -40,8 +32,7 @@ updates:
         patterns: ["*"]
         update-types: ["patch"]
 
-  # Separate lockfile and policy: these crates do not ship, but their build scripts execute
-  # on developer and CI machines and should not silently age outside the advisory gate.
+  # fuzz/ is a separate workspace and lockfile.
   - package-ecosystem: cargo
     directory: /fuzz
     schedule:

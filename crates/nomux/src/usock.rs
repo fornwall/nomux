@@ -85,7 +85,8 @@ pub(crate) fn connect_within(path: &Path, within: Duration) -> io::Result<UnixSt
             }
             outcome => return outcome,
         }
-        if Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             let ms = u64::try_from(within.as_millis()).unwrap_or(u64::MAX);
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -96,7 +97,7 @@ pub(crate) fn connect_within(path: &Path, within: Duration) -> io::Result<UnixSt
                 ),
             ));
         }
-        thread::sleep(PROBE_RETRY);
+        thread::sleep(PROBE_RETRY.min(remaining));
     }
 }
 
