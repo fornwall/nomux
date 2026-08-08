@@ -161,30 +161,10 @@ fn an_unknown_outcome_is_sent_on_the_pass_that_decides_it() {
     );
 }
 
-/// Regression: the session's own child is collected as soon as `waitpid` will give
-/// it up, whether or not the terminal has been let go of.
-///
-/// A shell that exits behind a job still holding the slave — `sleep 300 &` and then
-/// `exit`, which is what a `nohup ... &` leaves — never brings the master to end of
-/// file, so nothing stamps `terminal_closed_at` and a collection gated on it never runs.
-/// Nothing else reaps: `Pty::try_wait` has no other caller until `terminate`. The
-/// shell was therefore left a zombie for the whole life of the session, which is up
-/// to the seven-day idle timeout.
-///
-/// Nothing is sent to provoke the pass the reap happens on, and that is the other
-/// half of what this pins. With the client idle and the master silent — the job says
-/// nothing for five minutes — a daemon whose child exited behind a held slave has no
-/// wakeup left short of `IDLE_TICK`, an hour away, so a reap that depended on one
-/// would be a reap the user waits an hour for. What supplies it is the `SIGCHLD`
-/// handler `startup::arm_child_signal` installs: the exit is itself the event.
-///
-/// Collecting is not reporting, which is what the `Ping` below asks about, once the
-/// reap it is not responsible for has already happened: `next_of` refuses anything
-/// but the session's own chatter, so an `Exit` frame arriving here would fail this
-/// test. It must not, because the transcript is plainly not finished — the job that
-/// outlived the shell still has the terminal.
+/// A shell that exits behind a live job remains waitable, reserving the session id until
+/// shutdown. Its outcome is known but not reported while the job holds the terminal.
 #[test]
-fn a_shell_that_exits_behind_a_background_job_is_still_reaped() {
+fn an_exited_shell_reserves_its_live_background_session() {
     let (session, mut client, ok) = Session::attached("zombie_shell");
     let shell = shell_of(&session);
     let ready = client.make_ready("-echo", None, ok.resume_from);
@@ -197,10 +177,10 @@ fn a_shell_that_exits_behind_a_background_job_is_still_reaped() {
         "the shell never exited"
     );
 
-    assert!(
-        poll_until(SETTLE, || process_state(shell) != Some('Z')),
-        "the shell exited behind a job that still holds the slave and was left a \
-         zombie as pid {shell}, nothing having woken the daemon to collect it"
+    assert_eq!(
+        process_state(shell),
+        Some('Z'),
+        "the shell was reaped early"
     );
 
     client.send(&Frame::Ping);
@@ -220,35 +200,13 @@ fn a_shell_that_exits_behind_a_background_job_is_still_reaped() {
     );
 }
 
-/// Regression: the child is still reaped after the daemon has answered for it.
+/// A child answered for as unknown stays waitable until session shutdown.
 ///
-/// The other half of [`a_shell_that_exits_behind_a_background_job_is_still_reaped`],
-/// where `terminal_closed_at` never arrives: here it arrives too early. A child that
-/// closes the terminal without exiting — § 6.5's "anything that daemonises itself" — brings the
-/// master to end of file with `waitpid` empty, so at `OUTCOME_GRACE` the daemon
-/// reports its outcome as unknown over a process that is still running. The old
-/// `collect_status` then opened with `if self.exited.is_some() { return; }` and was the
-/// only caller of `Pty::try_wait` before `terminate`, which made that report the last word: the child,
-/// when it really exited, stayed a zombie the daemon held for the life of the session —
-/// up to the seven-day idle timeout.
-///
-/// The `Exit` frame is what orders the two halves. Releasing the cue only once it has
-/// arrived is what puts the unknown outcome *before* the real exit; the other way round `waitpid`
-/// is ready at end of file, the ordinary arm collects, and the test is green against the
-/// defect it was written for.
-///
-/// `exec` for the reason
-/// [`an_unknown_outcome_is_sent_on_the_pass_that_decides_it`] gives, over a
-/// non-interactive shell that blocks on the cue rather than a `sleep`, so when the child
-/// goes is the test's to say rather than a wall clock's.
-///
-/// Nothing supplies the pass the reap happens on, as in the sibling — and here
-/// nothing else could: `poll_timeout` drops its `OUTCOME_GRACE` wakeup the moment
-/// `outcome` is set, so a session left holding a zombie sleeps on to `IDLE_TICK`. The
-/// `SIGCHLD` the real exit delivers is the whole of the wakeup, and the wait below is
-/// for what it sets off.
+/// The other half of [`an_exited_shell_reserves_its_live_background_session`]: this child
+/// closes its terminal, receives an unknown outcome, then exits on cue. `SIGCHLD` still
+/// drives outcome observation, but the child remains waitable as the session's identity.
 #[test]
-fn a_child_that_exits_after_an_unknown_outcome_is_still_reaped() {
+fn a_child_that_exits_after_an_unknown_outcome_keeps_its_identity() {
     let (session, mut client, ok) = Session::attached("zombie_synth");
     let child = shell_of(&session);
     let cue = Cue::new(&session.root);
@@ -269,10 +227,10 @@ fn a_child_that_exits_after_an_unknown_outcome_is_still_reaped() {
          that outlived its process"
     );
 
-    assert!(
-        poll_until(SETTLE, || process_state(child) != Some('Z')),
-        "the daemon answered for pid {child} at the grace and then stopped reaping, so \
-         the child it spoke for is a zombie it holds until the session ends"
+    assert_eq!(
+        process_state(child),
+        Some('Z'),
+        "the daemon released pid {child} before session shutdown"
     );
 }
 

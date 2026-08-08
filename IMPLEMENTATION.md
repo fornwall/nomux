@@ -630,10 +630,7 @@ name in the frozen layout ([DESIGN.md § 5.2](DESIGN.md#52-reaping)).
 The outcome is not readable the instant the master reports end of file, so it stays pending
 for up to 2 s (`OUTCOME_GRACE`). Past that the daemon reports
 `Exit{status: 0, kind: Unknown}`. This closes the transcript without inventing a process
-outcome: only a child that closed its terminal without exiting reaches this arm, and that
-process may still be running. `waitpid` remains active on `SIGCHLD`, so the child is still
-reaped if it exits after the frame has been sent; the already reported unknown outcome is
-never rewritten underneath a client.
+outcome. Exit observation remains active afterward; the reported outcome is never rewritten.
 
 **End of file is not the only way an exit is heard about, and cannot be.** A shell that
 exits behind a job still holding the slave — `sleep 3600 &` then `exit` — never brings the
@@ -669,11 +666,9 @@ the attached client for at most 500 ms — against the whole call, not per `writ
 **Every signal goes out twice — to the child's process group, then to every live process a
 `/proc` walk finds in the child's session, in that order.** Neither alone covers it:
 `kill(2)` addresses a group and never a session, and the groups job control created are
-exactly what nothing is tracking. The child's own number is guarded against reuse by its
-start time, read at spawn and compared before either reach; where spawn took none, an
-unreaped child passes on the strength of still holding that number — `try_wait` answering
-`Ok(None)` — and only a *collected* one is left alone rather than signalled on a recycled
-number. Every other session member is held by a pidfd opened before its `stat` line is read,
+exactly what nothing is tracking. An exited child stays waitable until shutdown, so its zombie
+reserves the numeric pid, group and session. Every other session
+member is held by a pidfd opened before its `stat` line is read,
 and the signal goes through that descriptor rather than through the number. A member that
 cannot be pinned — on a pre-5.3 kernel, under a restrictive seccomp profile, or because it
 exited during the walk — is skipped rather than signalled ambiguously; the direct child's

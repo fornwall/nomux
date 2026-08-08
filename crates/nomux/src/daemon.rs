@@ -998,20 +998,12 @@ impl Daemon {
         self.pending_input.shrink_to(0);
     }
 
-    /// Collects the child's status once `waitpid` will give it up (§ 6.5), behind
-    /// [`Daemon::worth_a_waitpid`]'s gate. End of file is not the exit and usually
-    /// precedes it — the kernel closes the dying child's descriptors before making it
-    /// reapable. The ask costs the pid, which makes
-    /// [`Pty::pid_reissued`] load-bearing; whether the client is *told* is
-    /// [`Daemon::pump_output`]'s decision. The `waitpid` runs ahead of the
-    /// `self.outcome` test: § 6.5's unknown outcome names a child that may still be
-    /// running, so stopping the asks after reporting it would hold the later zombie for
-    /// the rest of the session.
+    /// Observes the child's outcome without releasing an occupied session id (§ 6.5).
     fn collect_outcome(&mut self) {
-        let reaped = if self.worth_a_waitpid() {
+        let observed = if self.worth_a_waitpid() {
             self.pty
                 .as_mut()
-                .and_then(|pty| pty.try_wait().ok().flatten())
+                .and_then(|pty| pty.try_outcome().ok().flatten())
         } else {
             None
         };
@@ -1021,8 +1013,8 @@ impl Daemon {
         if self.outcome.is_some() {
             return;
         }
-        if let Some(status) = reaped {
-            self.outcome = Some(pty::exit_parts(status));
+        if let Some(outcome) = observed {
+            self.outcome = Some(outcome);
         } else if self
             .terminal_closed_at
             .is_some_and(|closed_at| closed_at.elapsed() >= OUTCOME_GRACE)
@@ -1034,16 +1026,12 @@ impl Daemon {
         }
     }
 
-    /// Whether this pass has any reason to ask `waitpid` (§ 6.5).
-    ///
-    /// A `SIGCHLD` is the strong condition rather than a hint: the kernel sets the dying
-    /// task `EXIT_ZOMBIE` before it queues the signal, so a byte in the child pipe is a
-    /// `waitpid` that will not come back empty. The second clause serves
-    /// [`OUTCOME_GRACE`] whether the signal arrived or not, and is deliberately *not*
-    /// `terminal_closed_at.is_some()` alone: past § 6.5's unknown outcome that stays
-    /// true over a child that daemonised itself and may run for days.
-    const fn worth_a_waitpid(&self) -> bool {
-        self.child_signalled || (self.terminal_closed_at.is_some() && self.outcome.is_none())
+    /// Whether this pass can observe or safely reap the child (§ 6.5).
+    fn worth_a_waitpid(&self) -> bool {
+        self.child_signalled
+            || (self.terminal_closed_at.is_some()
+                && (self.outcome.is_none()
+                    || self.pty.as_ref().is_some_and(Pty::needs_observation)))
     }
 
     fn read_client(&mut self, read_buf: &mut [u8], scratch: &mut Vec<u8>) {

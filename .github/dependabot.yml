@@ -1,17 +1,7 @@
 version: 2
 
-# Two pins are covered by no ecosystem below: the stable channel in
-# `rust-toolchain.toml` and the dated nightly in `scripts/nightly-version`. That is accepted
-# rather than automated because Dependabot cannot update either file. The nightly decides
-# the bytes of a binary whose SHA-256 a client pins, so a bump needs a release build and size
-# review (and a `scripts/size-baseline` refresh if that review accepts material growth). A
-# stable bump can land a new wall of lints on a tree whose gates deny warnings. Both therefore
-# move in a reviewed commit carrying whatever else the compiler bump requires.
-#
-# What that leaves unattended is a compiler-side fix nobody notices. It is the dependency
-# tree — everybody else's code, which is the larger surface — that the weekly `schedule:` in
-# .github/workflows/ci.yml watches on a timer, running the whole workflow and with it
-# `cargo deny check advisories`, precisely because those move without this repository moving.
+# Dependabot cannot update the pinned stable and nightly toolchains; those stay manual. CI's
+# weekly advisory check covers dependency risk while the tree is otherwise idle.
 updates:
   # The executable actions are commit-pinned, so Dependabot is what moves each pin. Daily checks
   # keep that supply chain current; grouping keeps the resulting pull-request stream small.
@@ -34,9 +24,7 @@ updates:
         exclude-patterns: ["actions/upload-artifact", "actions/download-artifact"]
         update-types: ["minor", "patch"]
 
-  # The dependency tree is small and the binary ships to servers. Minor and patch updates are one
-  # auto-merge candidate; major updates remain individual PRs for deliberate review.
-  #
+  # Patch groups auto-merge; minor and major updates remain review-only.
   - package-ecosystem: cargo
     directory: /
     schedule:
@@ -44,9 +32,13 @@ updates:
       time: "05:27"
       timezone: Europe/Stockholm
     groups:
-      minor-and-patch-cargo:
+      patch-cargo:
         patterns: ["*"]
-        update-types: ["minor", "patch"]
+        update-types: ["patch"]
+      security-patch-cargo:
+        applies-to: security-updates
+        patterns: ["*"]
+        update-types: ["patch"]
 
   # Separate lockfile and policy: these crates do not ship, but their build scripts execute
   # on developer and CI machines and should not silently age outside the advisory gate.
@@ -57,6 +49,10 @@ updates:
       time: "05:37"
       timezone: Europe/Stockholm
     groups:
-      minor-and-patch-fuzz-cargo:
+      patch-fuzz-cargo:
         patterns: ["*"]
-        update-types: ["minor", "patch"]
+        update-types: ["patch"]
+      security-patch-fuzz-cargo:
+        applies-to: security-updates
+        patterns: ["*"]
+        update-types: ["patch"]

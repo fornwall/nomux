@@ -952,41 +952,20 @@ fn a_gap_repaints_with_ctrl_l_only_when_the_client_asks() {
     );
 }
 
-/// An overrun that goes on producing gaps owes the child *one* repaint, not one per
-/// gap (`IMPLEMENTATION.md` § 4.3).
-///
-/// The `ctrl_l` policy because this counts repaints and that one is countable: the
-/// daemon writes exactly one `0x0c` per repaint, where the winsize dance is two
-/// `TIOCSWINSZ` in a row and standard signals do not queue — counting those would be
-/// counting the scheduler. The child records what reaches its terminal in a file rather
-/// than echoing it, because the stream back to the client is the very thing with holes
-/// in it: a repaint issued mid-overflow is discarded by the next overflow, so counting
-/// what reached the client would count only the repaints that did no harm.
-///
-/// The ring is larger than the megabyte of output the daemon queues for one client plus
-/// the 256 KiB frame that overshoots it, which makes "still behind" structural rather
-/// than timing: once the ring has overflowed it stays full, so the pass reporting a gap
-/// can never also hand this client the whole of it.
+/// A sustained overrun owes the child one repaint after recovery, not one per gap
+/// (`IMPLEMENTATION.md` § 4.3). `Ctrl-L` makes the repaint countable in the child's
+/// input record. The ring exceeds the maximum client queue plus one frame, so a pass
+/// reporting a gap cannot also queue the entire retained window.
 #[test]
 fn a_sustained_overflow_repaints_when_the_client_catches_up_rather_than_per_gap() {
-    /// Above `MAX_PENDING_WRITE` + `MAX_PAYLOAD` — see above for what that buys.
+    /// Above `MAX_PENDING_WRITE + MAX_PAYLOAD`.
     const RING: usize = 2 * 1024 * 1024;
-    /// What makes the overrun sustained rather than an incident. The defect repaints
-    /// once per gap, so it is also what [`BUDGET`] is being separated from.
     const GAPS: usize = 16;
-    /// What the daemon is allowed: the one repaint owed once the child falls quiet,
-    /// plus slack for a pass where this client happened to catch up mid-flood.
+    /// One owed repaint plus scheduling slack.
     const BUDGET: usize = 4;
-    /// Between frames, so that the child outruns this client rather than the other way
-    /// round — a frame per this is 25 MB/s, against the 150 MB/s the daemon was measured
-    /// lifting off the PTY here. A client that keeps up never falls behind the ring.
-    const PACE: Duration = Duration::from_millis(10);
-    /// Printed by the flooder as its last act, so reaching it means the client has been
-    /// queued the whole stream — the condition the repaint waits for. Arithmetic for the
-    /// reason [`WINCHED`] is.
+    /// Caps this client near 5 MB/s even on a busy test host.
+    const PACE: Duration = Duration::from_millis(50);
     const OVER: &str = "NOMUX-42-FLOOD-OVER";
-    /// Sent as ordinary input once everything the repaint owes is behind it, so the
-    /// count below is taken against a record that is complete.
     const FENCE: &[u8] = b"FENCE\n";
 
     // One deadline for the four consecutive waits below rather than one each
