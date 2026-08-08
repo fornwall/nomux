@@ -473,8 +473,8 @@ gap is § 6.6's publish window.
 Signal dispositions: `SIGHUP` ignored, and restored in the child with four others before
 `exec` (§ 6.1). `SIGTERM` and `SIGINT` handled, not ignored (§ 6.5), armed before the
 pidfile so the pid `kill` reads does not name a process on the default disposition —
-best-effort, the arming resting on a `pipe2` whose failure the daemon swallows rather than
-refuse a session over. `SIGCHLD` handled too, down a **second** self-pipe (§ 6.5), and
+failure to create that signal path refuses startup. `SIGCHLD` is handled too, down a
+**second** self-pipe (§ 6.5), and
 handled rather than ignored for a reason of the child's: `SIG_IGN` survives `exec` and takes
 with it the kernel's own reaping, so the login shell would inherit a session where the kernel
 reaps its children out from under it and every `wait` it makes fails `ECHILD`, for the

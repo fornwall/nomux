@@ -375,12 +375,11 @@ fn restore_scope_environment(original: OriginalInvocationId) {
 ///
 /// # Errors
 ///
-/// Propagates failures to arm either required signal path or write `<id>.pid`. Detachment
-/// and the advisory label remain best effort: neither can make the event loop unsafe.
+/// Propagates detachment, signal setup and pidfile failures. The label remains advisory.
 fn publish(paths: &SessionPaths, label: Option<&str>) -> io::Result<(OwnedFd, OwnedFd)> {
     // Before the pidfile, so the pid `nomux kill` reads belongs to the process that
     // survives.
-    detach_from_controlling_terminal();
+    detach_from_controlling_terminal()?;
     // No second `listen` here. `UnixListener::bind` already issues one at the maximum
     // depth on Linux, and a backlog belongs to the socket's open file description, so
     // `detach_from_controlling_terminal`'s fork shares it rather than resetting it.
