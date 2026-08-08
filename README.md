@@ -52,18 +52,10 @@ builds, size budgets and the pinned nightly are in
 
 ## Status
 
-Server prototype under extensive test on Linux at the protocol revision
-[IMPLEMENTATION.md § 2.2](IMPLEMENTATION.md#22-messages) states. The remaining blockers
-before a production claim are tracked in [PLAN.md](PLAN.md).
-
-- **Platform** — Linux with procfs and PTYs. Linux 5.3+ is required for the complete
-  control surface: on an older kernel `list` and sessions still work, but `kill` refuses
-  rather than signal a reusable bare pid without `pidfd_open`. Everywhere else, plain SSH
-  ([DESIGN.md § 7](DESIGN.md#7-degradation)). POSIX detachment survives an SSH-channel
-  loss, but not a systemd policy that kills the containing login scope.
-- **Suite** — layers and invariants in [IMPLEMENTATION.md § 9](IMPLEMENTATION.md#9-testing); CI adds `--run-ignored all`.
-- **Release** — both musl targets build reproducibly inside the size and growth gates, and a `v*` tag builds, checks and publishes them ([IMPLEMENTATION.md § 8](IMPLEMENTATION.md#8-build)).
-- **Client** — not started; the current server-side contract is documented in [IMPLEMENTATION.md](IMPLEMENTATION.md) and remains provisional until exercised end to end.
+Server prototype under extensive test on Linux with procfs and PTYs. Linux 5.3+ is
+required for the complete control surface; older kernels support sessions and `list`, but
+`kill` refuses without `pidfd_open`. Testing and release invariants are in
+[IMPLEMENTATION.md](IMPLEMENTATION.md); production blockers are in [PLAN.md](PLAN.md).
 
 ## License
 

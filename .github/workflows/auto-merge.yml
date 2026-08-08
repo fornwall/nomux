@@ -1,13 +1,11 @@
 name: Auto-merge trusted pull requests
 
 on:
-  push:
-    branches: [main]
   pull_request_target:
     branches: [main]
     types: [opened, reopened, synchronize, edited, ready_for_review]
   schedule:
-    - cron: '3,13,23,33,43,53 * * * *'
+    - cron: '3/5 * * * *'
   workflow_dispatch:
 
 permissions: {}
