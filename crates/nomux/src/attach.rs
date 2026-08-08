@@ -328,7 +328,8 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> Result<UnixStream, Failu
     // A collector may unlink `<id>.lock` while this call is blocked on it, which
     // `rundir::SpawnLock` has: the lock that comes back is the one on the file now at
     // the path.
-    let spawn_lock = paths.lock_spawn().map_err(|err| {
+    let deadline = Instant::now() + SPAWN_TIMEOUT;
+    let spawn_lock = paths.lock_spawn_until(deadline).map_err(|err| {
         let class = if err.kind() == io::ErrorKind::ResourceBusy {
             FailureClass::Retryable
         } else {
@@ -363,7 +364,6 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> Result<UnixStream, Failu
         }
     };
 
-    let deadline = Instant::now() + SPAWN_TIMEOUT;
     loop {
         match liveness(&socket, CONNECT_TIMEOUT) {
             Liveness::Alive(stream) => {

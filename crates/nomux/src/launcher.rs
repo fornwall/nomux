@@ -13,10 +13,10 @@ use std::io;
 use std::os::fd::BorrowedFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{ChildStderr, Command, Stdio};
+use std::process::{ChildStderr, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::rundir::SpawnLock;
 
@@ -27,6 +27,8 @@ const LAUNCHER_ENV: &str = "NOMUX_LAUNCHER";
 /// would hand it the spawn-lock capability.
 const SYSTEMD_RUN_PATHS: [&str; 2] = ["/usr/bin/systemd-run", "/bin/systemd-run"];
 const LOGINCTL_PATHS: [&str; 2] = ["/usr/bin/loginctl", "/bin/loginctl"];
+const DETECTION_TIMEOUT: Duration = Duration::from_secs(1);
+const DETECTION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Preference {
@@ -284,7 +286,10 @@ fn trusted_program(candidates: &[&str]) -> Option<PathBuf> {
 fn user_manager_reachable() -> bool {
     env::var_os("XDG_RUNTIME_DIR")
         .filter(|runtime| Path::new(runtime).is_absolute())
-        .is_some_and(|runtime| UnixStream::connect(PathBuf::from(runtime).join("bus")).is_ok())
+        .is_some_and(|runtime| {
+            crate::usock::connect_within(&PathBuf::from(runtime).join("bus"), DETECTION_TIMEOUT)
+                .is_ok()
+        })
 }
 
 /// Whether logind promises to keep this user's manager after the final logout.
@@ -296,15 +301,38 @@ fn user_linger_enabled() -> bool {
     let Some(loginctl) = trusted_program(&LOGINCTL_PATHS) else {
         return false;
     };
-    Command::new(loginctl)
+    let mut command = Command::new(loginctl);
+    command
         .arg("show-user")
         .arg(rustix::process::getuid().as_raw().to_string())
         .arg("--property=Linger")
         .arg("--value")
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
+        .stderr(Stdio::null());
+    output_within(&mut command, DETECTION_TIMEOUT)
         .is_ok_and(|output| output.status.success() && linger_value(&output.stdout))
+}
+
+fn output_within(command: &mut Command, within: Duration) -> io::Result<Output> {
+    let mut child = command.stdout(Stdio::piped()).spawn()?;
+    let deadline = Instant::now() + within;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(DETECTION_POLL_INTERVAL);
+            }
+            Ok(None) => {
+                drop(child.kill());
+                drop(child.try_wait());
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            Err(err) => {
+                drop(child.kill());
+                return Err(err);
+            }
+        }
+    }
 }
 
 fn linger_value(output: &[u8]) -> bool {
@@ -329,6 +357,17 @@ mod tests {
         ] {
             assert!(!linger_value(answer), "accepted {answer:?}");
         }
+    }
+
+    #[test]
+    fn a_launcher_probe_cannot_hold_startup_forever() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("60");
+        let started = Instant::now();
+        let err = output_within(&mut command, Duration::from_millis(20))
+            .expect_err("the probe must time out");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

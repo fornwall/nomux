@@ -10,6 +10,7 @@ use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use std::{env, fs};
 
 use rustix::fs::{FlockOperation, Mode, OFlags};
@@ -32,6 +33,7 @@ const FILE_MODE: u32 = 0o600;
 /// How many times an acquirer takes the lock before giving up — the first attempt and
 /// one re-take, for finding that the file it locked is no longer the file at the path.
 const LOCK_ATTEMPTS: usize = 2;
+const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Runs `f` with the umask suppressed, so a node created at `mode` gets exactly `mode`.
 ///
@@ -494,21 +496,20 @@ impl SessionPaths {
         self.with_extension("agent")
     }
 
-    /// Takes the spawn lock, waiting for whoever holds it. [`Self::acquire`]'s refusals, and
-    /// its `Ok(None)` as [`io::ErrorKind::ResourceBusy`]: a caller that has already waited
-    /// and still came back empty has not been told the lock is free.
-    pub(crate) fn lock_spawn(&self) -> io::Result<SpawnLock> {
-        self.acquire(FlockOperation::LockExclusive)?.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::ResourceBusy,
-                format!(
-                    "the spawn lock for session {} could not be taken: it kept being \
-                     removed, or the descriptors and lock records it takes to hold one \
-                     have run out",
-                    self.id
-                ),
-            )
-        })
+    /// Takes the spawn lock without letting a stuck creator block every later command.
+    pub(crate) fn lock_spawn_until(&self, deadline: Instant) -> io::Result<SpawnLock> {
+        loop {
+            if let Some(lock) = self.try_lock_spawn_or_refuse()? {
+                return Ok(lock);
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::ResourceBusy,
+                    format!("timed out waiting for session {}'s spawn lock", self.id),
+                ));
+            }
+            std::thread::sleep(LOCK_POLL_INTERVAL);
+        }
     }
 
     /// Takes the spawn lock if it is free this instant, for callers with better things to do
@@ -1227,6 +1228,23 @@ mod tests {
             "and the spelling with nobody to report to gives the id up rather than \
              inventing a standing it does not have"
         );
+    }
+
+    #[test]
+    fn waiting_for_a_held_spawn_lock_is_bounded() {
+        let root = Scratch::new("rundir-lock-timeout");
+        let paths = SessionPaths::in_dir(root.path(), "tab_7").expect("resolve paths");
+        let held = paths.try_lock_spawn().expect("hold the lock");
+
+        let err = paths
+            .lock_spawn_until(Instant::now() + Duration::from_millis(20))
+            .expect_err("a held lock must time out");
+        assert_eq!(err.kind(), io::ErrorKind::ResourceBusy);
+
+        drop(held);
+        paths
+            .lock_spawn_until(Instant::now() + Duration::from_secs(1))
+            .expect("take the released lock");
     }
 
     /// The leading `-` belongs with the traversal cases because it is the same kind of
