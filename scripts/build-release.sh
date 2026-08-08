@@ -130,6 +130,16 @@ rustflags="$rustflags$us-Zunstable-options$us-Cpanic=immediate-abort"
 rm -rf "$dist"
 mkdir -p "$dist"
 
+# `-pie` alone leaves AArch64 on crt1.o, producing ET_DYN with no self-relocator. Change the
+# pinned compiler's target decision so it selects rcrt1.o; the library path supplies the bundled
+# musl objects that a custom target name cannot find in its own sysroot directory.
+aarch_build=nomux-aarch64-static-pie
+aarch_pie_spec="$target_root/$aarch_build.json"
+rustc --print target-spec-json -Z unstable-options --target aarch64-unknown-linux-musl |
+    awk '/"target-pointer-width":/ { print "  \"static-position-independent-executables\": true," }
+         { print }' > "$aarch_pie_spec"
+aarch_libdir=$(rustc --print target-libdir --target aarch64-unknown-linux-musl)
+
 # Between here and the checksums, target/dist holds some of the binaries and no SHA256SUMS, and
 # nothing in it says which. Cleared on a signal as well as on a failed command: these are cross
 # builds, Ctrl-C is an ordinary way to end one, and a shell killed by a signal need not run its
@@ -198,14 +208,19 @@ check_static() {
 for target in $targets; do
     echo "building $target ($toolchain)..." >&2
     target_rustflags=$rustflags
-    # Rust's AArch64 musl target does not select static PIE by default.
+    build_target=$target
+    build_dir=$target
     case "$target" in
-    aarch64-*) target_rustflags="$target_rustflags$us-Crelocation-model=pic$us-Clink-arg=-pie" ;;
+    aarch64-*)
+        build_target=$aarch_pie_spec
+        build_dir=$aarch_build
+        target_rustflags="$target_rustflags$us-Clinker=rust-lld$us-Lnative=$aarch_libdir/self-contained"
+        ;;
     esac
     CARGO_ENCODED_RUSTFLAGS="$target_rustflags" \
-        cargo build --locked --release --target "$target" --bin nomux \
-        -Zbuild-std=std,panic_abort >&2
-    cp "$target_root/$target/release/nomux" "$dist/nomux-$target"
+        cargo build --locked --release --target "$build_target" --bin nomux \
+        -Zbuild-std=std,panic_abort -Zjson-target-spec >&2
+    cp "$target_root/$build_dir/release/nomux" "$dist/nomux-$target"
     check_leaks "$dist/nomux-$target"
     check_static "$dist/nomux-$target"
 done
