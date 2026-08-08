@@ -115,6 +115,7 @@ jobs:
       # is an unpinned input — a release raising its Go floor would break hook *installation* and
       # take clippy, doc and the tests below with it before any of them run.
       - name: install actionlint
+        if: github.event_name != 'schedule'
         env:
           VERSION: 1.7.12
           SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
@@ -129,28 +130,33 @@ jobs:
 
       # The gate itself, from .pre-commit-config.yaml. `--skip cargo-nextest`: the step below runs
       # a strict superset of that hook, and the session suite is too slow to run twice.
-      - run: prek run --all-files --skip cargo-nextest
+      - if: github.event_name != 'schedule'
+        run: prek run --all-files --skip cargo-nextest
 
       # rustdoc's lints are a namespace of their own, reached by neither the clippy hook nor
       # RUSTFLAGS, and a renamed item turns a link into nothing rather than into an error.
       # `--document-private-items` because the binary is almost entirely private; `--lib --bins`
       # because a bare `cargo doc` documents only the lib when both share a name.
-      - run: cargo doc --locked --workspace --no-deps --document-private-items --lib --bins
+      - if: github.event_name != 'schedule'
+        run: cargo doc --locked --workspace --no-deps --document-private-items --lib --bins
 
       # nextest cannot run doctests, so they need a pass of their own. Here rather than in a hook:
       # the workspace's one is not worth a cargo front-end invocation on every commit.
-      - run: cargo test --locked --doc --workspace
+      - if: github.event_name != 'schedule'
+        run: cargo test --locked --doc --workspace
 
       # The cargo-nextest hook's command plus the two flags that only make sense here.
       # `--run-ignored all`: the one ignored test sits out a real 30 s first-attach reaping
       # timeout, too slow for a hook. `--no-fail-fast`: one failure should not hide the state of
       # everything else, which is most of the value of a CI run over a local one.
-      - run: cargo nextest run --locked --workspace --run-ignored all --no-fail-fast
+      - if: github.event_name != 'schedule'
+        run: cargo nextest run --locked --workspace --run-ignored all --no-fail-fast
 
       # The suite above keeps the default chaos interleaving reproducible. Three more fixed
       # seeds buy different disconnect boundaries without turning a failure into an
       # unreproducible random draw; each run is only the four chaos cases.
       - name: Replay additional chaos interleavings
+        if: github.event_name != 'schedule'
         run: |
           for seed in 1 11400714819323198485 15111065706836454659; do
             NOMUX_CHAOS_SEED="$seed" cargo nextest run --locked --workspace --test chaos

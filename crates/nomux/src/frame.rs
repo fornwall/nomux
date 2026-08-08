@@ -355,11 +355,16 @@ impl<'a> Frame<'a> {
     ///
     /// # Errors
     ///
-    /// [`ProtoError::Truncated`] if the payload ends early,
+    /// [`ProtoError::PayloadTooLarge`] if the payload exceeds the protocol limit,
+    /// [`ProtoError::Truncated`] if it ends early,
     /// [`ProtoError::TrailingBytes`] if it is longer than the frame requires,
     /// and [`ProtoError::Malformed`] for invalid enum discriminants or non-UTF-8
     /// text.
     pub fn decode(ty: FrameType, payload: &'a [u8]) -> Result<Self, ProtoError> {
+        let len = u32::try_from(payload.len()).unwrap_or(u32::MAX);
+        if len > crate::MAX_PAYLOAD {
+            return Err(ProtoError::PayloadTooLarge(len));
+        }
         let mut r = Reader::new(payload);
         let frame = match ty {
             FrameType::Hello => {
@@ -695,6 +700,12 @@ mod tests {
             buf.len(),
             before,
             "failed encode must not leave partial data"
+        );
+
+        let payload = vec![0; MAX_PAYLOAD as usize + 1];
+        assert_eq!(
+            Frame::decode(FrameType::Output, &payload),
+            Err(ProtoError::PayloadTooLarge(MAX_PAYLOAD + 1))
         );
     }
 

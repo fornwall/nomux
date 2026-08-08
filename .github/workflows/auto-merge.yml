@@ -1,14 +1,14 @@
 name: Auto-merge trusted pull requests
 
-# Owner PRs use `pull_request_target`, so this trusted path always runs from the protected base
-# branch. Dependabot is deliberately handled on `pull_request` instead: GitHub forces the token
-# for a Dependabot-authored `pull_request_target` run to read-only even when a job requests write
-# permission. Nothing here checks out the pull request; CI remains the authority on its tree.
 on:
-  pull_request:
-    types: [opened, reopened, synchronize, ready_for_review]
+  push:
+    branches: [main]
   pull_request_target:
-    types: [opened, reopened, synchronize, ready_for_review]
+    branches: [main]
+    types: [opened, reopened, synchronize, edited, ready_for_review]
+  schedule:
+    - cron: '3,13,23,33,43,53 * * * *'
+  workflow_dispatch:
 
 permissions: {}
 
@@ -28,8 +28,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
-      # GitHub requires both permissions to enable native auto-merge. They apply only to this job;
-      # the workflow-level token has no permissions at all.
       contents: write
       pull-requests: write
     steps:
@@ -39,49 +37,94 @@ jobs:
           PR_URL: ${{ github.event.pull_request.html_url }}
         run: gh pr merge --auto --merge "$PR_URL"
 
-  verify_dependabot:
-    name: verify compatible dependency update
-    if: >-
-      github.event_name == 'pull_request' &&
-      github.event.pull_request.user.login == 'dependabot[bot]' &&
-      !github.event.pull_request.draft &&
-      github.event.pull_request.auto_merge == null
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      pull-requests: read
-    outputs:
-      dependency-names: ${{ steps.metadata.outputs.dependency-names }}
-      update-type: ${{ steps.metadata.outputs.update-type }}
-    steps:
-      # Besides exposing the semantic update type, this rejects a PR whose author or commits do
-      # not verify as Dependabot's. This third-party code gets a read-only token; the separate job
-      # below is the only Dependabot path that gets write permission. Pin the action just as CI
-      # pins every executable action.
-      - name: Verify the Dependabot PR and read its update type
-        id: metadata
-        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
-
-  dependabot:
-    name: enable for compatible dependency update
-    needs: verify_dependabot
-    if: >-
-      !contains(needs.verify_dependabot.outputs.dependency-names, 'actions/download-artifact') &&
-      !contains(needs.verify_dependabot.outputs.dependency-names, 'dependabot/fetch-metadata') &&
-      (needs.verify_dependabot.outputs.update-type == 'version-update:semver-patch' ||
-       needs.verify_dependabot.outputs.update-type == 'version-update:semver-minor')
+  dependencies:
+    name: enable safe dependency updates
+    if: github.event_name != 'pull_request_target' && github.actor != 'dependabot[bot]'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: write
       pull-requests: write
     steps:
-      # Major upgrades remain reviewed. So do the action that runs later with the release job's
-      # write token and the metadata action that decides this policy; neither executes its
-      # privileged path on its own update PR. Every other patch and minor update still waits for
-      # every branch rule and required check before this pending decision takes effect.
-      - name: Enable auto-merge for patch and minor updates
+      - name: Enable auto-merge for a verified Cargo patch update
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_URL: ${{ github.event.pull_request.html_url }}
-        run: gh pr merge --auto --merge "$PR_URL"
+        run: |
+          candidates=$(gh pr list --repo "$GITHUB_REPOSITORY" --base main --state open --limit 100 \
+            --json number,url,author,baseRefName,headRefName,isCrossRepository,isDraft,autoMergeRequest \
+            --jq 'map(select(.author.login == "app/dependabot" and .baseRefName == "main" and
+                  (.isCrossRepository | not) and (.isDraft | not) and .autoMergeRequest == null and
+                  (.headRefName |
+                    test("^dependabot/cargo/(fuzz/)?(patch|security-patch)-(fuzz-)?cargo-")))) |
+                  sort_by(.number)[] | [.number, .url] | @tsv')
+          while IFS=$'\t' read -r number url; do
+            [ -n "$number" ] || continue
+            files=$(gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/pulls/$number/files?per_page=100" --jq '.[].filename')
+            if grep -Evqx '(fuzz/)?Cargo\.(toml|lock)' <<< "$files"; then
+              continue
+            fi
+            commits=$(gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/pulls/$number/commits?per_page=100")
+            if jq -e 'flatten | length > 0 and all(.[];
+              .author.login == "dependabot[bot]" and .commit.verification.verified and
+              .commit.verification.reason == "valid" and
+              (.commit.message | contains("update-type: version-update:semver-patch")) and
+              (.commit.message | test("update-type: version-update:semver-(major|minor)") | not) and
+              (.commit.message |
+                test("dependency-group: (patch|security-patch)-(fuzz-)?cargo(\\n|$)")))' \
+              <<< "$commits" >/dev/null &&
+                gh pr merge --repo "$GITHUB_REPOSITORY" --auto --merge "$url"; then
+              exit 0
+            fi
+          done <<< "$candidates"
+
+  refresh:
+    name: refresh the oldest stale trusted PR
+    if: github.event_name != 'pull_request_target' && github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    concurrency:
+      group: auto-merge-refresh
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Refresh the oldest stale trusted PR
+        env:
+          AUTOMERGE_DEPLOY_KEY: ${{ secrets.AUTOMERGE_DEPLOY_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          stale=$(gh pr list --repo "$GITHUB_REPOSITORY" --base main --state open --limit 100 \
+            --json number,author,headRefName,isCrossRepository,isDraft,autoMergeRequest,mergeStateStatus \
+            --jq 'map(select((.author.login == "app/dependabot" or
+                              .author.login == env.OWNER) and
+                  (.isCrossRepository | not) and (.isDraft | not) and
+                  .autoMergeRequest != null and .mergeStateStatus == "BEHIND")) |
+                  sort_by(.number) | .[0] // empty |
+                  [.number, .headRefName] | @tsv')
+          [ -n "$stale" ] || exit 0
+          IFS=$'\t' read -r number head_ref <<< "$stale"
+          key="$RUNNER_TEMP/nomux-auto-merge-key"
+          known_hosts="$RUNNER_TEMP/nomux-known-hosts"
+          install -m 600 /dev/null "$key"
+          printf '%s\n' "$AUTOMERGE_DEPLOY_KEY" > "$key"
+          printf '%s\n' \
+            'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' \
+            > "$known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$known_hosts"
+
+          repo="$RUNNER_TEMP/nomux-auto-merge"
+          git init --quiet "$repo"
+          git -C "$repo" remote add origin "git@github.com:$GITHUB_REPOSITORY.git"
+          git -C "$repo" fetch --quiet --no-tags origin \
+            "refs/heads/main:refs/remotes/origin/main" \
+            "refs/heads/$head_ref:refs/remotes/origin/head"
+          git -C "$repo" checkout --quiet --detach origin/head
+          git -C "$repo" -c user.name='nomux auto-merge' \
+            -c user.email='nomux@users.noreply.github.com' merge --no-edit --no-ff origin/main
+          git -C "$repo" push --quiet origin "HEAD:refs/heads/$head_ref"
+          echo "refreshed PR #$number"
