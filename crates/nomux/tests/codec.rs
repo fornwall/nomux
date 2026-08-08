@@ -1,45 +1,11 @@
-//! The codec (`IMPLEMENTATION.md` § 9), from the two directions it can be got wrong in.
+//! Protocol codec coverage (`IMPLEMENTATION.md` § 9).
 //!
-//! [`generated`] drives the codec against *itself* over a generated input space: encode,
-//! decode, and assert that nothing panicked and nothing changed. That proves the two
-//! halves agree, not that either is right — swap `HelloOk`'s `resume_from` and
-//! `in_applied` in both directions and every case still passes, the two being the same
-//! width, while the bytes on the wire are wrong.
-//!
-//! [`vectors`] is the half that closes it: byte literals read out of the § 2.2 table by
-//! hand rather than produced by the encoder, checked in both directions. They are the only
-//! thing in the repository that would notice a field order, field width or endianness
-//! change, and the only reason the client — a separate codebase reading the same table —
-//! can be built against the document instead of against this code.
-//!
-//! One binary because they are one subject: a deliberate wire change is a
-//! [`nomux_protocol::PROTOCOL_VERSION`] bump, an edit to § 2.2 and a new set of vectors, and it
-//! should not be possible to move any one of the three alone.
+//! [`generated`] checks round trips and parser totality. [`vectors`] independently
+//! transcribes § 2.2, catching matching encoder/decoder mistakes. A wire change updates
+//! the protocol revision, the table, and its vectors together.
 
-/// Generated coverage: every field at its extremes, every frame type pointed at every
-/// payload, and payloads one flipped bit away from valid.
-///
-/// The codec reads bytes the peer chose, so the bar is not "rejects bad input" but "never
-/// panics on any input" — `indexing_slicing` is denied crate-wide, which makes an
-/// out-of-bounds panic unlikely rather than impossible.
-///
-/// This is the parser's coverage on stable, run as part of the normal suite: the input
-/// space that matters is a 4-byte header and a length-prefixed payload, which a generator
-/// reaches by construction. The coverage-guided half is `fuzz/`, which reaches
-/// `Frame::decode` under a sanitiser and off a corpus it keeps
-/// ([IMPLEMENTATION.md § 9](../../../IMPLEMENTATION.md#9-testing)); neither replaces the
-/// other. Committed fuzz seeds are replayed below on stable, so any discovered regression
-/// becomes part of the publish gate even when the time-boxed sanitizer search is not.
-/// `decode_header` has no target of its own,
-/// [`generated::header_decode_is_total`] having closed that domain outright.
-///
-/// The generator is a seeded [`generated::Rng`] rather than a property-testing crate. The
-/// cases here are already small — a payload is at most a few dozen bytes and a text field at
-/// most 24 characters — so shrinking would have nothing left to take away, and what it buys
-/// is not worth fifteen transitive dependencies and three proc-macro compiles in a tree that
-/// otherwise has two. What replaces it is determinism: every case is derived from
-/// [`generated::SEED`], a failure prints the `u64` its own case came from, and
-/// `Rng::new(that)` replays it alone.
+/// Deterministic generated coverage of field extremes, cross-type payloads and mutations.
+/// Committed fuzz seeds are replayed here so sanitizer findings remain release gates.
 mod generated {
     use std::collections::HashSet;
     use std::path::Path;
@@ -666,16 +632,7 @@ mod generated {
     }
 }
 
-/// Byte-exact conformance to the frame table in `IMPLEMENTATION.md` § 2.2.
-///
-/// A failure here is either a deliberate wire change, which is a [`nomux_protocol::PROTOCOL_VERSION`]
-/// bump and an edit to § 2.2, or a bug. It is never a test that needs relaxing.
-///
-/// The same table is written out beside this file as `wire-vectors.txt`, in a form an
-/// implementation in another language reads without parsing Rust. It is transcribed from
-/// § 2.2 by hand as these vectors are, not generated from them;
-/// [`vectors::the_hex_fixture_carries_the_same_table`] parses it and holds the two against
-/// each other, so neither can move alone and a slip in either is caught by the other.
+/// Byte-exact conformance to `IMPLEMENTATION.md` § 2.2 and the language-neutral fixture.
 mod vectors {
     use std::{cell::Cell, fmt::Debug};
 
@@ -684,8 +641,6 @@ mod vectors {
         PROTOCOL_VERSION, RESUME_FROM_START, SERVER_PREAMBLE, WinSize,
     };
 
-    /// The language-neutral transcription of the table below, compiled in rather than opened:
-    /// a test holding a file it has no handle to is a test that cannot quietly rewrite it.
     const FIXTURE: &str = include_str!("wire-vectors.txt");
 
     /// Distinct in all four fields on purpose: `cols`, `rows`, `xpixel` and `ypixel`
@@ -715,18 +670,7 @@ mod vectors {
         bytes: &'static [u8],
     }
 
-    /// Every vector, in discriminant order. Split into groups only to keep each list
-    /// readable; the tests below treat them as one table.
-    ///
-    /// Byte patterns are ascending and distinct per field, so that a swap between two
-    /// same-width neighbours — the failure a round-trip test cannot see — changes the
-    /// expected bytes.
-    ///
-    /// Both handshake frames appear more than once, because distinct values catch a swap
-    /// between two fields and do nothing about a swap *inside* one: each repeat disagrees
-    /// with the ones before it on every bit. `Hello`'s four jointly show all bits set,
-    /// bit 0 alone, all bits clear and bit 1 alone; that pins both states and the position
-    /// of each of its three bits. `HelloOk`'s two show its one flag at both states.
+    /// Every vector in discriminant order, with distinct values for adjacent fields.
     fn vectors() -> Vec<Vector> {
         let mut all = hello_vectors();
         all.extend(hello_ok_vectors());
@@ -1506,23 +1450,7 @@ mod vectors {
         Ok(records)
     }
 
-    /// `wire-vectors.txt` says what this table says, so a second implementation can be built
-    /// against these bytes without reading Rust.
-    ///
-    /// Neither side is generated from the other. Both are § 2.2 transcribed by hand — once as
-    /// the Rust literals above, once in the fixture's own notation — and this reads the file
-    /// back and holds the two against each other, so a wire change has to be made twice and a
-    /// slip in either is caught by the other. A file rendered from the table would instead
-    /// have carried whatever the table said, mistakes included: a fixture that agrees with
-    /// this code by construction is evidence about nothing, and the second reading of § 2.2 is
-    /// the whole of what it has to offer.
-    ///
-    /// The record's own fields are read and the frame built from them, which is then held
-    /// against `bytes`. So a record is wrong if any line of it is, and neither half of one can
-    /// be right on account of the other.
-    ///
-    /// [`FIXTURE`] is `include_str!`, so there is no handle to write the file through and no
-    /// flag that would rewrite it: a disagreement is settled against § 2.2 rather than blessed.
+    /// The independently transcribed fixture must describe the same frames and bytes.
     #[test]
     fn the_hex_fixture_carries_the_same_table() {
         let records = records(FIXTURE).unwrap_or_else(|complaint| panic!("{complaint}"));
@@ -1560,24 +1488,7 @@ mod vectors {
         }
     }
 
-    /// Every closed set on this wire is written down in bytes above, at every value it has,
-    /// and the handshake vectors are written at the revision this build speaks.
-    ///
-    /// The three sets are [`FrameType`], [`ExitKind`] and [`ErrorCode`] — the last
-    /// being the one a table like this most easily leaves half-written, its six values
-    /// riding on a frame nobody reaches on the happy path, so a fixture pinning `Takeover`
-    /// alone reads complete and lets another implementation number the rest as it likes.
-    ///
-    /// Swept from each set's `ALL` rather than from a list written out here, which would
-    /// stop covering the protocol the moment the protocol grew, and quietly. The two flags
-    /// bytes have no `ALL` and are destructured exhaustively instead, for the same property
-    /// reached the other way round: a bool added to either stops this file compiling. Both
-    /// states of each, because a bit exercised at one value is pinned only against being
-    /// renumbered wholesale — give `Hello` all of its flags at once and they can trade
-    /// places without moving a byte. The revision rides along because the `Hello` vectors
-    /// write it out as a literal, which is what makes them a check on the document and
-    /// equally what would let them pass at one the daemon refuses; `HelloOk` carries none
-    /// (§ 2.2).
+    /// Every value of each closed wire set and both states of every flag are covered.
     #[test]
     fn the_vectors_pin_every_value_of_every_closed_set() {
         let mut types = Vec::new();
