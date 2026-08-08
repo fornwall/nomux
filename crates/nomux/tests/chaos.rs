@@ -37,7 +37,7 @@ use std::fs;
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
-use nomux::{Frame, MAX_PAYLOAD, RESUME_FROM_START};
+use nomux_protocol::{Frame, MAX_PAYLOAD, RESUME_FROM_START};
 
 use harness::{
     MAX_PENDING_WRITE, Rng, Session, StreamModel, poll_by, reconnect_until_gap, socket_capacity,
@@ -61,7 +61,7 @@ fn frame_by(
     deadline: Instant,
     seed: u64,
     stalled: &str,
-) -> (nomux::FrameType, Vec<u8>) {
+) -> (nomux_protocol::FrameType, Vec<u8>) {
     client
         .frame_before(deadline, stalled)
         .unwrap_or_else(|| panic!("{stalled} (seed {seed})"))

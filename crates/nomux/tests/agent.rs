@@ -13,7 +13,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 
-use nomux::{Frame, FrameType, RESUME_FROM_START};
+use nomux_protocol::{Frame, FrameType, RESUME_FROM_START};
 
 use harness::{
     Client, SPIN_WINDOW, Session, cpu_ticks, read_uninterrupted, socket_capacity, still_serving,

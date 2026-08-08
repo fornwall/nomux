@@ -133,10 +133,7 @@ jobs:
       - if: github.event_name != 'schedule'
         run: prek run --all-files --skip cargo-nextest
 
-      # rustdoc's lints are a namespace of their own, reached by neither the clippy hook nor
-      # RUSTFLAGS, and a renamed item turns a link into nothing rather than into an error.
-      # `--document-private-items` because the binary is almost entirely private; `--lib --bins`
-      # because a bare `cargo doc` documents only the lib when both share a name.
+      # rustdoc has its own lints; include private binary modules and both targets.
       - if: github.event_name != 'schedule'
         run: cargo doc --locked --workspace --no-deps --document-private-items --lib --bins
 

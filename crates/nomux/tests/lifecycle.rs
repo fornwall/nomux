@@ -25,7 +25,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nomux::{Frame, FrameType, RESUME_FROM_START};
+use nomux_protocol::{Frame, FrameType, RESUME_FROM_START};
 
 use harness::{
     Client, Cue, FRAME_PATIENCE, Flock, HeldLock, Reaper, Rng, SETTLE, SPIN_WINDOW, Session,
@@ -74,7 +74,7 @@ fn a_child_killed_by_a_signal_is_reported_as_signalled_rather_than_as_a_status()
 
     assert_eq!(
         (replay.status, replay.kind),
-        (9, nomux::ExitKind::Signalled),
+        (9, nomux_protocol::ExitKind::Signalled),
         "a child killed by SIGKILL must arrive as the signal that killed it, not as \
          a status a process chose"
     );
@@ -150,7 +150,7 @@ fn an_unknown_outcome_is_sent_on_the_pass_that_decides_it() {
     );
     assert_eq!(
         replay.kind,
-        nomux::ExitKind::Unknown,
+        nomux_protocol::ExitKind::Unknown,
         "closing the terminal is not evidence that the child exited successfully"
     );
     assert!(
@@ -455,7 +455,7 @@ fn a_child_that_exits_with_input_still_queued_delivers_its_last_output_in_full()
 
     assert_eq!(
         ended,
-        (9, nomux::ExitKind::Exited),
+        (9, nomux_protocol::ExitKind::Exited),
         "the child's own status must survive the exit its queued input interrupted"
     );
     assert!(
@@ -1087,7 +1087,7 @@ fn a_session_whose_child_has_exited_keeps_its_files_and_its_status_with_nobody_a
     let replay = replay_to_the_exit(&mut client);
     assert_eq!(
         (replay.status, replay.kind),
-        (7, nomux::ExitKind::Exited),
+        (7, nomux_protocol::ExitKind::Exited),
         "the child's own status must survive being held for {UNATTENDED:?} with \
          nobody to give it to"
     );
@@ -1120,7 +1120,7 @@ struct Replay {
     /// Exit status, or the signal number when `kind` is `Signalled`.
     status: i32,
     /// How the child terminated.
-    kind: nomux::ExitKind,
+    kind: nomux_protocol::ExitKind,
     /// Whole seconds the daemon says have passed since the child let go of the
     /// terminal.
     since_terminal_closed_secs: u32,

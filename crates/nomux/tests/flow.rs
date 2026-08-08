@@ -28,7 +28,9 @@ use std::io::{ErrorKind, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-use nomux::{Frame, FrameType, HEADER_LEN, RESUME_FROM_START, SERVER_PREAMBLE, decode_header};
+use nomux_protocol::{
+    Frame, FrameType, HEADER_LEN, RESUME_FROM_START, SERVER_PREAMBLE, decode_header,
+};
 
 use harness::{
     ABANDON_PENDING_WRITE, Cue, FRAME_PATIENCE, MAX_PENDING_INPUT, MAX_PENDING_WRITE, SPIN_WINDOW,

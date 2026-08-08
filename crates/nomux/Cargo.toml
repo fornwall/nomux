@@ -10,6 +10,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[lib]
+name = "nomux_protocol"
+
 [dependencies]
 rustix = { version = "1.1.4", features = ["pty", "termios", "process", "event", "fs", "pipe", "stdio"] }
 # Raw signal, fork, and AF_UNIX calls that rustix does not expose with these features.

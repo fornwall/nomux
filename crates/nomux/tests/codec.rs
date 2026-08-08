@@ -13,7 +13,7 @@
 //! can be built against the document instead of against this code.
 //!
 //! One binary because they are one subject: a deliberate wire change is a
-//! [`nomux::PROTOCOL_VERSION`] bump, an edit to § 2.2 and a new set of vectors, and it
+//! [`nomux_protocol::PROTOCOL_VERSION`] bump, an edit to § 2.2 and a new set of vectors, and it
 //! should not be possible to move any one of the three alone.
 
 /// Generated coverage: every field at its extremes, every frame type pointed at every
@@ -45,7 +45,7 @@ mod generated {
     use std::path::Path;
     use std::{fs, io};
 
-    use nomux::{
+    use nomux_protocol::{
         ErrorCode, ExitKind, Frame, FrameType, HEADER_LEN, Hello, HelloOk, MAX_PAYLOAD, ProtoError,
         WinSize, decode_header,
     };
@@ -668,7 +668,7 @@ mod generated {
 
 /// Byte-exact conformance to the frame table in `IMPLEMENTATION.md` § 2.2.
 ///
-/// A failure here is either a deliberate wire change, which is a [`nomux::PROTOCOL_VERSION`]
+/// A failure here is either a deliberate wire change, which is a [`nomux_protocol::PROTOCOL_VERSION`]
 /// bump and an edit to § 2.2, or a bug. It is never a test that needs relaxing.
 ///
 /// The same table is written out beside this file as `wire-vectors.txt`, in a form an
@@ -679,7 +679,7 @@ mod generated {
 mod vectors {
     use std::{cell::Cell, fmt::Debug};
 
-    use nomux::{
+    use nomux_protocol::{
         ErrorCode, ExitKind, Frame, FrameType, HEADER_LEN, Hello, HelloOk, MAX_PAYLOAD,
         PROTOCOL_VERSION, RESUME_FROM_START, SERVER_PREAMBLE, WinSize,
     };

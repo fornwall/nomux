@@ -11,7 +11,7 @@
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 
-use nomux::{
+use nomux_protocol::{
     Frame, FrameType, HEADER_LEN, Header, MAX_AGENT_DATA, MAX_OUTPUT_DATA, MAX_PAYLOAD,
     SERVER_PREAMBLE, decode_header,
 };
@@ -266,11 +266,11 @@ impl Conn {
     ///
     /// # Errors
     ///
-    /// [`nomux::ProtoError`] for an unparseable header.
+    /// [`nomux_protocol::ProtoError`] for an unparseable header.
     pub(crate) fn take_frame(
         &mut self,
         scratch: &mut Vec<u8>,
-    ) -> Result<Option<FrameType>, nomux::ProtoError> {
+    ) -> Result<Option<FrameType>, nomux_protocol::ProtoError> {
         let available = self.rx.get(self.rx_pos..).unwrap_or(&[]);
         let Some(head) = available.first_chunk::<HEADER_LEN>() else {
             return Ok(None);
@@ -295,7 +295,7 @@ mod tests {
     use std::io::ErrorKind;
     use std::time::Instant;
 
-    use nomux::{
+    use nomux_protocol::{
         ErrorCode, Hello, HelloOk, PROTOCOL_VERSION, ProtoError, RESUME_FROM_START, WinSize,
     };
 

@@ -13,7 +13,7 @@ use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use nomux::{
+use nomux_protocol::{
     ErrorCode, ExitKind, Frame, FrameType, Hello, HelloOk, PROTOCOL_VERSION, RESUME_FROM_START,
     WinSize,
 };
@@ -182,7 +182,7 @@ struct Daemon {
     /// deadline by which it must. Usually a liveness probe from `list`.
     pending: Option<(Conn, Instant)>,
     /// Agent socket and the connection it is serving, once a session created with
-    /// [`nomux::Hello::agent_forward`] has bound one.
+    /// [`nomux_protocol::Hello::agent_forward`] has bound one.
     agent: Option<Agent>,
     /// Where the child starts, captured before the daemon moved to `/`.
     child_dir: PathBuf,
@@ -1736,7 +1736,7 @@ mod tests {
         assert_eq!(
             evicted,
             {
-                let mut wire = nomux::SERVER_PREAMBLE.to_vec();
+                let mut wire = nomux_protocol::SERVER_PREAMBLE.to_vec();
                 Frame::InputAck {
                     applied_through: TYPED.len() as u64,
                 }
@@ -1810,7 +1810,7 @@ mod tests {
         assert_eq!(
             greeting,
             {
-                let mut wire = nomux::SERVER_PREAMBLE.to_vec();
+                let mut wire = nomux_protocol::SERVER_PREAMBLE.to_vec();
                 Frame::HelloOk(HelloOk {
                     resume_from: 0,
                     in_applied: 0,
@@ -1848,7 +1848,7 @@ mod tests {
         }
         .encode(&mut wire)
         .expect("a valid frame");
-        peer.write_all(&wire[..=nomux::HEADER_LEN])
+        peer.write_all(&wire[..=nomux_protocol::HEADER_LEN])
             .expect("deliver an incomplete frame");
         peer.shutdown(std::net::Shutdown::Write)
             .expect("close only the input half");
@@ -1864,7 +1864,7 @@ mod tests {
         assert_eq!(
             collect(&mut peer),
             {
-                let mut expected = nomux::SERVER_PREAMBLE.to_vec();
+                let mut expected = nomux_protocol::SERVER_PREAMBLE.to_vec();
                 Frame::Error {
                     code: ErrorCode::Protocol,
                     message: "truncated frame at end of input",

@@ -33,7 +33,7 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
-use nomux::{Frame, RESUME_FROM_START};
+use nomux_protocol::{Frame, RESUME_FROM_START};
 
 use harness::{
     Rng, SETTLE, Session, Spawned, collect, control, control_with_shell, daemon_reaper, entries,
