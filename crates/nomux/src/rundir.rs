@@ -724,7 +724,7 @@ impl SessionPaths {
     /// else has to reach `kill`.
     pub(crate) fn unlink_all_locked(&self, _lock: &SpawnLock) -> io::Result<()> {
         let mut failure = Ok(());
-        for path in self.removal_order() {
+        for path in self.removal_order(&mut failure) {
             if let Err(err) = remove_node(&path)
                 && err.kind() != io::ErrorKind::NotFound
                 && failure.is_ok()
@@ -748,20 +748,44 @@ impl SessionPaths {
     /// The named files lead and are attempted whatever the directory says: a `read_dir`
     /// this call could not make is not a session with nothing left to remove (§ 6.6).
     /// The scan adds every *other* name sharing the id.
-    fn removal_order(&self) -> Vec<PathBuf> {
+    fn removal_order(&self, failure: &mut io::Result<()>) -> Vec<PathBuf> {
         /// The extensions the named paths already cover.
         const ALREADY: [&str; 5] = ["sock", "pid", "label", "agent", "lock"];
 
         let mut order = vec![self.socket(), self.pid(), self.label(), self.agent()];
-        if let Ok(entries) = fs::read_dir(&self.dir) {
-            order.extend(entries.filter_map(Result::ok).filter_map(|entry| {
-                let path = entry.path();
-                // No `session_id_of` validation: this compares against an id checked when
-                // the `SessionPaths` was built.
-                let mine = split_run_name(&path)
-                    .is_some_and(|(id, extension)| id == self.id && !ALREADY.contains(&extension));
-                mine.then_some(path)
-            }));
+        let scan_failure = |err: io::Error| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "session {}: {} could not be scanned: {err}",
+                    self.id,
+                    self.dir.display()
+                ),
+            )
+        };
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(entries) => Some(entries),
+            Err(err) => {
+                *failure = Err(scan_failure(err));
+                None
+            }
+        };
+        for entry in entries.into_iter().flatten() {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    if failure.is_ok() {
+                        *failure = Err(scan_failure(err));
+                    }
+                    continue;
+                }
+            };
+            let path = entry.path();
+            if split_run_name(&path)
+                .is_some_and(|(id, extension)| id == self.id && !ALREADY.contains(&extension))
+            {
+                order.push(path);
+            }
         }
         // `<id>.lock` last (§ 6.3), load-bearing: unlinks after it would land on a
         // session somebody else has legitimately brought up.
@@ -1085,7 +1109,9 @@ mod tests {
             fs::write(dir.join(name), b"").unwrap();
         }
 
-        let order = paths.removal_order();
+        let mut scanned = Ok(());
+        let order = paths.removal_order(&mut scanned);
+        scanned.expect("scan the run directory");
         assert_eq!(
             order.last(),
             Some(&paths.lock()),
@@ -1185,9 +1211,10 @@ mod tests {
             fs::read_dir(&dir).is_err(),
             "the fixture must take, or this asserts nothing"
         );
-        paths
+        let err = paths
             .unlink_all_locked(&lock)
-            .expect("the named files are removable whatever the scan could do");
+            .expect_err("an incomplete scan must be reported");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(
             !dir.join("tab_7.sock").exists(),
