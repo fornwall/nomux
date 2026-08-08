@@ -71,9 +71,15 @@ fn write_private(path: &Path, body: &[u8]) -> io::Result<()> {
     fs::File::from(file).write_all(body)
 }
 
-/// Binds a unix socket at exactly [`SOCKET_MODE`], never briefly wider ([`with_umask`]).
+/// Binds a non-blocking unix socket at exactly [`SOCKET_MODE`].
 pub(crate) fn bind_socket_private(path: &Path) -> io::Result<UnixListener> {
-    with_umask(SOCKET_MODE, || UnixListener::bind(path))
+    let listener = with_umask(SOCKET_MODE, || UnixListener::bind(path))?;
+    if let Err(err) = listener.set_nonblocking(true) {
+        drop(listener);
+        drop(fs::remove_file(path));
+        return Err(err);
+    }
+    Ok(listener)
 }
 
 /// Longest `<id>.pid` body anything reads (§ 6.6). A pid and its newline are eleven

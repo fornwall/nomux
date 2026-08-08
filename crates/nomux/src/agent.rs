@@ -128,7 +128,6 @@ impl Agent {
         drop(fs::remove_file(path));
         // Never briefly world-connectable: this is the socket that hands out signatures.
         let listener = crate::rundir::bind_socket_private(path)?;
-        listener.set_nonblocking(true)?;
         Ok(Self {
             listener,
             path: path.to_path_buf(),

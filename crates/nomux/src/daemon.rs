@@ -440,9 +440,7 @@ fn bind_socket(paths: &SessionPaths) -> io::Result<UnixListener> {
     paths.clear_pid();
     paths.clear_label();
 
-    let listener = crate::rundir::bind_socket_private(&path)?;
-    listener.set_nonblocking(true)?;
-    Ok(listener)
+    crate::rundir::bind_socket_private(&path)
 }
 
 /// What one entry of the poll set belongs to.
