@@ -1,37 +1,9 @@
 # Run with prek (https://github.com/j178/prek):
 #   prek install            install .git/hooks/pre-commit
 #   prek run --all-files    run every hook over the whole tree
-#
-# This file is the gate. .github/workflows/ci.yml runs `prek run --all-files` rather
-# than restating these commands, so a hook and the CI step that enforces it cannot
-# drift apart. What CI adds on top is steps of its own, none of them belonging in a
-# pre-commit hook: rustdoc, the workspace's one doctest, the ignored tests, the tag and
-# version check a `v*` push makes, and `cargo deny check advisories` — the advisories
-# alone, because that one fetches a database over the network and a hook may not.
-#
-# Hooks are ordered cheapest-first so an obvious failure reports fast.
-# They trigger on Rust sources and on manifests, since the lint configuration
-# itself lives in Cargo.toml.
-#
-# `--locked` on every compiling cargo hook: without it a hook may quietly update
-# Cargo.lock to make itself pass. `cargo fmt` resolves nothing and rejects the flag
-# outright, so it is the one hook without it.
 repos:
   - repo: local
     hooks:
-      # The tree cites IMPLEMENTATION.md and DESIGN.md by section number ~700 times, most
-      # of them from source comments. Nothing about a renumbering announces itself: a
-      # comment pointing at a section that has gone reads exactly like one that has not,
-      # so the reference rots in a file nobody reopens. Cheapest hook, and the only one
-      # that can fail on a commit touching no Rust at all.
-      #
-      # `ya?ml` and `^scripts/`, which is what it takes to reach every tracked file. `yml`
-      # alone matched neither this file — the gate itself, and a `.yaml` — nor anything a
-      # future workflow adds under that spelling; and `scripts/size-baseline`, read by
-      # scripts/build-release.sh, carries no extension at all, so a baseline refresh used to
-      # be a commit that fired no hook whatsoever. The shared nightly pin is extensionless too;
-      # `^scripts/` reaches both. This pattern decides only when the hook runs; what it then
-      # reads is the file list inside scripts/check-references.sh, and the two are kept in step.
       - id: section-references-resolve
         name: every § names a section that exists
         entry: sh scripts/check-references.sh
@@ -39,13 +11,6 @@ repos:
         files: '\.(rs|md|sh|toml|ya?ml)$|^scripts/'
         pass_filenames: false
 
-      # ci.yml carries ~50 lines of embedded shell that the hook below never sees —
-      # it matches `*.sh`. actionlint shellchecks every `run:` block and validates the
-      # workflow schema besides, which is the half of that file nothing else reads.
-      #
-      # From $PATH, as shellcheck below is. CI installs the released binary by
-      # checksum, so what fails a build is a pinned version; a laptop running a newer
-      # one may find more, which is the same deal shellcheck already has here.
       - id: actionlint
         name: actionlint
         entry: actionlint
@@ -53,15 +18,12 @@ repos:
         files: '^\.github/workflows/.*\.ya?ml$'
         pass_filenames: false
 
-      # Every tracked `*.sh`, matched by path suffix wherever it lands, rather than
-      # `scripts/*.sh`.
       - id: shellcheck
         name: shellcheck
         entry: shellcheck --shell=sh
         language: system
         files: '\.sh$'
 
-      # Neither `Cargo.lock` nor a manifest can change formatting; `rustfmt.toml` can.
       - id: cargo-fmt
         name: cargo fmt --check
         entry: cargo fmt --all --check
@@ -69,12 +31,7 @@ repos:
         files: '\.rs$|^rustfmt\.toml$'
         pass_filenames: false
 
-      # fuzz/ is a workspace of its own — fuzz/Cargo.toml says why — so `--all` above stops
-      # at the root's one member and rustfmt never sees a fuzz target. Its own hook rather
-      # than a second command on the one above, a hook being one entry, and it costs
-      # nothing: rustfmt resolves no dependencies, so this wants neither the nightly a fuzz
-      # build needs nor the C++ compile of libFuzzer it drags in. That compile is why the
-      # clippy pass over fuzz/ is a step in ci.yml's fuzz job and not a hook beside this.
+      # fuzz/ is a separate workspace.
       - id: cargo-fmt-fuzz
         name: cargo fmt --check (fuzz)
         entry: cargo fmt --manifest-path fuzz/Cargo.toml --all --check
@@ -82,8 +39,6 @@ repos:
         files: '^fuzz/.*\.(rs|toml)$|^rustfmt\.toml$'
         pass_filenames: false
 
-      # `-- -D warnings` rather than a deny in [workspace.lints], for the reason
-      # Cargo.toml gives.
       - id: cargo-clippy
         name: cargo clippy
         entry: cargo clippy --locked --workspace --all-targets -- -D warnings
@@ -98,11 +53,7 @@ repos:
         files: '(\.rs|\.toml)$|^Cargo\.lock$'
         pass_filenames: false
 
-      # Bans, licences and sources, which are answered from the lockfile alone. The
-      # advisories are CI's: they need the RustSec database fetched over the network, and a
-      # commit hook that reaches the network fails on a train. Every manifest can change
-      # the root dependency graph through workspace membership or path dependencies, so
-      # nested `Cargo.toml` files trigger it too.
+      # Advisory checks remain in CI because they require the network.
       - id: cargo-deny
         name: cargo deny check bans licenses sources
         entry: cargo deny --locked check bans licenses sources
@@ -110,8 +61,6 @@ repos:
         files: '(^|/)Cargo\.toml$|^Cargo\.lock$|^deny\.toml$'
         pass_filenames: false
 
-      # The fuzz workspace's build dependencies execute locally even though no harness
-      # artifact ships. Advisories stay in networked CI; provenance is cheap and offline.
       - id: cargo-deny-fuzz
         name: cargo deny fuzz sources
         entry: cargo deny --locked --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check sources
