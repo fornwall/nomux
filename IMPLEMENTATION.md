@@ -37,6 +37,8 @@ it, and what nomux *sets* is §6.1.1's. `NOMUX_UPDATE_BASELINE` is tested for ex
 | `HOME` | every mode | Second choice (§6.3), and the child's working directory (§6.1.1) |
 | `XDG_RUNTIME_DIR` | every mode | Login-scoped fallback run directory (§6.3) |
 | `SHELL` | daemon | The child's login shell (§6.1.1) |
+| `NOMUX_LAUNCHER` | `spawn` | `auto` (default), `direct` or `systemd` daemon launch (§6.2) |
+| `INVOCATION_ID` | `spawn`, daemon | Preserved across a systemd scope handoff; otherwise untouched (§6.2) |
 | `NOMUX_RING_BYTES` | daemon | Ring capacity in bytes (§4) |
 | `NOMUX_CHAOS_SEED` | the chaos suite | Disconnect-point seed; unset is a fixed default, so a failure reproduces (§9) |
 | `NOMUX_UPDATE_BASELINE` | `scripts/build-release.sh` | Rewrite `scripts/size-baseline` from this build (§8) |
@@ -88,12 +90,18 @@ and never has to scan for a boundary. *winsize* is four `u16`s — cols, rows, x
 | `0x09` | C→D | `Detach` | — |
 | `0x0a` | C→D | `Ping` | — |
 | `0x0b` | D→C | `Pong` | — |
-| `0x0c` | D→C | `Error` | `u16` code (1 protocol, 2 takeover, 3 version, 4 input_gap, 5 internal), UTF-8 message |
+| `0x0c` | D→C | `Error` | `u16` code (1 protocol, 2 takeover, 3 version, 4 input_gap, 5 internal, 6 already_attached), UTF-8 message |
 | `0x0d` | D→C | `AgentOpen` | `u32` generation |
 | `0x0e` | ↔ | `AgentData` | `u32` generation, opaque `ssh-agent` bytes |
 | `0x0f` | ↔ | `AgentClose` | `u32` generation |
 
-`Hello` carries the current revision, **10** — `PROTOCOL_VERSION` in
+Before its first response frame on every connection, the daemon writes the fixed 12-byte
+synchronization preamble `00 6e 6f 6d 75 78 2d 73 79 6e 63 ff`. A remote client scans for
+that complete sequence and starts frame decoding at the following byte, discarding login-shell
+output before it. The preamble is stable across revisions so a mismatched client can synchronize
+to the daemon's `Error{Version}` response.
+
+`Hello` carries the current revision, **11** — `PROTOCOL_VERSION` in
 `crates/nomux/src/lib.rs`, bumped on any wire change, compatible ones included.
 
 The session id is *not* in `Hello`: the socket path fixes it warm, and the id handed to
@@ -141,6 +149,7 @@ every other closed set on the wire — `Error.code`, `Exit.kind`.
 | --- | --- | --- |
 | 0 | agent forwarding (§6.7) | Only on the `Hello` that **creates** the session (§6.1.1) |
 | 1 | repaint with `ctrl_l` rather than `winch` (§4.3) | Every attach; it costs nothing to restate, and only the client knows what is on the screen |
+| 2 | attach only if detached (§6.4) | Every attach; refusal leaves the incumbent untouched, and clear preserves unconditional takeover |
 
 `HelloOk.flags`:
 
@@ -274,18 +283,19 @@ r=; case ${XDG_STATE_HOME-} in /*) r=${XDG_STATE_HOME%/}/nomux/run ;; *)
 case ${HOME-} in /*) r=${HOME%/}/.local/state/nomux/run ;; *)
 case ${XDG_RUNTIME_DIR-} in /*) r=${XDG_RUNTIME_DIR%/}/nomux ;; esac ;; esac ;; esac
 case $r in /*) printf 'NOMUX-RUNDIR %s\n' "$r" >&2 ;; esac
-[ -x "$p/nomux-$VER" ] && exec "$p/nomux-$VER" "$MODE" "$ID" 2>/dev/null
+[ -x "$p/nomux-$VER" ] && exec "$p/nomux-$VER" "$MODE" "$ID"
 echo "NOMUX-BOOTSTRAP $(uname -s) $(uname -m) $p"
 ```
 
 `exec` replaces the shell on success, so the `echo` is what a host with no usable binary
 answers with — but only behind the `[ -x ]`. A bare `exec` whose argument cannot be executed
 exits a non-interactive shell where it stands, and the line after it never runs at all: dash,
-bash and BusyBox `ash` all leave 127 and an empty stream, and `2>/dev/null` swallows even the
-shell's own diagnostic. The test is the whole of why the fallback is reachable. What it does
-not cover is `ENOEXEC` — a binary present, executable, and built for another architecture —
-which still exits 126 saying nothing, and is §5.3's one retry rather than something this line
-reports. Warm cost: zero extra round trips. `$MODE` is `spawn` or `attach`
+bash and BusyBox `ash` leave a shell status rather than reaching the fallback. The test is the
+whole of why the fallback is reachable. What it does not cover is `ENOEXEC` — a binary present,
+executable, and built for another architecture — which exits 126 and is §5.3's one retry.
+Stderr is deliberately retained: a binary that did run reports §10's versioned relay outcome
+there, while a failed `exec` has no such record and may carry the shell's own diagnostic.
+Warm cost: zero extra round trips. `$MODE` is `spawn` or `attach`
 ([DESIGN.md § 4](DESIGN.md#4-architecture)), a substitution rather than a second command,
 the client knowing which because it knows whether it holds a session for this tab. The
 fields are `uname`'s — `Linux`, `x86_64` — because `sh` emits the line before any binary
@@ -305,13 +315,13 @@ which is a wire change for something that needs none. An SSH exec channel carrie
 separate extended data, so the two never interleave, and ~100 bytes cannot fill a window
 sshd opens at 2 MiB.
 
-§5.2's `exec` carries no `2>/dev/null`, so on that path the binary's own stderr reaches the
-channel as well, and it still does not collide: everything nomux writes there is §11's
-`nomux: `, this line is written before any binary exists as a process, and it is therefore
-first on the stream whichever of the two commands ran. The prefix is what the client scans
-for rather than reading the stream as one field, because a login shell sourcing an rc file
-gets there first on plenty of hosts — the same chatter that would corrupt the frames on
-stdout, which is the other half of why the field is not there.
+On both exec paths the binary's own stderr reaches the channel, and it still does not collide:
+nomux's human diagnostics start `nomux: `, §10's machine record has its own exact prefix, and
+this line is written before any binary exists as a process, so it is first among nomux's
+output whichever command ran. Each prefix is scanned as a complete line rather than treating
+the stream as one field, because a login shell sourcing an rc file gets there first on plenty
+of hosts — the same chatter that would corrupt the frames on stdout, which is the other half
+of why the field is not there.
 
 The value is §6.3's precedence restated in `sh`, and it has to be that precedence exactly.
 Each source counts **only where it names an absolute path**, `rundir::absolute_env` testing
@@ -388,8 +398,8 @@ daemon's own code and so needs none of this.
 negative is cached per-host so a hardened box is not re-probed on each reconnect. Three
 conditions off the tree reach the same fallback: a restricted shell with no `uname` is
 plain SSH; `AllowStreamLocalForwarding no` costs only the warm path, leaving the exec
-relay; and systemd may kill the SSH session scope at logout, which this release reports as
-an explicit limitation (§6.2) rather than pretending a double-fork or linger marker fixes.
+relay; and a host without §6.2's persistent user-manager conditions uses direct daemon
+startup, which makes no promise against a service manager that kills the SSH session scope.
 
 ## 6. Daemon
 
@@ -477,14 +487,30 @@ after: `exec` preserves a pending signal as well as a blocked one, so a signal b
 pending arrives the instant the mask clears, and a handler armed behind that is one it
 missed.
 
-This is POSIX terminal detachment, not escape from a service manager. On systemd, `setsid`
-and `fork` leave the process in the SSH `session-*.scope`; with `KillUserProcesses=yes`,
-logout stops that scope and the daemon with it. `loginctl enable-linger` keeps the user's
-manager alive but does not move an already-running session process into a manager unit, so
-it is not a workaround for this release. Reliable survival under that policy requires a
-user-manager-backed scope or service and remains a release gate in [PLAN.md](PLAN.md);
-whatever linger detection such a launcher needs is that work's to add. Nothing on the wire
-reports logout policy, which the daemon could not turn into a survival statement anyway.
+This is POSIX terminal detachment, not escape from a service manager: on systemd, `setsid`
+and `fork` alone leave a process in the SSH `session-*.scope`, where `KillUserProcesses=yes`
+may stop it at logout. `spawn` therefore selects its launcher before starting anything:
+
+- `NOMUX_LAUNCHER=auto` (also unset or empty) uses a transient `systemd-run --user --scope`
+  only when `systemd-run` exists at `/usr/bin` or `/bin`, an absolute
+  `$XDG_RUNTIME_DIR/bus` accepts a connection, and `loginctl show-user` says exactly
+  `Linger=yes`. Otherwise it takes the direct path above. A manager merely running now is
+  not a promise that it will survive the final logout.
+- `direct` forces that fallback; `systemd` forces the scope and reports startup failure if
+  the trusted executable or manager is unavailable. No executable is selected through
+  caller-controlled `PATH`.
+- The scope is manager-owned, named `nomux-<id>-<relay-pid>.scope`, and collected after it
+  empties. The already-held spawn-lock descriptor crosses `systemd-run`; the final command
+  resolves `/proc/<relay-pid>/exe`, retaining the exact running nomux inode across an atomic
+  upgrade. Labels escape systemd-run's dollar expansion. Its replacement `INVOCATION_ID`
+  is restored to the creator's raw value or absence before the PTY child is created, so the
+  launch policy does not otherwise rewrite the shell environment.
+
+Automatic direct fallback is intentionally honest rather than optimistic: it supports hosts
+without systemd or linger, but promises no persistence under a policy that kills the SSH
+scope. Nothing on the wire reports logout policy, which the daemon could not turn into a
+survival statement anyway. [PLAN.md](PLAN.md) retains the real SSH logout matrix as required
+validation.
 
 ### 6.3 Socket
 
@@ -571,10 +597,13 @@ client's ([DESIGN.md § 5.1](DESIGN.md#51-identity)).
 
 ### 6.4 Multiple clients
 
-Exactly one attached client. A second `Hello` on a live session takes over; the previous
-connection receives `Error{TAKEOVER}` and closes. Its queued output is dropped first
-(§ 4.1) and the final write is bounded by § 6.5's 500 ms. No read-only mirrors and no
-session sharing.
+Exactly one attached client. By default, a second `Hello` on a live session takes over;
+the previous connection receives `Error{TAKEOVER}` and closes. Its queued output is dropped
+first (§ 4.1) and the final write is bounded by § 6.5's 500 ms. A `Hello` with
+`if_detached` set instead receives `Error{ALREADY_ATTACHED}` and closes when the slot is
+occupied, leaving the incumbent, its queued output, the agent channel and every session
+setting untouched. The client may use that refusal to ask before retrying without the flag.
+No read-only mirrors and no session sharing.
 
 **The `Hello` is what takes over, not the `connect`.** A newly accepted connection waits as
 *pending* and owns nothing until it greets, since `list` (§ 6.6) and § 6.3's spawn race both
@@ -585,8 +614,14 @@ session keeps its client. Only one may be pending at a time; a second waits in t
 where its `connect` completes and so `list` still reports the session, until the incumbent
 greets, hits end of file, or misses its 5 s deadline.
 
+The conditional decision is made after the incumbent's final read. Input already delivered
+therefore remains applied, while a `Detach` already waiting in the old connection frees the
+slot before `if_detached` is tested and lets the newcomer attach. A close whose readiness has
+not yet been observed may conservatively earn `ALREADY_ATTACHED`; retrying it is safe.
+
 **A `Hello` this daemon cannot answer is refused before the eviction, not after.** The
-`Hello.protocol` check runs on the pending connection, ahead of the handshake. Deferred past
+`Hello.protocol` check runs on the pending connection, ahead of both the conditional-attached
+test and the handshake. Deferred past
 the takeover, a newer client's *failed* greeting would throw the working client off and drop
 the newcomer too, leaving nobody attached and nobody permitted to reconnect
 ([DESIGN.md § 6.4](DESIGN.md#64-version-skew)).
@@ -604,11 +639,11 @@ end. Read as a departure, that end of file cost the script every byte its child 
 after it ran out. A half-closed client holds the session as an attached silent one does,
 bounded by that same 8 MiB.
 
-Beside those stand eight kinds of refusal, each carrying a final `Error` — the takeover
-above, four malformations, a version this daemon cannot answer (refused on the *pending*
-connection, per the paragraph above), a shell that would not start, and § 3's input gap —
-and the session's own shutdown (§ 6.5), which closes whatever is attached whether or not it
-did anything wrong.
+Beside those stand nine kinds of refusal, each carrying a final `Error` — the takeover and
+conditional occupied-slot refusal above, four malformations, a version this daemon cannot
+answer (refused on the *pending* connection, per the paragraph above), a shell that would
+not start, and § 3's input gap — and the session's own shutdown (§ 6.5), which closes
+whatever is attached whether or not it did anything wrong.
 
 **A second `Hello` on an established connection is one of those malformations.** Greeting
 is what *makes* a connection the client, so one arriving on a connection that already is
@@ -964,6 +999,35 @@ of these each can produce. It reports the fate of *the relay*, never of the chil
 | 1 | The relay had the session and then failed: an unexpected errno out of `poll`, a read or a write — `ENOSPC` on a redirected stdout, and the like. **Not a statement about the session**, which is unaffected and whose host is not unattachable; a client that scores this as one takes a host out of rotation over a full disk |
 | 126 | This mode cannot have the session: `spawn` met an id already taken, `attach` one it could not join, or either met a socket that would not answer at all — full backlog, `EACCES`, descriptor limit — and a probe settling neither death nor life is evidence *of* a session (§ 6.3). Also a run directory refused (§ 6.3) — group-writable, another uid's, a symlink, unopenable by its owner — or one no source names at all, or one on a filesystem that can give no `flock` and so cannot serialise a spawn |
 | 127 | No such session. `attach`: a refused `connect`, a socket no longer there, or a run directory simply absent. `spawn`: a daemon that never bound within the timeout |
+
+Those legacy codes deliberately collapse decisions a client must keep apart. On every
+classified runtime failure the binary therefore writes this stable ASCII record to stderr
+before its escaped human diagnostic:
+
+```text
+NOMUX-RELAY-ERROR 1 <class>
+```
+
+The record is exactly three space-separated fields and one complete line. A client scans
+complete stderr lines — login-shell or bootstrap output may precede it — accepts only version
+1 and the class/code pairs below, and never parses the human line. No caller-controlled id,
+path or error text occurs in the record.
+
+| Class | Legacy code | Established fact |
+| --- | --- | --- |
+| `collision` | 126 | `spawn` found a live session occupying the id |
+| `retryable` | 126 | Repeating the same invocation after bounded backoff is safe: transient resource pressure while `attach` probes, or contention exhausting the spawn-lock acquisition policy |
+| `unsafe-host` | 126 | The host cannot currently provide the trusted run-directory or locking boundary this mode requires |
+| `uncertain` | 126 | The probe established neither presence nor absence; notably, `spawn` never retries creation from this state |
+| `missing-session` | 127 | `attach` established that no session answers at the id |
+| `startup-failure` | 127 | `spawn` proved the id free but could not launch a daemon or observe its publication deadline |
+| `post-connect` | 1 | A stream was obtained and the local relay subsequently failed; this says nothing adverse about the host or session |
+
+Exit 64 is command usage and intentionally has no runtime record. Clean exit 0 has none
+either, including a frame-level daemon refusal the transparent relay merely drains. An old
+binary supplies no record, so a new client falls back to the legacy code; an old client still
+sees the unchanged code from a new binary. A missing or unrunnable binary likewise has no
+record, which keeps the shell's own 126/127 distinguishable from a nomux runtime outcome.
 
 The child's own status, when known, arrives in the `Exit` frame (§ 2.2) the relay cannot
 read (§ 7); `128+n` is the client's convention for a known signal. Kind `Unknown` carries

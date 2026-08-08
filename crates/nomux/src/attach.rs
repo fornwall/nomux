@@ -7,36 +7,41 @@
 //!
 //! One relay, two ways in ([`Intent`]). Everything past the connection is shared.
 //!
-//! # The four refusals
+//! # Probe outcomes
 //!
 //! Both modes decide on one probe of the socket, and § 6.3 makes a `connect` that failed
 //! for anything but a refusal evidence of nothing.
 //!
-//! | probe             | `attach`, wanting a session | `spawn`, wanting a free id |
-//! |-------------------|-----------------------------|----------------------------|
-//! | refused or absent | [`no_such_session`], 127    | start a daemon             |
-//! | accepted          | relay to it                 | [`already_running`], 126   |
-//! | neither           | [`unattachable`], 126       | [`may_be_running`], 126    |
+//! | probe             | `attach`, wanting a session            | `spawn`, wanting a free id |
+//! |-------------------|-----------------------------------------|----------------------------|
+//! | refused or absent | [`MissingSession`][FailureClass], 127   | start a daemon             |
+//! | accepted          | relay to it                             | [`Collision`][FailureClass], 126 |
+//! | neither           | [`Retryable`][FailureClass] or [`Uncertain`][FailureClass], 126 | [`Uncertain`][FailureClass], 126 |
 //!
 //! [`crate::usock::connect_within`] has why the last row is the wedged daemon rather than
 //! an absent one.
 
 use std::collections::VecDeque;
-use std::env;
+use std::error::Error as StdError;
+use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::mem::{MaybeUninit, size_of};
 use std::net::Shutdown;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
-use std::process::{ChildStderr, Command, Stdio};
+use std::process::ChildStderr;
 use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags};
 
-use crate::rundir::{SessionPaths, SpawnLock, check_run_dir, ensure_run_dir};
+use crate::rundir::{SessionPaths, check_run_dir, ensure_run_dir};
 use crate::usock::{Liveness, liveness};
+
+/// Legacy status for a runtime refusal that does not establish absence.
+const EXIT_UNATTACHABLE: u8 = 126;
+/// Legacy status for an absent session or a daemon that never became reachable.
+const EXIT_NO_SESSION: u8 = 127;
 
 /// How long to wait for a freshly spawned daemon to bind its socket.
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -78,47 +83,147 @@ pub(crate) enum Intent<'a> {
     Resume,
 }
 
+/// Stable machine-readable reason a relay invocation failed.
+///
+/// The variants deliberately describe the client's next decision instead of an errno:
+/// several different syscalls can say that retrying is safe, while the same `TimedOut`
+/// means retrying an `attach` but not a `spawn` whose id was never proved free.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FailureClass {
+    /// `spawn` found a live session already occupying the requested id.
+    Collision,
+    /// Repeating the same invocation after bounded backoff is safe.
+    Retryable,
+    /// This host cannot currently provide a trusted run-directory or locking boundary.
+    UnsafeHost,
+    /// The invocation established neither that the session exists nor that it is absent.
+    Uncertain,
+    /// `attach` found no session at the requested id.
+    MissingSession,
+    /// `spawn` established that no daemon became reachable.
+    StartupFailure,
+    /// The relay reached the session and subsequently failed locally.
+    PostConnect,
+}
+
+impl FailureClass {
+    /// Token carried by the versioned stderr record.
+    pub(crate) const fn token(self) -> &'static str {
+        match self {
+            Self::Collision => "collision",
+            Self::Retryable => "retryable",
+            Self::UnsafeHost => "unsafe-host",
+            Self::Uncertain => "uncertain",
+            Self::MissingSession => "missing-session",
+            Self::StartupFailure => "startup-failure",
+            Self::PostConnect => "post-connect",
+        }
+    }
+
+    /// Existing process status retained for clients that do not read the stderr record.
+    pub(crate) const fn exit_code(self) -> u8 {
+        match self {
+            Self::Collision | Self::Retryable | Self::UnsafeHost | Self::Uncertain => {
+                EXIT_UNATTACHABLE
+            }
+            Self::MissingSession | Self::StartupFailure => EXIT_NO_SESSION,
+            Self::PostConnect => 1,
+        }
+    }
+}
+
+/// A classified runtime failure of `spawn` or `attach`.
+#[derive(Debug)]
+pub(crate) struct Failure {
+    class: FailureClass,
+    source: io::Error,
+}
+
+impl Failure {
+    const fn new(class: FailureClass, source: io::Error) -> Self {
+        Self { class, source }
+    }
+
+    /// Machine-readable class of this failure.
+    pub(crate) const fn class(&self) -> FailureClass {
+        self.class
+    }
+}
+
+impl fmt::Display for Failure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl StdError for Failure {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Either malformed session input or a classified runtime relay failure.
+///
+/// Usage remains exit 64 and is intentionally absent from the runtime record's closed set.
+#[derive(Debug)]
+pub(crate) enum RunError {
+    /// A session id that cannot name a session on this command line.
+    Usage(io::Error),
+    /// A runtime outcome carrying a stable [`FailureClass`].
+    Classified(Failure),
+}
+
+impl From<Failure> for RunError {
+    fn from(failure: Failure) -> Self {
+        Self::Classified(failure)
+    }
+}
+
 /// Reaches the session `session_id` names, per `intent`, and relays stdio to it.
 ///
 /// # Errors
 ///
 /// Fails if the session cannot be reached or created, or if relaying fails. The two are
 /// separate kinds, which is [`relay_failed`]'s whole job.
-pub(crate) fn run(session_id: &str, intent: Intent<'_>) -> io::Result<()> {
-    let paths = SessionPaths::new(session_id)?;
+pub(crate) fn run(session_id: &str, intent: Intent<'_>) -> Result<(), RunError> {
+    let paths = SessionPaths::new(session_id).map_err(|err| {
+        if err.kind() == io::ErrorKind::InvalidInput {
+            RunError::Usage(err)
+        } else {
+            Failure::new(FailureClass::UnsafeHost, err).into()
+        }
+    })?;
     let stream = match intent {
         Intent::Create(label) => create(&paths, label)?,
         Intent::Resume => resume(&paths)?,
     };
-    relay(&stream).map_err(|err| relay_failed(&err))
+    relay(&stream).map_err(|err| relay_failed(&err).into())
 }
 
-/// Renames a failure of the relay itself, which has already had the session.
+/// Classifies a failure of the relay itself, which has already had the session.
 ///
-/// Everything else out of [`run`] answers the question § 10's table asks — whether this
-/// mode can have this session — and every kind that table does not name scores 126,
-/// "this mode cannot have the session", which `DESIGN.md` § 7 has the client cache per
-/// host. A relay that connected, ran for an hour and then met `ENOSPC` writing the stdout
-/// the user redirected has answered that question already and answered it *yes*:
-/// `nomux attach work > /var/log/big` on a filesystem that fills would otherwise take the
-/// host out of the client's rotation over a full disk.
+/// Everything else out of [`run`] describes why this mode could not reach the session. A
+/// relay that connected, ran for an hour and then met `ENOSPC` writing the stdout the user
+/// redirected has already established that the host and session were usable. Calling that
+/// [`FailureClass::PostConnect`] is what tells a client to retry `attach`, rather than to
+/// take the host out of rotation over a full disk.
 ///
-/// One kind for all of them, since none of what `relay` can propagate — `poll`,
+/// One class for all of them, since none of what `relay` can propagate — `poll`,
 /// [`Pump::fill_from`], [`Pump::drain_to`] — says anything about the session, and nothing
 /// else in this crate constructs it.
-fn relay_failed(err: &io::Error) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::ConnectionAborted,
-        format!("relaying to the session failed: {err}"),
+fn relay_failed(err: &io::Error) -> Failure {
+    Failure::new(
+        FailureClass::PostConnect,
+        io::Error::other(format!("relaying to the session failed: {err}")),
     )
 }
 
 /// Connects to a session that is already there, and refuses to invent one that is not.
-fn resume(paths: &SessionPaths) -> io::Result<UnixStream> {
+fn resume(paths: &SessionPaths) -> Result<UnixStream, Failure> {
     // Checked and never created, which is `list` and `kill`'s rule (§ 6.3) and is
     // this mode's now that it creates nothing either. A directory that is not there
     // holds no session, which is the refusal below rather than a failure of its own.
-    if !check_run_dir(paths.dir())? {
+    if !check_run_dir(paths.dir()).map_err(|err| Failure::new(FailureClass::UnsafeHost, err))? {
         return Err(no_such_session(paths));
     }
     match liveness(&paths.socket(), CONNECT_TIMEOUT) {
@@ -130,58 +235,78 @@ fn resume(paths: &SessionPaths) -> io::Result<UnixStream> {
 
 /// `attach` on an id nothing is serving — never created here, or reaped, which are not
 /// told apart because both want the same next command.
-fn no_such_session(paths: &SessionPaths) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::NotFound,
-        format!(
+fn no_such_session(paths: &SessionPaths) -> Failure {
+    Failure::new(
+        FailureClass::MissingSession,
+        io::Error::other(format!(
             "no session {id}: nothing answers on {sock}. `nomux spawn {id}` starts one, \
              and `nomux list` says what this host is holding",
             id = paths.id(),
             sock = paths.socket().display(),
-        ),
+        )),
     )
 }
 
 /// `attach` on an id whose socket answered neither death nor life.
-fn unattachable(paths: &SessionPaths, err: &io::Error) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::ResourceBusy,
-        format!(
+fn unattachable(paths: &SessionPaths, err: &io::Error) -> Failure {
+    Failure::new(
+        resume_probe_class(err),
+        io::Error::other(format!(
             "session {id} could not be joined: {sock} could not be probed, so that nothing \
              is serving it was never established: {err}. `nomux list` says what this host \
              is holding",
             id = paths.id(),
             sock = paths.socket().display(),
-        ),
+        )),
     )
+}
+
+/// Transient resource pressure under which repeating an `attach` is safe.
+fn resume_probe_class(err: &io::Error) -> FailureClass {
+    let transient_kind = matches!(
+        err.kind(),
+        io::ErrorKind::TimedOut
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::OutOfMemory
+    );
+    let transient_errno = matches!(
+        err.raw_os_error(),
+        Some(libc::EAGAIN | libc::EMFILE | libc::ENFILE | libc::ENOMEM | libc::ENOBUFS)
+    );
+    if transient_kind || transient_errno {
+        FailureClass::Retryable
+    } else {
+        FailureClass::Uncertain
+    }
 }
 
 /// `spawn` on an id something is already serving: the client's own state disagreeing with
 /// the host's rather than a race to retry.
-fn already_running(paths: &SessionPaths) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        format!(
+fn already_running(paths: &SessionPaths) -> Failure {
+    Failure::new(
+        FailureClass::Collision,
+        io::Error::other(format!(
             "session {id} already exists: something answers on {sock}. `nomux attach {id}` \
              joins it, and `nomux kill {id}` ends it",
             id = paths.id(),
             sock = paths.socket().display(),
-        ),
+        )),
     )
 }
 
 /// `spawn` on an id whose socket answered neither death nor life: [`already_running`]'s
 /// kind on weaker evidence, `spawn` being allowed to create only an id it can say is free.
-fn may_be_running(paths: &SessionPaths, err: &io::Error) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        format!(
+fn may_be_running(paths: &SessionPaths, err: &io::Error) -> Failure {
+    Failure::new(
+        FailureClass::Uncertain,
+        io::Error::other(format!(
             "session {id} may already exist: {sock} could not be probed, so that it is \
              free was never established: {err}. `nomux attach {id}` joins it if it is \
              there, and `nomux list` says what this host is holding",
             id = paths.id(),
             sock = paths.socket().display(),
-        ),
+        )),
     )
 }
 
@@ -192,18 +317,25 @@ fn may_be_running(paths: &SessionPaths, err: &io::Error) -> io::Error {
 /// of the function rather than released after the spawn, because garbage collection
 /// takes the same lock (`IMPLEMENTATION.md` § 6.6): while it is held, nothing can
 /// unlink the socket this is waiting for.
-fn create(paths: &SessionPaths, label: Option<&str>) -> io::Result<UnixStream> {
+fn create(paths: &SessionPaths, label: Option<&str>) -> Result<UnixStream, Failure> {
     // Before the lock and the probe below, not on the way to spawning a daemon. The
     // socket this is about to hand the user's keystrokes to is a *name* in the run
     // directory (§ 6.3), and where that directory is a symlink into somewhere another
     // user can write, the name is theirs to make: checking only when nothing answers
     // checks only the case where nothing was planted.
-    ensure_run_dir(paths.dir())?;
+    ensure_run_dir(paths.dir()).map_err(|err| Failure::new(FailureClass::UnsafeHost, err))?;
 
     // A collector may unlink `<id>.lock` while this call is blocked on it, which
     // `rundir::SpawnLock` has: the lock that comes back is the one on the file now at
     // the path.
-    let spawn_lock = paths.lock_spawn()?;
+    let spawn_lock = paths.lock_spawn().map_err(|err| {
+        let class = if err.kind() == io::ErrorKind::ResourceBusy {
+            FailureClass::Retryable
+        } else {
+            FailureClass::UnsafeHost
+        };
+        Failure::new(class, err)
+    })?;
 
     let socket = paths.socket();
     // Once, and under the lock: another spawn may have created the session while we
@@ -218,12 +350,17 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> io::Result<UnixStream> {
         Liveness::Unknown(err) => return Err(may_be_running(paths, &err)),
     }
 
-    let complaint = match spawn_daemon(paths.id(), label, &spawn_lock) {
+    let complaint = match crate::launcher::spawn_daemon(paths.id(), label, &spawn_lock) {
         Ok(complaint) => complaint,
         // The one failure with nothing of anyone's behind it: no daemon was started, and
         // the probe above has just said nobody else is serving the id either, so the
         // name is this call's own to give back.
-        Err(err) => return Err(released(paths, err)),
+        Err(err) => {
+            return Err(released(
+                paths,
+                Failure::new(FailureClass::StartupFailure, err),
+            ));
+        }
     };
 
     let deadline = Instant::now() + SPAWN_TIMEOUT;
@@ -240,7 +377,10 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> io::Result<UnixStream> {
                         || format!("daemon for session {id} did not start"),
                         |said| format!("daemon for session {id} did not start: {said}"),
                     );
-                    let refusal = io::Error::new(io::ErrorKind::TimedOut, complaint);
+                    let refusal = Failure::new(
+                        FailureClass::StartupFailure,
+                        io::Error::new(io::ErrorKind::TimedOut, complaint),
+                    );
                     return Err(released(paths, refusal));
                 }
                 std::thread::sleep(SPAWN_POLL_INTERVAL);
@@ -258,11 +398,10 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> io::Result<UnixStream> {
 ///
 /// Called from the two exits that established the id is nobody's and from nowhere else,
 /// § 6.6 forbidding an exit that established neither death nor life to unlink over a live
-/// session. Which exit it is cannot be read off the error, which is why this is a call
-/// rather than a wrapper on every failure: the deadline above and
-/// [`crate::usock::connect_within`] both report `TimedOut`, one over a socket nothing ever
-/// bound and one over a socket somebody bound and stopped accepting on.
-fn released(paths: &SessionPaths, err: io::Error) -> io::Error {
+/// session. This remains an explicit call rather than cleanup attached to a failure class:
+/// classification says what the client does next, while only the observation at the call
+/// site licenses unlinking the name.
+fn released(paths: &SessionPaths, err: Failure) -> Failure {
     drop(fs::remove_file(paths.lock()));
     err
 }
@@ -285,70 +424,6 @@ fn await_publication(paths: &SessionPaths, deadline: Instant) {
     while !pid.exists() && Instant::now() < deadline {
         std::thread::sleep(PUBLISH_POLL_INTERVAL);
     }
-}
-
-/// Starts the daemon detached from this process's session.
-///
-/// Both halves — `setsid` and `/dev/null` stdio — are the daemon's own job as of
-/// `IMPLEMENTATION.md` § 6.2, and both are still done here because it cannot reach
-/// either soon enough; that section has the two windows this closes.
-fn spawn_daemon(
-    session_id: &str,
-    label: Option<&str>,
-    spawn_lock: &SpawnLock,
-) -> io::Result<Option<ChildStderr>> {
-    // The inode this process was loaded from, not the path it was loaded under, for two
-    // reasons. A name is resolved again at exec, and what it resolves to by then belongs to
-    // any uid that can write the install directory (`SECURITY.md`) — only that second exec
-    // is closed, the first having run out of that directory, whose trust `DESIGN.md` § 8
-    // leaves to the client. And the name need not resolve to this build at all: § 5.2
-    // installs by `mv -f`, which unlinks the running inode without destroying it, so a
-    // spawn parked in that window would otherwise lose its daemon to a concurrent upgrade
-    // *of its own version*.
-    let mut command = Command::new("/proc/self/exe");
-    let lock_fd = spawn_lock.raw_fd();
-    command
-        // Keeps the real path in `ps`, off the very link named above, so a host with no
-        // `/proc` still fails here rather than newly at the exec.
-        // `control::names_daemon_for` skips `argv[0]` and reads neither spelling.
-        .arg0(env::current_exe()?)
-        .arg("daemon")
-        .arg(session_id)
-        // Private startup capability, deliberately an argument rather than an
-        // environment variable the login shell could inherit. The descriptor names
-        // the already-locked open-file description; the number alone grants nothing.
-        .arg("--lock-fd")
-        .arg(lock_fd.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        // A pipe rather than `/dev/null`, which is the only reason a failure to start
-        // has a reason attached to it (§ 6.2).
-        .stderr(Stdio::piped());
-    if let Some(label) = label {
-        // As two arguments, never `--label=<text>`: the label is free-form text
-        // from a tab title and this way nothing has to be escaped.
-        command.arg("--label").arg(label);
-    }
-
-    // Bound out here rather than written inside the `unsafe` block below, for the
-    // reason `pty::Pty::spawn` gives at the same shape.
-    let pre_exec = move || -> io::Result<()> {
-        rustix::process::setsid()?;
-        // `SpawnLock` opens `CLOEXEC` by default. Clear it only in the forked child:
-        // descriptor flags are per descriptor table, so the parent's copy stays
-        // protected while this one crosses exactly this exec. The daemon restores it
-        // before it can spawn the login shell.
-        // SAFETY: `lock_fd` belongs to `spawn_lock`, which outlives `Command::spawn`.
-        let lock = unsafe { BorrowedFd::borrow_raw(lock_fd) };
-        rustix::io::fcntl_setfd(lock, rustix::io::FdFlags::empty())?;
-        Ok(())
-    };
-    // SAFETY: runs in the forked child before exec and must be async-signal-safe.
-    // `setsid` and `fcntl` are.
-    unsafe {
-        command.pre_exec(pre_exec);
-    }
-    command.spawn().map(|mut child| child.stderr.take())
 }
 
 /// Whatever the daemon managed to say before it stopped saying anything.
@@ -684,9 +759,42 @@ impl Pump {
 #[cfg(test)]
 mod tests {
     use std::fs::File;
-    use std::io::Write as _;
+    use std::io::{self, Write as _};
 
-    use super::{ChildStderr, daemon_complaint};
+    use super::{ChildStderr, FailureClass, daemon_complaint, resume_probe_class};
+
+    #[test]
+    fn failure_classes_have_stable_tokens_and_legacy_statuses() {
+        let cases = [
+            (FailureClass::Collision, "collision", 126),
+            (FailureClass::Retryable, "retryable", 126),
+            (FailureClass::UnsafeHost, "unsafe-host", 126),
+            (FailureClass::Uncertain, "uncertain", 126),
+            (FailureClass::MissingSession, "missing-session", 127),
+            (FailureClass::StartupFailure, "startup-failure", 127),
+            (FailureClass::PostConnect, "post-connect", 1),
+        ];
+        for (class, token, status) in cases {
+            assert_eq!(class.token(), token);
+            assert_eq!(class.exit_code(), status);
+        }
+    }
+
+    #[test]
+    fn only_safe_attach_retries_are_called_retryable() {
+        for err in [
+            io::Error::new(io::ErrorKind::TimedOut, "full backlog"),
+            io::Error::from_raw_os_error(libc::EMFILE),
+            io::Error::from_raw_os_error(libc::ENFILE),
+            io::Error::from_raw_os_error(libc::ENOBUFS),
+        ] {
+            assert_eq!(resume_probe_class(&err), FailureClass::Retryable);
+        }
+        assert_eq!(
+            resume_probe_class(&io::Error::from_raw_os_error(libc::EACCES)),
+            FailureClass::Uncertain
+        );
+    }
 
     /// Reads back what a daemon writing `bytes` to its stderr would be reported as.
     ///

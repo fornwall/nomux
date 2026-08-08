@@ -2,11 +2,11 @@
 
 Open server-side work, in priority order; the client is a separate project.
 
-1. **Survive systemd logout policy honestly.** Launch or move the daemon into a user-manager
-   scope/service, define behavior without a user bus, and test real SSH logout across the
-   `KillUserProcesses` × linger matrix. POSIX `setsid` alone does not leave
-   `session-*.scope`; make terminal-detach, directory-change and standard-I/O failures
-   reportable before publication rather than best-effort.
+1. **Validate systemd logout policy end to end.** The launcher now selects a transient user
+   scope only when the user bus is reachable and logind reports linger, with an explicit
+   direct fallback otherwise. Exercise real SSH logout across the `KillUserProcesses` ×
+   linger matrix, including a missing user bus, and decide whether terminal-detach,
+   directory-change and standard-I/O failures may remain best-effort after publication.
 2. **Exercise the real client lifecycle.** A reference client must cover upload verification,
    Hello, shell I/O, detach/replay, takeover, agent forwarding and exit before the protocol
    or control surface is declared stable.

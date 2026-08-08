@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use nomux::{
-    ErrorCode, Frame, FrameType, HEADER_LEN, Hello, PROTOCOL_VERSION, RESUME_FROM_START, WinSize,
-    decode_header,
+    ErrorCode, Frame, FrameType, HEADER_LEN, Hello, PROTOCOL_VERSION, RESUME_FROM_START,
+    SERVER_PREAMBLE, WinSize, decode_header,
 };
 
 use harness::{
@@ -473,6 +473,49 @@ fn a_second_client_takes_over_and_the_first_is_told_why() {
     // shell rather than one that merely got a `HelloOk`.
     second.input(ok.in_applied, b"echo NOMUX-TOOK-OVER\n");
     second.read_until("NOMUX-TOOK-OVER", ok.resume_from);
+}
+
+/// The opt-in opposite of takeover: the newcomer learns that the slot is occupied,
+/// while the incumbent keeps driving the shell. Once that incumbent deliberately
+/// detaches, the same kind of greeting succeeds. The ordinary takeover test above keeps
+/// the flag's default pinned separately.
+#[test]
+fn a_conditional_attach_refuses_to_displace_but_succeeds_after_detach() {
+    let (session, mut incumbent, ok) = Session::attached("if_detached");
+
+    let mut refused = session.connect();
+    refused.send(&Frame::Hello(Hello {
+        protocol: PROTOCOL_VERSION,
+        agent_forward: false,
+        repaint_ctrl_l: false,
+        if_detached: true,
+        out_offset: RESUME_FROM_START,
+        win: harness::WIN,
+        term: "xterm-256color",
+    }));
+    refused.expect_error(
+        ErrorCode::AlreadyAttached,
+        "a conditional attach must distinguish an occupied slot from a takeover",
+    );
+    refused.expect_eof("an Error{ALREADY_ATTACHED}");
+
+    let before = b"echo NOMUX-STILL-ATTACHED\n";
+    incumbent.input(ok.in_applied, before);
+    incumbent.read_until("NOMUX-STILL-ATTACHED", ok.resume_from);
+
+    incumbent.send(&Frame::Detach);
+    incumbent.expect_eof("a Detach after a refused conditional attach");
+    drop(incumbent);
+
+    let mut resumed = session.connect();
+    let accepted = resumed.hello_if_detached(RESUME_FROM_START);
+    assert_eq!(
+        accepted.in_applied,
+        before.len() as u64,
+        "the refusal and detach changed the session's input position"
+    );
+    resumed.input(accepted.in_applied, b"echo NOMUX-CONDITIONALLY-ATTACHED\n");
+    resumed.read_until("NOMUX-CONDITIONALLY-ATTACHED", accepted.resume_from);
 }
 
 /// The refusals a connection can earn against a session that is already serving, and
@@ -1144,6 +1187,7 @@ fn a_version_mismatch_refuses_the_newcomer_without_evicting_the_client() {
         protocol: PROTOCOL_VERSION + 1,
         agent_forward: false,
         repaint_ctrl_l: false,
+        if_detached: true,
         out_offset: RESUME_FROM_START,
         win: harness::WIN,
         term: "xterm-256color",
@@ -1277,11 +1321,12 @@ fn greeted(socket: &Path) -> bool {
 
     let deadline = Instant::now() + Duration::from_secs(1);
     let mut seen = Vec::new();
-    while seen.len() < HEADER_LEN {
+    let opening_len = SERVER_PREAMBLE.len() + HEADER_LEN;
+    while seen.len() < opening_len {
         if Instant::now() >= deadline {
             return false;
         }
-        let mut chunk = [0u8; HEADER_LEN];
+        let mut chunk = [0u8; 64];
         match read_uninterrupted(&mut stream, &mut chunk) {
             Ok(0) => return false,
             Ok(n) => seen.extend_from_slice(chunk.get(..n).unwrap_or(&[])),
@@ -1290,7 +1335,13 @@ fn greeted(socket: &Path) -> bool {
             Err(_) => return false,
         }
     }
-    let Some(head) = seen.get(..HEADER_LEN).and_then(|head| head.try_into().ok()) else {
+    if seen.get(..SERVER_PREAMBLE.len()) != Some(SERVER_PREAMBLE.as_slice()) {
+        return false;
+    }
+    let Some(head) = seen
+        .get(SERVER_PREAMBLE.len()..opening_len)
+        .and_then(|head| head.try_into().ok())
+    else {
         return false;
     };
     decode_header(head).is_ok_and(|header| header.ty == FrameType::HelloOk)

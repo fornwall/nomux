@@ -13,7 +13,7 @@ use std::os::unix::net::UnixStream;
 
 use nomux::{
     Frame, FrameType, HEADER_LEN, Header, MAX_AGENT_DATA, MAX_OUTPUT_DATA, MAX_PAYLOAD,
-    decode_header,
+    SERVER_PREAMBLE, decode_header,
 };
 
 use crate::daemon::{MAX_PENDING_READ, MAX_PENDING_WRITE};
@@ -60,6 +60,12 @@ pub(crate) struct Conn {
     rx_pos: usize,
     tx: Vec<u8>,
     tx_pos: usize,
+    /// Whether this connection has ever queued its server-to-client synchronization
+    /// sequence. Once true it stays true, so no later frame can put magic in the middle
+    /// of the stream.
+    preamble_queued: bool,
+    /// Bytes at `tx_pos` that still belong to a partially written preamble.
+    preamble_remaining: usize,
     eof: bool,
 }
 
@@ -77,6 +83,8 @@ impl Conn {
             rx_pos: 0,
             tx: Vec::new(),
             tx_pos: 0,
+            preamble_queued: false,
+            preamble_remaining: 0,
             eof: false,
         })
     }
@@ -115,6 +123,11 @@ impl Conn {
     /// here chunking to at most [`MAX_PAYLOAD`] or queueing a control frame whose size
     /// it fixed itself.
     pub(crate) fn send(&mut self, frame: &Frame<'_>) {
+        if !self.preamble_queued {
+            self.tx.extend_from_slice(SERVER_PREAMBLE);
+            self.preamble_queued = true;
+            self.preamble_remaining = SERVER_PREAMBLE.len();
+        }
         let _ = frame.encode(&mut self.tx);
     }
 
@@ -194,7 +207,10 @@ impl Conn {
             let pending = self.tx.get(self.tx_pos..).unwrap_or(&[]);
             match self.stream.write(pending) {
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                Ok(n) => self.tx_pos += n,
+                Ok(n) => {
+                    self.tx_pos += n;
+                    self.preamble_remaining = self.preamble_remaining.saturating_sub(n);
+                }
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
                 Err(err) => return Err(err),
@@ -249,8 +265,18 @@ impl Conn {
     /// loop may be handed.
     pub(crate) fn close_with(mut self, frame: Option<&Frame<'_>>) {
         if let Some(frame) = frame {
+            // A final refusal replaces queued frames, but not an unfinished prefix: the
+            // peer may already hold its first bytes. Keeping the suffix makes the magic
+            // whole before the replacement frame rather than leaving a truncated magic
+            // followed by a header.
+            let preamble = self
+                .tx
+                .get(self.tx_pos..self.tx_pos + self.preamble_remaining)
+                .unwrap_or(&[])
+                .to_vec();
             self.tx.clear();
             self.tx_pos = 0;
+            self.tx.extend_from_slice(&preamble);
             self.send(frame);
         }
         drop(self.flush_final());
@@ -346,6 +372,7 @@ mod tests {
                 protocol: PROTOCOL_VERSION,
                 agent_forward: true,
                 repaint_ctrl_l: false,
+                if_detached: false,
                 out_offset: RESUME_FROM_START,
                 win: WIN,
                 term: "xterm-256color",
@@ -410,6 +437,23 @@ mod tests {
     fn take<'a>(conn: &mut Conn, scratch: &'a mut Vec<u8>) -> Option<Frame<'a>> {
         let ty = conn.take_frame(scratch).expect("a well-formed header")?;
         Some(Frame::decode(ty, scratch).expect("a well-formed payload"))
+    }
+
+    /// Takes a frame from the server side of a test pair, consuming and checking the
+    /// one response-stream preamble before the first one.
+    fn take_server<'a>(
+        conn: &mut Conn,
+        scratch: &'a mut Vec<u8>,
+        synchronized: &mut bool,
+    ) -> Option<Frame<'a>> {
+        if !*synchronized {
+            let available = conn.rx.get(conn.rx_pos..).unwrap_or(&[]);
+            let preamble = available.get(..SERVER_PREAMBLE.len())?;
+            assert_eq!(preamble, SERVER_PREAMBLE);
+            conn.rx_pos += SERVER_PREAMBLE.len();
+            *synchronized = true;
+        }
+        take(conn, scratch)
     }
 
     /// Reads one bufferful from the peer, treating "nothing there" as zero bytes.
@@ -584,11 +628,12 @@ mod tests {
         let mut lens = Vec::new();
         let mut got = Vec::new();
         let mut next = 7;
+        let mut synchronized = false;
         while sender.queued() > 0 || reader.buffered() > 0 {
             let before = (sender.queued(), reader.buffered());
             sender.flush_some().expect("a flush");
             fill(&mut reader).expect("a fill");
-            while let Some(frame) = take(&mut reader, &mut scratch) {
+            while let Some(frame) = take_server(&mut reader, &mut scratch, &mut synchronized) {
                 let Frame::Output { offset, data } = frame else {
                     panic!("expected Output, got {frame:?}");
                 };
@@ -606,6 +651,7 @@ mod tests {
 
         assert_eq!(lens, vec![MAX_OUTPUT_DATA, chunk, 1000]);
         assert!(got == data, "the reassembled stream must be what went in");
+        assert!(synchronized, "the stream preamble was not consumed");
     }
 
     /// Several whole frames and a partial one in a single read: the trailing bytes
@@ -712,7 +758,7 @@ mod tests {
         let payload = bulk(4096);
         let frame_len = HEADER_LEN + 8 + payload.len();
         let (mut peer, mut conn) = pair();
-        let (mut expected, mut got) = (Vec::new(), Vec::new());
+        let (mut expected, mut got) = (SERVER_PREAMBLE.to_vec(), Vec::new());
         let (mut offset, mut short_writes, mut halvings, mut high_water) = (0u64, 0usize, 0, 0);
 
         let rounds = 128;
@@ -859,10 +905,31 @@ mod tests {
 
         let mut got = Vec::new();
         drain(&mut peer, &mut got);
+        let mut expected = SERVER_PREAMBLE.to_vec();
+        expected.extend_from_slice(&encoded(&last));
         assert!(
-            got == encoded(&last),
-            "only the last frame may be delivered"
+            got == expected,
+            "only the preamble and last frame may be delivered"
         );
+    }
+
+    /// The magic is a stream prefix, not a frame prefix: later frames follow each other
+    /// directly and a client cannot encounter a false resynchronization point midstream.
+    #[test]
+    fn the_server_preamble_precedes_only_the_first_frame() {
+        let (mut peer, mut conn) = pair();
+        let first = Frame::Pong;
+        let second = Frame::Detach;
+        conn.send(&first);
+        conn.send(&second);
+        conn.flush_some().expect("flush both frames");
+
+        let mut got = Vec::new();
+        drain(&mut peer, &mut got);
+        let mut expected = SERVER_PREAMBLE.to_vec();
+        expected.extend_from_slice(&encoded(&first));
+        expected.extend_from_slice(&encoded(&second));
+        assert_eq!(got, expected);
     }
 
     /// `flush_final` against a peer that has stopped reading gives up on its

@@ -28,7 +28,7 @@ use std::io::{ErrorKind, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-use nomux::{Frame, FrameType, HEADER_LEN, RESUME_FROM_START, decode_header};
+use nomux::{Frame, FrameType, HEADER_LEN, RESUME_FROM_START, SERVER_PREAMBLE, decode_header};
 
 use harness::{
     ABANDON_PENDING_WRITE, Cue, FRAME_PATIENCE, MAX_PENDING_INPUT, MAX_PENDING_WRITE, SPIN_WINDOW,
@@ -845,7 +845,12 @@ fn input_frames(at_least: usize, from: u64) -> (Vec<u8>, u64) {
 /// sent. What is decoded is whatever was delivered whole.
 fn frames(bytes: &[u8]) -> Vec<Frame<'_>> {
     let mut frames = Vec::new();
-    let mut at = 0;
+    assert_eq!(
+        bytes.get(..SERVER_PREAMBLE.len()),
+        Some(SERVER_PREAMBLE.as_slice()),
+        "a daemon response stream must open with its synchronization preamble"
+    );
+    let mut at = SERVER_PREAMBLE.len();
     while let Some(head) = bytes
         .get(at..at + HEADER_LEN)
         .and_then(|head| <[u8; HEADER_LEN]>::try_from(head).ok())

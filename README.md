@@ -12,9 +12,10 @@ reporting and scrollback all work unchanged.
 > repository is the server half; the SSH client and terminal emulator that drive it are a
 > separate, unreleased project, and without that client there is no way to get a shell out
 > of this — the relay modes speak a binary frame protocol over stdio rather than driving a
-> terminal, so `nomux list` and `nomux kill` are what works standalone. On systemd hosts
-> that kill SSH session scopes at logout, this release cannot yet keep a daemon alive; a
-> user-manager-backed launch is an explicit release gate. AI-generated, and experimental.
+> terminal, so `nomux list` and `nomux kill` are what works standalone. On systemd hosts,
+> session creation uses a user-manager scope when a reachable lingering user manager makes
+> that a persistence promise; its direct fallback may still be killed by logout policy.
+> The real SSH logout matrix has not yet been exercised. AI-generated, and experimental.
 
 `nomux <mode> [session-id]`. The binary-protocol modes are `daemon`, `spawn` and
 `attach`; `--label` is accepted only when creating through `daemon` or `spawn`.
