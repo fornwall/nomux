@@ -10,8 +10,7 @@ license = "Apache-2.0"
 repository = "https://github.com/fornwall/nomux"
 authors = ["Fredrik Fornwall <fredrik@fornwall.net>"]
 
-# See IMPLEMENTATION.md § 8 — the cold upload happens over cellular, so size is a
-# correctness-adjacent concern. Target <= 400 KiB per architecture.
+# Release artifacts must stay below 400 KiB (IMPLEMENTATION.md § 8).
 [profile.release]
 opt-level = "z"
 lto = "fat"
@@ -19,9 +18,6 @@ codegen-units = 1
 panic = "abort"
 strip = "symbols"
 
-# Every lint below stays at "warn"; the deny lives in the gates, in
-# .pre-commit-config.yaml, so a toolchain bump is a red gate rather than a tree that will
-# not build. No rustc *group* is named: a level applies to a group's members downwards.
 [workspace.lints.rust]
 missing_docs = "warn"
 missing_debug_implementations = "warn"
@@ -36,13 +32,8 @@ explicit_outlives_requirements = "warn"
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
-# No `clippy::cargo`: complete metadata, two pinned dependencies and no features satisfy
-# every member of it by construction, and deny.toml is where bans and licences are checked.
-# Directly contradicts `unreachable_pub`: in a binary every module is private, so
-# this lint wants bare `pub` while `unreachable_pub` wants `pub(crate)`. Keep the
-# explicit form, which says what it means and greps cleanly.
+# This conflicts with `unreachable_pub` for binary-private modules.
 redundant_pub_crate = "allow"
-# Selected restriction lints. A daemon that panics loses the user's session.
 unwrap_used = "warn"
 expect_used = "warn"
 panic = "warn"
