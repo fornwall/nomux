@@ -1,12 +1,5 @@
-# The fuzz harness is a separate workspace because its vendored LLVM runtime has
-# different licensing and its path dependency is intentionally unversioned. Those are
-# shipping-policy questions; build scripts in this graph still execute on developer and
-# CI machines, so advisories and provenance remain mandatory here.
-
 [advisories]
 ignore = []
-# Build scripts and the harness execute locally even though no fuzz artifact ships; unsoundness
-# anywhere in their graph therefore has the same answer as it does in the release workspace.
 unsound = "all"
 yanked = "deny"
 

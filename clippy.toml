@@ -1,5 +1,3 @@
-# The test suite unwraps, expects, panics and indexes, and would not compile under
-# the workspace lint wall without these.
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true
