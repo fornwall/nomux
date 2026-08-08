@@ -64,8 +64,6 @@ pub(crate) struct Conn {
     /// sequence. Once true it stays true, so no later frame can put magic in the middle
     /// of the stream.
     preamble_queued: bool,
-    /// Bytes at `tx_pos` that still belong to a partially written preamble.
-    preamble_remaining: usize,
     eof: bool,
 }
 
@@ -84,7 +82,6 @@ impl Conn {
             tx: Vec::new(),
             tx_pos: 0,
             preamble_queued: false,
-            preamble_remaining: 0,
             eof: false,
         })
     }
@@ -126,7 +123,6 @@ impl Conn {
         if !self.preamble_queued {
             self.tx.extend_from_slice(SERVER_PREAMBLE);
             self.preamble_queued = true;
-            self.preamble_remaining = SERVER_PREAMBLE.len();
         }
         let _ = frame.encode(&mut self.tx);
     }
@@ -207,10 +203,7 @@ impl Conn {
             let pending = self.tx.get(self.tx_pos..).unwrap_or(&[]);
             match self.stream.write(pending) {
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                Ok(n) => {
-                    self.tx_pos += n;
-                    self.preamble_remaining = self.preamble_remaining.saturating_sub(n);
-                }
+                Ok(n) => self.tx_pos += n,
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
                 Err(err) => return Err(err),
@@ -258,25 +251,11 @@ impl Conn {
     /// with `None`, whatever is already queued (§ 6.5's shutdown). Waits up to
     /// [`FINAL_FLUSH_TIMEOUT`] for a peer that is not taking it.
     ///
-    /// A `frame` replaces the queue rather than joining it: a reattaching client replays
-    /// from the ring (§ 6.4), and a small final write is what completes against a peer
-    /// that is barely reading. Consumed rather than borrowed because
-    /// [`Conn::flush_final`]'s timeout path leaves the socket blocking, which no event
-    /// loop may be handed.
+    /// Consumed rather than borrowed because [`Conn::flush_final`]'s timeout path leaves
+    /// the socket blocking, which no event loop may be handed.
     pub(crate) fn close_with(mut self, frame: Option<&Frame<'_>>) {
         if let Some(frame) = frame {
-            // A final refusal replaces queued frames, but not an unfinished prefix: the
-            // peer may already hold its first bytes. Keeping the suffix makes the magic
-            // whole before the replacement frame rather than leaving a truncated magic
-            // followed by a header.
-            let preamble = self
-                .tx
-                .get(self.tx_pos..self.tx_pos + self.preamble_remaining)
-                .unwrap_or(&[])
-                .to_vec();
-            self.tx.clear();
-            self.tx_pos = 0;
-            self.tx.extend_from_slice(&preamble);
+            // Replacing queued bytes can splice this frame into a partially written one.
             self.send(frame);
         }
         drop(self.flush_final());
@@ -882,20 +861,20 @@ mod tests {
         }
     }
 
-    /// `close_with` given a frame throws the queue away: a client being closed replays
-    /// from the ring anyway, and a small final write is what lets it complete against a
-    /// peer that is barely reading.
     #[test]
-    fn a_closing_frame_replaces_whatever_was_queued() {
-        let payload = bulk(4096);
+    fn a_closing_frame_does_not_splice_into_a_partial_frame() {
         let (mut peer, mut conn) = pair();
-        for i in 0..64u64 {
-            conn.send(&Frame::Output {
-                offset: i * 4096,
-                data: &payload,
-            });
-        }
-        assert!(conn.queued() > 0, "there is something to throw away");
+        let output = Frame::Output {
+            offset: 7,
+            data: b"abcdefghijklmnop",
+        };
+        conn.send(&output);
+
+        // Model a short write ending three bytes into the payload. Tests can move the
+        // cursor directly, avoiding assumptions about the host's socket buffer size.
+        let cut = SERVER_PREAMBLE.len() + HEADER_LEN + 8 + 3;
+        let mut got = conn.tx[..cut].to_vec();
+        conn.tx_pos = cut;
 
         let last = Frame::Error {
             code: ErrorCode::Takeover,
@@ -903,14 +882,11 @@ mod tests {
         };
         conn.close_with(Some(&last));
 
-        let mut got = Vec::new();
         drain(&mut peer, &mut got);
         let mut expected = SERVER_PREAMBLE.to_vec();
+        expected.extend_from_slice(&encoded(&output));
         expected.extend_from_slice(&encoded(&last));
-        assert!(
-            got == expected,
-            "only the preamble and last frame may be delivered"
-        );
+        assert_eq!(got, expected, "both frames must remain decodable");
     }
 
     /// The magic is a stream prefix, not a frame prefix: later frames follow each other

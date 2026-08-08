@@ -1737,6 +1737,11 @@ mod tests {
             evicted,
             {
                 let mut wire = nomux::SERVER_PREAMBLE.to_vec();
+                Frame::InputAck {
+                    applied_through: TYPED.len() as u64,
+                }
+                .encode(&mut wire)
+                .expect("a valid frame");
                 Frame::Error {
                     code: ErrorCode::Takeover,
                     message: "another client attached",
@@ -1745,7 +1750,7 @@ mod tests {
                 .expect("a valid frame");
                 wire
             },
-            "the evicted connection was told something other than why it was evicted"
+            "the evicted connection was not acknowledged and told why it was evicted"
         );
         assert_eq!(
             applied,
