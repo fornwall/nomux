@@ -256,7 +256,6 @@ fn start(
         restore_scope_environment(original_invocation_id);
     }
     let paths = SessionPaths::new(session_id)?;
-    let ring = allocate_ring(session_id)?;
     ensure_run_dir(paths.dir())?;
 
     // The authority to probe, replace and bind this id. `spawn` hands its already-locked
@@ -275,6 +274,11 @@ fn start(
             )
         })?,
     };
+    let ring = allocate_ring(session_id).inspect_err(|_| {
+        if publishing.created_name() {
+            drop(fs::remove_file(paths.lock()));
+        }
+    })?;
     // The bind is whole before § 6.2's fork: past it the caller has already been
     // answered, so every errno after it reads as success. One `Err` exit, so `<id>.lock`
     // is scrubbed in a single place.
