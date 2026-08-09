@@ -438,14 +438,27 @@ directory (§ 6.6) is the only fix, and only for variables that name a path.
 The `daemon` mode holds this itself instead of trusting whoever started it:
 
 ```
+chdir "/", open /dev/null   before publication, so either failing still reaches somebody
 ignore SIGHUP
 leads a session and holds no controlling terminal?  already detached; nothing to do
   else setsid            refused only if we lead a process group
     else fork → parent _exit, child setsid
 ...                      stop signals, <id>.pid, <id>.label, drop the lock
-chdir "/"
 0/1/2 → /dev/null
 ```
+
+The two releases are split across that sequence rather than taken together at the end,
+and the split is the point. What can *fail* — leaving the inherited directory, and opening
+the `/dev/null` the descriptors will point at — happens while the caller still has the
+stderr pipe this section holds open, so a refusal is an ordinary startup error somebody
+reads. What cannot fail is left to the end, because pointing 0/1/2 at an already-proven
+descriptor is the call that takes the daemon's voice away and nothing that might need to
+explain itself may follow it.
+
+Both were once silent, on the argument that a pinned mount is cheaper than a refused
+session. That held only while the daemon might be killed at logout anyway; `e2e-tests/`
+measures that a lingering user manager carries it through, so the mount would stay busy
+for the session's whole idle life — a week (§ 6.5) — with nothing said about it anywhere.
 
 The test is **no controlling terminal**, not "leads a session": a session leader may still
 hold one. `startup::detach_from_controlling_terminal` carries the rest. The fork happens after the socket

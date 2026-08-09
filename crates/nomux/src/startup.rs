@@ -202,12 +202,49 @@ fn has_controlling_terminal() -> bool {
     }
 }
 
-/// Cuts the daemon loose from the rest of the state it inherited: the working directory, and
-/// then the standard descriptors, last of all for the reason § 6.2 gives.
+/// Lets go of the directory the daemon inherited (§ 6.2), which would otherwise keep a
+/// removable or network mount busy for the life of the session.
 ///
-/// Failures are not propagated: a daemon that cannot `chdir` still works, and the mount it
-/// might pin is the cheaper of the two outcomes; a daemon that cannot open `/dev/null` keeps
-/// whatever it was handed, which is worse and still no reason to refuse somebody a session.
+/// Called *before* the socket and pidfile publish this session, which is the whole of why it
+/// can fail out loud. Past publication the caller has already been answered and an `Err` has
+/// nowhere left to go, so this was once silent — and a pinned mount was the cheaper of the
+/// two outcomes only while the daemon might be killed at logout anyway. `e2e-tests/` now
+/// measures that it is not: a lingering user manager carries the session through, so the
+/// mount stays busy for [`crate::daemon`]'s whole idle life, a week.
+///
+/// The child does not follow. `pty::child_dir` captured where it starts before this ran.
+///
+/// # Errors
+///
+/// Propagates the `chdir`. `/` is searchable on any host that got this far — the run
+/// directory, `/proc` and `/dev/log` were all resolved through it — so a refusal here
+/// describes a host that is broken in ways a session would not survive either.
+pub(crate) fn leave_startup_directory() -> io::Result<()> {
+    rustix::process::chdir("/").map_err(Into::into)
+}
+
+/// Opens the `/dev/null` that [`silence_standard_descriptors`] will point stdio at.
+///
+/// Split from the redirection it feeds, and for [`leave_startup_directory`]'s reason: the
+/// *open* is what can fail, so it happens while a failure can still be reported, and the
+/// `dup2`s that cannot be reported are left with nothing to fail at. A host with no
+/// `/dev/null` used to get a daemon holding the login's descriptors open for a week —
+/// silently, and with the terminal case (§ 6.2's `nomux daemon x`) the worst of it.
+///
+/// # Errors
+///
+/// Propagates the `open`, which is an unpopulated `/dev` or a descriptor limit reached at
+/// exactly this moment.
+pub(crate) fn open_null_device() -> io::Result<OwnedFd> {
+    rustix::fs::open("/dev/null", OFlags::RDWR | OFlags::CLOEXEC, Mode::empty()).map_err(Into::into)
+}
+
+/// Points the three standard descriptors at `null`, last of all for the reason § 6.2 gives:
+/// this is the call that takes the daemon's voice away, so nothing that might need to
+/// explain itself may run after it.
+///
+/// Still silent, and now trivially so — [`open_null_device`] already proved the descriptor,
+/// and `dup2` onto a valid one fails for nothing this process can cause.
 ///
 /// What makes pointing the three at `/dev/null` safe is not the ordering, which cannot help:
 /// by here the daemon has bound its socket and armed its stop pipe, and nothing below can
@@ -218,13 +255,8 @@ fn has_controlling_terminal() -> bool {
 /// would land the listener on fd 1 and the pipe's read end on fd 2 for the `dup2`s below to
 /// silence — an id claimed by a daemon nothing can ever reach. `tests/session.rs` starts one
 /// that way and greets it.
-pub(crate) fn release_startup_state() {
-    let _ = rustix::process::chdir("/");
-    let Ok(null) = rustix::fs::open("/dev/null", OFlags::RDWR | OFlags::CLOEXEC, Mode::empty())
-    else {
-        return;
-    };
-    let _ = rustix::stdio::dup2_stdin(&null);
-    let _ = rustix::stdio::dup2_stdout(&null);
-    let _ = rustix::stdio::dup2_stderr(&null);
+pub(crate) fn silence_standard_descriptors(null: &OwnedFd) {
+    let _ = rustix::stdio::dup2_stdin(null);
+    let _ = rustix::stdio::dup2_stdout(null);
+    let _ = rustix::stdio::dup2_stderr(null);
 }

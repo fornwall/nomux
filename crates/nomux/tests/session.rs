@@ -1255,7 +1255,7 @@ fn an_abrupt_client_disconnect_does_not_kill_the_session() {
 /// failing behind the backoff, and the pipe that says "stop" reading as though it had.
 ///
 /// It does not happen, because std's runtime fills those three before `main` ever runs
-/// (`startup::release_startup_state` has the argument). That is a guarantee from outside
+/// (`startup::silence_standard_descriptors` has the argument). That is a guarantee from outside
 /// this tree and invisible inside it, which is exactly why the property is asserted rather
 /// than reasoned about — and nothing else in this suite starts a daemon with a
 /// descriptor table of its own.

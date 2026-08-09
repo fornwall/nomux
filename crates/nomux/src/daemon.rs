@@ -26,7 +26,8 @@ use crate::nbio;
 use crate::pty::{self, Pty};
 use crate::rundir::{SessionPaths, ensure_run_dir};
 use crate::startup::{
-    arm_child_signal, arm_stop_signals, detach_from_controlling_terminal, release_startup_state,
+    arm_child_signal, arm_stop_signals, detach_from_controlling_terminal, leave_startup_directory,
+    open_null_device, silence_standard_descriptors,
 };
 use crate::usock::{Liveness, liveness};
 
@@ -239,7 +240,7 @@ pub(crate) fn run(
     let result = start(session_id, label, inherited_lock_fd, scope_invocation_id);
     if let Err(err) = &result {
         // Also to syslog, not only through the `Err` the caller prints: past
-        // `release_startup_state` there is no stderr left to reach anybody through.
+        // `silence_standard_descriptors` there is no stderr left to reach anybody through.
         crate::sanitize::error(session_id, &err.to_string());
     }
     result
@@ -278,6 +279,17 @@ fn start(
     // created the directory entry may remove it" lives: for an inherited authority the
     // parent owns failed-handoff cleanup, and that spelling declines on its own.
     let ring = allocate_ring(session_id).inspect_err(|_| paths.release_lock_name(&publishing))?;
+
+    // § 6.2's two releases, both taken here rather than after publication, which is what
+    // makes them reportable: past the bind and the pidfile the caller has already been
+    // answered and an `Err` reaches nobody. The `dup2`s they feed stay at the end, where
+    // they belong — silencing stdio is what must happen last.
+    //
+    // The child's directory is read first of all, or it would record the `/` the line
+    // below moves to instead of the directory the connection was in.
+    let child_dir = pty::child_dir(std::env::current_dir().ok().as_deref());
+    let released = leave_startup_directory().and_then(|()| open_null_device());
+    let null = released.inspect_err(|_| paths.release_lock_name(&publishing))?;
     // The bind is whole before § 6.2's fork: past it the caller has already been
     // answered, so every errno after it reads as success. One `Err` exit, so `<id>.lock`
     // is scrubbed in a single place.
@@ -304,11 +316,10 @@ fn start(
     // reports a session it could not remove (§ 6.6).
     drop(publishing);
 
-    // Everything above resolved its paths already, so the daemon lets go of the directory
-    // it inherited (§ 6.2), which would otherwise keep a removable or network mount busy
-    // for the life of the session. The child does not follow — it starts in the home.
-    let child_dir = pty::child_dir(std::env::current_dir().ok().as_deref());
-    release_startup_state();
+    // The daemon's voice goes here and nowhere earlier (§ 6.2): everything above could
+    // still explain itself on the stderr `spawn` holds open, and nothing below has any.
+    silence_standard_descriptors(&null);
+    drop(null);
 
     let mut daemon = Daemon {
         paths,
@@ -1194,7 +1205,7 @@ impl Daemon {
         };
         match Pty::spawn(&config) {
             Ok(pty) => self.pty = Some(pty),
-            // Recorded rather than returned: past `release_startup_state` there is no
+            // Recorded rather than returned: past `silence_standard_descriptors` there is no
             // stderr for an `Err` to surface on, so carrying one up would buy nothing but
             // six `io::Result` signatures.
             Err(err) => {

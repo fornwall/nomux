@@ -209,6 +209,39 @@ impl Session {
         Self::start_with(name, &ring_bytes.to_string(), "/bin/sh")
     }
 
+    /// Starts a daemon in `cwd` and with **no** `HOME`, so the child falls back to the
+    /// directory the daemon was started in (`pty::child_dir`).
+    ///
+    /// The one shape that can see § 6.2's ordering. Every other session here is given a
+    /// `HOME`, which `child_dir` prefers — so the fallback is never consulted and a
+    /// daemon that captured its directory *after* moving to `/` would look identical.
+    pub(crate) fn start_homeless_in(name: &str, cwd: &Path) -> Self {
+        let root = run_root(name);
+        let id = intern(name);
+        let child = launch(
+            nomux_with_shell(&root, &["daemon", &id])
+                .env("PS1", "")
+                .env_remove("HOME")
+                .current_dir(cwd)
+                .env("NOMUX_RING_BYTES", DEFAULT_TEST_RING.to_string())
+                .env_remove("SSH_AUTH_SOCK")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        )
+        .expect("spawn daemon");
+
+        let socket = root.join("nomux/run").join(format!("{id}.sock"));
+        wait_until_answering(&socket);
+        Self {
+            child,
+            root,
+            socket,
+            id,
+            name: name.to_owned(),
+        }
+    }
+
     /// The body every daemon in this suite goes through, so what each of them is told
     /// is said once. `ring_bytes` reaches `NOMUX_RING_BYTES` verbatim, for the one test
     /// about a value the daemon cannot parse (`IMPLEMENTATION.md` § 4), and `shell`

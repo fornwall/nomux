@@ -490,6 +490,39 @@ fn the_daemon_releases_its_working_directory_but_the_shell_does_not() {
     client.read_until(home, ok.resume_from);
 }
 
+/// Regression: the daemon reads where the child will start *before* it moves to `/`.
+///
+/// § 6.2 takes those two steps in that order and nothing else can tell them apart. The
+/// test above cannot: it gives the daemon a `HOME`, which `pty::child_dir` prefers, so
+/// the fallback is never reached and a capture taken after the move reads the same
+/// answer. With no `HOME` the fallback *is* the answer, and a daemon that reordered the
+/// two would start every session's shell in `/` — a working directory the user never
+/// chose, and one no assertion in this suite would have objected to.
+#[test]
+fn a_homeless_session_starts_its_shell_where_the_daemon_was_started() {
+    // A directory that is neither `/` nor anything `child_dir` would reach on its own,
+    // so the assertion below can only pass by way of the fallback.
+    let started_in = run_root("cwd-fallback-origin");
+    fs::create_dir_all(&started_in).expect("create the directory the daemon starts in");
+    // Resolved, because `/proc` and the shell's own `pwd` both report the real path and
+    // the scratch root can sit under a symlinked temporary directory.
+    let started_in = fs::canonicalize(&started_in).expect("resolve it");
+
+    let session = Session::start_homeless_in("cwd-fallback", &started_in);
+    let mut client = session.connect();
+    let ok = client.hello(RESUME_FROM_START);
+
+    let cwd = fs::read_link(format!("/proc/{}/cwd", session.child.id())).expect("read daemon cwd");
+    assert_eq!(
+        cwd,
+        Path::new("/"),
+        "the daemon must still let go of the directory itself"
+    );
+
+    client.input(0, b"pwd\n");
+    client.read_until(started_in.to_str().expect("utf-8 origin"), ok.resume_from);
+}
+
 /// § 6.2's detachment, on the path that needs a fork.
 ///
 /// [`leads_a_process_group`] is what forces the `EPERM` only a fork can answer: a
