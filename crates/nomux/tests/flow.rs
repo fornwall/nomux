@@ -225,8 +225,6 @@ fn input_delivered_before_a_half_close_is_applied_rather_than_dropped() {
     /// and the socket buffers between them, so what crosses is bounded by the daemon
     /// rather than by this.
     const BLAST: usize = 8 << 20;
-    /// One `Input` frame's payload, well inside `MAX_PAYLOAD`.
-    const CHUNK: usize = 60 * 1024;
 
     let session = Session::start("input_halfclose");
     let cue = Cue::new(&session.root);
@@ -244,24 +242,7 @@ fn input_delivered_before_a_half_close_is_applied_rather_than_dropped() {
     );
     drop(client);
 
-    // Where each whole frame ends on the wire, against the input offset one past it.
-    // The push below stops wherever the daemon stopped taking, routinely mid-frame,
-    // and a part-frame is owed to nobody — `take_frame` never completes one — so this
-    // is what turns a byte count into the offset the daemon is actually in debt for.
-    let chunk = vec![b'x'; CHUNK];
-    let mut frames = Vec::with_capacity(BLAST + CHUNK);
-    let mut whole = Vec::new();
-    let mut offset = ready.in_offset;
-    while frames.len() < BLAST {
-        Frame::Input {
-            offset,
-            data: &chunk,
-        }
-        .encode(&mut frames)
-        .expect("encode input");
-        offset += CHUNK as u64;
-        whole.push((frames.len(), offset));
-    }
+    let (frames, whole) = input_frames(BLAST, ready.in_offset);
 
     // A raw socket rather than the harness client, because this has to stop writing
     // exactly where the daemon stops reading and then half-close on the spot. A second
@@ -290,7 +271,7 @@ fn input_delivered_before_a_half_close_is_applied_rather_than_dropped() {
             .rev()
             .find(|(through, _)| *through <= sent)
             .map_or(ready.in_offset, |(_, end)| *end);
-        if applied_end - ready.in_offset > MAX_PENDING_INPUT + CHUNK as u64
+        if applied_end - ready.in_offset > MAX_PENDING_INPUT + INPUT_CHUNK as u64
             || Instant::now() >= deadline
         {
             break applied_end;
@@ -302,7 +283,7 @@ fn input_delivered_before_a_half_close_is_applied_rather_than_dropped() {
     // it — in the receive buffer or the socket's — which is what the bug threw away
     // and so is what has to be there for any of this to be a test.
     assert!(
-        owed > MAX_PENDING_INPUT + CHUNK as u64,
+        owed > MAX_PENDING_INPUT + INPUT_CHUNK as u64,
         "the {owed} bytes of whole frames that reached the daemon all fit in the \
          {MAX_PENDING_INPUT} it queues, so nothing was ever held back outside it and \
          the half-close below would prove nothing"
@@ -831,15 +812,23 @@ fn stalled_detach(session: &Session, pings: &[u8]) -> UnixStream {
     socket
 }
 
-/// At least `at_least` bytes of encoded `Input` frames starting at `from`, and one
-/// past the last input offset they carry.
+/// One `Input` frame's payload, well inside `MAX_PAYLOAD`.
+const INPUT_CHUNK: usize = 60 * 1024;
+
+/// At least `at_least` bytes of encoded `Input` frames starting at `from`, and where
+/// each whole frame ends on the wire against the input offset one past it.
 ///
 /// Built in full before any of it is sent, because its callers measure how much of a
 /// buffer the daemon takes: encoding as they went would have them measuring this
 /// process instead.
-fn input_frames(at_least: usize, from: u64) -> (Vec<u8>, u64) {
-    let chunk = vec![b'x'; 60 * 1024];
+///
+/// The boundaries come back with the bytes because a push routinely stops mid-frame and
+/// a part-frame is owed to nobody — `take_frame` never completes one — so they are what
+/// turns a byte count into the offset the daemon is actually in debt for.
+fn input_frames(at_least: usize, from: u64) -> (Vec<u8>, Vec<(usize, u64)>) {
+    let chunk = vec![b'x'; INPUT_CHUNK];
     let mut frames = Vec::with_capacity(at_least + chunk.len());
+    let mut whole = Vec::new();
     let mut offset = from;
     while frames.len() < at_least {
         Frame::Input {
@@ -849,8 +838,9 @@ fn input_frames(at_least: usize, from: u64) -> (Vec<u8>, u64) {
         .encode(&mut frames)
         .expect("encode input");
         offset += chunk.len() as u64;
+        whole.push((frames.len(), offset));
     }
-    (frames, offset)
+    (frames, whole)
 }
 
 /// The frames in `bytes`, stopping at the first one that is not all there.
@@ -967,9 +957,8 @@ fn a_daemon_that_cannot_accept_stands_back_rather_than_spinning() {
     // that never expires is the same session lost by a quieter route.
     drop(starved);
     let mut client = session.connect();
-    let ok = client.hello(RESUME_FROM_START);
-    client.input(0, b"echo NOMUX-AFTER-EMFILE\n");
-    client.read_until("NOMUX-AFTER-EMFILE", ok.resume_from);
+    client.hello(RESUME_FROM_START);
+    still_serving(&mut client, "NOMUX-AFTER-EMFILE");
 }
 
 /// The soft limit on open descriptors that `pid` is running under.
