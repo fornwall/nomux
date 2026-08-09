@@ -204,9 +204,8 @@ rejecting a mismatched `Hello.protocol`.
 The feature must be invisible when unavailable: every terminal failure falls back to a plain
 SSH session, cached per host where the failure describes a host boundary, on the conditions
 in [IMPLEMENTATION.md § 5.3](IMPLEMENTATION.md#53-client-decisions). Relay stderr supplies the
-stable class needed to make that decision without parsing prose: collision, safe-to-retry,
-unsafe host, uncertain presence, missing session, startup failure, or failure after a
-successful connection ([IMPLEMENTATION.md § 10](IMPLEMENTATION.md#10-exit-codes)).
+stable class that decision needs, so nothing has to parse prose
+([IMPLEMENTATION.md § 10](IMPLEMENTATION.md#10-exit-codes)).
 
 ## 8. Security model
 
