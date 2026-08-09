@@ -1906,14 +1906,16 @@ mod tests {
     }
 
     /// The states of the gate the `waitpid` is spent behind, asked directly: the syscall
-    /// it elides is not observable from out here, so what a test can pin is the
-    /// decision. The last state is the one with a defect behind it — `terminal_closed_at`
-    /// alone stays true for the rest of a session whose child daemonised itself, putting
-    /// an every-pass `waitpid` in exactly the sessions most likely to last days.
+    /// it elides is not observable from out here, so what a test can pin is the decision.
+    /// Against a live terminal throughout, since `terminal_closed_at` is only ever set
+    /// from [`Daemon::read_pty`] and so never without one — a `None` PTY answers `false`
+    /// to the last two clauses whatever they mean, which is a fixture that would agree
+    /// with any of them.
     #[test]
     fn a_waitpid_is_asked_for_only_where_something_says_it_may_be_ready() {
         let root = Scratch::new("waitpid-gate");
         let mut daemon = blank(&root, "gate");
+        daemon.pty = Some(shell("waitpid-gate"));
         assert!(
             !daemon.worth_a_waitpid(),
             "a running child answers `None` to every one of these, which is the syscall \
@@ -1933,12 +1935,18 @@ mod tests {
         daemon.terminal_closed_at = Some(Instant::now());
         assert!(daemon.worth_a_waitpid());
 
+        // § 6.5's unknown outcome is reported to the client, and exit observation goes on
+        // regardless: the child that daemonised itself is still there and still unreaped,
+        // so the gate this closes is only the one over a child already observed.
         daemon.outcome = Some((0, ExitKind::Unknown));
         assert!(
-            !daemon.worth_a_waitpid(),
-            "§ 6.5's unknown outcome leaves `terminal_closed_at` set over a child that may run \
-             for days, so the end of file cannot be the condition on its own"
+            daemon.worth_a_waitpid(),
+            "a reported outcome must not close the gate over a child nothing has observed"
         );
+
+        if let Some(mut pty) = daemon.pty.take() {
+            pty.terminate();
+        }
     }
 
     /// Regression: the agent listener had the error *tolerance* of the session
