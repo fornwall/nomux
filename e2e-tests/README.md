@@ -8,8 +8,8 @@ The answer is not nomux's to give, and it is no longer nomux's to influence eith
 `setsid` and `fork` move the daemon off the controlling terminal but not out of sshd's
 `session-N.scope` cgroup ([`startup.rs`'s
 `detach_from_controlling_terminal`](../crates/nomux/src/startup.rs) says so), and
-[`launcher.rs`](../crates/nomux/src/launcher.rs) now launches the daemon **directly and
-always** — there is no scope to escape into, nothing is probed before the launch, and the
+[`attach.rs`'s `spawn_daemon`](../crates/nomux/src/attach.rs) now launches the daemon
+**directly and always** — there is no scope to escape into, nothing is probed before the launch, and the
 daemon's fate is decided by `logind.conf`'s `KillUserProcesses` and by nothing else. That
 makes the matrix a measurement of host policy rather than of a choice nomux makes, which
 is a smaller claim but the same amount of work to check: whether each combination behaves

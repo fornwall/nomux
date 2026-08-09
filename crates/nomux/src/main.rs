@@ -12,7 +12,6 @@ mod attach;
 mod conn;
 mod control;
 mod daemon;
-mod launcher;
 mod nbio;
 mod pty;
 mod ring;

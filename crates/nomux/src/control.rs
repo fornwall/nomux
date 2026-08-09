@@ -27,7 +27,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// What `list` gives a probe instead. Nothing, because only [`Liveness::Stale`] changes
 /// what it does with a session, and every errno behind `Stale` is settled on the first
-/// attempt ([`crate::usock::connect_within`]) — waiting a full backlog out would cost two
+/// attempt (`usock`'s connect) — waiting a full backlog out would cost two
 /// seconds per wedged daemon to print the same line.
 const LIST_PROBE: Duration = Duration::ZERO;
 
