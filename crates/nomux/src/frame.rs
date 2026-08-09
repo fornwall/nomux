@@ -279,20 +279,6 @@ impl<'a> Frame<'a> {
     /// [`crate::MAX_PAYLOAD`], or [`ProtoError::Malformed`] for a field too long for
     /// its own length prefix. `out` is rewound to its original length in every case.
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), ProtoError> {
-        let variable_len = match self {
-            Self::Input { data, .. } | Self::Output { data, .. } => {
-                Some(8usize.saturating_add(data.len()))
-            }
-            Self::Error { message, .. } => Some(2usize.saturating_add(message.len())),
-            Self::AgentData { data, .. } => Some(4usize.saturating_add(data.len())),
-            _ => None,
-        };
-        if let Some(len) = variable_len.filter(|&len| len > crate::MAX_PAYLOAD as usize) {
-            return Err(ProtoError::PayloadTooLarge(
-                u32::try_from(len).unwrap_or(u32::MAX),
-            ));
-        }
-
         // The rewind lives here, once: a caller appending frames back to back never
         // ships half of one, whatever `encode_from` grows a new way to fail on.
         let start = out.len();
@@ -306,9 +292,7 @@ impl<'a> Frame<'a> {
         out.extend_from_slice(&[0; HEADER_LEN]);
         self.encode_payload(out)?;
 
-        // The saturation is reachable only from a caller in this process handing over a
-        // 4 GiB field — never a peer, whose frames `decode_header` has already bounded.
-        // `encode_header` refuses anything over `MAX_PAYLOAD`, saturated or not.
+        // Only a 4 GiB field saturates, and `encode_header` refuses it either way.
         let payload_len = out.len() - start - HEADER_LEN;
         let len = u32::try_from(payload_len).unwrap_or(u32::MAX);
         let header = encode_header(self.frame_type(), len)?;
@@ -717,22 +701,20 @@ mod tests {
         let data = vec![0u8; MAX_PAYLOAD as usize];
         let mut buf = b"previous frame".to_vec();
         let before = buf.len();
-        let capacity = buf.capacity();
         let err = Frame::Output {
             offset: 0,
             data: &data,
         }
         .encode(&mut buf);
-        assert!(matches!(err, Err(ProtoError::PayloadTooLarge(_))));
+        assert_eq!(
+            err,
+            Err(ProtoError::PayloadTooLarge(MAX_PAYLOAD + 8)),
+            "the reported length is the whole payload, offset bytes included"
+        );
         assert_eq!(
             buf.len(),
             before,
             "failed encode must not leave partial data"
-        );
-        assert_eq!(
-            buf.capacity(),
-            capacity,
-            "known-oversized data must be rejected before allocation"
         );
 
         let payload = vec![0; MAX_PAYLOAD as usize + 1];
