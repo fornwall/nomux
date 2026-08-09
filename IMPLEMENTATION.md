@@ -318,13 +318,10 @@ which is a wire change for something that needs none. An SSH exec channel carrie
 separate extended data, so the two never interleave, and ~100 bytes cannot fill a window
 sshd opens at 2 MiB.
 
-On both exec paths the binary's own stderr reaches the channel, and it still does not collide:
-nomux's human diagnostics start `nomux: `, §10's machine record has its own exact prefix, and
-this line is written before any binary exists as a process, so it is first among nomux's
-output whichever command ran. Each prefix is scanned as a complete line rather than treating
-the stream as one field, because a login shell sourcing an rc file gets there first on plenty
-of hosts — the same chatter that would corrupt the frames on stdout, which is the other half
-of why the field is not there.
+On both exec paths the binary's own stderr reaches the channel and still does not collide:
+nomux's human diagnostics start `nomux: `, §10's machine record has its own exact prefix,
+and each is scanned as a complete line because a login shell sourcing an rc file gets there
+first on plenty of hosts.
 
 The value is §6.3's precedence restated in `sh`, and it has to be that precedence to the
 byte. `rundir::absolute_env` counts a source **only where it names an absolute path**, so
