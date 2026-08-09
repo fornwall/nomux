@@ -11,7 +11,7 @@
 //! `attach.rs`'s `fill_from`.
 
 use std::collections::VecDeque;
-use std::io::IoSlice;
+use std::io::{self, IoSlice};
 use std::os::fd::BorrowedFd;
 
 use rustix::io::Errno;
@@ -64,17 +64,16 @@ pub(crate) fn read_or_eof(fd: BorrowedFd<'_>, buf: &mut [u8]) -> ReadOutcome {
 
 /// Writes as much of `queue` as `fd` will take, removing what it accepted.
 ///
-/// A non-empty queue or an `Ok(0)` on return is normal, not a failure: come back on
-/// `POLLOUT` (`IMPLEMENTATION.md` § 4.1). One write and not a loop until `EAGAIN`, so an
+/// A non-empty queue on return is normal: come back on `POLLOUT` (`IMPLEMENTATION.md`
+/// § 4.1). One write and not a loop until `EAGAIN`, so an
 /// event-loop destination gets one fair share of a pass and the stdout worker makes no
-/// second unpromised blocking write; a zero can therefore only mean nothing moved here,
-/// unlike the `WriteZero` `Conn::flush_some` makes of the same count.
+/// second unpromised blocking write.
 ///
 /// One `writev` over both halves rather than a write apiece, load-bearing rather than
 /// an optimisation: a wrapped `VecDeque` served back-first delivers transposed
 /// keystrokes rather than an error anybody could see, and an empty front handed to
 /// `write` alone comes back `Ok(0)`, after which the queue never drains again.
-pub(crate) fn drain_to(queue: &mut VecDeque<u8>, fd: BorrowedFd<'_>) -> Result<(), Errno> {
+pub(crate) fn drain_to(queue: &mut VecDeque<u8>, fd: BorrowedFd<'_>) -> io::Result<()> {
     if queue.is_empty() {
         return Ok(());
     }
@@ -84,7 +83,8 @@ pub(crate) fn drain_to(queue: &mut VecDeque<u8>, fd: BorrowedFd<'_>) -> Result<(
             rustix::io::writev(fd, &[IoSlice::new(front), IoSlice::new(back)])
         };
         return match written {
-            Ok(0) | Err(Errno::AGAIN) => Ok(()),
+            Ok(0) => Err(io::ErrorKind::WriteZero.into()),
+            Err(Errno::AGAIN) => Ok(()),
             // Clamped like every returned count in this tree: `drain` past the end
             // panics, and this binary is built `panic = "abort"`.
             Ok(n) => {
@@ -92,7 +92,7 @@ pub(crate) fn drain_to(queue: &mut VecDeque<u8>, fd: BorrowedFd<'_>) -> Result<(
                 Ok(())
             }
             Err(Errno::INTR) => continue,
-            Err(err) => Err(err),
+            Err(err) => Err(err.into()),
         };
     }
 }
