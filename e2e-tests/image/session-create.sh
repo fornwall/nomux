@@ -36,4 +36,4 @@ printf 'USER-BUS=%s\n' "$(
         echo absent
     fi
 )"
-printf 'SESSION-SCOPE=%s\n' "$(cat /proc/self/cgroup | tr '\n' ' ')"
+printf 'SESSION-SCOPE=%s\n' "$(tr '\n' ' ' < /proc/self/cgroup)"
