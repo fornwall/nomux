@@ -45,12 +45,11 @@ it, and what nomux *sets* is §6.1.1's. `NOMUX_UPDATE_BASELINE` is tested for ex
 Off the table, the toolchain's own. `scripts/build-release.sh` reads `CARGO_HOME` and
 `CARGO_TARGET_DIR`, sets `RUSTUP_TOOLCHAIN` itself, and passes its own flags as
 `CARGO_ENCODED_RUSTFLAGS` rather than `RUSTFLAGS` for the reason it gives about the paths
-it interpolates (§8) — which is also why the job-wide `RUSTFLAGS` deny CI sets on its
-`check` job is *not* set on the release one, `CARGO_ENCODED_RUSTFLAGS` making cargo ignore
-`RUSTFLAGS` outright and a deny there silently absent. The
-unit tests site scratch directories under `TMPDIR` via `env::temp_dir()`, and the integration
-tests use an owner-only `nomux-it-<uid>` child there (§9); the sticky parent protects that
-entry in the same way a valid runtime-directory fallback is protected.
+it interpolates (§8) — which is also why CI's job-wide deny is not set on the release job,
+and `ci.yml` argues that where it sets it. The unit tests site scratch directories under
+`TMPDIR` via `env::temp_dir()`, and the integration tests use an owner-only
+`nomux-it-<uid>` child there (§9); the sticky parent protects that entry as a valid
+runtime-directory fallback is protected.
 
 ## 2. Wire protocol
 
