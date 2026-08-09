@@ -3,9 +3,8 @@
 //! These must work against a daemon of *any* version, so the contract here is the
 //! on-disk layout — never a protocol frame, never `PROTOCOL_VERSION`.
 //!
-//! Those two modes and nothing else. The socket probe all of this is written against is
-//! [`crate::usock::liveness`], where the daemon's bind and the attach paths reach it
-//! without reading a line of a file § 6.6 froze.
+//! The socket probe all of this is written against is [`crate::usock::liveness`], where the
+//! daemon's bind and the attach paths reach it without reading a line of a file § 6.6 froze.
 
 use std::io::{self, Write};
 use std::os::fd::OwnedFd;
@@ -203,9 +202,7 @@ fn resolve(paths: &SessionPaths) -> io::Result<Option<Chosen>> {
                 // A pid `/proc` does not rule out is taken whatever the probe did:
                 // [`chosen`] identifies a *process*, by a route the socket has no part in, so
                 // a mode or a descriptor limit keeping this process off the socket is no
-                // reason to stop signalling a daemon this one has positively named. Nothing
-                // is unlinked on the strength of it — every exit from [`kill`] still goes
-                // through a probe that has to say the session stopped.
+                // reason to stop signalling a daemon this one has positively named.
                 return chosen(paths, filed).map(Some).ok_or_else(|| {
                     let problem = unidentified(paths.id(), filed, body);
                     unresolved(paths, unprobed.as_ref(), &problem)
@@ -253,12 +250,10 @@ struct Chosen {
     /// What the refusals print and what `list` shows: a descriptor is nothing a user can
     /// carry to another command, so the number is still the whole of what is reportable.
     pid: Pid,
-    /// What the signals go through, or the errno that would give none up — the only thing
-    /// here that ever signals, for [`pin`]'s reason.
-    ///
-    /// An error is no descriptor, so nothing is signalled and [`kill`] settles what became of
-    /// the session by probing the socket alone. Only [`still_answering`] reads the errno,
-    /// that being the one path where the difference is visible.
+    /// What the signals go through, or the errno that gave none up — the only thing here
+    /// that ever signals, for [`pin`]'s reason. Where it is an error nothing is signalled and
+    /// [`kill`] settles the session by probing the socket alone; only [`still_answering`]
+    /// reads the errno, that being the one path where the difference is visible.
     reach: io::Result<OwnedFd>,
 }
 
