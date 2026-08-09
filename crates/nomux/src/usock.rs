@@ -112,16 +112,13 @@ pub(crate) enum Liveness {
     Stale(io::Error),
     /// The `connect` failed for a reason that is not death, carrying it.
     ///
-    /// § 6.3's "`EACCES` is not staleness": the same conservative answer as
-    /// [`Self::Alive`] for the *unlink*, and its opposite everywhere else, since only an
-    /// accepted connection may escalate to `SIGKILL`.
+    /// Answers as conservatively as [`Self::Alive`] for the *unlink*, and its opposite
+    /// everywhere else, since only an accepted connection may escalate to `SIGKILL`.
     Unknown(io::Error),
 }
 
-/// Probes the socket. A refused connection means the daemon is gone; the socket file
-/// outlives the process that bound it.
-///
-/// Through [`connect_within`], which owns the argument for the deadline.
+/// Probes the socket, through [`connect_within`], which owns the argument for the
+/// deadline and [`nothing_is_listening`], which owns what a failure means.
 pub(crate) fn liveness(socket: &Path, within: Duration) -> Liveness {
     match connect_within(socket, within) {
         Ok(stream) => Liveness::Alive(stream),

@@ -15,11 +15,13 @@
 //! | probe             | `attach`, wanting a session            | `spawn`, wanting a free id |
 //! |-------------------|-----------------------------------------|----------------------------|
 //! | refused or absent | [`MissingSession`][FailureClass], 127   | start a daemon             |
-//! | accepted          | relay to it                             | [`Collision`][FailureClass], 126 |
+//! | accepted, this uid's | relay to it                          | [`Collision`][FailureClass], 126 |
+//! | accepted, another uid's | [`UnsafeHost`][FailureClass], 126 | [`Uncertain`][FailureClass], 126 |
 //! | neither           | [`Retryable`][FailureClass] or [`Uncertain`][FailureClass], 126 | [`Uncertain`][FailureClass], 126 |
 //!
 //! `usock::connect_within`, behind [`crate::usock::liveness`], has why the last row is the
-//! wedged daemon rather than an absent one.
+//! wedged daemon rather than an absent one, and why the third is not an accepted
+//! connection at all.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -61,10 +63,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// of every session creation.
 const PUBLISH_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
-/// Largest transfer either direction makes in one call, and the whole of what a [`Pump`]
-/// can be holding: a direction is polled for reading only while [`Pump::has_data`] is
-/// false, so it reads again only once what it read last has gone, which is why neither of
-/// the two needs a cap of its own.
+/// Largest transfer either direction makes in one call, and — by [`Pump::has_data`]'s
+/// invariant — the whole of what a [`Pump`] can be holding.
 const RELAY_CHUNK: usize = 16 * 1024;
 
 /// Whether this invocation may bring the session into being — the whole of the
