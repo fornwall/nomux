@@ -237,28 +237,16 @@ mod tests {
         }
     }
 
+    /// The encoder's half only. [`decode_header`] is `pub`, and `tests/codec.rs`'s
+    /// `header_decode_is_total` closes its whole domain — every type byte crossed with
+    /// the lengths either side of the cap — so asserting single points of it here would
+    /// only be a slower copy. [`encode_header`] is `pub(crate)` and out of that test's
+    /// reach.
     #[test]
-    fn oversized_payload_is_rejected() {
+    fn oversized_payload_is_refused_by_the_encoder() {
         assert_eq!(
             encode_header(FrameType::Output, MAX_PAYLOAD + 1),
             Err(ProtoError::PayloadTooLarge(MAX_PAYLOAD + 1))
-        );
-        // 0x00_04_00_01 == MAX_PAYLOAD + 1, encoded by hand since the encoder refuses.
-        assert_eq!(
-            decode_header(&[FrameType::Output.as_wire(), 0x04, 0x00, 0x01]),
-            Err(ProtoError::PayloadTooLarge(MAX_PAYLOAD + 1))
-        );
-    }
-
-    #[test]
-    fn unknown_frame_type_is_rejected() {
-        assert_eq!(
-            decode_header(&[0x00, 0, 0, 0]),
-            Err(ProtoError::UnknownFrameType(0x00))
-        );
-        assert_eq!(
-            decode_header(&[0xff, 0, 0, 0]),
-            Err(ProtoError::UnknownFrameType(0xff))
         );
     }
 }
