@@ -263,9 +263,7 @@ impl Pty {
         }
         if !self.reaped {
             drop(self.child.kill());
-        }
-        if self.child.wait().is_ok() {
-            self.reaped = true;
+            self.reaped = self.child.try_wait().is_ok_and(|status| status.is_some());
         }
     }
 }
