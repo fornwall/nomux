@@ -1083,8 +1083,14 @@ fn a_sustained_overflow_repaints_when_the_client_catches_up_rather_than_per_gap(
     /// Above `MAX_PENDING_WRITE + MAX_PAYLOAD`.
     const RING: usize = 2 * 1024 * 1024;
     const GAPS: usize = 16;
-    /// One owed repaint plus scheduling slack.
-    const BUDGET: usize = 4;
+    /// The one repaint § 4.3 owes, plus one of slack.
+    ///
+    /// Four left the property barely pinned: a daemon repainting once per *four* gaps
+    /// would still come in under it, and the whole rule is that sixteen gaps owe one
+    /// repaint rather than a fraction of one each. Measured at exactly one over fourteen
+    /// runs, half of them against twenty busy cores, so the slack is for a catch-up this
+    /// test did not intend rather than for a figure that moves.
+    const BUDGET: usize = 2;
     /// Caps this client near 5 MB/s even on a busy test host.
     const PACE: Duration = Duration::from_millis(50);
     const OVER: &str = "NOMUX-42-FLOOD-OVER";
