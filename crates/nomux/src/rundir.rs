@@ -27,7 +27,7 @@ const SOCKET_MODE: u32 = 0o600;
 
 /// Permissions for the three plain files: the pidfile, the label and the spawn lock.
 /// Exact rather than umask-derived: a `<id>.lock` its own uid cannot open later is one
-/// nothing can lock, which [`SessionPaths::acquire`] refuses outright.
+/// nothing can lock, which [`SessionPaths::try_lock_spawn_or_refuse`] refuses outright.
 const FILE_MODE: u32 = 0o600;
 
 /// How many times an acquirer takes the lock before giving up — the first attempt and
@@ -825,7 +825,7 @@ fn remove_node(path: &Path) -> io::Result<()> {
 
 /// A caller's exclusive standing on one session id — an exclusive `flock` on
 /// `<id>.lock`, released on drop, and never anything weaker: a host that cannot give one
-/// gets a refusal ([`SessionPaths::acquire`]).
+/// gets a refusal ([`SessionPaths::try_lock_spawn_or_refuse`]).
 ///
 /// Collection (§ 6.6) must take it as well as a spawn (§ 6.3), because **a file unlinked
 /// while it is locked stops being a mutex**: the next process to ask creates a new file at
