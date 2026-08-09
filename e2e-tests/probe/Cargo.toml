@@ -1,0 +1,19 @@
+[workspace]
+# A workspace of its own, as `fuzz/` is: this builds against the pinned toolchain but
+# has nothing to do with the shipping binary's size budget or lint set.
+
+[package]
+name = "nomux-probe"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+# The wire protocol, from the crate under test. There is no other client
+# (README's warning), so the matrix has to carry the one it needs.
+nomux_protocol = { path = "../../crates/nomux", package = "nomux" }
+
+[profile.release]
+opt-level = "z"
+strip = "symbols"

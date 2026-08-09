@@ -27,7 +27,7 @@ const SOCKET_MODE: u32 = 0o600;
 
 /// Permissions for the three plain files: the pidfile, the label and the spawn lock.
 /// Exact rather than umask-derived: a `<id>.lock` its own uid cannot open later is one
-/// nothing can lock, which [`SessionPaths::acquire`] refuses outright.
+/// nothing can lock, which [`SessionPaths::try_lock_spawn_or_refuse`] refuses outright.
 const FILE_MODE: u32 = 0o600;
 
 /// How many times an acquirer takes the lock before giving up — the first attempt and
@@ -512,12 +512,6 @@ impl SessionPaths {
         }
     }
 
-    /// Takes the spawn lock if it is free this instant, for callers with better things to do
-    /// than wait — [`Self::acquire`] unchanged, `Ok(None)` and both refusals.
-    pub(crate) fn try_lock_spawn_or_refuse(&self) -> io::Result<Option<SpawnLock>> {
-        self.acquire()
-    }
-
     /// [`Self::try_lock_spawn_or_refuse`] for the two opportunistic collections, which
     /// have nobody to report a refusal to and answer every failure by touching nothing.
     /// Daemon startup deliberately does not use this lossy spelling: it must either own
@@ -526,7 +520,8 @@ impl SessionPaths {
         self.try_lock_spawn_or_refuse().ok().flatten()
     }
 
-    /// Locks `<id>.lock` and confirms that what got locked is still that file.
+    /// Locks `<id>.lock` if it is free this instant and confirms that what got locked is
+    /// still that file — for callers with better things to do than wait.
     ///
     /// `Ok(None)` is "not this time" — held by somebody else, replaced more often than
     /// [`LOCK_ATTEMPTS`] allows for, or descriptors and lock records run out — all about
@@ -537,7 +532,7 @@ impl SessionPaths {
     /// The two failures about the *file* and the *filesystem*, still there next time: a
     /// `<id>.lock` nothing can lock, and a run directory mounted read-only. Neither may
     /// be answered by going ahead ([`SpawnLock`]).
-    fn acquire(&self) -> io::Result<Option<SpawnLock>> {
+    pub(crate) fn try_lock_spawn_or_refuse(&self) -> io::Result<Option<SpawnLock>> {
         let path = self.lock();
         for _ in 0..LOCK_ATTEMPTS {
             // `RDONLY`: `flock(2)` needs no access mode, and asking for write would refuse
@@ -713,6 +708,19 @@ impl SessionPaths {
         Ok(lock)
     }
 
+    /// Gives `<id>.lock` back after a startup that failed before the session existed —
+    /// but only where `lock` is the acquisition that created the name.
+    ///
+    /// The rule is [`SpawnLock::created_name`]'s and the one place it is applied: a name
+    /// this call did not make may be a mutex another process still has standing on, and
+    /// unlinking one is how two acquirers come to hold the only lock there is. Absence is
+    /// the state this is reaching for, so nothing is reported.
+    pub(crate) fn release_lock_name(&self, lock: &SpawnLock) {
+        if lock.created_name {
+            drop(fs::remove_file(self.lock()));
+        }
+    }
+
     /// Removes every file belonging to this session, ignoring absences. `lock` is never
     /// read: it is the caller's standing to remove `<id>.lock` with the rest
     /// ([`SpawnLock`]).
@@ -817,7 +825,7 @@ fn remove_node(path: &Path) -> io::Result<()> {
 
 /// A caller's exclusive standing on one session id — an exclusive `flock` on
 /// `<id>.lock`, released on drop, and never anything weaker: a host that cannot give one
-/// gets a refusal ([`SessionPaths::acquire`]).
+/// gets a refusal ([`SessionPaths::try_lock_spawn_or_refuse`]).
 ///
 /// Collection (§ 6.6) must take it as well as a spawn (§ 6.3), because **a file unlinked
 /// while it is locked stops being a mutex**: the next process to ask creates a new file at
@@ -828,7 +836,8 @@ pub(crate) struct SpawnLock {
     fd: OwnedFd,
     /// Whether this acquisition created the directory entry it locked, established
     /// atomically with `O_EXCL`: a startup failure may remove the name only then —
-    /// otherwise it may be a stale mutex another process still has standing on.
+    /// otherwise it may be a stale mutex another process still has standing on. Read
+    /// only by [`SessionPaths::release_lock_name`], which is that rule.
     created_name: bool,
 }
 
@@ -839,11 +848,6 @@ impl SpawnLock {
     /// the exec boundary without a release/reacquire window.
     pub(crate) fn raw_fd(&self) -> i32 {
         self.fd.as_raw_fd()
-    }
-
-    /// Whether taking this lock created its directory entry.
-    pub(crate) const fn created_name(&self) -> bool {
-        self.created_name
     }
 
     /// Whether this holds a lock on the file that is at `path` now — `flock` attaches to
@@ -1254,6 +1258,36 @@ mod tests {
             paths.try_lock_spawn().is_none(),
             "and the spelling with nobody to report to gives the id up rather than \
              inventing a standing it does not have"
+        );
+    }
+
+    /// A startup that failed gives back only the `<id>.lock` it made itself. Both callers
+    /// — `daemon::start` on a refused ring or bind, and `attach::create` on a launcher
+    /// that started nothing — reach the rule through [`SessionPaths::release_lock_name`],
+    /// and the second of the two used to remove the name whoever it was. Unlinking a
+    /// mutex somebody else created is how two acquirers come to hold the only lock there
+    /// is, so the distinction is the whole of what this function is.
+    #[test]
+    fn only_the_acquisition_that_made_the_lock_name_gives_it_back() {
+        let root = Scratch::new("rundir-lock-name");
+        let paths = SessionPaths::in_dir(root.path(), "tab_7").expect("resolve paths");
+
+        let made = paths.try_lock_spawn().expect("create and hold the lock");
+        paths.release_lock_name(&made);
+        assert!(
+            !paths.lock().exists(),
+            "the acquisition that created the name is the one that may take it away"
+        );
+        drop(made);
+
+        // Somebody else's `<id>.lock`, which this acquisition finds rather than creates.
+        fs::write(paths.lock(), b"").expect("plant a lock file");
+        let found = paths.try_lock_spawn().expect("hold the planted lock");
+        paths.release_lock_name(&found);
+        assert!(
+            paths.lock().exists(),
+            "a name this acquisition did not make may be a mutex another process still \
+             has standing on, so a failed startup leaves it exactly where it is"
         );
     }
 

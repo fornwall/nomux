@@ -1,0 +1,17 @@
+# Keys only, and no multiplexing anywhere: the matrix measures what happens at the
+# *final* logout, so a second session held open by anything would suppress the very
+# thing under test.
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+
+# Left explicitly on: pam_systemd is what creates the `session-N.scope` a directly
+# launched daemon stays in, and the `CELL_PAM_SYSTEMD=no` cell turns it off in
+# /etc/pam.d/common-session rather than here, so this axis has one switch.
+UsePAM yes
+
+# A logout should be a logout the instant the connection drops.
+TCPKeepAlive yes
+ClientAliveInterval 5
+ClientAliveCountMax 1
