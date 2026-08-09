@@ -611,33 +611,33 @@ impl SessionPaths {
     }
 
     /// The refusal for a `<id>.lock` that cannot be locked by anybody — § 6.3's rule that
-    /// nothing here proceeds without the lock. Apart from [`Self::read_only_lock`]
-    /// because the repairs differ: a `chmod` versus pointing `XDG_RUNTIME_DIR` elsewhere.
+    /// nothing here proceeds without the lock, going ahead without one being how two
+    /// daemons come to claim one id and unlink each other's live sessions. Apart from
+    /// [`Self::read_only_lock`] because the repairs differ, which is what the message
+    /// carries: a `chmod` versus pointing `XDG_RUNTIME_DIR` at a filesystem with `flock`.
     fn unlockable(&self, path: &Path, err: rustix::io::Errno) -> io::Error {
         let err = io::Error::from(err);
         io::Error::new(
             err.kind(),
             format!(
-                "the spawn lock for session {id} cannot be held by anybody: {path}: {err}; \
-                 this filesystem cannot serialise session startup, and going ahead without \
-                 the lock is how two daemons come to claim one id and unlink each other's \
-                 live sessions",
+                "session {id}: spawn lock {path} cannot be held by anybody: {err}; \
+                 chmod it, or point XDG_RUNTIME_DIR at a filesystem with flock",
                 id = self.id,
                 path = path.display(),
             ),
         )
     }
 
-    /// The refusal for a run directory nothing can be created in, which is a fact about the
-    /// mount rather than about locking ([`Self::unlockable`]).
+    /// The refusal for a run directory nothing can be created in, which is a fact about
+    /// the mount rather than about locking ([`Self::unlockable`]): there is no session
+    /// here to start and none to remove.
     fn read_only_lock(&self, path: &Path) -> io::Error {
         let err = io::Error::from(rustix::io::Errno::ROFS);
         io::Error::new(
             err.kind(),
             format!(
-                "the spawn lock for session {id} could not be created: {path}: {err}; the \
-                 run directory is on a read-only filesystem, so there is no session here to \
-                 start and none to remove",
+                "session {id}: spawn lock {path} could not be created: {err}; the run \
+                 directory is on a read-only filesystem, so point it elsewhere",
                 id = self.id,
                 path = path.display(),
             ),
