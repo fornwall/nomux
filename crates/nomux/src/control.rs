@@ -46,7 +46,7 @@ const KILL_GRACE: Duration = Duration::from_millis(500);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// The kernel's longest path, which is as long as `argv[0]` gets for a daemon *this*
-/// program starts: `spawn` execs it by a resolved path (§ 5.2).
+/// program starts: `spawn` sets it from `env::current_exe`, a path the kernel resolved.
 const PATH_MAX: usize = 4096;
 
 /// Longest `/proc/<pid>/cmdline` prefix [`is_daemon_for`] reads: enough for a well-formed
