@@ -192,10 +192,7 @@ struct Daemon {
     /// never what the terminal is — `stty rows` in the session needs no permission from
     /// this daemon — which is why [`Daemon::on_hello`] clears it.
     applied_win: Option<WinSize>,
-    /// Whether a `SIGCHLD` has arrived that no `waitpid` has been spent on yet. Set by the
-    /// pass that empties [`Daemon::child_pipe`] and cleared by the ask it pays for, in that
-    /// order — so a signal landing between the two leaves its byte in an emptied pipe,
-    /// which is the next wakeup rather than a reap nobody makes.
+    /// Whether a `SIGCHLD` has arrived that no `waitpid` has been spent on yet.
     child_signalled: bool,
     /// When the PTY master reported end of file. Distinct from `outcome`: `waitpid`
     /// usually has no result yet at that moment.
@@ -722,8 +719,7 @@ impl Daemon {
         }
         // Emptied, where the pipe just above deliberately is not: this session goes on, and
         // a byte left in a watched descriptor is [`ACCEPT_BACKOFF`]'s spin with nothing
-        // wrong at all. Before the `waitpid` [`Daemon::collect_outcome`] spends at the end
-        // of this pass, in [`Daemon::child_signalled`]'s order.
+        // wrong at all.
         if revents(Source::Child).intersects(READABLE) {
             self.child_signalled = true;
             // A short read is an empty pipe, so the ordinary one byte costs one syscall
@@ -1012,8 +1008,10 @@ impl Daemon {
         } else {
             None
         };
-        // Spent whether or not anything came back, and after the ask: a `SIGCHLD` from here
-        // on leaves its byte in the pipe [`Daemon::poll_once`] emptied, which is a wakeup.
+        // Set by the pass that empties [`Daemon::child_pipe`] and cleared here, after the
+        // ask it paid for: a `SIGCHLD` landing between the two leaves its byte in an
+        // emptied pipe, which is the next wakeup rather than a reap nobody makes. Spent
+        // whether or not anything came back.
         self.child_signalled = false;
         if self.outcome.is_some() {
             return;
