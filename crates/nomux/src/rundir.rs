@@ -680,7 +680,15 @@ impl SessionPaths {
         // SAFETY: `F_GETFD` takes no third argument, treats `raw` as a number only, and
         // mutates no memory. Failure is reported through errno below.
         if unsafe { libc::fcntl(raw, libc::F_GETFD) } == -1 {
-            return Err(io::Error::last_os_error());
+            let err = io::Error::last_os_error();
+            return Err(io::Error::new(
+                err.kind(),
+                format!(
+                    "session {id}: --lock-fd {raw} is not an open descriptor for {path}: {err}",
+                    id = self.id,
+                    path = self.lock().display(),
+                ),
+            ));
         }
         // SAFETY: `spawn` cleared `CLOEXEC` on this owned descriptor in the forked
         // child and passed its number as an argument. This process has not opened or
@@ -1364,7 +1372,9 @@ mod tests {
 
     /// A `--lock-fd` this daemon cannot adopt is a bad *descriptor* and never a bad id:
     /// § 10 reserves [`io::ErrorKind::InvalidInput`] to [`SessionPaths::in_dir`], since
-    /// `main::report` scores it as the 64 a client caches as its own typo.
+    /// `main::report` scores it as the 64 a client caches as its own typo. It also has to
+    /// say what it was refusing, as every other refusal here does: this one reached the
+    /// user as a bare `Bad file descriptor` naming neither the session nor the file.
     #[test]
     fn a_malformed_lock_fd_is_never_reported_as_a_malformed_id() {
         let root = Scratch::new("rundir-inherit");
@@ -1380,8 +1390,14 @@ mod tests {
         let err = paths
             .inherit_spawn_lock(closed)
             .expect_err("a closed number is no capability");
-        assert_eq!(err.raw_os_error(), Some(libc::EBADF), "{err}");
         assert_ne!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("session tab_7")
+                && text.contains("tab_7.lock")
+                && text.contains(&format!("os error {}", libc::EBADF)),
+            "the refusal must name the session, the file it was for, and the errno: {err}"
+        );
     }
 
     #[test]
