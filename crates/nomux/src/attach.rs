@@ -239,21 +239,24 @@ fn no_such_session(paths: &SessionPaths) -> Failure {
     )
 }
 
-/// `attach` on an id whose socket answered neither death nor life.
+/// `attach` on an id whose socket did not answer with life or death.
+///
+/// The error is quoted rather than summarised: it is the whole of what was established,
+/// and it is not always about a probe that failed — a socket somebody else bound answered
+/// perfectly well (`usock::Foreign`).
 fn unattachable(paths: &SessionPaths, err: &io::Error) -> Failure {
     Failure::new(
         resume_probe_class(err),
         io::Error::other(format!(
-            "session {id} could not be joined: {sock} could not be probed, so that nothing \
-             is serving it was never established: {err}. `nomux list` says what this host \
+            "session {id} could not be joined: {err}. `nomux list` says what this host \
              is holding",
             id = paths.id(),
-            sock = paths.socket().display(),
         )),
     )
 }
 
-/// Transient resource pressure under which repeating an `attach` is safe.
+/// Transient resource pressure under which repeating an `attach` is safe, and the one
+/// refusal that establishes something instead: a socket this uid may not speak to.
 fn resume_probe_class(err: &io::Error) -> FailureClass {
     let transient_kind = matches!(
         err.kind(),
@@ -268,6 +271,11 @@ fn resume_probe_class(err: &io::Error) -> FailureClass {
     );
     if transient_kind || transient_errno {
         FailureClass::Retryable
+    } else if err.kind() == io::ErrorKind::PermissionDenied {
+        // A socket bound by another uid, or one this uid may not reach through the run
+        // directory's modes: either way the boundary § 6.3 requires is not there, which is
+        // a fact about the host and not an outcome that a retry could settle.
+        FailureClass::UnsafeHost
     } else {
         FailureClass::Uncertain
     }
@@ -740,7 +748,10 @@ mod tests {
     use std::fs::File;
     use std::io::{self, Write as _};
 
-    use super::{ChildStderr, FailureClass, daemon_complaint, resume_probe_class};
+    use super::{
+        ChildStderr, FailureClass, SessionPaths, daemon_complaint, resume_probe_class, unattachable,
+    };
+    use crate::usock::Foreign;
 
     #[test]
     fn failure_classes_have_stable_tokens_and_legacy_statuses() {
@@ -770,8 +781,32 @@ mod tests {
             assert_eq!(resume_probe_class(&err), FailureClass::Retryable);
         }
         assert_eq!(
-            resume_probe_class(&io::Error::from_raw_os_error(libc::EACCES)),
+            resume_probe_class(&io::Error::from_raw_os_error(libc::ENOTRECOVERABLE)),
             FailureClass::Uncertain
+        );
+    }
+
+    /// A session socket somebody else bound is reported as that, to the stderr this mode
+    /// still has, rather than as a probe that established nothing.
+    ///
+    /// The refusal is `usock`'s own — the suite cannot become a second uid to provoke one
+    /// — and the two halves that were wrong are both here: the class, which said the host
+    /// was fine and the answer unknown, and the sentence, which said the socket could not
+    /// be probed when it had been probed and had answered.
+    #[test]
+    fn a_socket_another_user_bound_names_that_user_rather_than_an_unprobeable_socket() {
+        let paths = SessionPaths::in_dir(std::path::Path::new("/run/nomux"), "work").unwrap();
+        let failure = unattachable(&paths, &Foreign::Uid(4242).refusal());
+        let said = failure.to_string();
+
+        assert_eq!(failure.class(), FailureClass::UnsafeHost);
+        assert!(
+            said.contains("uid 4242"),
+            "the one fact established is whose socket this is: {said:?}"
+        );
+        assert!(
+            !said.contains("could not be probed"),
+            "it was probed, and it answered: {said:?}"
         );
     }
 
