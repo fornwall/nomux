@@ -53,7 +53,6 @@ fn compact(buf: &mut Vec<u8>, pos: &mut usize, floor: usize) {
 const FINAL_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// A client connection carrying partially read and partially written frames.
-#[derive(Debug)]
 pub(crate) struct Conn {
     stream: UnixStream,
     rx: Vec<u8>,
@@ -65,6 +64,21 @@ pub(crate) struct Conn {
     /// of the stream.
     preamble_queued: bool,
     eof: bool,
+}
+
+impl std::fmt::Debug for Conn {
+    /// Sizes and flags, never bytes: `rx` and `tx` are deliberately left out. Derived,
+    /// this would hand both buffers to whatever printed a `Conn` — the megabyte § 4.1
+    /// lets each of them reach, of session output and of whatever the peer last typed —
+    /// and the only place this binary prints to is syslog.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Conn")
+            .field("buffered", &self.buffered())
+            .field("queued", &self.queued())
+            .field("preamble_queued", &self.preamble_queued)
+            .field("eof", &self.eof)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Conn {
@@ -311,6 +325,28 @@ mod tests {
         let (peer, ours) = UnixStream::pair().expect("a socketpair");
         peer.set_nonblocking(true).expect("a non-blocking peer");
         (peer, Conn::new(ours).expect("a connection"))
+    }
+
+    /// The rendering pinned exactly, so a `#[derive(Debug)]` cannot come back silently:
+    /// derived, both buffers go wherever a `Conn` is printed, and in this binary that is
+    /// syslog. Frames on both sides, so a derive would have contents to leak.
+    #[test]
+    fn the_debug_rendering_carries_no_buffer_contents() {
+        let (mut peer, mut conn) = pair();
+        conn.send(&Frame::Output {
+            offset: 0,
+            data: b"queued output",
+        });
+        let typed = encoded(&Frame::Input {
+            offset: 0,
+            data: b"typed input",
+        });
+        feed(&mut peer, &mut conn, &typed);
+
+        assert_eq!(
+            format!("{conn:?}"),
+            "Conn { buffered: 23, queued: 37, preamble_queued: true, eof: false, .. }"
+        );
     }
 
     /// A payload whose every byte is a function of its position, so a compaction that
