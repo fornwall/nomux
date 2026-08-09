@@ -1317,9 +1317,11 @@ impl Daemon {
                 client.repaint_due = true;
             }
 
-            // Defence in depth against a second short-return path ever appearing: the back
-            // half of a wrapped deque is only labelled correctly if the front was queued
-            // whole, and a stream contiguous and wrong is what no client can detect.
+            // Stopping on a short front slice is the ordinary path, not a guard against
+            // one: [`Conn::send_output`] re-checks its cap per chunk and the front slice
+            // can be the whole ring. The back half is only labelled correctly if the front
+            // was queued whole, and a stream contiguous and wrong is what no client can
+            // detect.
             for part in self.ring.slices_from(client.sent_through) {
                 if part.is_empty() {
                     continue;
