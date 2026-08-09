@@ -398,6 +398,12 @@ copy outliving that would keep a terminal open with nobody on it.
 disciplines give double echo, doubled `\r\n` translation and broken raw mode. That is also
 why `TERM` arrives in `Hello` (§ 2.2) and not from sshd.
 
+**Every `Hello` re-issues the size, an unchanged one included.** Greeting clears
+`applied_win`, so a reattach sets `TIOCSWINSZ` even where the size matches what this daemon
+last applied: `stty rows` needs no permission from the daemon, so the child may have moved
+the master itself since the last greeting, and a reattach is the only chance to put that
+right.
+
 The master is non-blocking, so input the PTY will not take waits in the daemon's queue,
 where § 4.1's cap alone bounds it.
 
