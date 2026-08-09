@@ -21,7 +21,6 @@ use rustix::event::{PollFd, PollFlags, Timespec};
 
 use crate::agent::{self, Agent};
 use crate::conn::Conn;
-use crate::launcher::OriginalInvocationId;
 use crate::nbio;
 use crate::pty::{self, Pty};
 use crate::rundir::{SessionPaths, ensure_run_dir};
@@ -235,9 +234,8 @@ pub(crate) fn run(
     session_id: &str,
     label: Option<&str>,
     inherited_lock_fd: Option<i32>,
-    scope_invocation_id: Option<OriginalInvocationId>,
 ) -> io::Result<()> {
-    let result = start(session_id, label, inherited_lock_fd, scope_invocation_id);
+    let result = start(session_id, label, inherited_lock_fd);
     if let Err(err) = &result {
         // Also to syslog, not only through the `Err` the caller prints: past
         // `silence_standard_descriptors` there is no stderr left to reach anybody through.
@@ -247,15 +245,7 @@ pub(crate) fn run(
 }
 
 /// The body of [`run`], separated so that every way out of it is logged once.
-fn start(
-    session_id: &str,
-    label: Option<&str>,
-    inherited_lock_fd: Option<i32>,
-    scope_invocation_id: Option<OriginalInvocationId>,
-) -> io::Result<()> {
-    if let Some(original_invocation_id) = scope_invocation_id {
-        restore_scope_environment(original_invocation_id);
-    }
+fn start(session_id: &str, label: Option<&str>, inherited_lock_fd: Option<i32>) -> io::Result<()> {
     let paths = SessionPaths::new(session_id)?;
     ensure_run_dir(paths.dir())?;
 
@@ -354,28 +344,6 @@ fn start(
     crate::sanitize::info(session_id, &format!("exiting: {reason}"));
     daemon.shutdown();
     result
-}
-
-/// Restores the SSH session's invocation id after systemd-run replaced it.
-///
-/// A transient scope receives its own `INVOCATION_ID`; allowing that to reach the PTY child
-/// would make the scope launcher observable in the shell environment. The parent encoded the
-/// original raw value, including absence, in the daemon command line.
-fn restore_scope_environment(original: OriginalInvocationId) {
-    match original {
-        OriginalInvocationId::Absent => {
-            // SAFETY: daemon startup is single-threaded and no user code can run yet.
-            unsafe {
-                std::env::remove_var("INVOCATION_ID");
-            }
-        }
-        OriginalInvocationId::Value(value) => {
-            // SAFETY: daemon startup is single-threaded and no user code can run yet.
-            unsafe {
-                std::env::set_var("INVOCATION_ID", value);
-            }
-        }
-    }
 }
 
 /// Hands the id to the process that will actually serve it: § 6.2's detachment, the
