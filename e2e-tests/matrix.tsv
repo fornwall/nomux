@@ -1,0 +1,34 @@
+# The cells of PLAN.md item 1, and what each is predicted to do. Tab-separated;
+# `#` comments and blank lines ignored. run.sh measures each and fails on any cell
+# whose measured verdict differs from `expect` — in *either* direction, because a
+# prediction that turns out too pessimistic is as much a finding as one too optimistic.
+#
+# `expect` is `survives` or `dies`: whether the session created in one SSH login is
+# still there in the next, after the first has been logged out.
+#
+# The three axes are the three things `launcher::spawn_daemon` reads before it chooses,
+# plus the one thing it cannot see (KillUserProcesses) that decides whether its choice
+# was the right one.
+#
+# cell	port	kill_user_processes	linger	pam_systemd	expect
+#
+# No pam_systemd: no session scope, no $XDG_RUNTIME_DIR, no user bus. The launcher must
+# decline the scope path, and nothing on the host is managing logins, so nothing kills
+# the daemon whatever KillUserProcesses says.
+no-user-bus	2201	no	no	no	survives
+#
+# The forgiving host. Direct launch (no linger), session scope not killed at logout.
+kup-off-linger-off	2202	no	no	yes	survives
+#
+# Linger on, so the scope path is taken; nothing would have killed it anyway. This cell
+# is what says the scope launch does not *itself* break a session that used to work.
+kup-off-linger-on	2203	no	yes	yes	survives
+#
+# The cell the whole exercise is for, and the one the README already warns about. The
+# launcher has no linger, so it falls back to the direct path, and the direct path leaves
+# the daemon in `session-N.scope` — which logind kills at the final logout.
+kup-on-linger-off	2204	yes	no	yes	dies
+#
+# The configuration nomux actually wants on a strict host: linger enabled, so the daemon
+# goes into a manager-owned transient scope that outlives the login session.
+kup-on-linger-on	2205	yes	yes	yes	survives

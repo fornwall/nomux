@@ -61,6 +61,28 @@ function delink(s,   t, g, i, r) {
     }
     return s
 }
+# A markdown link is relative to the document carrying it, which is only the same thing as
+# repository-root-relative while every document sits at the root. e2e-tests/README.md links
+# `../crates/nomux/src/startup.rs`, so a target is joined to its document`s directory and
+# normalised before anything is opened. Root-level documents are unaffected: their prefix is
+# empty and there is nothing to normalise away.
+function reldir(f,   d) {
+    d = f
+    return sub(/\/[^/]*$/, "", d) ? d "/" : ""
+}
+function normalise(p,   parts, n, i, out, k, j) {
+    n = split(p, parts, "/"); k = 0
+    for (i = 1; i <= n; i++) {
+        if (parts[i] == "" || parts[i] == ".") continue
+        # A `..` that would climb past the root is left in place rather than dropped, so the
+        # result names nothing and is reported instead of silently becoming another file.
+        if (parts[i] == ".." && k > 0 && out[k] != "..") { k--; continue }
+        out[++k] = parts[i]
+    }
+    p = ""
+    for (j = 1; j <= k; j++) p = p (j > 1 ? "/" : "") out[j]
+    return p
+}
 function scan(f,   n, l, t, m, g, p, a, q, k, doc, num, prev) {
     while ((getline l < f) > 0) {
         n++; t = l
@@ -69,7 +91,8 @@ function scan(f,   n, l, t, m, g, p, a, q, k, doc, num, prev) {
         while (f ~ /\.md$/ && match(t, /\]\([^()]*\)/)) {
             g = substr(t, RSTART + 2, RLENGTH - 3); t = substr(t, RSTART + RLENGTH)
             if (g ~ /^(https?:|mailto:|#)/) continue
-            p = g; sub(/#.*/, "", p); a = substr(g, index(g, "#") + 1); load(p)
+            p = g; sub(/#.*/, "", p); a = substr(g, index(g, "#") + 1)
+            p = normalise(reldir(f) p); load(p)
             if (!ex[p]) bad(f, n, "link to " p ", which is not in the repository")
             else if (index(g, "#") && p ~ /\.md$/ && !((p, a) in anc))
                 bad(f, n, p " has no heading anchored at #" a)

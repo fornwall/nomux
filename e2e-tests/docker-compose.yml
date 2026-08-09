@@ -1,0 +1,70 @@
+# One container per cell of matrix.tsv, each booting systemd as PID 1 so there is a real
+# logind to have a policy and a real sshd to log out of. Keep the two files in step: the
+# port here is the port the matrix names.
+
+x-cell: &cell
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: nomux-e2e:latest
+  # systemd needs to write the cgroup hierarchy it manages. A privileged container is the
+  # short way to that; this harness starts throwaway Debian images from a local build and
+  # is not run against anything it does not own.
+  privileged: true
+  # Its own cgroup namespace, so the container's systemd owns a root it may delegate from
+  # rather than the host's. (Compose spells this `cgroup`; `cgroupns_mode` is the
+  # `docker run --cgroupns` name and the schema rejects it here.)
+  cgroup: private
+  # systemd's shutdown request. Without it `compose down` is a SIGTERM PID 1 ignores and
+  # every cell waits out the grace period.
+  stop_signal: SIGRTMIN+3
+  stop_grace_period: 15s
+  tmpfs:
+    - /run
+    - /run/lock
+    - /tmp
+  volumes:
+    # Built by run.sh rather than baked, so iterating on nomux does not rebuild the image.
+    - ./bin:/opt/nomux-bin:ro
+    - ./.keys/id_ed25519.pub:/opt/nomux-key.pub:ro
+
+services:
+  no-user-bus:
+    <<: *cell
+    environment:
+      CELL_KILL_USER_PROCESSES: "no"
+      CELL_LINGER: "no"
+      CELL_PAM_SYSTEMD: "no"
+    ports: ["127.0.0.1:2201:22"]
+
+  kup-off-linger-off:
+    <<: *cell
+    environment:
+      CELL_KILL_USER_PROCESSES: "no"
+      CELL_LINGER: "no"
+      CELL_PAM_SYSTEMD: "yes"
+    ports: ["127.0.0.1:2202:22"]
+
+  kup-off-linger-on:
+    <<: *cell
+    environment:
+      CELL_KILL_USER_PROCESSES: "no"
+      CELL_LINGER: "yes"
+      CELL_PAM_SYSTEMD: "yes"
+    ports: ["127.0.0.1:2203:22"]
+
+  kup-on-linger-off:
+    <<: *cell
+    environment:
+      CELL_KILL_USER_PROCESSES: "yes"
+      CELL_LINGER: "no"
+      CELL_PAM_SYSTEMD: "yes"
+    ports: ["127.0.0.1:2204:22"]
+
+  kup-on-linger-on:
+    <<: *cell
+    environment:
+      CELL_KILL_USER_PROCESSES: "yes"
+      CELL_LINGER: "yes"
+      CELL_PAM_SYSTEMD: "yes"
+    ports: ["127.0.0.1:2205:22"]

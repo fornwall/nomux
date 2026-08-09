@@ -39,6 +39,16 @@ repos:
         files: '^fuzz/.*\.(rs|toml)$|^rustfmt\.toml$'
         pass_filenames: false
 
+      # e2e-tests/probe/ is a third workspace, for fuzz/'s reason. Only formatting is
+      # gated here: the matrix itself needs Docker and a few minutes, so it stays a
+      # command someone runs rather than something in the way of every commit.
+      - id: cargo-fmt-e2e-probe
+        name: cargo fmt --check (e2e probe)
+        entry: cargo fmt --manifest-path e2e-tests/probe/Cargo.toml --all --check
+        language: system
+        files: '^e2e-tests/probe/.*\.(rs|toml)$|^rustfmt\.toml$'
+        pass_filenames: false
+
       - id: cargo-clippy
         name: cargo clippy
         entry: cargo clippy --locked --workspace --all-targets -- -D warnings
