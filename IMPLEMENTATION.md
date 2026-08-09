@@ -22,8 +22,9 @@ is published ([DESIGN.md § 2](DESIGN.md#2-scope)).
 
 - Edition 2024; MSRV is `rust-toolchain.toml`'s pin.
 - Lints: `[workspace.lints]` in `Cargo.toml` is the list, every entry at `warn` bar one,
-  which `Cargo.toml` names and argues. The deny is `-D warnings` on the clippy hook in
-  `.pre-commit-config.yaml`, which gates this tree rather than any build of it; test
+  which `Cargo.toml` names and argues. The denies are two and neither is in the manifest:
+  `-D warnings` on the clippy hook in `.pre-commit-config.yaml`, which gates this tree, and
+  job-level `RUSTFLAGS`/`RUSTDOCFLAGS` on CI's `check` job, which gates a merge. Test
   relaxations live in `clippy.toml`.
 
 ### Environment
