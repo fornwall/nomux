@@ -466,15 +466,6 @@ const READABLE: PollFlags = PollFlags::IN
     .union(PollFlags::ERR)
     .union(PollFlags::NVAL);
 
-/// Takes back out of a self-pipe whatever its handler put there. A short read is an
-/// empty pipe, so the ordinary one byte costs one syscall rather than one and the
-/// `EAGAIN` behind it; any error ends the loop — a wasted pass rather than a spin on a
-/// descriptor that has genuinely failed.
-fn drain_signals(pipe: BorrowedFd<'_>) {
-    let mut sink = [0u8; 64];
-    while nbio::read(pipe, &mut sink).is_ok_and(|read| read == sink.len()) {}
-}
-
 impl Daemon {
     fn event_loop(&mut self) -> io::Result<()> {
         // Both held for the session and neither given back: `read_buf` never moves, and
@@ -736,7 +727,11 @@ impl Daemon {
         // of this pass, in [`Daemon::child_signalled`]'s order.
         if revents(Source::Child).intersects(READABLE) {
             self.child_signalled = true;
-            drain_signals(self.child_pipe.as_fd());
+            // A short read is an empty pipe, so the ordinary one byte costs one syscall
+            // rather than one and the `EAGAIN` behind it; an error stops the loop too,
+            // a wasted pass being better than a spin on a descriptor that has failed.
+            let mut sink = [0u8; 64];
+            while nbio::read(self.child_pipe.as_fd(), &mut sink).is_ok_and(|n| n == sink.len()) {}
         }
 
         let client_events = revents(Source::Client);
