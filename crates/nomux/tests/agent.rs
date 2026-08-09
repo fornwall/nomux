@@ -211,8 +211,8 @@ fn a_second_agent_connection_waits_for_the_one_being_served() {
     let (session, mut client, ok) = Session::attached_with("agent_serial", true, false);
     client.make_ready("-echo", None, ok.resume_from);
 
-    let first = session.connect_agent();
-    expect_agent(
+    let mut first = session.connect_agent();
+    let held = expect_agent(
         &mut client,
         FrameType::AgentOpen,
         "the first peer has the slot",
@@ -223,14 +223,27 @@ fn a_second_agent_connection_waits_for_the_one_being_served() {
         .write_all(b"\0\0\0\x01\x0b")
         .expect("write while waiting for a turn");
 
-    // Two round trips through the daemon, which is what makes this a fence: an
-    // `AgentOpen` the daemon had already queued for `second` would be ahead of the
-    // second `Pong` in the stream, and `next_of` refuses anything but this session's
-    // own chatter on the way to what it was asked for.
-    for _ in 0..2 {
-        client.send(&Frame::Ping);
-        drop(client.next_of(FrameType::Pong));
-    }
+    // A round trip through the *agent* rather than a `Ping` and its `Pong`, which fences
+    // only the client's own stream: a pass that answered the ping without having looked
+    // at the agent listener would satisfy that and say nothing about the peer waiting
+    // behind this one. What is asserted here is a pass the daemon spent inside the agent
+    // code — it took bytes off the served connection and produced an `AgentData` for them
+    // — with `second` in the backlog throughout, and nothing for `second` came out of it.
+    // `next_of` refuses anything but this session's own chatter on the way, so an
+    // `AgentOpen` the daemon had queued for `second` fails here rather than being read
+    // past.
+    first
+        .write_all(b"\0\0\0\x01\x0e")
+        .expect("write from the peer that holds the slot");
+    let payload = client.next_of(FrameType::AgentData);
+    assert_eq!(
+        Frame::decode(FrameType::AgentData, &payload).expect("decode"),
+        Frame::AgentData {
+            generation: held,
+            data: b"\0\0\0\x01\x0e",
+        },
+        "the served peer's bytes must arrive under the channel that has the slot"
+    );
 
     drop(first);
     expect_agent(
