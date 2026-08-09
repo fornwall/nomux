@@ -937,6 +937,11 @@ fn a_daemon_that_cannot_accept_stands_back_rather_than_spinning() {
     // there.
     let starved = UnixStream::connect(&session.socket).expect("knock on the door");
     let burned = cpu_ticks(daemon);
+    // Before the assertion rather than after it: the shortage is imposed from outside,
+    // so a failing measurement would otherwise leave the daemon unable to accept for
+    // whatever the rest of the run does with it, and this test's own report would be
+    // followed by a second failure that is only this line not having run.
+    set_open_file_limit(daemon, restore);
     assert!(
         burned <= TOLERATED,
         "the daemon burned {burned} clock ticks in {SPIN_WINDOW:?} failing to accept \
@@ -945,7 +950,6 @@ fn a_daemon_that_cannot_accept_stands_back_rather_than_spinning() {
 
     // And the listener came back rather than being stood down for good: a backoff
     // that never expires is the same session lost by a quieter route.
-    set_open_file_limit(daemon, restore);
     drop(starved);
     let mut client = session.connect();
     let ok = client.hello(RESUME_FROM_START);
