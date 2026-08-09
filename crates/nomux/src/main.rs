@@ -31,6 +31,10 @@ use std::process::ExitCode;
 /// the only one shared by every mode — `IMPLEMENTATION.md` § 10 has both tables and
 /// says why the rest of that range is left alone.
 const EXIT_USAGE: u8 = 64;
+/// `--version` and `--help` get a heading of their own rather than a place under
+/// `options:` because they are modes here, not options: [`only`] refuses anything after
+/// either, and `spawn --help` is an unknown option. Advertising them as options is what
+/// made the two disagree.
 const USAGE: &str = "\
 usage: nomux <mode> [session-id] [options]
 
@@ -45,6 +49,8 @@ human control modes:
 
 options:
   --label <text>        Display name for `list` (daemon and spawn only)
+
+in place of a mode, alone:
   --version, -V         Print version and protocol revision
   --help, -h            Print this usage
 ";

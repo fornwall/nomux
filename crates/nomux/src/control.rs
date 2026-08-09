@@ -3,9 +3,8 @@
 //! These must work against a daemon of *any* version, so the contract here is the
 //! on-disk layout — never a protocol frame, never `PROTOCOL_VERSION`.
 //!
-//! Those two modes and nothing else. The socket probe all of this is written against is
-//! [`crate::usock::liveness`], where the daemon's bind and the attach paths reach it
-//! without reading a line of a file § 6.6 froze.
+//! The socket probe all of this is written against is [`crate::usock::liveness`], where the
+//! daemon's bind and the attach paths reach it without reading a line of a file § 6.6 froze.
 
 use std::io::{self, Write};
 use std::os::fd::OwnedFd;
@@ -16,7 +15,7 @@ use std::time::{Duration, Instant};
 use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal, test_kill_process};
 
 use crate::rundir::{
-    MAX_PID_LEN, MAX_SESSION_ID_LEN, SessionPaths, SpawnLock, check_run_dir, parse_pid, read_label,
+    MAX_PID_LEN, MAX_SESSION_ID_LEN, SessionPaths, check_run_dir, parse_pid, read_label,
     read_prefix, run_dir, session_ids,
 };
 use crate::usock::{Liveness, liveness};
@@ -44,10 +43,16 @@ const KILL_GRACE: Duration = Duration::from_millis(500);
 
 /// How often to look again while waiting any of the graces out. One interval for all of
 /// them: each waits on another process reaching a point of its own.
+///
+/// It also bounds how many connections a stage can leave sitting in the daemon's backlog,
+/// which is `somaxconn` deep (`UnixListener::bind` asks the kernel for its maximum) and is
+/// drained by `accept` alone — a probe closing its end at once does *not* give the slot
+/// back. At 25 ms that is some 80 per stage against a modern default of 4096, so this is
+/// not a figure to tighten without counting.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// The kernel's longest path, which is as long as `argv[0]` gets for a daemon *this*
-/// program starts: `spawn` execs it by a resolved path (§ 5.2).
+/// program starts: `spawn` sets it from `env::current_exe`, a path the kernel resolved.
 const PATH_MAX: usize = 4096;
 
 /// Longest `/proc/<pid>/cmdline` prefix [`is_daemon_for`] reads: enough for a well-formed
@@ -133,8 +138,9 @@ pub(crate) fn kill(session_id: &str) -> io::Result<()> {
     }
     // Held from here to the end of the function (§ 6.6): without it, an attach that starts a
     // fresh daemon between the signal below and the unlink that follows loses its socket to a
-    // kill it was never the target of.
-    let lock = hold_spawn_lock(&paths)?;
+    // kill it was never the target of. Bounded rather than a blocking `flock`, because a
+    // process that stopped letting go is no reason for the escape hatch to hang forever.
+    let lock = paths.lock_spawn_until(Instant::now() + GRACE)?;
     if let Some(chosen) = resolve(&paths)? {
         chosen.signal(Signal::TERM);
         // Liveness first, deadline second, so a daemon that let go on the last interval is
@@ -177,36 +183,6 @@ pub(crate) fn kill(session_id: &str) -> io::Result<()> {
     }
 }
 
-/// Takes the spawn lock for the whole of a `kill`, waiting briefly for it (§ 6.6).
-///
-/// Bounded rather than a blocking `flock` because a process that stopped holding it is
-/// not a reason for the escape hatch to hang forever.
-///
-/// # Errors
-///
-/// Reports [`io::ErrorKind::ResourceBusy`] when the lock is still held at the deadline,
-/// rather than claim a postcondition it did not establish — and passes on the refusal a
-/// host that can hold no lock at all earns, which polling would only turn into that same
-/// busy message about a process that does not exist.
-fn hold_spawn_lock(paths: &SessionPaths) -> io::Result<SpawnLock> {
-    let deadline = Instant::now() + GRACE;
-    loop {
-        if let Some(lock) = paths.try_lock_spawn_or_refuse()? {
-            return Ok(lock);
-        }
-        if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::ResourceBusy,
-                format!(
-                    "session {} is being started or removed by another process",
-                    paths.id()
-                ),
-            ));
-        }
-        thread::sleep(POLL_INTERVAL);
-    }
-}
-
 /// Which process a locked session's daemon is, or `None` where nothing is listening and
 /// the files are all that is left.
 ///
@@ -232,9 +208,7 @@ fn resolve(paths: &SessionPaths) -> io::Result<Option<Chosen>> {
                 // A pid `/proc` does not rule out is taken whatever the probe did:
                 // [`chosen`] identifies a *process*, by a route the socket has no part in, so
                 // a mode or a descriptor limit keeping this process off the socket is no
-                // reason to stop signalling a daemon this one has positively named. Nothing
-                // is unlinked on the strength of it — every exit from [`kill`] still goes
-                // through a probe that has to say the session stopped.
+                // reason to stop signalling a daemon this one has positively named.
                 return chosen(paths, filed).map(Some).ok_or_else(|| {
                     let problem = unidentified(paths.id(), filed, body);
                     unresolved(paths, unprobed.as_ref(), &problem)
@@ -282,12 +256,10 @@ struct Chosen {
     /// What the refusals print and what `list` shows: a descriptor is nothing a user can
     /// carry to another command, so the number is still the whole of what is reportable.
     pid: Pid,
-    /// What the signals go through, or the errno that would give none up — the only thing
-    /// here that ever signals, for [`pin`]'s reason.
-    ///
-    /// An error is no descriptor, so nothing is signalled and [`kill`] settles what became of
-    /// the session by probing the socket alone. Only [`still_answering`] reads the errno,
-    /// that being the one path where the difference is visible.
+    /// What the signals go through, or the errno that gave none up — the only thing here
+    /// that ever signals, for [`pin`]'s reason. Where it is an error nothing is signalled and
+    /// [`kill`] settles the session by probing the socket alone; only [`still_answering`]
+    /// reads the errno, that being the one path where the difference is visible.
     reach: io::Result<OwnedFd>,
 }
 
@@ -401,8 +373,7 @@ fn refuse(message: String) -> io::Error {
 /// because that is the one thing the user can repair.
 fn running_but(paths: &SessionPaths, problem: &str) -> io::Error {
     refuse(format!(
-        "session {id} is running, but {pid}: {problem}; leaving it alone rather than \
-         unlinking a live session's files",
+        "session {id} is running, but {pid}: {problem}",
         id = paths.id(),
         pid = paths.pid().display(),
     ))
@@ -450,14 +421,11 @@ fn still_answering(id: &str, chosen: &Chosen) -> String {
     match &chosen.reach {
         Ok(_) => format!(
             "session {id} is still answering after SIGTERM and SIGKILL to pid {pid}, so \
-             that pid is not the process serving it; leaving it alone rather than \
-             unlinking a live session's files"
+             that pid is not the process serving it"
         ),
         Err(err) => format!(
             "session {id} is still answering, and pid {pid} could not be held to be \
-             signalled ({err}), so neither SIGTERM nor SIGKILL was sent and nothing here \
-             established what is serving it; leaving it alone rather than unlinking a \
-             live session's files"
+             signalled ({err}), so neither SIGTERM nor SIGKILL was sent"
         ),
     }
 }
@@ -467,9 +435,7 @@ fn still_answering(id: &str, chosen: &Chosen) -> String {
 /// known.
 fn unprobeable(paths: &SessionPaths, problem: &io::Error) -> io::Error {
     refuse(format!(
-        "session {id}: {sock} could not be probed, so whether it has stopped was never \
-         established: {problem}; leaving its files alone rather than unlinking what \
-         may be a live session",
+        "session {id}: {sock} could not be probed: {problem}",
         id = paths.id(),
         sock = paths.socket().display(),
     ))
@@ -482,9 +448,8 @@ fn bound_since(paths: &SessionPaths) -> io::Error {
     io::Error::new(
         io::ErrorKind::AddrInUse,
         format!(
-            "session {id} is answering on {sock} again: a daemon has bound the id since \
-             this kill established it was gone, so those files are its own and not this \
-             call's to remove",
+            "session {id} is answering on {sock} again: a daemon bound the id after this \
+             kill established it was gone",
             id = paths.id(),
             sock = paths.socket().display(),
         ),
