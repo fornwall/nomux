@@ -435,11 +435,6 @@ fn refuses(out: &Output, code: i32, class: Option<&str>, must_say: &str, what: &
 /// wait-for-the-socket that `spawn` does on the user's behalf are exercised here and
 /// nowhere else.
 ///
-/// Named for what it asserts. It used to say "relays transparently", and what it
-/// looks for is a substring in a byte stream — which says the frames got through in
-/// *some* form and nothing about transparency. That property has a test of its own
-/// and it is byte-exact; this one is about the spawn, and the round trip through the
-/// child is how it establishes that the daemon it started is really serving.
 #[test]
 fn spawn_starts_a_daemon_for_a_session_that_does_not_exist_yet() {
     use std::sync::mpsc;

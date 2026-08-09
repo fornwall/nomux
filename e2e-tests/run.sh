@@ -407,12 +407,8 @@ while IFS='	' read -r name port kup linger pam logout expect; do
         verdict=DEVIATES
         failed=1
     fi
-    # A daemon in a transient `nomux-*.scope` means `systemd-run --user --scope` is back in
-    # the launcher, and a cgroup this does not recognise means the column has stopped
-    # telling `direct` from `no-logind` and is decorating the table rather than saying
-    # anything. Both are failures on their own, apart from the verdict: a cell can reach
-    # the predicted verdict down a path that no longer exists, and did — `kup-on-linger-on`
-    # read `survives` for exactly that reason until the scope launch was deleted.
+    # A transient `nomux-*.scope` or an unknown cgroup makes the launch-path column false,
+    # whatever verdict the cell happened to reach.
     case "$path" in
     scope | '?')
         verdict="$verdict/LAUNCH"
@@ -428,9 +424,7 @@ done <<EOF
 $cells
 EOF
 
-# A cell that never ran must never read as a cell that passed. This caught a real bug —
-# an ssh without `-n` consuming the loop's own input — and the only reason it was
-# noticed is that the count was checked rather than the verdicts trusted.
+# A cell that never ran must never read as a cell that passed.
 if [ "$measured_count" != "$expected_count" ]; then
     printf '%s' "$results"
     die "FAIL: matrix.tsv named $expected_count cells and only $measured_count were measured." \

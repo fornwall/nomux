@@ -16,8 +16,7 @@ on:
   # their checksums; without this, getting them back means an empty commit.
   workflow_dispatch:
 
-# Cancel superseded branch runs; let `main` finish, since each commit there is a distinct set of
-# musl artifacts that nothing else produces.
+# Cancel superseded pull-request runs; branch and tag runs finish.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -95,15 +94,8 @@ jobs:
       # and it shells out to `cargo metadata`, which rewrites a stale lock to make itself work.
       - run: cargo deny --locked check advisories
 
-      # fuzz/ is a separate workspace with a lock file of its own, so its dependencies are not in
-      # the graph the line above walks — but its build scripts execute on this machine, which is
-      # what an advisory there is about. Advisories alone: the cargo-deny-fuzz hook, run by prek
-      # below, already checks sources against the same manifest and config, and fuzz/deny.toml
-      # has no `[licenses]` or `[bans]` section to check. That absence is the policy, not an
-      # oversight: an allow-list is about what may be distributed and `multiple-versions` is
-      # about what the shipping binary costs, and fuzz/ is never distributed and never linked
-      # into it. Advisories and sources are the two that are about this machine, and on those
-      # two the file says exactly what the root deny.toml says.
+      # fuzz/ has an independent lockfile; check its moving advisories here and its source
+      # policy in the hook below.
       - run: cargo deny --locked --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check advisories
 
       # probe/ is a third workspace and lockfile. Its path dependency intentionally falls outside

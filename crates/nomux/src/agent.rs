@@ -26,18 +26,8 @@ const MAX_CHANNEL_QUEUE: usize = 256 * 1024;
 /// daemon gives it up (`IMPLEMENTATION.md` § 6.7, which has why it runs from the last
 /// byte rather than from the accept).
 ///
-/// There being only the one slot, without this a peer that connects and never closes
-/// holds every later agent user off for the life of the session. What it bounds is that
-/// peer's *own* wait and nothing more: `rundir::bind_socket_private` takes std's default
-/// `UnixListener` backlog and an `AF_UNIX` `connect` into a full one blocks rather than
-/// being refused (§ 6.3), so what a peer standing behind `n` stalled ones waits is
-/// `n` times this. `git submodule update --jobs 8` behind one stalled connection is
-/// eight of these in series.
-///
-/// Left at a minute all the same, against that: the window closes an exchange that is
-/// *live*, and § 6.7's reason for a generous one — the client may be putting a signature
-/// in front of a human, who may be reaching for a hardware key — is a wait no shorter
-/// figure survives. A slot nothing else can use is the cheaper thing to spend.
+/// One slot makes later peers wait this long in series. A minute still leaves room for
+/// a human or hardware key to answer a live signing request.
 #[expect(
     clippy::duration_suboptimal_units,
     reason = "Duration::from_mins is unstable on the pinned toolchain"
