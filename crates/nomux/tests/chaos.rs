@@ -20,8 +20,9 @@
 //!   the middle of that stream costs it neither a byte nor its input position:
 //!   [`a_full_screen_stream_is_byte_exact_across_gaps_that_cut_its_escape_sequences`].
 //!
-//! Disconnect points come from a fixed seed so a failure is reproducible; override it
-//! with `NOMUX_CHAOS_SEED` to explore other interleavings.
+//! Disconnect points come from a fixed seed so a failure is reproducible: every failure
+//! here carries the seed it was under, and `NOMUX_CHAOS_SEED=<that seed>` replays it —
+//! in decimal or hexadecimal, since that is the form a failure prints.
 
 #![allow(
     clippy::panic,
@@ -54,6 +55,61 @@ const PATIENCE: Duration = Duration::from_secs(20);
 /// Seed used when `NOMUX_CHAOS_SEED` is unset.
 const DEFAULT_SEED: u64 = 0x6e6f_6d75_785f_3031;
 
+/// The seed for this run, from `NOMUX_CHAOS_SEED` or [`DEFAULT_SEED`].
+fn chaos_seed() -> u64 {
+    parse_seed(std::env::var("NOMUX_CHAOS_SEED").ok().as_deref())
+}
+
+/// Reads a seed the way § 9's reproducibility promise needs it read.
+///
+/// Both spellings, and the underscores a Rust literal carries, because the seed a
+/// failure prints and the seed this file writes down are hexadecimal — so the one form
+/// a reader is certain to paste is the one a decimal-only parser rejects. And a value
+/// that cannot be read is fatal rather than ignored: falling back to the default would
+/// run *some* seed successfully and report it as the reproduction that was asked for,
+/// which is the one outcome worse than not reproducing at all.
+fn parse_seed(value: Option<&str>) -> u64 {
+    let Some(value) = value else {
+        return DEFAULT_SEED;
+    };
+    let text = value.trim().replace('_', "");
+    let digits = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X"));
+    let read = digits.map_or_else(|| text.parse::<u64>(), |hex| u64::from_str_radix(hex, 16));
+    read.unwrap_or_else(|err| {
+        panic!(
+            "NOMUX_CHAOS_SEED={value:?} is not a seed ({err}); give it decimal or \
+             hexadecimal digits — a run that quietly fell back to {DEFAULT_SEED:#x} \
+             would look like the reproduction it is not"
+        )
+    })
+}
+
+#[test]
+fn a_seed_is_read_in_every_form_a_failure_prints_it() {
+    assert_eq!(parse_seed(None), DEFAULT_SEED, "an unset variable");
+    assert_eq!(
+        parse_seed(Some(" 42 ")),
+        42,
+        "decimal, with the shell's spaces"
+    );
+    assert_eq!(
+        parse_seed(Some("0x6e6f6d75785f3031")),
+        DEFAULT_SEED,
+        "hexadecimal, as a failure and this file both spell it"
+    );
+    assert_eq!(
+        parse_seed(Some("0x6e6f_6d75_785f_3031")),
+        DEFAULT_SEED,
+        "the literal above, pasted from the source with its underscores"
+    );
+}
+
+#[test]
+#[should_panic(expected = "is not a seed")]
+fn an_unreadable_seed_is_fatal_rather_than_the_default() {
+    let _ = parse_seed(Some("0xnope"));
+}
+
 /// The next frame, bounded by the whole test's `deadline` rather than by one frame's
 /// (`harness::poll_by`), and saying which seed the stall was under.
 fn frame_by(
@@ -65,13 +121,6 @@ fn frame_by(
     client
         .frame_before(deadline, stalled)
         .unwrap_or_else(|| panic!("{stalled} (seed {seed})"))
-}
-
-fn chaos_seed() -> u64 {
-    std::env::var("NOMUX_CHAOS_SEED")
-        .ok()
-        .and_then(|value| value.trim().parse().ok())
-        .unwrap_or(DEFAULT_SEED)
 }
 
 /// What `yes` writes `since` bytes into its output. Checking against position rather
