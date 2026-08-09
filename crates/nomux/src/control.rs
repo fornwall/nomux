@@ -372,8 +372,7 @@ fn refuse(message: String) -> io::Error {
 /// because that is the one thing the user can repair.
 fn running_but(paths: &SessionPaths, problem: &str) -> io::Error {
     refuse(format!(
-        "session {id} is running, but {pid}: {problem}; leaving it alone rather than \
-         unlinking a live session's files",
+        "session {id} is running, but {pid}: {problem}",
         id = paths.id(),
         pid = paths.pid().display(),
     ))
@@ -421,14 +420,11 @@ fn still_answering(id: &str, chosen: &Chosen) -> String {
     match &chosen.reach {
         Ok(_) => format!(
             "session {id} is still answering after SIGTERM and SIGKILL to pid {pid}, so \
-             that pid is not the process serving it; leaving it alone rather than \
-             unlinking a live session's files"
+             that pid is not the process serving it"
         ),
         Err(err) => format!(
             "session {id} is still answering, and pid {pid} could not be held to be \
-             signalled ({err}), so neither SIGTERM nor SIGKILL was sent and nothing here \
-             established what is serving it; leaving it alone rather than unlinking a \
-             live session's files"
+             signalled ({err}), so neither SIGTERM nor SIGKILL was sent"
         ),
     }
 }
@@ -438,9 +434,7 @@ fn still_answering(id: &str, chosen: &Chosen) -> String {
 /// known.
 fn unprobeable(paths: &SessionPaths, problem: &io::Error) -> io::Error {
     refuse(format!(
-        "session {id}: {sock} could not be probed, so whether it has stopped was never \
-         established: {problem}; leaving its files alone rather than unlinking what \
-         may be a live session",
+        "session {id}: {sock} could not be probed: {problem}",
         id = paths.id(),
         sock = paths.socket().display(),
     ))
@@ -453,9 +447,8 @@ fn bound_since(paths: &SessionPaths) -> io::Error {
     io::Error::new(
         io::ErrorKind::AddrInUse,
         format!(
-            "session {id} is answering on {sock} again: a daemon has bound the id since \
-             this kill established it was gone, so those files are its own and not this \
-             call's to remove",
+            "session {id} is answering on {sock} again: a daemon bound the id after this \
+             kill established it was gone",
             id = paths.id(),
             sock = paths.socket().display(),
         ),
