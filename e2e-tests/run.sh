@@ -280,8 +280,18 @@ while IFS='	' read -r name port kup linger pam logout expect; do
     # logging out, or by losing the network under it. That difference is the whole of the
     # `logout` axis; everything from here down is the same measurement either way.
     if [ "$logout" = abrupt ]; then
-        created=$(abrupt_login "$port" "$name" "$id" 2>&1) || die \
-            "$name: the abrupt-disconnect login did not get as far as a disconnect."
+        # No `2>&1` on this branch, unlike the clean one below. `abrupt_login` has five
+        # distinct explanations for giving up and writes every one of them to stderr, so
+        # merging them into `$created` would leave `die` printing the generic line below and
+        # nothing else — on a CI runner, with the containers already torn down, that is the
+        # whole of what there is to go on. Letting them stream out live is also what keeps
+        # the invariant `abrupt_login`'s own redirections exist for: its stdout is the cell's
+        # report and gets parsed for TEARDOWN-SECONDS and DAEMON-CGROUP below, and the
+        # `iptables -D` at the end of it is `|| true`, so its complaints have somewhere to go
+        # that is not the parsed stream.
+        if ! created=$(abrupt_login "$port" "$name" "$id"); then
+            die "$name: the abrupt-disconnect login did not get as far as a disconnect."
+        fi
     elif ! created=$(ssh_to "$port" "nomux-cell-create $id" 2>&1); then
         printf '%s\n' "$created" | sed 's/^/    /' >&2
         die "$name: could not create a session to test"
