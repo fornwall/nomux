@@ -20,6 +20,7 @@ mod harness;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -644,8 +645,15 @@ fn a_spawn_whose_socket_cannot_be_bound_leaves_no_lock_behind() {
 /// kills the process between `bind_socket` and the event loop, and `<id>.sock` and
 /// `<id>.lock` are left for the next daemon and for `list` to read as a live session.
 ///
-/// The directory is what is asserted, rather than the exit status: both orders end the
-/// process, and only one of them ends it having tidied up.
+/// The directory alone will not do, and used to be all this asserted. `before` is the
+/// listing of a directory created empty three lines above it, so *every* way of failing
+/// before `bind_socket` — a mistyped argument, an unusable shell, an exec that never
+/// happened — leaves it empty and satisfies the comparison. How the process ended is what
+/// separates those from the fault this is named for: a `SIGTERM` that landed on `SIG_DFL`
+/// leaves `signal()` reporting it, and a refusal on the way up leaves a status and a
+/// sentence on standard error. Only a daemon that reached the event loop and left through
+/// § 6.5's shutdown exits cleanly, so the two together say the directory was emptied
+/// rather than never filled.
 #[test]
 fn a_daemon_that_inherits_a_pending_stop_signal_still_runs_its_shutdown() {
     let root = run_root("pending_term");
@@ -662,6 +670,22 @@ fn a_daemon_that_inherits_a_pending_stop_signal_still_runs_its_shutdown() {
     let finished = harness::collect(&mut command);
 
     let complaint = harness::stderr(&finished);
+    // The signal first, that being the regression: with the mask cleared ahead of the
+    // handlers this process dies *as* the `SIGTERM` rather than because of it, and
+    // `signal()` is the only thing that tells those two endings apart.
+    assert_eq!(
+        finished.status.signal(),
+        None,
+        "the inherited SIGTERM killed the daemon at its default disposition, between \
+         `bind_socket` and the event loop, with § 6.5's shutdown never run: {complaint:?}"
+    );
+    assert_eq!(
+        finished.status.code(),
+        Some(0),
+        "the daemon did not reach the shutdown this is about; every failure on the way up \
+         also leaves the directory below empty, so without this the comparison would pass \
+         over a daemon that never bound anything: {complaint:?}"
+    );
     assert_eq!(
         entries(&dir),
         before,
