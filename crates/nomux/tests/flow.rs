@@ -396,7 +396,7 @@ fn a_half_closed_client_is_served_to_the_end_and_let_go_there() {
     let ok = setup.hello(RESUME_FROM_START);
     // `raw -echo` so that nothing but the child puts `LATE` on the stream, and the cue
     // so that it does so at a moment this test chooses.
-    setup.make_ready(
+    let ready = setup.make_ready(
         "raw -echo",
         Some(r#"read cue < cue; printf "LATE-$((6*7))"; exit 7"#),
         ok.resume_from,
@@ -474,11 +474,26 @@ fn a_half_closed_client_is_served_to_the_end_and_let_go_there() {
     );
 
     // The session outlives the client that read it to the end, per § 6.5 — and is
-    // clientless again, which is what puts it back on the idle deadline.
+    // clientless again, which is what puts it back on the idle deadline. Asked as two
+    // numbers rather than by driving the shell, the child having exited: `still_serving`
+    // has nobody left to echo its marker, and `in_applied > 0` is satisfied by any
+    // session that ever applied a byte, including one that has since stopped serving.
     let mut probe = session.connect();
+    let resumed = probe.hello(RESUME_FROM_START);
+    assert_eq!(
+        resumed.in_applied, ready.in_offset,
+        "the input position must survive the connection the session finished serving, \
+         and the child that has gone"
+    );
+    // And the status with it: `terminal_end_sent` is per connection, so a newcomer is
+    // owed the `Exit` this session already handed the peer above (§ 4.2, § 6.5).
+    let payload = probe.next_of(FrameType::Exit);
     assert!(
-        probe.hello(RESUME_FROM_START).in_applied > 0,
-        "the session did not survive the connection it finished serving"
+        matches!(
+            Frame::decode(FrameType::Exit, &payload).expect("decode the exit"),
+            Frame::Exit { status, .. } if status == STATUS
+        ),
+        "a client attaching after the child has gone is owed the status it left with"
     );
 }
 
