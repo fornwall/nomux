@@ -22,8 +22,9 @@ is published ([DESIGN.md § 2](DESIGN.md#2-scope)).
 
 - Edition 2024; MSRV is `rust-toolchain.toml`'s pin.
 - Lints: `[workspace.lints]` in `Cargo.toml` is the list, every entry at `warn` bar one,
-  which `Cargo.toml` names and argues. The deny is `-D warnings` on the clippy hook in
-  `.pre-commit-config.yaml`, which gates this tree rather than any build of it; test
+  which `Cargo.toml` names and argues. The denies are two and neither is in the manifest:
+  `-D warnings` on the clippy hook in `.pre-commit-config.yaml`, which gates this tree, and
+  job-level `RUSTFLAGS`/`RUSTDOCFLAGS` on CI's `check` job, which gates a merge. Test
   relaxations live in `clippy.toml`.
 
 ### Environment
@@ -44,12 +45,11 @@ it, and what nomux *sets* is §6.1.1's. `NOMUX_UPDATE_BASELINE` is tested for ex
 Off the table, the toolchain's own. `scripts/build-release.sh` reads `CARGO_HOME` and
 `CARGO_TARGET_DIR`, sets `RUSTUP_TOOLCHAIN` itself, and passes its own flags as
 `CARGO_ENCODED_RUSTFLAGS` rather than `RUSTFLAGS` for the reason it gives about the paths
-it interpolates (§8) — which is also why the job-wide `RUSTFLAGS` deny CI sets on its
-`check` job is *not* set on the release one, `CARGO_ENCODED_RUSTFLAGS` making cargo ignore
-`RUSTFLAGS` outright and a deny there silently absent. The
-unit tests site scratch directories under `TMPDIR` via `env::temp_dir()`, and the integration
-tests use an owner-only `nomux-it-<uid>` child there (§9); the sticky parent protects that
-entry in the same way a valid runtime-directory fallback is protected.
+it interpolates (§8) — which is also why CI's job-wide deny is not set on the release job,
+and `ci.yml` argues that where it sets it. The unit tests site scratch directories under
+`TMPDIR` via `env::temp_dir()`, and the integration tests use an owner-only
+`nomux-it-<uid>` child there (§9); the sticky parent protects that entry as a valid
+runtime-directory fallback is protected.
 
 ## 2. Wire protocol
 
@@ -130,10 +130,9 @@ of the terminal, elapsed against a monotonic clock and saturating at `u32::MAX`.
 `Ping` is the client's alone: the daemon never sends one, answers every one it decodes with
 a `Pong`, and holds no inactivity deadline over an attached client — § 6.4's six endings
 carry no timer between them, and the 5 s `PENDING_HELLO_TIMEOUT` bounds a *pending*
-connection only. So a `Pong` that does not come back is no evidence about liveness, only
-that what was queued ahead of it has not drained: § 4.1 has a client's own `Ping` queueing
-behind its own stalled input, and the daemon's answers queueing past `MAX_PENDING_WRITE`
-unmeasured.
+connection only. What the pair is for is a round trip that changes nothing, which is what
+§ 9's suite fences on to know that everything sent ahead of it has been decoded; how far
+the *child* has got is `InputAck.applied_through` (§ 3) and never a `Pong`.
 
 ### 2.3 Flags
 
@@ -206,7 +205,7 @@ Four bounds, each enforced on its own queue:
 | `MAX_PENDING_WRITE` | 1 MiB | Past this queued to the client, output stops being queued; the ring absorbs the PTY regardless |
 | `ABANDON_PENDING_WRITE` | 8 MiB | Past this the client is not slow but gone, and is dropped; reattaching replays from the ring. The gap between the two figures is clear of the first plus one output chunk |
 | `MAX_PENDING_INPUT` | 1 MiB | Past this queued for a child that is not reading, the daemon stops **accepting** input: it stops decoding `Input` frames and stops asking the socket for more. Dropping is not available, `in_applied` being exactly-once (§3), and `Error{INPUT_GAP}` would accuse a client that had done nothing wrong. The bytes wait in the kernel's buffer, where the peer blocks on them — §6.7's argument for a saturated agent connection |
-| `MAX_PENDING_READ` | 1 MiB | One connection's undecoded receive buffer, bounded by the daemon's own number rather than by whatever the peer set `SO_SNDBUF` to. Past it the socket is not read at all, so the overshoot is one read buffer. Slowest of the four to fill, a stock host's send buffer being a fifth of it: the megabyte only accumulates across the passes in which the decode loop stopped short of what the pass before had read |
+| `MAX_PENDING_READ` | 1 MiB | One connection's undecoded receive buffer, bounded by the daemon's own number rather than by whatever the peer set `SO_SNDBUF` to. Past it the socket is not read at all, and it is the *undecoded* count that is held there: `Conn::compact` reclaims a consumed prefix only once that prefix is half the buffer, so the allocation an administrator sizes a host by peaks just under 2 MiB — and `tx` the same way against `MAX_PENDING_WRITE`. Slowest of the four to fill, a stock host's send buffer being a fifth of it: the megabyte only accumulates across the passes in which the decode loop stopped short of what the pass before had read |
 
 All four are chosen against each other and so live together in `daemon.rs`, which argues
 the arithmetic. `MAX_PENDING_WRITE` bites in three places: the output pump queues nothing
@@ -214,13 +213,10 @@ at all above it, so the `Gap` opening a discontinuous replay is measured along w
 `Output` frames behind it; `Conn::send_output` re-checks per chunk within the call, the
 ring being far larger than the budget; and the poll set drops `POLLIN` from the agent
 socket while the queue sits at the cap (§ 6.7). What the daemon tells a client directly —
-`InputAck`, `Pong`, `Exit`, `HelloOk`, `AgentOpen`, `AgentClose` — queues past it
-unmeasured, and what keeps the 7 MiB between the two figures is that each of those is small
-and answers either a frame the client sent or an event of the session's own, not that the
-set is closed. `AgentData` is unmeasured too and is the one of them carrying bulk: what
-bounds it is that third reader rather than its size, a client at the cap costing the agent
-socket its `POLLIN`, so the overshoot is the one 64 KiB read already in hand. The
-consequence a client author needs is that the input cap is enforced in the decode loop:
+`InputAck`, `Pong`, `Exit`, `HelloOk`, `AgentOpen`, `AgentClose` and `AgentData` — queues
+past it unmeasured, and only `ABANDON_PENDING_WRITE` bounds that, 7 MiB further up where
+the client is gone rather than slow. The consequence a client author needs is that the
+input cap is enforced in the decode loop:
 **its own `Ping`, `Resize` and `Detach` queue behind its own stalled input**, and a
 takeover's final drain goes with the outgoing connection — accepted, since §3 has the
 client resending from `in_applied`. A new connection is polled as pending and never held
@@ -317,29 +313,19 @@ which is a wire change for something that needs none. An SSH exec channel carrie
 separate extended data, so the two never interleave, and ~100 bytes cannot fill a window
 sshd opens at 2 MiB.
 
-On both exec paths the binary's own stderr reaches the channel, and it still does not collide:
-nomux's human diagnostics start `nomux: `, §10's machine record has its own exact prefix, and
-this line is written before any binary exists as a process, so it is first among nomux's
-output whichever command ran. Each prefix is scanned as a complete line rather than treating
-the stream as one field, because a login shell sourcing an rc file gets there first on plenty
-of hosts — the same chatter that would corrupt the frames on stdout, which is the other half
-of why the field is not there.
+On both exec paths the binary's own stderr reaches the channel and still does not collide:
+nomux's human diagnostics start `nomux: `, §10's machine record has its own exact prefix,
+and each is scanned as a complete line because a login shell sourcing an rc file gets there
+first on plenty of hosts.
 
-The value is §6.3's precedence restated in `sh`, and it has to be that precedence exactly.
-Each source counts **only where it names an absolute path**, `rundir::absolute_env` testing
-nothing else — so unset, empty and relative are one answer and not three, and a `~/run` no
-shell expanded is relative like the rest, which is why `${VAR-}` and a `case` do the work
-where a `${VAR:-default}` would silently promote the relative ones. `$HOME` substitutes for
-`$XDG_STATE_HOME` takes the *same* `nomux/run`, under `.local/state`: a branch of one
-precedence, not a third directory. `${VAR%/}/` is the join — `PathBuf::push` adds a
-separator only where the last byte is not one, and stripping one to put one back is that
-rule to the byte, down to `XDG_RUNTIME_DIR=/` giving `/nomux` and not the `//nomux` POSIX
-leaves implementation-defined. What the shell reads is what the `exec` inherits, so a login
-shell that *materialises* one of these — `zsh` supplies and exports `$HOME` where the
-environment carried none, `dash`, `bash` and BusyBox `ash` do not — moves both answers or
-neither. Where no source qualifies, nothing is printed, which is the daemon's own answer
-(§6.3, §10) rather than a silence: a client that reads no line has learnt that there is no
-warm path here.
+The value is §6.3's precedence restated in `sh`, and it has to be that precedence to the
+byte. `rundir::absolute_env` counts a source **only where it names an absolute path**, so
+unset, empty and relative are one answer and not three — which is why `${VAR-}` and a `case`
+do the work a `${VAR:-default}` would get wrong by silently promoting the relative ones —
+and `${VAR%/}/` is `PathBuf::push`'s join spelled out, down to `XDG_RUNTIME_DIR=/` giving
+`/nomux` and not the `//nomux` POSIX leaves implementation-defined. Where no source
+qualifies nothing is printed, which is the daemon's own answer (§6.3, §10) rather than a
+silence: a client that reads no line has learnt there is no warm path here.
 
 `printf` and not `echo`: `NOMUX-BOOTSTRAP`'s fields are `uname`'s and cannot hold a
 backslash, a path can, and `echo`'s treatment of one is unspecified — in `dash` it is an
@@ -412,6 +398,12 @@ copy outliving that would keep a terminal open with nobody on it.
 disciplines give double echo, doubled `\r\n` translation and broken raw mode. That is also
 why `TERM` arrives in `Hello` (§ 2.2) and not from sshd.
 
+**Every `Hello` re-issues the size, an unchanged one included.** Greeting clears
+`applied_win`, so a reattach sets `TIOCSWINSZ` even where the size matches what this daemon
+last applied: `stty rows` needs no permission from the daemon, so the child may have moved
+the master itself since the last greeting, and a reattach is the only chance to put that
+right.
+
 The master is non-blocking, so input the PTY will not take waits in the daemon's queue,
 where § 4.1's cap alone bounds it.
 
@@ -482,37 +474,23 @@ after: `exec` preserves a pending signal as well as a blocked one, so a signal b
 pending arrives the instant the mask clears, and a handler armed behind that is one it
 missed.
 
-This is POSIX terminal detachment and nothing more — it is not escape from a service
-manager, and nomux no longer attempts one. `spawn` starts the daemon **directly**, always:
-one child from `/proc/self/exe`, so an atomic upgrade underneath a running relay still
-launches the exact inode that relay is executing, with the already-held spawn-lock
+This is POSIX terminal detachment and nothing more. `spawn` starts the daemon **directly**,
+always: one child from `/proc/self/exe`, so an atomic upgrade underneath a running relay
+still launches the exact inode that relay is executing, with the already-held spawn-lock
 descriptor inherited across the `exec`. There is no launcher to select and nothing is
 probed before the launch.
 
-The consequence, stated plainly: on systemd, `setsid` and `fork` leave the daemon in
-sshd's `session-*.scope` cgroup, so where `logind.conf` sets `KillUserProcesses=yes`
-logind stops it at the final logout and **the session does not survive**. Most
-distributions ship `KillUserProcesses=no`, which is why a direct launch is survivable in
-practice, and that is exactly the position `tmux` and GNU `screen` are in: on this axis
-nomux is now no better and no worse than they are.
-
-A transient `systemd-run --user --scope` used to carry the daemon out of that cgroup where
-a reachable, lingering user manager could own the scope. It is gone, along with the
-`systemd-run` and `loginctl` probes that chose it, the `NOMUX_LAUNCHER` override, the
-`--systemd-scope` private option and the `INVOCATION_ID` restoration that undid the
-scope's rewrite of the environment. That is a deliberate subtraction and not an
-improvement: what it buys is less code and no bus connection, `loginctl` call or
-executable probe on the session-creation path, and what it gives up is logout persistence
-on a strict host.
-
-Somebody who needs that persistence arranges it above nomux — `loginctl enable-linger`
-plus a scope of their own, or a `systemd-run --user --scope` wrapper around the `spawn`
-command. The client ships as one versioned unit with this binary
-([DESIGN.md § 2](DESIGN.md#2-scope)), so it is a reasonable place for host policy to live,
-and it is the only side that knows which hosts it has been told to treat that way.
-Nothing on the wire reports logout policy, which the daemon could not turn into a survival
-statement anyway. [PLAN.md](PLAN.md) retains the real SSH logout matrix as required
-validation of what a directly launched daemon actually does.
+The consequence, stated plainly: `setsid` and `fork` leave the daemon in sshd's
+`session-*.scope`, so where `logind.conf` sets `KillUserProcesses=yes` logind stops it at
+the final logout and **the session does not survive**. Most distributions ship
+`KillUserProcesses=no`, which is why a direct launch is survivable in practice, and it is
+exactly where `tmux` and GNU `screen` stand. Persistence on a strict host is arranged above
+nomux, by the client that ships as one versioned unit with this binary and is the only side
+that knows which hosts it has been told to treat that way —
+[DESIGN.md § 10](DESIGN.md#10-rejected-alternatives) has why the scope launcher that used to
+try is gone. Nothing on the wire reports logout policy, which the daemon could not turn into
+a survival statement anyway; [PLAN.md](PLAN.md) keeps the real SSH logout matrix as the
+validation.
 
 ### 6.3 Socket
 
@@ -545,12 +523,14 @@ The two copies can still drift, and that is affordable for one reason only: a wr
 directory is a `direct-streamlocal` sshd refuses, and § 5.3 answers a refusal with the exec
 relay, which resolves the path in the daemon's own code.
 
-A `sun_path` is 108 bytes including its terminator, so the directory, a `/`, the id and a
-six-byte suffix — `.label` and `.agent`, the joint longest of the five — have to fit in
-107. Under `/run/user/1000/nomux`, the directory the code builds, that allows an id of 80 and
-the 64-byte ceiling binds first; under the fallback the longest is `77 - len($HOME)`. **A
-refused id is therefore not necessarily a bad id**, which § 10 turns into an exit code and a
-client must not cache as a property of the id. The refusal lands before the `bind`, since
+A `sun_path` is 108 bytes including its terminator, so the directory, a `/`, the id and
+`.agent` — the longer of the two names this layout *binds*, `.sock` being the other — have
+to fit in 107. A plain file's name is never measured; `.label` is the same six bytes and
+costs nothing. Under `/run/user/1000/nomux`, the directory the code builds, that allows an
+id of 80 and the 64-byte ceiling binds first; under the fallback the longest is
+`77 - len($HOME)`. **A refused id is therefore not necessarily a bad id**, which § 10 turns
+into an exit code and a client must not cache as a property of the id. The refusal lands
+before the `bind`, since
 `list` and `kill` read an unbindable address as a *live* session whose files they must not
 unlink.
 
@@ -635,11 +615,10 @@ refusal: those bytes can never become a frame, and keeping their connection atta
 disable idle reaping indefinitely. Six things end an *established* connection without a
 refusal: a queued write that fails; § 4.1's `ABANDON_PENDING_WRITE`; the `Exit` going out to a
 half-closed peer with nothing left owed; `POLLHUP` or `POLLERR`; a read that fails before
-end of file; and a `Detach` frame. The third is what ends `nomux attach <id> < script`: past
-the child's exit the master leaves the poll set, so a ring read to its end stays read to its
-end. Read as a departure, that end of file cost the script every byte its child produced
-after it ran out. A half-closed client holds the session as an attached silent one does,
-bounded by that same 8 MiB.
+end of file; and a `Detach` frame. The third is what ends `nomux attach <id> < script`,
+whose stdin runs out long before its child does: read as a departure, that end of file
+would cost the script every byte produced after it. A half-closed client holds the session
+as an attached silent one does, bounded by that same 8 MiB.
 
 Beside those stand nine kinds of refusal, each carrying a final `Error` — the takeover and
 conditional occupied-slot refusal above, four malformations, a version this daemon cannot
@@ -734,14 +713,15 @@ The two plain files either mode reads by hand go through one bounded helper
 (`rundir::read_prefix`), which reads to the file's end or to that bound and never past it,
 and opens `O_NONBLOCK | O_NOFOLLOW` against a FIFO or a symlink left at either name. The two
 ends are deliberately asymmetric: a label that reaches its bound is truncated and costs a
-column, where a pid body reaching **32 bytes is refused outright**, a prefix ending
-mid-number being a smaller, plausible, live pid and not the number on disk.
+column, where a pid body reaching **32 bytes is refused outright** — `rundir::parse_pid`'s
+rule and not the helper's, a prefix ending mid-number being a smaller, plausible, live pid
+and not the number on disk.
 
-**The pidfile's trailing newline is enforced, not decorative.** A body that does not end in
-one is refused whatever else it holds, which is what makes the format self-delimiting for
-its one line: a short write leaving `3277` of `32770419\n` has no terminator and is rejected
-rather than signalled as a live pid it never named. A second implementation must write the
-newline.
+**The pidfile's trailing newline is `parse_pid`'s too, enforced and not decorative.** A
+body that does not end in one is refused whatever else it holds, which makes the format
+self-delimiting for its one line: a short write leaving `3277` of `32770419\n` has no
+terminator and is rejected rather than signalled as a live pid it never named. A second
+implementation must write the newline.
 
 - Both establish first that the run directory is this user's alone (§ 6.3), before any name in it is resolved. Neither creates it: on a host that has never run a session, `kill` reports the "no such session" that already holds and `list` prints nothing.
 - `list` reads the directory and probes each socket with `connect`; `ECONNREFUSED` — or a socket no longer there at all — means stale, and stale entries are unlinked. The probe is safe because connecting is not attaching (§ 6.4).
@@ -762,13 +742,11 @@ all 2 s of it. One `GRACE` of 2 s serves the first three stages, as its own doc 
 | `SIGKILL` grace (`KILL_GRACE`) | 0.5 s | 2 s | 12.5 s |
 | Final probe under the lock | — | 2 s | 14.5 s |
 
-A call that spends the whole **14.5 s** is *always* a refusal — `bound_since` or
-`unprobeable` at that last probe — and the one refusal landing earlier is `still_answering`,
-which returns at the row above, **12.5 s**, without ever reaching it. Nothing *succeeds*
-slowly: collection needs `Liveness::Stale`, and every ordinary `kill` settles that on the
-first probe it makes, a fraction of a second. The probe budget is deliberately *not* clamped
-to the grace remaining, since a probe cut short reports `Unknown` — evidence of neither death
-nor life — and `kill` would then refuse a session it could have collected.
+A call that spends the whole **14.5 s** is *always* a refusal, and the one refusal landing
+earlier is `still_answering`, at the row above. Nothing *succeeds* slowly: collection needs
+`Liveness::Stale`, which every ordinary `kill` settles on its first probe. The probe budget
+is deliberately not clamped to the grace remaining — a probe cut short reports `Unknown`,
+and `kill` would then refuse a session it could have collected.
 
 `kill` exits non-zero rather than report a "no such session" it did not establish. Five
 states do that:
