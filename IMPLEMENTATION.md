@@ -740,13 +740,11 @@ all 2 s of it. One `GRACE` of 2 s serves the first three stages, as its own doc 
 | `SIGKILL` grace (`KILL_GRACE`) | 0.5 s | 2 s | 12.5 s |
 | Final probe under the lock | — | 2 s | 14.5 s |
 
-A call that spends the whole **14.5 s** is *always* a refusal — `bound_since` or
-`unprobeable` at that last probe — and the one refusal landing earlier is `still_answering`,
-which returns at the row above, **12.5 s**, without ever reaching it. Nothing *succeeds*
-slowly: collection needs `Liveness::Stale`, and every ordinary `kill` settles that on the
-first probe it makes, a fraction of a second. The probe budget is deliberately *not* clamped
-to the grace remaining, since a probe cut short reports `Unknown` — evidence of neither death
-nor life — and `kill` would then refuse a session it could have collected.
+A call that spends the whole **14.5 s** is *always* a refusal, and the one refusal landing
+earlier is `still_answering`, at the row above. Nothing *succeeds* slowly: collection needs
+`Liveness::Stale`, which every ordinary `kill` settles on its first probe. The probe budget
+is deliberately not clamped to the grace remaining — a probe cut short reports `Unknown`,
+and `kill` would then refuse a session it could have collected.
 
 `kill` exits non-zero rather than report a "no such session" it did not establish. Five
 states do that:
