@@ -214,13 +214,10 @@ at all above it, so the `Gap` opening a discontinuous replay is measured along w
 `Output` frames behind it; `Conn::send_output` re-checks per chunk within the call, the
 ring being far larger than the budget; and the poll set drops `POLLIN` from the agent
 socket while the queue sits at the cap (§ 6.7). What the daemon tells a client directly —
-`InputAck`, `Pong`, `Exit`, `HelloOk`, `AgentOpen`, `AgentClose` — queues past it
-unmeasured, and what keeps the 7 MiB between the two figures is that each of those is small
-and answers either a frame the client sent or an event of the session's own, not that the
-set is closed. `AgentData` is unmeasured too and is the one of them carrying bulk: what
-bounds it is that third reader rather than its size, a client at the cap costing the agent
-socket its `POLLIN`, so the overshoot is the one 64 KiB read already in hand. The
-consequence a client author needs is that the input cap is enforced in the decode loop:
+`InputAck`, `Pong`, `Exit`, `HelloOk`, `AgentOpen`, `AgentClose` and `AgentData` — queues
+past it unmeasured, and only `ABANDON_PENDING_WRITE` bounds that, 7 MiB further up where
+the client is gone rather than slow. The consequence a client author needs is that the
+input cap is enforced in the decode loop:
 **its own `Ping`, `Resize` and `Detach` queue behind its own stalled input**, and a
 takeover's final drain goes with the outgoing connection — accepted, since §3 has the
 client resending from `in_applied`. A new connection is polled as pending and never held
