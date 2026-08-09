@@ -17,7 +17,7 @@ die() {
 
 max_bytes=409600 # 400 KiB
 # Well above ordinary drift — a compiler bump or a few match arms move these by tenths of a
-# percent — and well below the 46% jump the gate was written for. Around 4 KiB on x86_64: loose
+# percent — and well below the 46% jump the gate was written for. Around 5.5 KiB on x86_64: loose
 # enough that nobody learns to rerun with the escape hatch by habit.
 max_growth_pct=3
 

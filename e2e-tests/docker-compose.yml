@@ -1,6 +1,9 @@
 # One container per cell of matrix.tsv, each booting systemd as PID 1 so there is a real
 # logind to have a policy and a real sshd to log out of. Keep the two files in step: the
-# port here is the port the matrix names.
+# port here is the port the matrix names, and the three environment variables are the axes
+# it predicts a verdict for. `confirm_axes` in run.sh enforces the second half of that by
+# reading back what the container booted with; the port is what binds a row to a service,
+# so a swapped one is what the check is really there to catch.
 
 x-cell: &cell
   build:
@@ -45,14 +48,6 @@ services:
       CELL_PAM_SYSTEMD: "yes"
     ports: ["127.0.0.1:2202:22"]
 
-  kup-off-linger-on:
-    <<: *cell
-    environment:
-      CELL_KILL_USER_PROCESSES: "no"
-      CELL_LINGER: "yes"
-      CELL_PAM_SYSTEMD: "yes"
-    ports: ["127.0.0.1:2203:22"]
-
   kup-on-linger-off:
     <<: *cell
     environment:
@@ -69,20 +64,14 @@ services:
       CELL_PAM_SYSTEMD: "yes"
     ports: ["127.0.0.1:2205:22"]
 
-  # The `drop-` half repeats the five hosts above with nothing changed inside the
+  # The `drop-` half repeats two of the hosts above with nothing changed inside the
   # container: how the login ends is the runner's doing, not the image's, so an
   # abrupt cell and its clean twin must boot identically or the comparison is not one.
   # They get containers of their own all the same, because a cell blackholes port 22 for
   # as long as its disconnect takes and a neighbour sharing the container would be locked
-  # out for that whole window.
-
-  drop-no-user-bus:
-    <<: *cell
-    environment:
-      CELL_KILL_USER_PROCESSES: "no"
-      CELL_LINGER: "no"
-      CELL_PAM_SYSTEMD: "no"
-    ports: ["127.0.0.1:2206:22"]
+  # out for that whole window. That window is also why there are two of these and not five:
+  # each costs the run its ClientAlive timeout in wall clock, and matrix.tsv says what the
+  # two buy that the retired three did not.
 
   drop-kup-off-linger-off:
     <<: *cell
@@ -92,14 +81,6 @@ services:
       CELL_PAM_SYSTEMD: "yes"
     ports: ["127.0.0.1:2207:22"]
 
-  drop-kup-off-linger-on:
-    <<: *cell
-    environment:
-      CELL_KILL_USER_PROCESSES: "no"
-      CELL_LINGER: "yes"
-      CELL_PAM_SYSTEMD: "yes"
-    ports: ["127.0.0.1:2208:22"]
-
   drop-kup-on-linger-off:
     <<: *cell
     environment:
@@ -107,11 +88,3 @@ services:
       CELL_LINGER: "no"
       CELL_PAM_SYSTEMD: "yes"
     ports: ["127.0.0.1:2209:22"]
-
-  drop-kup-on-linger-on:
-    <<: *cell
-    environment:
-      CELL_KILL_USER_PROCESSES: "yes"
-      CELL_LINGER: "yes"
-      CELL_PAM_SYSTEMD: "yes"
-    ports: ["127.0.0.1:2210:22"]

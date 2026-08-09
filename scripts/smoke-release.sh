@@ -235,6 +235,11 @@ emit_detach >&4
 exec 4>&-
 wait_for_relay "$relay" "the attach relay"
 relay=
+# The same assertion `wait_for_transcript` made above, and not a duplicate of it. That one ran
+# against a file still being written and stopped at the first poll that satisfied it; this one
+# runs after the relay has exited, so the file is final. `complete` requires header_bytes == 0 —
+# no frame left half-written — which is a claim about the end of a stream, and the only moment
+# there is a real end to make it about is here.
 inspect_transcript "$run_root/attach-transcript" complete
 
 listing=$(XDG_STATE_HOME="$state_root" "$binary" list)
