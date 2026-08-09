@@ -104,9 +104,7 @@ const PENDING_HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// Stop accepting client input once this much is queued for a PTY not taking it (§ 4.1).
 ///
 /// § 4.1's four caps live here together because the figures are chosen against each
-/// other. Two are enforced in [`Conn`] rather than measured for the daemon:
-/// [`Conn::fill`] stops at [`MAX_PENDING_READ`], [`Conn::send_output`] at
-/// [`MAX_PENDING_WRITE`].
+/// other; that section carries the arithmetic and where each one bites.
 const MAX_PENDING_INPUT: usize = 1 << 20;
 
 /// Stop queueing output once this much is already waiting for a slow client (§ 4.1).
