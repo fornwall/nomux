@@ -874,30 +874,19 @@ fn kill_reports_an_unprobeable_socket_over_a_pidfile_that_names_no_daemon() {
     );
 }
 
-/// Regression: a daemon is still recognised when its command line is long *behind*
-/// the id.
-///
-/// `MAX_CMDLINE_LEN` is sized for a well-formed `nomux daemon <id>` and nothing else:
-/// `--label` is unbounded, `spawn` passing what it was given straight through
-/// (`attach::spawn_daemon`), and the 256-byte cap in `sanitize_label` applies to the file
-/// the daemon *writes* rather than to its own `argv`. So a command line has no length a
-/// buffer can be sized against, and a rule that needed to see the end of one would strand
-/// a session over a label.
-///
-/// Nothing behind the id is read as anything but padding: the pair is looked for among
-/// the arguments the read saw the end of, and finding it is an answer whether or not
-/// the rest arrived. The label here is an order of magnitude past what the layout
-/// stores and past the whole buffer. What both modes then have to do is the same
-/// thing — `list` must print the pid the file names rather than `?`, and `kill` must
-/// signal it and say so. The other direction, where the pair is *not* found in a read
-/// that filled the buffer, is
-/// `control::tests::a_long_command_line_that_is_not_a_daemon_is_answered_rather_than_left_unknown`.
+/// Direct and older daemons can still carry arguments past `MAX_CMDLINE_LEN`. Once the
+/// complete `daemon <id>` prefix is present, trailing bytes must not prevent `list` or
+/// `kill` from identifying the process.
 #[test]
 fn a_daemon_started_with_an_over_long_label_is_still_recognised_as_one() {
     let root = run_root("lk20");
     let label = "L".repeat(8192);
-    let started = control_with_shell(&root, &["spawn", "lk20", "--label", &label]);
-    succeeded(&started, "a session with a very long label failed to start");
+    let _started = Spawned::spawn(
+        nomux_with_shell(&root, &["daemon", "lk20", "--label", &label])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    );
     let (daemon, _reaper) = daemon_reaper(&root, "lk20");
 
     let listed = stdout(&control(&root, &["list"]));

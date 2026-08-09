@@ -165,10 +165,10 @@ fn daemon_args(
             encode_invocation_id(env::var_os("INVOCATION_ID").as_deref())
         ));
     }
-    if let Some(label) = label {
-        // systemd-run releases disagree about whether command arguments undergo environment
-        // expansion. An ASCII hex handoff contains nothing either behavior can reinterpret;
-        // the daemon decodes it only when the private scope marker accompanies it.
+    let label = label
+        .map(crate::sanitize::sanitize_label)
+        .filter(|label| !label.is_empty());
+    if let Some(label) = label.as_deref() {
         if systemd_scope {
             command.arg("--label").arg(encode_hex(label.as_bytes()));
         } else {
@@ -372,11 +372,20 @@ mod tests {
     }
 
     #[test]
-    fn scope_labels_are_insulated_from_argument_expansion() {
-        let label = "$HOME/${USER}/$$";
-        let encoded = encode_hex(label.as_bytes());
-        assert_eq!(encoded, "x24484f4d452f247b555345527d2f2424");
-        assert_eq!(decode_scope_label(&encoded).as_deref(), Ok(label));
+    fn launcher_labels_are_bounded_before_the_daemon_exec() {
+        let label = format!("\u{1b}]0;ignored\u{7}  $HOME/{}", "é".repeat(200));
+        let expected = crate::sanitize::sanitize_label(&label);
+
+        let direct = direct_command("session", Some(&label), 19).unwrap();
+        assert_eq!(
+            direct.get_args().last().and_then(OsStr::to_str),
+            Some(&*expected)
+        );
+
+        let scoped = scope_command(Path::new("systemd-run"), "session", Some(&label), 19);
+        let encoded = scoped.get_args().last().and_then(OsStr::to_str).unwrap();
+        assert!(encoded.len() <= 1 + 2 * crate::sanitize::MAX_LABEL_LEN);
+        assert_eq!(decode_scope_label(encoded).as_deref(), Ok(&*expected));
     }
 
     #[test]
