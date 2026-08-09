@@ -986,11 +986,14 @@ impl Daemon {
         let Some(pty) = self.pty.as_ref() else {
             return;
         };
-        // No PTY error ends the session, in either direction ([`Daemon::read_client`] states
-        // the rule). What this must *not* do is record the exit: `terminal_closed_at` drops the
-        // master from the poll set, and the read side can still be holding everything the
-        // child wrote on its way out.
+        // Deliberately not [`Daemon::read_pty`]'s answer, which does stop the session: a
+        // failed master write costs the queue and nothing more, § 3 promising ownership
+        // rather than durability. What it must *not* do is record the exit —
+        // `terminal_closed_at` drops the master from the poll set, and the read side may
+        // still hold everything the child wrote on its way out. Logged, or bytes already
+        // acknowledged through `InputAck` go missing with nothing said anywhere.
         if nbio::drain_to(&mut self.pending_input, pty.master()).is_err() {
+            crate::sanitize::error(self.paths.id(), "PTY write failed; input queue dropped");
             self.pending_input.clear();
         }
         // Given back on the way through empty, or one paste into a child that stopped
