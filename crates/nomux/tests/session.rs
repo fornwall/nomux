@@ -36,6 +36,85 @@ use harness::{
     still_serving,
 };
 
+/// `daemon::PENDING_HELLO_TIMEOUT`: how long a connection that has not said `Hello`
+/// keeps the one pending slot. Private to the daemon, mirrored here, and the two must
+/// move together.
+const PENDING_HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The one pending slot is taken back from a peer that connects and then says nothing.
+///
+/// § 6.4 has the daemon promote a connection on its `Hello`, and it holds exactly one
+/// ungreeted connection at a time — the listener leaves the poll set while that slot is
+/// taken, so nobody is accepted only to be dropped unheard. Without a deadline on it, a
+/// peer of this uid that connects and stops there holds every later attach off for the
+/// life of the session, which is the one denial of service reachable from outside the
+/// daemon. Nothing else in this suite waits that deadline out.
+///
+/// The peer that must eventually be served connects *before* the deadline fires rather
+/// than after it, which is what makes this a test about the slot rather than about a
+/// socket the daemon closed: it sits in the listen backlog for as long as the silent one
+/// holds the slot, and the `HelloOk` it is answered with can only come from a daemon that
+/// took the slot back and accepted it. The close is also timed, because a daemon that
+/// hung up on every ungreeted connection at once would satisfy the rest of this while
+/// refusing the liveness probe `harness::wait_until_answering` and § 6.6's `list` are
+/// built on.
+#[test]
+fn a_connection_that_never_greets_gives_the_pending_slot_back() {
+    // One deadline for both waits (`harness::poll_by`), and above [`FRAME_PATIENCE`] by
+    // the timeout this spends before either of them can begin.
+    let deadline = Instant::now() + PENDING_HELLO_TIMEOUT + FRAME_PATIENCE;
+    let session = Session::start("no_hello");
+
+    // By hand rather than through a `Client`, which has no way to say nothing: what is
+    // under test is a peer that never reaches the protocol at all.
+    let mut silent = UnixStream::connect(&session.socket).expect("connect without greeting");
+    silent
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("set a read timeout");
+
+    // Queued behind it from here: `connect` on a listening unix socket completes in the
+    // kernel, so this is in the backlog whether or not the daemon has looked, and the
+    // backlog is ordered — nothing can serve this one before the silent one is dealt with.
+    let mut waiting = session.connect_by(deadline);
+
+    let connected = Instant::now();
+    let mut chunk = [0u8; 64];
+    let closed = poll_by(deadline, || {
+        match read_uninterrupted(&mut silent, &mut chunk) {
+            Ok(0) => true,
+            Ok(n) => panic!(
+                "the daemon sent {n} bytes to a connection that never greeted; nothing \
+                 precedes a HelloOk on this wire but the preamble behind it"
+            ),
+            // The read timeout expiring, which is the deadline above's to answer.
+            Err(err) if err.kind() == ErrorKind::WouldBlock => false,
+            Err(err) => panic!("reading the connection that never greeted: {err}"),
+        }
+    });
+    assert!(
+        closed,
+        "a peer that connected and said nothing still holds the daemon's one pending \
+         slot, so every attach after it — this test's own included — waits for the life \
+         of the session"
+    );
+    // Measured from before the `connect`, so it is under whatever the daemon's own clock
+    // started at accept: a close inside this is the daemon refusing ungreeted connections
+    // rather than deadlining them, which would cost § 6.6 the probe it identifies a live
+    // session with.
+    assert!(
+        connected.elapsed() >= PENDING_HELLO_TIMEOUT,
+        "the ungreeted connection was closed after {:?}, inside the {PENDING_HELLO_TIMEOUT:?} \
+         § 6.4 gives a relayed Hello to arrive in",
+        connected.elapsed()
+    );
+
+    // And the slot came back to the peer that had been waiting in it since before the
+    // deadline fired — greeted, and driving the shell rather than merely acknowledged.
+    let ok = waiting.hello(RESUME_FROM_START);
+    waiting.input(ok.in_applied, b"echo NOMUX-AFTER-PENDING\n");
+    waiting.read_until("NOMUX-AFTER-PENDING", ok.resume_from);
+}
+
 /// A client claiming output the session never produced is clamped down to the end of
 /// the stream rather than believed (`IMPLEMENTATION.md` § 4.2).
 ///
