@@ -9,6 +9,7 @@
 
 [advisories]
 ignore = []
+unmaintained = "all"
 unsound = "all"
 yanked = "deny"
 

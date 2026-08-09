@@ -121,6 +121,10 @@ jobs:
       # two the file says exactly what the root deny.toml says.
       - run: cargo deny --locked --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check advisories
 
+      # probe/ is a third workspace and lockfile. Its path dependency intentionally falls outside
+      # the root wildcard ban, but its resolved registry dependencies still need checking.
+      - run: cargo deny --locked --manifest-path e2e-tests/probe/Cargo.toml --config deny.toml check advisories sources
+
       # The released binary, by checksum: from source it needs a Go toolchain, and the image's Go
       # is an unpinned input — a release raising its Go floor would break hook *installation* and
       # take clippy, doc and the tests below with it before any of them run.
@@ -153,9 +157,8 @@ jobs:
         run: cargo test --locked --doc --workspace
 
       # The cargo-nextest hook's command plus the two flags that only make sense here.
-      # `--run-ignored all`: the one ignored test sits out a real 30 s first-attach reaping
-      # timeout, too slow for a hook. `--no-fail-fast`: one failure should not hide the state of
-      # everything else, which is most of the value of a CI run over a local one.
+      # `--run-ignored all`: the two deadline tests are too slow for a hook. `--no-fail-fast`:
+      # one failure should not hide the state of everything else.
       - if: github.event_name != 'schedule'
         run: cargo nextest run --locked --workspace --run-ignored all --no-fail-fast
 
@@ -170,8 +173,7 @@ jobs:
           done
 
   # Sixty seconds is not a search and this job does not pretend to be one: it checks that fuzz/
-  # still compiles and still passes over its committed seeds, which is what rots in a workspace
-  # sitting outside the root one and so outside every hook but `cargo fmt`. No corpus is carried
+  # still compiles and still passes over its committed seeds. No corpus is carried
   # between runs — a cache restored from the last green commit would make what this job covers a
   # function of what happened to be cached. Release-gating: the time budget changes how much is
   # explored, not whether a crash already found in this run is safe to publish alongside.
