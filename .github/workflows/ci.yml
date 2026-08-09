@@ -211,6 +211,50 @@ jobs:
           path: fuzz/artifacts/
           if-no-files-found: ignore
 
+  # The one job that tests the promise the program exists to make: a session created in one SSH
+  # login is still there after that login has logged out. It cannot be a hook and it cannot be a
+  # unit test — the answer belongs to logind, so it takes systemd as PID 1, a real sshd and a real
+  # PAM stack, which is why it is five privileged containers rather than a `cargo test`.
+  # e2e-tests/README.md has what it proves and what it does not.
+  e2e:
+    name: systemd logout matrix
+    runs-on: ubuntu-24.04
+    # The weekly schedule exists for the advisory check alone; see the trigger comment above.
+    if: github.event_name != 'schedule'
+    # Behind the gate, as `fuzz` is and for its reason: a tree that cannot pass clippy has
+    # nothing worth booting five containers for.
+    needs: check
+    # Five containers each booting systemd, plus two musl builds. Well clear of the ~4 minutes
+    # observed locally, and short enough that a wedged cell does not hold the runner.
+    timeout-minutes: 25
+    steps:
+      # `persist-credentials: false`, for the reason the check job gives.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup toolchain install --profile minimal --no-self-update
+
+      # The binaries go into Debian containers, so they are built static against musl rather
+      # than the runner's glibc. run.sh refuses rather than guesses if this is missing.
+      - run: rustup target add x86_64-unknown-linux-musl
+
+      # Two workspaces: the crate under test and e2e-tests/probe, which is separate for the
+      # reason fuzz/ is. Keyed on what changes the containers, so a change to the harness itself
+      # does not throw away the compiled dependencies.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: e2e-${{ hashFiles('e2e-tests/Dockerfile', 'e2e-tests/docker-compose.yml') }}
+          workspaces: |
+            .
+            e2e-tests/probe
+
+      # Fails on any cell whose measured verdict differs from matrix.tsv's prediction, in either
+      # direction: a cell that survives where the file says it dies is as much a finding as the
+      # reverse, and both mean the file and the world have to be reconciled before merge.
+      - run: sh e2e-tests/run.sh
+
   # The 400 KiB budget is correctness-adjacent — the cold upload happens over cellular — and is
   # the one thing the local hooks cannot check.
   release:
@@ -332,7 +376,7 @@ jobs:
   publish:
     name: publish the release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [check, fuzz, release, smoke]
+    needs: [check, fuzz, e2e, release, smoke]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

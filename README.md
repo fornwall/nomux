@@ -14,8 +14,10 @@ reporting and scrollback all work unchanged.
 > of this — the relay modes speak a binary frame protocol over stdio rather than driving a
 > terminal, so `nomux list` and `nomux kill` are what works standalone. On systemd hosts,
 > session creation uses a user-manager scope when a reachable lingering user manager makes
-> that a persistence promise; its direct fallback may still be killed by logout policy.
-> The real SSH logout matrix has not yet been exercised. AI-generated, and experimental.
+> that a persistence promise; its direct fallback *is* killed at logout where
+> `KillUserProcesses=yes`, so a strict host needs `loginctl enable-linger`. The logout
+> matrix is exercised in containers ([e2e-tests/](e2e-tests/README.md)) but not yet on a
+> real host. AI-generated, and experimental.
 
 `nomux <mode> [session-id]`. The binary-protocol modes are `daemon`, `spawn` and
 `attach`; `--label` is accepted only when creating through `daemon` or `spawn`.
