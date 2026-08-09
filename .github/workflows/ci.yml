@@ -278,14 +278,8 @@ jobs:
 
       - run: sh scripts/build-release.sh
 
-      # `check_leaks` in that script proves only that no path *it* derived survives in an artifact;
-      # it cannot see one rustc spelled differently. This rebuilds the same commit from another
-      # checkout path, $CARGO_HOME and target directory and requires the two SHA256SUMS to agree,
-      # which is the property a client pinning them depends on. `git archive HEAD` is exactly the
-      # committed tree and leaves target/ behind, so the rebuild is cold; RUSTUP_HOME is shared on
-      # purpose, the toolchain being an input both builds are meant to agree on. It runs on pull
-      # requests too: this job is required before auto-merge, so reproducibility is a precondition
-      # of protected main rather than a failure first discovered after the merge.
+      # Rebuild from a different checkout, Cargo home and target directory to catch paths that
+      # `check_leaks` did not derive. The toolchain remains the same build input.
       - name: Rebuild from another path and compare the checksums
         run: |
           rebuild="$RUNNER_TEMP/nomux-rebuild"
@@ -305,12 +299,7 @@ jobs:
       # attestations cover every published asset as a set.
       - run: cp LICENSE target/dist/LICENSE
 
-      # The checksums are the point of this job — the client pins one per architecture — so they
-      # have to outlive the log they were printed to. On a tag the release below is where they
-      # land; this keeps every other commit's set reachable for the ninety days an artifact lasts.
-      # Also on failure: build-release.sh disarms its cleanup trap before the size gates, so an
-      # over-budget build keeps its binaries for whoever has to measure them, and dropping them
-      # here would undo that. `ignore` follows — a failure earlier than that is the trap firing.
+      # Preserve binaries from successful builds and size-gate failures for inspection.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: success() || failure()
         with:
