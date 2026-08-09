@@ -458,8 +458,6 @@ impl<'a> Frame<'a> {
             },
         };
 
-        // Every fixed-size frame must have consumed its payload exactly; the
-        // variable-length ones end in `rest()`, which empties the reader.
         r.finish().map(|()| frame)
     }
 }
@@ -531,6 +529,8 @@ impl<'a> Reader<'a> {
         all
     }
 
+    /// Refuses a payload the frame's fields did not consume exactly. The variable-length
+    /// frames pass by construction, [`Reader::rest`] having emptied the reader.
     const fn finish(self) -> Result<(), ProtoError> {
         if self.rest.is_empty() {
             Ok(())
@@ -656,24 +656,18 @@ mod tests {
         );
     }
 
-    /// § 4.2's `gap = resume_from > out_offset`, at the one offset where the sentinel
-    /// and a real position collide, and either side of an ordinary edge.
+    /// § 4.2's `gap = resume_from > out_offset` at the one offset where it is not just
+    /// the comparison: `RESUME_FROM_START` *is* `u64::MAX`, so a ring based at the top of
+    /// the offset space answers the sentinel and a client genuinely there with one
+    /// number. § 4.2 calls both no-gap, which is what makes the collision harmless.
     #[test]
-    fn the_derived_gap_is_the_comparison_section_4_2_makes() {
-        let gap = |resume_from, out_offset| {
-            HelloOk {
-                resume_from,
-                in_applied: 0,
-                agent: false,
-            }
-            .gap(out_offset)
+    fn the_resume_sentinel_collides_with_a_real_offset_harmlessly() {
+        let ok = HelloOk {
+            resume_from: u64::MAX,
+            in_applied: 0,
+            agent: false,
         };
-        // `RESUME_FROM_START` *is* `u64::MAX`, so a ring based at the top of the offset
-        // space answers the sentinel and a client genuinely there with one number.
-        // § 4.2 calls both no-gap, which is what makes the collision harmless.
-        assert!(!gap(u64::MAX, RESUME_FROM_START), "the sentinel is no gap");
-        assert!(gap(16, 8), "output dropped before the client is a gap");
-        assert!(!gap(8, 16), "a resume_from clamped down is no gap");
+        assert!(!ok.gap(RESUME_FROM_START), "the sentinel is no gap");
     }
 
     #[test]

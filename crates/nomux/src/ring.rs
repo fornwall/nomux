@@ -70,9 +70,8 @@ impl Ring {
     /// Discarding is not reported here; whether a *reader* lost anything is derived
     /// per client from [`Ring::base`], for the reason `IMPLEMENTATION.md` § 4 gives.
     pub(crate) fn push(&mut self, data: &[u8]) {
-        // One number for both sides of the eviction: what falls out of the window is
-        // `retained + new - capacity` however it splits between the buffer's head and
-        // this write's own, and `base` advances by the whole of it.
+        // One number for both sides of the eviction, however it splits between the
+        // buffer's head and this write's own: `base` advances by the whole of it.
         let overflow = self
             .buf
             .len()
