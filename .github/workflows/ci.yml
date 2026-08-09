@@ -14,6 +14,17 @@ on:
   # direct dependencies not earning a daily run of anything. The timer exists for `cargo deny
   # check advisories` alone: `fuzz` and `release` skip scheduled runs below, `publish` is
   # tag-gated already.
+  #
+  # What neither this timer nor Dependabot covers: the six tool versions pinned literally in this
+  # file — cargo-deny, cargo-nextest, prek and shellcheck on the `install-action` line, actionlint
+  # and its checksum in the step below it, cargo-fuzz in the `fuzz` job. Dependabot's
+  # `github-actions` ecosystem bumps `uses:` refs and nothing else, so these drift until somebody
+  # looks. scripts/nightly-version is the pattern that solves this for the one shared pin, and it
+  # works because shell scripts read it at run time; these six sit in `with:` and `env:`, which
+  # are evaluated before any step could read a file. Consolidating them means a step writing
+  # $GITHUB_OUTPUT and every use becoming a `format()` over `steps.*.outputs.*` — less readable
+  # than the literals, and a mistyped key would expand to `cargo-deny@` rather than fail. Left
+  # inline deliberately; bump them by hand.
   schedule:
     - cron: '17 4 * * 1'
   # The release job's artifacts expire and nothing else produces the per-architecture binaries or
