@@ -120,6 +120,12 @@ fn a_child_killed_by_a_signal_is_reported_as_signalled_rather_than_as_a_status()
 /// keeps one more for job control — `/dev/tty` on fd 10, under the `dash` this suite
 /// pins as `SHELL` — and the master goes on waiting. Replacing the process closes that
 /// one, since it is close-on-exec.
+///
+/// The child waits on a cue rather than sleeping, so this also carries the tail that used
+/// to be a second test: a child answered for as unknown is still the session's identity,
+/// and stays waitable until shutdown rather than being released the moment the daemon
+/// spoke for it. That cost a second `OUTCOME_GRACE` of its own to reach the state this one
+/// is already in, and asserted nothing about the frame it took off the wire and dropped.
 #[test]
 fn an_unknown_outcome_is_sent_on_the_pass_that_decides_it() {
     /// Comfortably above the two-second `OUTCOME_GRACE`, and nowhere near the hour the
@@ -127,16 +133,18 @@ fn an_unknown_outcome_is_sent_on_the_pass_that_decides_it() {
     /// pass under nextest's full-core parallelism, and small enough to be a bound.
     const BOUND: Duration = Duration::from_secs(10);
 
-    let (_session, mut client, ok) = Session::attached("outcome_unknown");
+    let (session, mut client, ok) = Session::attached("outcome_unknown");
+    let child = shell_of(&session);
+    let cue = Cue::new(&session.root);
 
     // The marker is the last thing the child writes, and the `exec` on its heels is
     // what closes the terminal — so the clock below starts within one shell statement
-    // of the end of file the daemon reacts to. The process it leaves behind is alive
-    // for far longer than this test runs, which is what leaves `waitpid` with nothing
-    // to report and forces the explicit unknown outcome.
+    // of the end of file the daemon reacts to. The process it leaves behind waits on a
+    // cue this test holds, which is what leaves `waitpid` with nothing to report and
+    // forces the explicit unknown outcome.
     client.make_ready(
         "-echo",
-        Some("exec sleep 300 0</dev/null 1>/dev/null 2>/dev/null"),
+        Some("exec sh -c 'read go < cue' 0</dev/null 1>/dev/null 2>/dev/null"),
         ok.resume_from,
     );
     let began = Instant::now();
@@ -161,6 +169,21 @@ fn an_unknown_outcome_is_sent_on_the_pass_that_decides_it() {
         "the Exit frame took {elapsed:?}: the status was collected at the two-second \
          grace and then held for a pass that never came, which is a terminal that \
          hangs until its user types at it on every exit `waitpid` is not ready for"
+    );
+
+    // And the child the daemon has already answered for is still the session's identity:
+    // it exits on cue and stays waitable rather than being released, which is what
+    // reserves the pid — and the id behind it — until shutdown.
+    cue.release();
+    assert!(
+        poll_until(SETTLE, || !process_alive(child)),
+        "the child never took the cue and exited, so nothing below is about a status \
+         that outlived its process"
+    );
+    assert_eq!(
+        process_state(child),
+        Some('Z'),
+        "the daemon released pid {child} before session shutdown"
     );
 }
 
@@ -200,40 +223,6 @@ fn an_exited_shell_reserves_its_live_background_session() {
         poll_until(SETTLE, || !process_alive(raw)),
         "the signalled daemon never exited, so the job it was collecting is still \
          running"
-    );
-}
-
-/// A child answered for as unknown stays waitable until session shutdown.
-///
-/// The other half of [`an_exited_shell_reserves_its_live_background_session`]: this child
-/// closes its terminal, receives an unknown outcome, then exits on cue. `SIGCHLD` still
-/// drives outcome observation, but the child remains waitable as the session's identity.
-#[test]
-fn a_child_that_exits_after_an_unknown_outcome_keeps_its_identity() {
-    let (session, mut client, ok) = Session::attached("zombie_synth");
-    let child = shell_of(&session);
-    let cue = Cue::new(&session.root);
-
-    client.make_ready(
-        "-echo",
-        Some("exec sh -c 'read go < cue' 0</dev/null 1>/dev/null 2>/dev/null"),
-        ok.resume_from,
-    );
-    // Two seconds of `OUTCOME_GRACE` later, and the daemon has told this client that the
-    // transcript ended without a known outcome while the child still waits below.
-    drop(client.next_of(FrameType::Exit));
-
-    cue.release();
-    assert!(
-        poll_until(SETTLE, || !process_alive(child)),
-        "the child never took the cue and exited, so nothing below is about a status \
-         that outlived its process"
-    );
-
-    assert_eq!(
-        process_state(child),
-        Some('Z'),
-        "the daemon released pid {child} before session shutdown"
     );
 }
 
