@@ -69,18 +69,13 @@ fn main() -> ExitCode {
             print!("{USAGE}");
             ExitCode::SUCCESS
         }),
-        Some(word @ "daemon") => with_session(
-            word,
-            args,
-            true,
-            |session, label, lock_fd, scope_invocation_id| {
-                report(daemon::run(session, label, lock_fd, scope_invocation_id))
-            },
-        ),
-        Some(word @ "spawn") => with_session(word, args, false, |session, label, _, _| {
+        Some(word @ "daemon") => with_session(word, args, true, |session, label, lock_fd| {
+            report(daemon::run(session, label, lock_fd))
+        }),
+        Some(word @ "spawn") => with_session(word, args, false, |session, label, _| {
             report_relay(attach::run(session, attach::Intent::Create(label)))
         }),
-        Some(word @ "attach") => with_session(word, args, false, |session, label, _, _| {
+        Some(word @ "attach") => with_session(word, args, false, |session, label, _| {
             // Refused rather than dropped on the floor: a `--label` on `attach` is a
             // caller that still believes `attach` might create the session.
             if label.is_some() {
@@ -91,7 +86,7 @@ fn main() -> ExitCode {
             }
             report_relay(attach::run(session, attach::Intent::Resume))
         }),
-        Some(word @ "kill") => with_session(word, args, false, |session, label, _, _| {
+        Some(word @ "kill") => with_session(word, args, false, |session, label, _| {
             if label.is_some() {
                 return usage_error(Some(
                     "`kill` takes no `--label`: labels are recorded only when a session is created",
@@ -134,23 +129,17 @@ fn usage_error(message: Option<&str>) -> ExitCode {
 /// to whichever of them `main` matched.
 ///
 /// `word` is that mode, carried only so a refusal can name it. `private_options_ok` is
-/// passed by the daemon arm alone: everywhere else the startup handoff options are unknown.
+/// passed by the daemon arm alone: everywhere else the startup handoff option is unknown.
 fn with_session(
     word: &str,
     args: impl Iterator<Item = OsString>,
     private_options_ok: bool,
-    run: impl FnOnce(
-        &str,
-        Option<&str>,
-        Option<i32>,
-        Option<launcher::OriginalInvocationId>,
-    ) -> ExitCode,
+    run: impl FnOnce(&str, Option<&str>, Option<i32>) -> ExitCode,
 ) -> ExitCode {
     let SessionArgs {
         session,
         label,
         lock_fd,
-        scope_invocation_id,
     } = match parse_session_args(args, private_options_ok) {
         Ok(parsed) => parsed,
         Err(message) => return usage_error(Some(&message)),
@@ -158,7 +147,7 @@ fn with_session(
     let Some(session) = session else {
         return usage_error(Some(&format!("`{word}` requires a session id")));
     };
-    run(&session, label.as_deref(), lock_fd, scope_invocation_id)
+    run(&session, label.as_deref(), lock_fd)
 }
 
 /// The shared command line of every mode that names a session.
@@ -168,15 +157,10 @@ struct SessionArgs {
     label: Option<String>,
     /// Private startup capability passed only from `spawn` to `daemon`.
     lock_fd: Option<i32>,
-    /// The original invocation id if systemd-run inserted a transient scope.
-    ///
-    /// The option says whether scope mode is active; its value preserves an absent
-    /// `INVOCATION_ID` distinctly from scope mode not being used.
-    scope_invocation_id: Option<launcher::OriginalInvocationId>,
 }
 
 /// Splits a session-mode command line into its id and optional label — and, only where
-/// `private_options_ok`, the startup handoff options.
+/// `private_options_ok`, the startup handoff option.
 ///
 /// Deliberately minimal — no argument parser, no abbreviations, no `--` handling.
 /// The only caller is the client, which builds this command line itself.
@@ -187,7 +171,6 @@ fn parse_session_args(
     let mut session = None;
     let mut label = None;
     let mut lock_fd = None;
-    let mut scope_invocation_id = None;
 
     while let Some(arg) = args.next() {
         let text = arg
@@ -196,14 +179,6 @@ fn parse_session_args(
         let value = match text.split_once('=') {
             Some(("--lock-fd", value)) if private_options_ok => {
                 parse_lock_fd(value, &mut lock_fd)?;
-                continue;
-            }
-            Some(("--systemd-scope", value)) if private_options_ok => {
-                if scope_invocation_id.is_some() {
-                    return Err("`--systemd-scope` is given once".to_owned());
-                }
-                scope_invocation_id =
-                    Some(launcher::decode_invocation_id(value).map_err(str::to_owned)?);
                 continue;
             }
             Some(("--label", value)) => value.to_owned(),
@@ -234,16 +209,10 @@ fn parse_session_args(
             return Err("`--label` is given once: a second would replace the first".to_owned());
         }
     }
-    if scope_invocation_id.is_some() {
-        label = label
-            .map(|encoded| launcher::decode_scope_label(&encoded).map_err(str::to_owned))
-            .transpose()?;
-    }
     Ok(SessionArgs {
         session,
         label,
         lock_fd,
-        scope_invocation_id,
     })
 }
 
@@ -332,44 +301,36 @@ mod tests {
     }
 
     #[test]
-    fn scope_marker_is_a_daemon_only_startup_handoff() {
-        let parsed = session_args(
-            &[
-                "session",
-                "--lock-fd",
-                "19",
-                "--systemd-scope=-",
-                "--label=x636f7374202435",
-            ],
-            true,
-        )
-        .expect("parse the daemon handoff");
-        assert_eq!(parsed.session.as_deref(), Some("session"));
-        assert_eq!(parsed.lock_fd, Some(19));
-        assert_eq!(parsed.label.as_deref(), Some("cost $5"));
-        assert_eq!(
-            parsed.scope_invocation_id,
-            Some(launcher::OriginalInvocationId::Absent)
-        );
+    fn the_lock_descriptor_is_a_daemon_only_startup_handoff() {
+        for spelling in [["--lock-fd", "19"].as_slice(), ["--lock-fd=19"].as_slice()] {
+            let mut args = vec!["session"];
+            args.extend_from_slice(spelling);
+            args.extend_from_slice(&["--label=cost $5"]);
+            let parsed = session_args(&args, true).expect("parse the daemon handoff");
+            assert_eq!(parsed.session.as_deref(), Some("session"));
+            assert_eq!(parsed.lock_fd, Some(19));
+            assert_eq!(parsed.label.as_deref(), Some("cost $5"));
 
-        assert_eq!(
-            session_args(&["session", "--systemd-scope=-"], false)
-                .expect_err("reject a private option on public modes"),
-            "unknown option `--systemd-scope=-`"
-        );
+            assert_eq!(
+                session_args(&args, false).expect_err("reject a private option on public modes"),
+                format!("unknown option `{}`", spelling[0])
+            );
+        }
     }
 
     #[test]
-    fn scope_marker_cannot_be_repeated_or_take_a_value() {
+    fn the_lock_descriptor_cannot_be_repeated_or_name_standard_stdio() {
         assert_eq!(
-            session_args(&["session", "--systemd-scope=-", "--systemd-scope=-"], true,)
-                .expect_err("reject a repeated marker"),
-            "`--systemd-scope` is given once"
+            session_args(&["session", "--lock-fd=19", "--lock-fd", "20"], true)
+                .expect_err("reject a repeated descriptor"),
+            "`--lock-fd` is given once"
         );
+        // A relay hands over a descriptor it opened; `2` would be the stderr the daemon is
+        // about to silence rather than a lock anybody holds.
         assert_eq!(
-            session_args(&["session", "--systemd-scope=yes"], true)
-                .expect_err("reject a marker value"),
-            "invalid `--systemd-scope` value"
+            session_args(&["session", "--lock-fd=2"], true)
+                .expect_err("reject a standard descriptor"),
+            "invalid `--lock-fd`"
         );
     }
 }
