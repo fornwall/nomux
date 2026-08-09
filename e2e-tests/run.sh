@@ -195,6 +195,17 @@ abrupt_login() {
     }
 
     out=$(mktemp)
+    client=''
+    # A trap of this subshell's own. `abrupt_login` is called from a command substitution, and
+    # a POSIX subshell starts with every trap its parent caught reset to the default — so the
+    # run's INT/TERM handler is not installed in here, and nothing else in this function is
+    # reached on a signal. What would be left behind is not only the temporary file: the
+    # background ssh client below holds a login open inside the container, which is exactly
+    # what the next cell in that container would measure. `abrupt_abort` removes both, which
+    # is why `client` is emptied above rather than left unset for it to trip over. The
+    # parent's trap still runs afterwards and still takes the containers down.
+    trap 'abrupt_abort "$name: interrupted before the disconnect was measured"; exit 130' \
+        INT TERM HUP
     # `exec`, so `$!` is ssh itself rather than a subshell holding it. This client has to be
     # killed by hand at the end — it is talking to a blackhole and will never learn
     # otherwise — and killing a wrapper would leave the connection open behind it.
