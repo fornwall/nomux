@@ -1,6 +1,7 @@
 #!/bin/sh
 # Measures PLAN.md item 1: does a session created in one SSH login survive that login's
-# logout, across the KillUserProcesses x linger x pam_systemd matrix?
+# logout, across the KillUserProcesses x linger x pam_systemd matrix, and does the answer
+# hold when the login does not end in a logout at all but in a dropped connection?
 #
 # One cell per container, one real SSH login to create and one to check. Runs from
 # anywhere in the tree. See README.md for what this proves and what it does not.
@@ -23,6 +24,21 @@ arch=x86_64-unknown-linux-musl
 settle=${NOMUX_E2E_SETTLE:-6}
 keep=${NOMUX_E2E_KEEP:-0}
 wanted=${1:-}
+
+# The two numbers that keep an `abrupt` cell honest, in seconds from the moment the wire
+# is cut to the moment the login is gone.
+#
+# The floor is the whole guard against this half of the matrix being a silent duplicate of
+# the clean half. `image/sshd_config` sets ClientAliveInterval 5 / ClientAliveCountMax 1,
+# so a genuinely blackholed connection can only end when that timer expires, and the two
+# paths are nowhere near each other: measured on this image, a blackhole takes 15-20s and
+# `kill -9` on the local ssh client takes 0.1s, because the host kernel still closes the
+# socket politely and sshd sees an ordinary logout. Anything under the floor did not
+# partition the connection, whatever it did.
+abrupt_floor=5
+# And the ceiling says the login ended at all. A cell that sat out its whole disconnect
+# with the session still logged in measured nothing either.
+abrupt_ceiling=90
 
 die() {
     printf '%s\n' "$@" >&2
@@ -57,26 +73,32 @@ chmod 600 "$key"
 
 # Never a known_hosts entry and never an agent: these containers are rebuilt constantly
 # and share a host key only by accident, and the matrix must not consult the user's.
+#
+# `-n` is load-bearing, not tidiness: without it ssh reads the caller's stdin, and the cell
+# loop below is fed by a here-document — so the first login swallowed every remaining cell
+# and the run reported "all matched" having measured one of five.
+#
+# Held as one list because `abrupt_login` needs the same flags on an `exec`, and two copies
+# of this drifting apart would mean two kinds of login that are not comparable.
+ssh_flags="-q -n
+    -o BatchMode=yes
+    -o IdentitiesOnly=yes
+    -o StrictHostKeyChecking=no
+    -o UserKnownHostsFile=/dev/null
+    -o ControlMaster=no
+    -o ControlPath=none
+    -o LogLevel=ERROR"
+
 ssh_to() {
     port=$1
     shift
-    # `-n` is load-bearing, not tidiness: without it ssh reads the caller's stdin, and the
-    # cell loop below is fed by a here-document — so the first login swallowed every
-    # remaining cell and the run reported "all matched" having measured one of five.
-    ssh -q -n -p "$port" -i "$key" \
-        -o BatchMode=yes \
-        -o IdentitiesOnly=yes \
-        -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -o ControlMaster=no \
-        -o ControlPath=none \
-        -o LogLevel=ERROR \
-        nomuxer@127.0.0.1 "$@"
+    # shellcheck disable=SC2086 # deliberate word splitting: $ssh_flags is a list of flags.
+    ssh $ssh_flags -p "$port" -i "$key" nomuxer@127.0.0.1 "$@"
 }
 
 # ------------------------------------------------------------------------------ the cells
 
-cells=$(sed 's/#.*//' matrix.tsv | awk 'NF == 6 { print }')
+cells=$(sed 's/#.*//' matrix.tsv | awk 'NF == 7 { print }')
 [ -n "$cells" ] || die "matrix.tsv named no cells"
 if [ -n "$wanted" ]; then
     cells=$(printf '%s\n' "$cells" | awk -v w="$wanted" '$1 == w')
@@ -121,6 +143,120 @@ await_ssh() {
         "      cgroup or PID 1 failures rather than assuming nomux is at fault."
 }
 
+# ------------------------------------------------------------------- the dropped wire
+
+# sshd's unprivileged child for the one login a cell makes — `sshd: nomuxer@notty`. It is
+# the login: while it is there the session is logged in, and when it goes PAM's session
+# close has run and logind has been told. Matched by uid and exact name rather than by
+# process title, which is an sshd version's business and not a fact to build on.
+login_present() {
+    docker exec "$1" pgrep -u nomuxer -x sshd > /dev/null 2>&1
+}
+
+# The tidying every `abrupt_login` failure past the first has to do, plus the complaint.
+# Leaving the client behind would be the worse half: it holds a login open, and a login
+# still there is exactly what the next cell in this container would measure. Reads `out` and
+# `client` from its one caller, which is where they are set.
+abrupt_abort() {
+    rm -f "$out"
+    kill "$client" 2>/dev/null || true
+    wait "$client" 2>/dev/null || true
+    printf '%s\n' "$@" >&2
+}
+
+# One `abrupt` cell's first login: create the session, then take the network away under it
+# instead of logging out.
+#
+# A clean cell lets `ssh host 'cmd'` return, which closes the connection in an orderly way
+# and lets sshd end the login at once. This one holds the login open with `nomux-cell-hold`
+# and then blackholes port 22 *inside the container*, both directions, so sshd's packets go
+# nowhere and no FIN or RST can reach it from the client either. What is left is the case
+# nomux exists for — a laptop lid, a dead NAT entry — where the only thing that can end the
+# login is sshd's `ClientAlive` timer, and the logout is reached through `cleanup_exit`
+# rather than through an orderly channel close.
+#
+# Killing the local ssh client is emphatically *not* this. The host kernel still closes the
+# socket, sshd sees an ordinary logout, and the cell becomes a silent duplicate of its
+# clean twin that passes and proves nothing. Measured on this image, that takes 0.1s
+# against 15-20s for the blackhole, which is why the caller checks the number.
+#
+# Prints the create login's own report with a TEARDOWN-SECONDS line appended, and is called
+# from a command substitution — so the variables below are a subshell's and the background
+# client cannot outlive the cell.
+abrupt_login() {
+    port=$1
+    name=$2
+    id=$3
+
+    cid=$(docker compose ps -q "$name")
+    [ -n "$cid" ] || {
+        echo "$name: no running container to cut the wire in" >&2
+        return 1
+    }
+
+    out=$(mktemp)
+    # `exec`, so `$!` is ssh itself rather than a subshell holding it. This client has to be
+    # killed by hand at the end — it is talking to a blackhole and will never learn
+    # otherwise — and killing a wrapper would leave the connection open behind it.
+    # shellcheck disable=SC2086 # deliberate word splitting: $ssh_flags is a list of flags.
+    ( exec ssh $ssh_flags -p "$port" -i "$key" nomuxer@127.0.0.1 \
+        "nomux-cell-create $id && nomux-cell-hold" ) > "$out" 2>&1 &
+    client=$!
+
+    # Cut the wire only once the session exists and the login has gone quiet, so what the
+    # next `ClientAlive` request meets is the blackhole and not a still-busy connection.
+    deadline=$(( $(date +%s) + 60 ))
+    while ! grep -q NOMUX-HOLD-READY "$out" 2>/dev/null; do
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            sed 's/^/    /' < "$out" >&2
+            abrupt_abort "$name: the create-and-hold login never reported itself ready"
+            return 1
+        fi
+        sleep 1
+    done
+
+    # There has to be a login to lose. A cell that measures an instant teardown because
+    # there was nothing left to tear down is the false pass all of this is guarding against.
+    if ! login_present "$cid"; then
+        abrupt_abort "$name: no sshd login process to disconnect; nothing was measured here"
+        return 1
+    fi
+
+    # Both rules to stdout-as-stderr: this function's stdout is the cell's report and gets
+    # parsed, so nothing else may land in it.
+    started=$(date +%s)
+    if ! docker exec "$cid" iptables -I INPUT 1 -p tcp --dport 22 -j DROP >&2 ||
+        ! docker exec "$cid" iptables -I OUTPUT 1 -p tcp --sport 22 -j DROP >&2; then
+        abrupt_abort "$name: could not blackhole port 22 in the container"
+        return 1
+    fi
+
+    gone=timeout
+    limit=$(( started + abrupt_ceiling ))
+    while [ "$(date +%s)" -lt "$limit" ]; do
+        if ! login_present "$cid"; then
+            gone=$(( $(date +%s) - started ))
+            break
+        fi
+        sleep 1
+    done
+
+    # The wire back before anything else touches this cell: the check login is a fresh
+    # connection to the same port and would be blackholed along with the old one. Deleted
+    # by rule rather than flushed, so a cell that ever grows a firewall of its own keeps it.
+    docker exec "$cid" iptables -D INPUT -p tcp --dport 22 -j DROP >&2 || true
+    docker exec "$cid" iptables -D OUTPUT -p tcp --sport 22 -j DROP >&2 || true
+
+    # The client is still waiting on a connection whose server has gone, and nothing will
+    # ever tell it so. It is told here.
+    kill "$client" 2>/dev/null || true
+    wait "$client" 2>/dev/null || true
+
+    cat "$out"
+    rm -f "$out"
+    printf 'TEARDOWN-SECONDS=%s\n' "$gone"
+}
+
 # ------------------------------------------------------------------------------ measure
 
 results=''
@@ -132,21 +268,50 @@ nl='
 
 # `while read` in a pipeline runs in a subshell, whose variables do not survive it, so
 # the loop reads from a here-document instead and the tallies below are this shell's.
-while IFS='	' read -r name port kup linger pam expect; do
+while IFS='	' read -r name port kup linger pam logout expect; do
     [ -n "$name" ] || continue
-    printf '\n=== %s (KillUserProcesses=%s linger=%s pam_systemd=%s, expect %s)\n' \
-        "$name" "$kup" "$linger" "$pam" "$expect" >&2
+    printf '\n=== %s (KillUserProcesses=%s linger=%s pam_systemd=%s %s logout, expect %s)\n' \
+        "$name" "$kup" "$linger" "$pam" "$logout" "$expect" >&2
     await_ssh "$port" "$name"
 
     id="cell$(printf '%s' "$name" | tr -cd 'a-z0-9')"
-    # One login: create the session, report which path the launcher took, then log out.
-    if ! created=$(ssh_to "$port" "nomux-cell-create $id" 2>&1); then
+    # One login: create the session, report which path the launcher took, then end — by
+    # logging out, or by losing the network under it. That difference is the whole of the
+    # `logout` axis; everything from here down is the same measurement either way.
+    if [ "$logout" = abrupt ]; then
+        created=$(abrupt_login "$port" "$name" "$id" 2>&1) || die \
+            "$name: the abrupt-disconnect login did not get as far as a disconnect."
+    elif ! created=$(ssh_to "$port" "nomux-cell-create $id" 2>&1); then
         printf '%s\n' "$created" | sed 's/^/    /' >&2
         die "$name: could not create a session to test"
     fi
     printf '%s\n' "$created" | sed 's/^/    /' >&2
 
-    # The logout has happened; give logind its moment to act on it.
+    # How long the login took to die, which for an abrupt cell is the evidence that the
+    # disconnect was one. Kept out of the verdict and checked on its own: a cell that
+    # reached the right answer down the wrong teardown path has not measured this row.
+    teardown='-'
+    if [ "$logout" = abrupt ]; then
+        teardown=$(printf '%s\n' "$created" | sed -n 's/^TEARDOWN-SECONDS=//p' | head -1)
+        case "$teardown" in
+        '' | *[!0-9]*)
+            die "$name: the login was still there ${abrupt_ceiling}s after the wire was cut" \
+                "      (TEARDOWN-SECONDS=${teardown:-<none>}). sshd never reached its" \
+                "      ClientAlive timeout, so nothing about a dropped connection was" \
+                "      measured here."
+            ;;
+        esac
+        if [ "$teardown" -lt "$abrupt_floor" ]; then
+            die "$name: the login ended ${teardown}s after the wire was cut, under the" \
+                "      ${abrupt_floor}s floor. That is an orderly close, not a partition:" \
+                "      sshd was told the client had gone instead of having to time it out," \
+                "      which makes this cell a silent duplicate of its clean twin. Fix the" \
+                "      blackhole in \`abrupt_login\` rather than the floor."
+        fi
+        teardown="${teardown}s"
+    fi
+
+    # The login is over, however it ended; give logind its moment to act on it.
     sleep "$settle"
 
     # A second, independent login asks whether the session is still there. ssh hands back
@@ -178,8 +343,9 @@ while IFS='	' read -r name port kup linger pam expect; do
         verdict=DEVIATES
         failed=1
     fi
-    results="$results$(printf '%-20s %-4s %-7s %-4s %-9s %-9s %-9s %s' \
-        "$name" "$kup" "$linger" "$pam" "$path" "$expect" "$measured" "$verdict")$nl"
+    results="$results$(printf '%-24s %-4s %-7s %-4s %-7s %-9s %-9s %-9s %-9s %s' \
+        "$name" "$kup" "$linger" "$pam" "$logout" "$path" "$teardown" \
+        "$expect" "$measured" "$verdict")$nl"
     measured_count=$((measured_count + 1))
 done <<EOF
 $cells
@@ -197,8 +363,8 @@ fi
 # ------------------------------------------------------------------------------- report
 
 echo
-printf '%-20s %-4s %-7s %-4s %-9s %-9s %-9s %s\n' \
-    CELL KUP LINGER PAM LAUNCH EXPECT MEASURED ''
+printf '%-24s %-4s %-7s %-4s %-7s %-9s %-9s %-9s %-9s %s\n' \
+    CELL KUP LINGER PAM LOGOUT LAUNCH TEARDOWN EXPECT MEASURED ''
 printf '%s' "$results"
 echo
 

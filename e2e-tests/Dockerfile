@@ -8,9 +8,15 @@ ENV DEBIAN_FRONTEND=noninteractive
 # `$XDG_RUNTIME_DIR` but no `$XDG_RUNTIME_DIR/bus`, so `user@UID.service` never comes up,
 # `launcher::user_manager_reachable` declines, and every cell silently measures the
 # direct path no matter what its linger axis says. Plain `dbus` is the system bus only.
+#
+# `iptables` is what makes the abrupt-disconnect cells abrupt: the runner blackholes port
+# 22 inside the container so sshd's packets go nowhere and no FIN or RST can reach it,
+# leaving `ClientAliveInterval` as the only thing that will end the login. Killing the
+# local ssh client would *not* do — the host kernel still closes the socket politely and
+# sshd sees an orderly logout, which is the cell that already exists.
 RUN apt-get update && apt-get install --no-install-recommends -y \
         systemd systemd-sysv dbus dbus-user-session libpam-systemd \
-        openssh-server procps iproute2 ca-certificates \
+        openssh-server procps iproute2 iptables ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # systemd in a container: the units that need host state nobody gave it only slow the
@@ -32,7 +38,9 @@ RUN useradd --create-home --shell /bin/bash nomuxer
 
 COPY image/cell-entrypoint.sh /usr/local/sbin/cell-entrypoint.sh
 COPY image/session-create.sh /usr/local/bin/nomux-cell-create
-RUN chmod 0755 /usr/local/sbin/cell-entrypoint.sh /usr/local/bin/nomux-cell-create
+COPY image/session-hold.sh /usr/local/bin/nomux-cell-hold
+RUN chmod 0755 /usr/local/sbin/cell-entrypoint.sh \
+        /usr/local/bin/nomux-cell-create /usr/local/bin/nomux-cell-hold
 
 # systemd's own shutdown request, so `docker compose down` is a clean poweroff rather
 # than a SIGTERM logind never hears.

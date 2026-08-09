@@ -11,7 +11,16 @@ PubkeyAuthentication yes
 # /etc/pam.d/common-session rather than here, so this axis has one switch.
 UsePAM yes
 
-# A logout should be a logout the instant the connection drops.
+# What ends the login in an `abrupt` cell, where the connection is blackholed and no FIN or
+# RST will ever arrive to say so. Short so the matrix does not sit out an hour of TCP
+# retransmission per cell; not so short that the timeout is hard to tell from an orderly
+# close, which is the false pass `run.sh`'s TEARDOWN floor exists to catch. As set, sshd
+# gives up 15-20s after the wire is cut against 0.1s for a close — measured, not assumed,
+# and further apart than the two intervals here would suggest.
+#
+# Leaving these unset would not make the matrix stricter, it would make it vacuous: sshd
+# would never ask, the login would outlive the connection indefinitely, and the abrupt cells
+# would report `survives` having torn nothing down.
 TCPKeepAlive yes
 ClientAliveInterval 5
 ClientAliveCountMax 1
