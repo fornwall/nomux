@@ -164,20 +164,14 @@ impl Conn {
     /// [`MAX_PENDING_READ`] still undecoded.
     ///
     /// `chunk` is the caller's, and is only ever written to: a buffer of its own would be
-    /// zeroed on every call, and the daemon already carries one.
+    /// zeroed on every call, and the daemon already carries one. It must be non-empty —
+    /// `read` into a zero-length slice answers `Ok(0)`, which is taken for the peer's end
+    /// of file. Both callers hand over the daemon's whole 64 KiB read buffer.
     ///
     /// # Errors
     ///
     /// Propagates read failures other than `EWOULDBLOCK` and `EINTR`.
     pub(crate) fn fill(&mut self, chunk: &mut [u8]) -> io::Result<()> {
-        // `Read::read` answers `Ok(0)` for an empty destination without consulting the
-        // socket. That is not the peer's EOF, and recording it as one would permanently
-        // take this connection out of the event loop's read set. Production hands over a
-        // 64 KiB buffer; keeping the helper sound for every slice costs one branch per
-        // fill rather than a latent lifecycle trap for its next caller.
-        if chunk.is_empty() {
-            return Ok(());
-        }
         while self.buffered() < MAX_PENDING_READ {
             let room = MAX_PENDING_READ - self.buffered();
             let read_len = chunk.len().min(room);
@@ -317,18 +311,6 @@ mod tests {
         let (peer, ours) = UnixStream::pair().expect("a socketpair");
         peer.set_nonblocking(true).expect("a non-blocking peer");
         (peer, Conn::new(ours).expect("a connection"))
-    }
-
-    #[test]
-    fn an_empty_read_buffer_does_not_invent_end_of_file() {
-        let (_peer, mut conn) = pair();
-
-        conn.fill(&mut []).expect("an empty fill is a no-op");
-
-        assert!(
-            !conn.is_eof(),
-            "a zero-length destination says nothing about whether the peer is open"
-        );
     }
 
     /// A payload whose every byte is a function of its position, so a compaction that
