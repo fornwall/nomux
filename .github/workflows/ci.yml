@@ -241,11 +241,16 @@ jobs:
       - run: rustup target add x86_64-unknown-linux-musl
 
       # Two workspaces: the crate under test and e2e-tests/probe, which is separate for the
-      # reason fuzz/ is. Keyed on what changes the containers, so a change to the harness itself
-      # does not throw away the compiled dependencies.
+      # reason fuzz/ is. No `key:` of its own, unlike `fuzz` and `release`. Those two build with
+      # the nightly from scripts/nightly-version, which rust-cache cannot see and so cannot key
+      # on; this job builds with the stable pin from rust-toolchain.toml, which rust-cache reads
+      # itself, and with the two lock files it already hashes. A key naming the container files
+      # was strictly worse than none: rust-cache carries the user key into its restore key too,
+      # so it has no fallback, and every edit to the Dockerfile or the compose file threw away a
+      # 26 MB cache that has nothing to do with either. Five consecutive runs logged
+      # "No cache found." and three separate lineages were written and never read.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: e2e-${{ hashFiles('e2e-tests/Dockerfile', 'e2e-tests/docker-compose.yml') }}
           workspaces: |
             .
             e2e-tests/probe
