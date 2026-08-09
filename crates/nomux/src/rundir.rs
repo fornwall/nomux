@@ -158,14 +158,12 @@ pub(crate) fn ensure_run_dir(dir: &Path) -> io::Result<()> {
 
 /// Refuses a run-directory path an untrusted user can redirect after it is checked.
 ///
-/// The later socket and file operations are path-based; Linux has no `bindat(2)`. A final
-/// directory at 0700 is therefore insufficient when another uid can rename an ancestor or
-/// replace one with a symlink between validation and use. Every existing ancestor must be
-/// a real directory, owned by this uid or root, and not writable by group or other. A sticky
-/// shared parent is safe for a child owned by this uid or root, as the kernel forbids another
-/// uid from renaming that entry. Missing components are allowed here — the sticky parent's
-/// own child among them, there being no owner to weigh before the `mkdir` — because
-/// [`ensure_run_dir`] creates them and then runs this check again before returning.
+/// § 6.3's ancestor rule, and the reason there is one: the later socket and file operations
+/// are path-based, Linux having no `bindat(2)`, so a final directory at 0700 is insufficient
+/// when another uid can rename an ancestor or replace one with a symlink between validation
+/// and use. Missing components are allowed here — the sticky parent's own child among them,
+/// there being no owner to weigh before the `mkdir` — because [`ensure_run_dir`] creates them
+/// and then runs this check again before returning.
 fn check_trusted_ancestors(dir: &Path) -> io::Result<()> {
     let us = rustix::process::getuid().as_raw();
     let mut child_owner = fs::symlink_metadata(dir)
@@ -193,14 +191,10 @@ fn check_trusted_ancestors(dir: &Path) -> io::Result<()> {
                 let mode = metadata.mode();
                 // The sticky bit is the one safe shared-directory exception: only the
                 // child owner, directory owner or root may rename the protected entry.
-                // A child that is not there yet is nothing that rule can speak for, and
+                // A child that is not there yet is nothing that rule can speak for —
                 // refusing it made a run directory under sticky `/tmp` impossible to
-                // *create* while an existing one was accepted — a permanent 126 on every
-                // host whose `XDG_STATE_HOME` points into one. [`ensure_run_dir`] makes
-                // the entry with an atomic `mkdir` and re-runs this check plus
-                // [`check_run_dir`]'s uid and mode on the entry that now exists, which is
-                // where a lost race is caught; every other caller reads the absence as
-                // "no session was ever created here" and touches nothing.
+                // *create* while an existing one was accepted. The atomic `mkdir` and
+                // the re-check on the entry it leaves are what catch a lost race.
                 let sticky_protects_child =
                     mode & 0o1000 != 0 && child_owner.is_none_or(|owner| owner == us || owner == 0);
                 if mode & 0o022 != 0 && !sticky_protects_child {
@@ -303,9 +297,9 @@ fn refuse_unopenable(dir: &Path, err: rustix::io::Errno) -> io::Error {
     }
 }
 
-/// A refusal in the terms the user needs: which directory, what is wrong with it, and what
-/// it was supposed to be. It reaches them as `nomux: ...` on stderr and is the whole
-/// account they get, so it names the path even where the errno beneath names nothing.
+/// A refusal in the terms the user needs. It reaches them as `nomux: ...` on stderr and is
+/// the whole account they get, so it names the path even where the errno beneath names
+/// nothing.
 fn refuse(dir: &Path, kind: io::ErrorKind, problem: &str) -> io::Error {
     io::Error::new(
         kind,
@@ -890,8 +884,7 @@ impl SpawnLock {
 /// file with more in it ([`parse_pid`], `control::unidentified`).
 ///
 /// A FIFO is refused rather than read short: it answers `EAGAIN` with no file end to
-/// reach. `O_NONBLOCK` keeps its `open` from waiting for a writer; `O_NOFOLLOW` keeps the
-/// name from resolving elsewhere. Anything that is not a regular file is
+/// reach, and its `open` would wait for a writer. Anything that is not a regular file is
 /// [`io::ErrorKind::InvalidData`] and never `InvalidInput`, which `main::report` scores
 /// as § 10's 64 for an id that could never have named a session.
 pub(crate) fn read_prefix<'a>(path: &Path, buf: &'a mut [u8]) -> io::Result<&'a [u8]> {
@@ -936,10 +929,8 @@ pub(crate) fn read_label(path: &Path) -> String {
 /// read back.
 ///
 /// Zero and negatives are refused: `kill(2)` reads those as a process group and as every
-/// process the caller may signal. The **newline is required**, being what says the file
-/// ends where the number does: `"3277"` out of `"32770419\n"` is a shorter, plausible,
-/// *live* pid, so a cut-off body must never parse — nor one that reached [`MAX_PID_LEN`],
-/// the same asymmetry one bound further out.
+/// process the caller may signal. The **newline is required**, and so is a body short of
+/// [`MAX_PID_LEN`] — § 6.6 has why a pidfile cut off mid-number must never parse.
 pub(crate) fn parse_pid(body: &[u8]) -> Option<i32> {
     if body.len() >= MAX_PID_LEN || !body.ends_with(b"\n") {
         return None;
@@ -1020,7 +1011,6 @@ mod tests {
 
         ensure_run_dir(&dir).unwrap();
         assert_eq!(mode_of(&dir), DIR_MODE, "created owner-only");
-        // The call every attach after the first makes, now that the entry exists.
         ensure_run_dir(&dir).unwrap();
         assert!(
             check_run_dir(&dir).unwrap(),
