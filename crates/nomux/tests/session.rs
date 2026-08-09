@@ -10,9 +10,7 @@
 #![allow(
     clippy::expect_used,
     clippy::panic,
-    reason = "the allow-*-in-tests settings in clippy.toml reach `#[test]` bodies \
-              and `#[cfg(test)]` modules, not the helpers an integration test crate \
-              keeps beside them"
+    reason = "integration test crate; clippy.toml's allow-*-in-tests reaches only #[cfg(test)]"
 )]
 
 mod harness;
