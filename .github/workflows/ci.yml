@@ -268,6 +268,16 @@ jobs:
             .
             e2e-tests/probe
 
+      # The only lint pass e2e-tests/probe gets, exactly as the fuzz job's clippy is the only one
+      # fuzz/ gets: the clippy hook reaches the root workspace alone, and until this the third
+      # workspace had `cargo fmt --check` and nothing else. Whether the probe is correct decides
+      # whether the matrix below means anything, so it is the wrong file to lint least. Here and
+      # not in `check` because this job already caches that workspace's target directory; measured
+      # at about five seconds against a warm one. Before `run.sh`, so a lint failure costs nothing
+      # rather than six booted containers. The deny rides on the command, this job having no
+      # job-level RUSTFLAGS to put it in.
+      - run: cargo clippy --locked --manifest-path e2e-tests/probe/Cargo.toml --all-targets -- -D warnings
+
       # Fails on any cell whose measured verdict differs from matrix.tsv's prediction, in either
       # direction: a cell that survives where the file says it dies is as much a finding as the
       # reverse, and both mean the file and the world have to be reconciled before merge.

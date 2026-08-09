@@ -55,8 +55,11 @@ echo "building nomux and the probe for $arch..." >&2
 rustup target list --installed | grep -qx "$arch" ||
     die "the $arch target is not installed: rustup target add $arch"
 
-( cd "$repo" && cargo build --release --target "$arch" --bin nomux ) >&2
-( cd "$here/probe" && cargo build --release --target "$arch" ) >&2
+# `--locked` on both, as every other cargo invocation in the tree has it: what this harness
+# measures is the behaviour of a committed tree, and a resolver quietly moving past either lock
+# file would make the run a fact about whatever crates.io held that morning.
+( cd "$repo" && cargo build --locked --release --target "$arch" --bin nomux ) >&2
+( cd "$here/probe" && cargo build --locked --release --target "$arch" ) >&2
 
 mkdir -p "$here/bin"
 cp "$target/$arch/release/nomux" "$here/bin/nomux"
