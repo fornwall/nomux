@@ -16,9 +16,7 @@
 
 #![allow(
     clippy::expect_used,
-    reason = "the allow-expect-in-tests setting in clippy.toml reaches `#[test]` \
-              bodies and `#[cfg(test)]` modules, not the helpers an integration \
-              test crate keeps beside them"
+    reason = "integration test crate; clippy.toml's allow-*-in-tests reaches only #[cfg(test)]"
 )]
 
 mod harness;
@@ -107,15 +105,11 @@ fn reconnecting_does_not_raise_the_input_ceiling() {
     const TOLERATED: usize = 8 << 20;
 
     let (session, mut client, ok) = Session::attached("input_ceiling");
-    // One deadline for the whole test rather than one per round (`harness::poll_by`), held
-    // by the client that sets the child up and by the probe every round greets with. What
-    // the rounds do inside it is bounded by the daemon rather than by patience: the first
-    // fills the input queue in a handful of pushes and every later one is answered by a
-    // daemon that has already stopped taking, so a full [`FRAME_PATIENCE`] is reached only
-    // by the defect below. A budget per round instead — one for the loop and a fresh one
-    // for each probe's connection — bounded this test at 146 seconds, well past
-    // `.config/nextest.toml`'s kill, and a run that reached it was reported killed rather
-    // than on the wait it was owed.
+    // One deadline for the whole test rather than one per round (`harness::poll_by`),
+    // held by the setup client and by the probe every round greets with. A budget per
+    // round instead bounded this test at 146 seconds, well past `.config/nextest.toml`'s
+    // kill, where a run that reached it was reported killed rather than on the wait it
+    // was owed.
     let deadline = Instant::now() + FRAME_PATIENCE;
     client.waits_by(deadline);
 
@@ -132,24 +126,15 @@ fn reconnecting_does_not_raise_the_input_ceiling() {
         // Pushed again while the daemon is still taking, rather than judged on the
         // first answer: [`push_until_refused`] returns on a window in which nothing was
         // accepted, and a daemon merely descheduled for the whole of one produces the
-        // same short count. In the first round that is not a ceiling but headroom, the
-        // round after it takes what was left, and the equality below then fails against
-        // a daemon that is behaving perfectly. It is the hazard
-        // [`input_delivered_before_a_half_close_is_applied_rather_than_dropped`] names
-        // and answers with the same loop, and it is what makes a quarter of a second
-        // rather than the whole one its neighbours spend affordable here: a window the
-        // daemon slept through costs another push instead of a wrong baseline.
+        // same short count — headroom read as a ceiling, which the round after it would
+        // then fail the equality below against a daemon behaving perfectly.
         //
-        // What ends the loop is an observation rather than a longer wait. A takeover
-        // the daemon *answered* — the `HelloOk` says it reached the decode loop, which
-        // is where the departing connection's buffer is drained — and that moved
-        // `in_applied` by nothing is the daemon having stopped taking input, which is
-        // the state a ceiling has to be measured in. A daemon that was merely asleep
-        // does not produce that answer, because it did not answer. The test's deadline is
-        // a backstop for one that never stops taking, which is the defect itself; the
-        // equality below is what reports it, and it reports it just as well from a round
-        // that took a single push — which is all a round after the first needs, the
-        // daemon having stopped taking before it started.
+        // What ends the loop is an observation rather than a longer wait: a takeover the
+        // daemon *answered* — the `HelloOk` says it reached the decode loop, where the
+        // departing connection's buffer is drained — and that moved `in_applied` by
+        // nothing. A daemon that was merely asleep does not produce that answer, because
+        // it did not answer. The deadline is a backstop for one that never stops taking,
+        // which is the defect itself.
         let applied = loop {
             // Every push starts where the daemon says it has got to, which is what
             // makes the measurement mean anything: input below `in_applied` is trimmed
@@ -225,8 +210,6 @@ fn input_delivered_before_a_half_close_is_applied_rather_than_dropped() {
     /// and the socket buffers between them, so what crosses is bounded by the daemon
     /// rather than by this.
     const BLAST: usize = 8 << 20;
-    /// One `Input` frame's payload, well inside `MAX_PAYLOAD`.
-    const CHUNK: usize = 60 * 1024;
 
     let session = Session::start("input_halfclose");
     let cue = Cue::new(&session.root);
@@ -244,36 +227,13 @@ fn input_delivered_before_a_half_close_is_applied_rather_than_dropped() {
     );
     drop(client);
 
-    // Where each whole frame ends on the wire, against the input offset one past it.
-    // The push below stops wherever the daemon stopped taking, routinely mid-frame,
-    // and a part-frame is owed to nobody — `take_frame` never completes one — so this
-    // is what turns a byte count into the offset the daemon is actually in debt for.
-    let chunk = vec![b'x'; CHUNK];
-    let mut frames = Vec::with_capacity(BLAST + CHUNK);
-    let mut whole = Vec::new();
-    let mut offset = ready.in_offset;
-    while frames.len() < BLAST {
-        Frame::Input {
-            offset,
-            data: &chunk,
-        }
-        .encode(&mut frames)
-        .expect("encode input");
-        offset += CHUNK as u64;
-        whole.push((frames.len(), offset));
-    }
+    let (frames, whole) = input_frames(BLAST, ready.in_offset);
 
     // A raw socket rather than the harness client, because this has to stop writing
     // exactly where the daemon stops reading and then half-close on the spot. A second
     // of a socket that will not take another byte is a daemon that has stopped rather
-    // than one that is busy, which is the same measure the two cap tests above are
-    // built on.
-    //
-    // Pushed again while the daemon has not yet taken more than it queues, rather than
-    // judged on the first answer: the push also ends on a window in which nothing was
-    // accepted, and a daemon merely descheduled for the whole of one produces the same
-    // short count. The state this test needs is the daemon having *stopped*, and one
-    // that really has is past the threshold on the first push.
+    // than one that is busy — the same measure the two cap tests above are built on, and
+    // pushed again for the same reason theirs is.
     let mut blaster = blaster(&session);
     let mut sent = 0;
     let deadline = Instant::now() + FRAME_PATIENCE;
@@ -290,7 +250,7 @@ fn input_delivered_before_a_half_close_is_applied_rather_than_dropped() {
             .rev()
             .find(|(through, _)| *through <= sent)
             .map_or(ready.in_offset, |(_, end)| *end);
-        if applied_end - ready.in_offset > MAX_PENDING_INPUT + CHUNK as u64
+        if applied_end - ready.in_offset > MAX_PENDING_INPUT + INPUT_CHUNK as u64
             || Instant::now() >= deadline
         {
             break applied_end;
@@ -302,7 +262,7 @@ fn input_delivered_before_a_half_close_is_applied_rather_than_dropped() {
     // it — in the receive buffer or the socket's — which is what the bug threw away
     // and so is what has to be there for any of this to be a test.
     assert!(
-        owed > MAX_PENDING_INPUT + CHUNK as u64,
+        owed > MAX_PENDING_INPUT + INPUT_CHUNK as u64,
         "the {owed} bytes of whole frames that reached the daemon all fit in the \
          {MAX_PENDING_INPUT} it queues, so nothing was ever held back outside it and \
          the half-close below would prove nothing"
@@ -386,7 +346,7 @@ fn a_half_closed_client_is_served_to_the_end_and_let_go_there() {
     const STATUS: i32 = 7;
     /// [`a_daemon_that_cannot_accept_stands_back_rather_than_spinning`]'s figure, for
     /// its reason and against the same window.
-    const TOLERATED: u64 = 5;
+    const TOLERATED: u64 = 1;
 
     let session = Session::start("halfclose_serve");
     let daemon = session.child.id();
@@ -396,7 +356,7 @@ fn a_half_closed_client_is_served_to_the_end_and_let_go_there() {
     let ok = setup.hello(RESUME_FROM_START);
     // `raw -echo` so that nothing but the child puts `LATE` on the stream, and the cue
     // so that it does so at a moment this test chooses.
-    setup.make_ready(
+    let ready = setup.make_ready(
         "raw -echo",
         Some(r#"read cue < cue; printf "LATE-$((6*7))"; exit 7"#),
         ok.resume_from,
@@ -474,11 +434,26 @@ fn a_half_closed_client_is_served_to_the_end_and_let_go_there() {
     );
 
     // The session outlives the client that read it to the end, per § 6.5 — and is
-    // clientless again, which is what puts it back on the idle deadline.
+    // clientless again, which is what puts it back on the idle deadline. Asked as two
+    // numbers rather than by driving the shell, the child having exited: `still_serving`
+    // has nobody left to echo its marker, and `in_applied > 0` is satisfied by any
+    // session that ever applied a byte, including one that has since stopped serving.
     let mut probe = session.connect();
+    let resumed = probe.hello(RESUME_FROM_START);
+    assert_eq!(
+        resumed.in_applied, ready.in_offset,
+        "the input position must survive the connection the session finished serving, \
+         and the child that has gone"
+    );
+    // And the status with it: `terminal_end_sent` is per connection, so a newcomer is
+    // owed the `Exit` this session already handed the peer above (§ 4.2, § 6.5).
+    let payload = probe.next_of(FrameType::Exit);
     assert!(
-        probe.hello(RESUME_FROM_START).in_applied > 0,
-        "the session did not survive the connection it finished serving"
+        matches!(
+            Frame::decode(FrameType::Exit, &payload).expect("decode the exit"),
+            Frame::Exit { status, .. } if status == STATUS
+        ),
+        "a client attaching after the child has gone is owed the status it left with"
     );
 }
 
@@ -621,10 +596,9 @@ fn a_client_that_never_reads_its_answers_is_dropped_rather_than_queued_for() {
     // full.
     let sent = push_until_refused(&mut peer, &pings, Duration::from_secs(1));
 
-    // Blocking with a timeout for the drain, so what the daemon managed to send is
-    // read at the speed it wrote it rather than at a poll interval per chunk — and so
-    // that a daemon which is merely slow is read from until the deadline rather than
-    // declared finished by an `EAGAIN` between two of its writes.
+    // Blocking with a timeout for the drain, so a daemon that is merely slow is read
+    // from until the deadline rather than declared finished by an `EAGAIN` between two
+    // of its writes.
     peer.set_nonblocking(false).expect("block for the drain");
     peer.set_read_timeout(Some(Duration::from_millis(100)))
         .expect("bound each read");
@@ -746,19 +720,17 @@ fn detaching_a_stalled_client_does_not_stop_the_child() {
         Some("chunk=$(cat filler); while :; do printf %s \"$chunk\"; printf . >> ticks; done"),
         ok.resume_from,
     );
-    // Before the rounds, so each of them arrives at a session with nobody attached: a
-    // takeover leaves through `Conn::close_with`, whose own bounded flush is § 6.4's
-    // deliberate one and would put a deadline into this measurement that belongs to
-    // another test.
+    // Before the rounds, so each arrives at a session with nobody attached: a takeover
+    // leaves through `Conn::close_with`, whose bounded flush is § 6.4's deliberate one
+    // and belongs to another test.
     drop(client);
 
     let ticks = session.root.join("ticks");
     let done = || fs::metadata(&ticks).map_or(0, |meta| meta.len());
 
-    // Twice what a peer that never reads can be handed, so the leftover at the moment of
-    // the detach is more than the socket will take however the reads and writes
-    // interleaved — the state a blocking final flush waits out. Measured rather than
-    // assumed, per [`socket_capacity`].
+    // Twice what a peer that never reads can be handed, so the leftover at the detach is
+    // more than the socket will take however the reads and writes interleaved — the
+    // state a blocking final flush waits out. Measured, per [`socket_capacity`].
     let held = socket_capacity();
     let queued = 2 * held + MAX_PENDING_WRITE;
     assert!(
@@ -774,9 +746,9 @@ fn detaching_a_stalled_client_does_not_stop_the_child() {
 
     let began = done();
     let deadline = Instant::now() + BUDGET;
-    // Held to the end: closing one of these with the daemon's answers still unread turns
-    // its next write into an `EPIPE`, which is the daemon *not* waiting for anything and
-    // so the opposite of what each round is composing.
+    // Held to the end: closing one with the daemon's answers still unread turns its next
+    // write into an `EPIPE`, which is the daemon *not* waiting and so the opposite of
+    // what each round composes.
     let _stalled: Vec<UnixStream> = (0..ROUNDS)
         .map(|_| stalled_detach(&session, &pings))
         .collect();
@@ -791,14 +763,12 @@ fn detaching_a_stalled_client_does_not_stop_the_child() {
 }
 
 /// One round of [`detaching_a_stalled_client_does_not_stop_the_child`]: a client that
-/// greets, is handed more than it will ever take, and detaches without reading a byte
-/// — § 4.1's departing client with its own output stalled behind it.
+/// greets, is handed more than it will ever take, and detaches without reading a byte —
+/// § 4.1's departing client with its own output stalled behind it.
 ///
 /// The `Detach` is what makes this a departure, and the two alternatives are not: a
-/// half-close is not one at all (§ 7), and a socket closed outright takes the flush
-/// away rather than testing it, an `EPIPE` being the daemon waiting for nothing.
-///
-/// The socket is handed back rather than dropped, for the reason the caller keeps it.
+/// half-close is not one at all (§ 7), and a socket closed outright takes the flush away
+/// rather than testing it.
 fn stalled_detach(session: &Session, pings: &[u8]) -> UnixStream {
     let mut socket = UnixStream::connect(&session.socket).expect("connect");
     write_frame(&mut socket, &hello_frame(false, false, RESUME_FROM_START));
@@ -816,15 +786,23 @@ fn stalled_detach(session: &Session, pings: &[u8]) -> UnixStream {
     socket
 }
 
-/// At least `at_least` bytes of encoded `Input` frames starting at `from`, and one
-/// past the last input offset they carry.
+/// One `Input` frame's payload, well inside `MAX_PAYLOAD`.
+const INPUT_CHUNK: usize = 60 * 1024;
+
+/// At least `at_least` bytes of encoded `Input` frames starting at `from`, and where
+/// each whole frame ends on the wire against the input offset one past it.
 ///
 /// Built in full before any of it is sent, because its callers measure how much of a
 /// buffer the daemon takes: encoding as they went would have them measuring this
 /// process instead.
-fn input_frames(at_least: usize, from: u64) -> (Vec<u8>, u64) {
-    let chunk = vec![b'x'; 60 * 1024];
+///
+/// The boundaries come back with the bytes because a push routinely stops mid-frame and
+/// a part-frame is owed to nobody — `take_frame` never completes one — so they are what
+/// turns a byte count into the offset the daemon is actually in debt for.
+fn input_frames(at_least: usize, from: u64) -> (Vec<u8>, Vec<(usize, u64)>) {
+    let chunk = vec![b'x'; INPUT_CHUNK];
     let mut frames = Vec::with_capacity(at_least + chunk.len());
+    let mut whole = Vec::new();
     let mut offset = from;
     while frames.len() < at_least {
         Frame::Input {
@@ -834,17 +812,17 @@ fn input_frames(at_least: usize, from: u64) -> (Vec<u8>, u64) {
         .encode(&mut frames)
         .expect("encode input");
         offset += chunk.len() as u64;
+        whole.push((frames.len(), offset));
     }
-    (frames, offset)
+    (frames, whole)
 }
 
 /// The frames in `bytes`, stopping at the first one that is not all there.
 ///
 /// The truncation is the point rather than an edge: one caller reads a connection the
-/// daemon abandoned rather than closed in order, whose last write is however much of
-/// the queue the socket took — so the tail is routinely half a frame, and a walk that
-/// insisted on it would be reporting on the truncation rather than on what the daemon
-/// sent. What is decoded is whatever was delivered whole.
+/// daemon abandoned rather than closed in order, whose tail is routinely half a frame —
+/// and a walk that insisted on it would report the truncation rather than what the
+/// daemon sent.
 fn frames(bytes: &[u8]) -> Vec<Frame<'_>> {
     let mut frames = Vec::new();
     assert_eq!(
@@ -868,16 +846,14 @@ fn frames(bytes: &[u8]) -> Vec<Frame<'_>> {
     frames
 }
 
-/// A greeted socket that refuses rather than blocks once the daemon stops taking what
-/// it is given.
+/// A greeted socket that refuses rather than blocks once the daemon stops taking what it
+/// is given.
 ///
-/// [`push_until_refused`] reads that refusal as the daemon having stopped, which is
-/// the behaviour all three of its callers are about — so the non-blocking flag is not
-/// a detail of how the writing is done, it is what makes the measurement possible at
-/// all. Two of them have the daemon stop by declining to read, where the refusal is
-/// an `EAGAIN`; the third by letting go of the connection altogether, where it is an
-/// `EPIPE`. The measurement is the same one either way: how much this peer got rid of
-/// before the daemon stopped taking it.
+/// [`push_until_refused`] reads that refusal as the daemon having stopped, which is what
+/// all three callers are about — so the non-blocking flag is what makes the measurement
+/// possible rather than a detail of how the writing is done. Two of them have the daemon
+/// stop by declining to read (`EAGAIN`), the third by letting go (`EPIPE`); the
+/// measurement is the same either way.
 fn blaster(session: &Session) -> UnixStream {
     let mut socket = UnixStream::connect(&session.socket).expect("connect");
     write_frame(&mut socket, &hello_frame(false, false, RESUME_FROM_START));
@@ -905,24 +881,24 @@ fn blaster(session: &Session) -> UnixStream {
 /// exactly the state a host out of descriptors puts it in. Measured as processor
 /// time for the reason
 /// [`a_closed_agent_channel_whose_peer_stopped_reading_leaves_the_daemon_asleep`]
-/// gives, against the same window and the same tolerance.
+/// gives, against the same window.
 #[test]
 fn a_daemon_that_cannot_accept_stands_back_rather_than_spinning() {
-    /// Five ticks is 50 ms of processor time against the half second [`SPIN_WINDOW`]
-    /// covers: a tenth of one core, well under the lowest spin figure seen and
-    /// unreachable by a daemon that is asleep.
-    const TOLERATED: u64 = 5;
+    /// One tick of headroom over the only other answer there is.
+    ///
+    /// Not a share of a core to be calibrated: a daemon asleep in `poll` is charged
+    /// nothing at all over [`SPIN_WINDOW`], and no amount of load moves zero. Five ticks
+    /// — a tenth of a core — is a figure a *partially* spinning daemon passes, and there
+    /// is no such daemon this test would want to accept.
+    const TOLERATED: u64 = 1;
 
     let session = Session::start("emfile");
     let daemon = session.child.id();
-    // Not merely answering. `Session::start` waits for the socket, and the daemon
-    // binds that before it writes its pidfile and opens `/dev/null` over its stdio
-    // — both of which need a descriptor, and the first of which is a `?` that ends
-    // the process. Starving it there is starving a
-    // *startup*, which is a different thing from the event loop this measures and
-    // fails it about one run in four on a loaded machine. The pidfile is the last of
-    // those that can refuse to start, so waiting for it is waiting for the state the
-    // test is about.
+    // Not merely answering: the daemon binds the socket before it writes its pidfile
+    // and opens `/dev/null` over its stdio, both of which need a descriptor. Starving it
+    // there starves a *startup* rather than the event loop this measures, and failed
+    // about one run in four on a loaded machine. The pidfile is the last of those, so
+    // waiting for it waits for the state the test is about.
     wait_for(&session.pid_file());
     let restore = open_file_limit(daemon);
     // Below the three the daemon cannot be without, so the next descriptor it asks
@@ -934,6 +910,11 @@ fn a_daemon_that_cannot_accept_stands_back_rather_than_spinning() {
     // there.
     let starved = UnixStream::connect(&session.socket).expect("knock on the door");
     let burned = cpu_ticks(daemon);
+    // Before the assertion rather than after it: the shortage is imposed from outside,
+    // so a failing measurement would otherwise leave the daemon unable to accept for
+    // whatever the rest of the run does with it, and this test's own report would be
+    // followed by a second failure that is only this line not having run.
+    set_open_file_limit(daemon, restore);
     assert!(
         burned <= TOLERATED,
         "the daemon burned {burned} clock ticks in {SPIN_WINDOW:?} failing to accept \
@@ -942,12 +923,10 @@ fn a_daemon_that_cannot_accept_stands_back_rather_than_spinning() {
 
     // And the listener came back rather than being stood down for good: a backoff
     // that never expires is the same session lost by a quieter route.
-    set_open_file_limit(daemon, restore);
     drop(starved);
     let mut client = session.connect();
-    let ok = client.hello(RESUME_FROM_START);
-    client.input(0, b"echo NOMUX-AFTER-EMFILE\n");
-    client.read_until("NOMUX-AFTER-EMFILE", ok.resume_from);
+    client.hello(RESUME_FROM_START);
+    still_serving(&mut client, "NOMUX-AFTER-EMFILE");
 }
 
 /// The soft limit on open descriptors that `pid` is running under.
@@ -956,9 +935,8 @@ fn open_file_limit(pid: u32) -> u64 {
         rlim_cur: 0,
         rlim_max: 0,
     };
-    // SAFETY: `prlimit` is passed a pid, the resource it is being asked about, a null
-    // pointer for the limit that is not being set, and a pointer to a `rlimit` this
-    // frame owns for the answer. Reading a limit needs no privilege at all.
+    // SAFETY: `prlimit` is passed a pid, the resource, a null pointer for the limit
+    // that is not being set, and a `rlimit` this frame owns for the answer.
     let read = unsafe {
         libc::prlimit(
             i32::try_from(pid).expect("a pid fits a pid_t"),
@@ -976,11 +954,8 @@ fn open_file_limit(pid: u32) -> u64 {
     current.rlim_cur
 }
 
-/// Puts `pid` under a soft limit of `soft` open descriptors.
-///
-/// The hard limit is read back and passed through untouched, which is what keeps
-/// this within what one uid may do to its own processes: raising a hard limit is
-/// privileged, leaving it alone is not.
+/// Puts `pid` under a soft limit of `soft` open descriptors, passing the hard limit back
+/// untouched — raising one is privileged, leaving it alone is not.
 fn set_open_file_limit(pid: u32, soft: u64) {
     let mut hard = libc::rlimit {
         rlim_cur: 0,
