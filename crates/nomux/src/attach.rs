@@ -23,7 +23,6 @@
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::fs;
 use std::io::{self, Read, Write};
 use std::mem::{MaybeUninit, size_of};
 use std::net::Shutdown;
@@ -348,12 +347,11 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> Result<UnixStream, Failu
         Ok(complaint) => complaint,
         // The one failure with nothing of anyone's behind it: no daemon was started, and
         // the probe above has just said nobody else is serving the id either, so the
-        // name is this call's own to give back.
+        // name is this call's own to give back — where this acquisition is what made it,
+        // which `release_lock_name` is what decides.
         Err(err) => {
-            return Err(released(
-                paths,
-                Failure::new(FailureClass::StartupFailure, err),
-            ));
+            paths.release_lock_name(&spawn_lock);
+            return Err(Failure::new(FailureClass::StartupFailure, err));
         }
     };
 
@@ -384,12 +382,6 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> Result<UnixStream, Failu
             Liveness::Unknown(err) => return Err(may_be_running(paths, &err)),
         }
     }
-}
-
-/// Removes the lock only when daemon launch failed before a child could exist.
-fn released(paths: &SessionPaths, err: Failure) -> Failure {
-    drop(fs::remove_file(paths.lock()));
-    err
 }
 
 /// Keeps the spawn lock until the daemon this spawn started has published

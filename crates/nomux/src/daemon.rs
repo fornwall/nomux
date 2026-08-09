@@ -274,23 +274,17 @@ fn start(
             )
         })?,
     };
-    let ring = allocate_ring(session_id).inspect_err(|_| {
-        if publishing.created_name() {
-            drop(fs::remove_file(paths.lock()));
-        }
-    })?;
+    // Scrubbed through `release_lock_name`, which is where "only an acquisition that
+    // created the directory entry may remove it" lives: for an inherited authority the
+    // parent owns failed-handoff cleanup, and that spelling declines on its own.
+    let ring = allocate_ring(session_id).inspect_err(|_| paths.release_lock_name(&publishing))?;
     // The bind is whole before § 6.2's fork: past it the caller has already been
     // answered, so every errno after it reads as success. One `Err` exit, so `<id>.lock`
     // is scrubbed in a single place.
     let listener = match bind_socket(&paths) {
         Ok(listener) => listener,
         Err(err) => {
-            // Only an acquisition that atomically created the directory entry may scrub
-            // it on a refusal; for an inherited authority the parent owns failed-handoff
-            // cleanup.
-            if publishing.created_name() {
-                drop(fs::remove_file(paths.lock()));
-            }
+            paths.release_lock_name(&publishing);
             return Err(err);
         }
     };
