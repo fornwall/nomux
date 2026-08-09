@@ -15,11 +15,10 @@ reporting and scrollback all work unchanged.
 > terminal, so `nomux list` and `nomux kill` are what works standalone. The daemon is
 > started directly and stays in sshd's session cgroup, so on a host configured
 > `KillUserProcesses=yes` logind kills it at the final logout and **the session does not
-> survive** — the same footing `tmux` and `screen` are on, and survivable for the same
-> reason: `KillUserProcesses=no` is the default nearly everywhere. Persistence on a strict
-> host has to be arranged around nomux (`loginctl enable-linger` and a scope of your own).
-> The logout matrix is exercised in containers ([e2e-tests/](e2e-tests/README.md)) but not
-> yet on a real host. AI-generated, and experimental.
+> survive** — the same footing `tmux` and `screen` are on, and arranged around rather than
+> fixed ([DESIGN.md § 10](DESIGN.md#10-rejected-alternatives)). The logout matrix is
+> exercised in containers ([e2e-tests/](e2e-tests/README.md)) but not yet on a real host.
+> AI-generated, and experimental.
 
 `nomux <mode> [session-id]`. The binary-protocol modes are `daemon`, `spawn` and
 `attach`; `--label` is accepted only when creating through `daemon` or `spawn`.
