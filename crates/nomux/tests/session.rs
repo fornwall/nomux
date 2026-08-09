@@ -558,6 +558,12 @@ fn a_second_client_takes_over_and_the_first_is_told_why() {
 /// while the incumbent keeps driving the shell. Once that incumbent deliberately
 /// detaches, the same kind of greeting succeeds. The ordinary takeover test above keeps
 /// the flag's default pinned separately.
+///
+/// This is also the suite's only `Detach`, every other departure here being a socket
+/// dropped — the *unclean* case. What separates the deliberate one is that nothing may be
+/// lost: the daemon closes the connection and keeps the input position, which is the
+/// `in_applied` compared below rather than an incidental step on the way to the
+/// conditional attach.
 #[test]
 fn a_conditional_attach_refuses_to_displace_but_succeeds_after_detach() {
     let (session, mut incumbent, ok) = Session::attached("if_detached");
@@ -897,36 +903,6 @@ fn an_attach_restates_a_geometry_the_child_moved_underneath_it() {
     let resumed = client.hello(RESUME_FROM_START);
     client.input(resumed.in_applied, b"stty size\n");
     client.read_until("24 80", resumed.resume_from);
-}
-
-/// `Detach` gives the connection up without giving up the session
-/// (`IMPLEMENTATION.md` § 2.2).
-///
-/// Never sent by anything else here — every other departure in the suite is a socket
-/// being dropped, the *unclean* case. What separates the deliberate one is that nothing
-/// may be lost: the daemon closes the connection and keeps the input position, so the
-/// client that comes back is told where it was rather than starting the stream again.
-#[test]
-fn a_detach_ends_the_connection_but_not_the_session() {
-    let (session, mut client, ok) = Session::attached("detach_frame");
-
-    let command = b"echo NOMUX-BEFORE-DETACH\n";
-    client.input(0, command);
-    client.read_until("NOMUX-BEFORE-DETACH", ok.resume_from);
-
-    client.send(&Frame::Detach);
-    client.expect_eof("a Detach");
-    drop(client);
-
-    let mut client = session.connect();
-    let resumed = client.hello(RESUME_FROM_START);
-    assert_eq!(
-        resumed.in_applied,
-        command.len() as u64,
-        "a detach must leave the session's input position where it was"
-    );
-    client.input(resumed.in_applied, b"echo NOMUX-AFTER-DETACH\n");
-    client.read_until("NOMUX-AFTER-DETACH", resumed.resume_from);
 }
 
 /// What the child prints when the terminal it is on changes size. See
