@@ -91,8 +91,10 @@ const fn yes_byte(since: u64) -> u8 {
 /// unannounced hole in it.
 #[test]
 fn overflow_during_disconnects_is_always_reported() {
+    const RING: usize = 32 * 1024;
+
     let chaos_seed = chaos_seed();
-    let session = Session::start_with_ring("chaos_firehose", 32 * 1024);
+    let session = Session::start_with_ring("chaos_firehose", RING);
     let deadline = Instant::now() + PATIENCE;
     let mut client = session.connect_by(deadline);
     let ok = client.hello(RESUME_FROM_START);
@@ -101,9 +103,10 @@ fn overflow_during_disconnects_is_always_reported() {
     let mut offset = ready.offset;
     let in_offset = ready.in_offset;
 
-    // `yes` outruns anything the client can do about it, which is the point.
-    let command = b"yes\n";
-    client.input(in_offset, command);
+    let capacity = socket_capacity();
+    let forced = 2 * (MAX_PENDING_WRITE + capacity + RING + MAX_PAYLOAD as usize);
+    let command = format!("yes | head -c {forced}; touch attached-overflow; exec yes\n");
+    client.input(in_offset, command.as_bytes());
     // Wait for the first output before disconnecting: otherwise the first drop could
     // discard the command itself — a client that closes with output queued makes the
     // kernel send RST, taking unread input with it — and the test would sit waiting for
@@ -112,9 +115,12 @@ fn overflow_during_disconnects_is_always_reported() {
     // counter below sees this one, so a setup satisfying them alone proves nothing.
     let (_, started) = client.read_past_gaps("y", offset);
     offset = started;
+    assert!(
+        poll_by(deadline, || session.root.join("attached-overflow").exists()),
+        "the child did not produce the forced attached overflow (seed {chaos_seed})"
+    );
 
     let mut rng = Rng::new(chaos_seed);
-    let capacity = socket_capacity();
     // Two promises, counted apart: § 9 obliges the daemon to announce an overflow to an
     // *attached* client, and to move the resume point of one that comes back.
     let mut announced_gaps = 0u32;
