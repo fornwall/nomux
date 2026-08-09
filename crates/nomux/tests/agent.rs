@@ -12,11 +12,13 @@ mod harness;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
+use std::time::{Duration, Instant};
 
 use nomux_protocol::{Frame, FrameType, RESUME_FROM_START};
 
 use harness::{
-    Client, SPIN_WINDOW, Session, cpu_ticks, read_uninterrupted, socket_capacity, still_serving,
+    Client, FRAME_PATIENCE, SPIN_WINDOW, Session, cpu_ticks, read_uninterrupted, socket_capacity,
+    still_serving,
 };
 
 /// Waits for the next `AgentOpen` or `AgentClose`, ignoring the session's own chatter,
@@ -250,6 +252,113 @@ fn a_second_agent_connection_waits_for_the_one_being_served() {
             data: b"\0\0\0\x01\x0b",
         },
         "what the waiting peer wrote before its turn must still be there"
+    );
+
+    still_serving(&mut client, "NOMUX-STILL-SERVING");
+}
+
+/// The other end of [`a_second_agent_connection_waits_for_the_one_being_served`]: a peer
+/// that takes the slot and then stalls is given up, so the queue behind it moves.
+///
+/// `agent::AGENT_IDLE_TIMEOUT` is what keeps § 6.7's "one connection at a time" from
+/// becoming "one connection, for ever". The waiting test above proves the second peer
+/// *queues*; nothing proved a first peer that never speaks again is ever let go of, and a
+/// unix `connect` into a full backlog blocks rather than being refused — so without this
+/// deadline the session's agent socket is dead to every later `ssh-add` for as long as the
+/// stalled peer's process lives.
+///
+/// `#[ignore]`d for the reason `lifecycle.rs`'s
+/// `a_daemon_nobody_ever_attaches_to_reaps_itself` is: a minute is unreasonable in a suite
+/// that finishes in seven seconds, and a deadline can only be observed from outside by
+/// outlasting it. It needs an override in `.config/nextest.toml`, whose default profile
+/// terminates a test after forty seconds.
+///
+/// The waiting peer writes its request *before* its turn, so what says the slot changed
+/// hands is a request the daemon held across the whole minute rather than a boundary
+/// frame on its own.
+#[test]
+#[ignore = "waits out the 60-second agent idle timeout; run in CI, not on every commit"]
+fn a_stalled_agent_channel_is_given_up_so_the_next_peer_gets_its_turn() {
+    /// `agent::AGENT_IDLE_TIMEOUT`, private to the daemon, mirrored here, and the two
+    /// must move together.
+    #[expect(
+        clippy::duration_suboptimal_units,
+        reason = "Duration::from_mins is unstable on the pinned toolchain, as it is \
+                  where the daemon writes this same figure"
+    )]
+    const AGENT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+    let (session, mut client, ok) = Session::attached_with("agent_idle", true, false);
+    client.make_ready("-echo", None, ok.resume_from);
+    // One deadline for every wait below (`harness::poll_by`), above `FRAME_PATIENCE` by
+    // the minute this spends before the first of them can be answered.
+    client.waits_by(Instant::now() + AGENT_IDLE_TIMEOUT + FRAME_PATIENCE);
+
+    let mut stalled = session.connect_agent();
+    let held = expect_agent(
+        &mut client,
+        FrameType::AgentOpen,
+        "the peer that is about to stall holds the slot",
+    );
+
+    // Behind it in the listen backlog, and served by nothing while the slot is held.
+    // Nothing is sent for `held` from here and `stalled` writes nothing: `Channel::touch`
+    // pushes the deadline out for a byte moving either way, so traffic on this channel
+    // would be the test resetting the clock it is waiting on.
+    let mut waiting = session.connect_agent();
+    waiting
+        .write_all(b"\0\0\0\x01\x0b")
+        .expect("write while waiting for a turn");
+
+    let opened = Instant::now();
+    assert_eq!(
+        expect_agent(
+            &mut client,
+            FrameType::AgentClose,
+            "a channel nothing has crossed for the idle deadline must be given up",
+        ),
+        held,
+        "the close names the channel that stalled"
+    );
+    // Measured from before the `AgentOpen` was read, so it sits under the daemon's own
+    // clock: a channel dropped inside this is one closed for something other than the
+    // deadline, and § 6.7's generous figure is what lets a human reach for a hardware key
+    // mid-signature.
+    assert!(
+        opened.elapsed() >= AGENT_IDLE_TIMEOUT,
+        "the channel was given up after {:?}, inside the {AGENT_IDLE_TIMEOUT:?} § 6.7 \
+         allows a live exchange",
+        opened.elapsed()
+    );
+
+    let generation = expect_agent(
+        &mut client,
+        FrameType::AgentOpen,
+        "and the peer that waited behind it is greeted only then",
+    );
+    assert_ne!(
+        generation, held,
+        "the successor was minted the name its predecessor had"
+    );
+    let payload = client.next_of(FrameType::AgentData);
+    assert_eq!(
+        Frame::decode(FrameType::AgentData, &payload).expect("decode"),
+        Frame::AgentData {
+            generation,
+            data: b"\0\0\0\x01\x0b",
+        },
+        "what the waiting peer wrote a minute before its turn must still be there"
+    );
+
+    // And the process that stalled learns, rather than blocking for ever on a socket the
+    // daemon has stopped serving — § 6.7's argument for closing over holding, reached by
+    // the deadline rather than by the client going away.
+    let mut buf = [0u8; 1];
+    assert_eq!(
+        read_uninterrupted(&mut stalled, &mut buf).expect("read from the stalled connection"),
+        0,
+        "the daemon gave the slot to somebody else and left the peer that had it waiting \
+         on a connection nothing will ever answer"
     );
 
     still_serving(&mut client, "NOMUX-STILL-SERVING");

@@ -6,3 +6,8 @@ slow-timeout = { period = "20s", terminate-after = 2 }
 [[profile.default.overrides]]
 filter = 'test(=a_daemon_nobody_ever_attaches_to_reaps_itself)'
 slow-timeout = { period = "20s", terminate-after = 5 }
+
+# This ignored test intentionally waits through the 60-second agent idle timeout.
+[[profile.default.overrides]]
+filter = 'test(=a_stalled_agent_channel_is_given_up_so_the_next_peer_gets_its_turn)'
+slow-timeout = { period = "20s", terminate-after = 6 }
