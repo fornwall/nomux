@@ -1,3 +1,12 @@
+# Policy for the fuzz workspace, which has a lock file the root deny.toml's graph never sees.
+#
+# Two sections, and the two that are missing are missing on purpose. The root file's
+# `[licenses]` allow-list is about what may be redistributed and its `[bans]` rules are about
+# what the shipping binary costs; nothing here is redistributed and nothing here is linked into
+# it, so neither has a subject in this workspace. What is left is what is about this machine —
+# an advisory against code whose build scripts run here, and where the crates came from — and on
+# those two this file says exactly what the root one says.
+
 [advisories]
 ignore = []
 unsound = "all"

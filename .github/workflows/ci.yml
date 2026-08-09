@@ -99,9 +99,15 @@ jobs:
       # and it shells out to `cargo metadata`, which rewrites a stale lock to make itself work.
       - run: cargo deny --locked check advisories
 
-      # fuzz/ is a separate workspace with deliberately different licence and path-dependency
-      # rules, but its build scripts execute here. Advisories alone: the cargo-deny-fuzz hook,
-      # run by prek below, already checks sources against the same manifest and config.
+      # fuzz/ is a separate workspace with a lock file of its own, so its dependencies are not in
+      # the graph the line above walks — but its build scripts execute on this machine, which is
+      # what an advisory there is about. Advisories alone: the cargo-deny-fuzz hook, run by prek
+      # below, already checks sources against the same manifest and config, and fuzz/deny.toml
+      # has no `[licenses]` or `[bans]` section to check. That absence is the policy, not an
+      # oversight: an allow-list is about what may be distributed and `multiple-versions` is
+      # about what the shipping binary costs, and fuzz/ is never distributed and never linked
+      # into it. Advisories and sources are the two that are about this machine, and on those
+      # two the file says exactly what the root deny.toml says.
       - run: cargo deny --locked --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check advisories
 
       # The released binary, by checksum: from source it needs a Go toolchain, and the image's Go
