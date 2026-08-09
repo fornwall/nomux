@@ -273,7 +273,7 @@ fn parse_lock_fd(value: &str, slot: &mut Option<i32>) -> Result<(), String> {
 /// ([`rundir::read_prefix`]) and why `Hello.term` is refused for an interior NUL before
 /// it can reach `Command::env`.
 fn report(result: std::io::Result<()>) -> ExitCode {
-    reported(result, |_| ExitCode::FAILURE)
+    reported(result, ExitCode::FAILURE)
 }
 
 /// Reports the relay modes' versioned machine record and legacy exit status.
@@ -284,11 +284,12 @@ fn report(result: std::io::Result<()>) -> ExitCode {
 fn report_relay(result: Result<(), attach::RunError>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
-        Err(attach::RunError::Usage(err)) => reported(Err(err), |_| {
+        Err(attach::RunError::Usage(err)) => reported(
+            Err(err),
             // `RunError::Usage` is constructed only from `InvalidInput`; keeping an
             // explicit fallback makes that invariant harmless if its internals change.
-            ExitCode::from(EXIT_USAGE)
-        }),
+            ExitCode::from(EXIT_USAGE),
+        ),
         Err(attach::RunError::Classified(failure)) => {
             let class = failure.class();
             eprintln!("NOMUX-RELAY-ERROR 1 {}", class.token());
@@ -300,10 +301,7 @@ fn report_relay(result: Result<(), attach::RunError>) -> ExitCode {
 
 /// The half the two share: success, the message on stderr, and § 10's one reserved kind.
 /// `failed` scores everything else, which is the whole of what the two tables differ by.
-fn reported(
-    result: std::io::Result<()>,
-    failed: impl FnOnce(std::io::ErrorKind) -> ExitCode,
-) -> ExitCode {
+fn reported(result: std::io::Result<()>, failed: ExitCode) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -316,7 +314,7 @@ fn reported(
             if kind == std::io::ErrorKind::InvalidInput {
                 ExitCode::from(EXIT_USAGE)
             } else {
-                failed(kind)
+                failed
             }
         }
     }

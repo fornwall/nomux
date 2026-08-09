@@ -469,14 +469,8 @@ impl SessionPaths {
         write_private(&self.label(), label.as_bytes())
     }
 
-    /// Records the pid `nomux kill` will signal, through [`write_private`] so its owner
-    /// can read it back; [`parse_pid`] is the other half of the format, and the file is
-    /// created and filled a syscall apart, which `control::resolve` knows about.
-    ///
-    /// The label is cleared first because this is the one call every incarnation of an id
-    /// makes, so an id restarted without `--label` stops carrying the last one's.
+    /// Records the pid `nomux kill` will signal, through [`write_private`].
     pub(crate) fn write_pid(&self) -> io::Result<()> {
-        self.clear_label();
         write_private(&self.pid(), format!("{}\n", std::process::id()).as_bytes())
     }
 
@@ -521,7 +515,7 @@ impl SessionPaths {
     /// Takes the spawn lock if it is free this instant, for callers with better things to do
     /// than wait — [`Self::acquire`] unchanged, `Ok(None)` and both refusals.
     pub(crate) fn try_lock_spawn_or_refuse(&self) -> io::Result<Option<SpawnLock>> {
-        self.acquire(FlockOperation::NonBlockingLockExclusive)
+        self.acquire()
     }
 
     /// [`Self::try_lock_spawn_or_refuse`] for the two opportunistic collections, which
@@ -543,7 +537,7 @@ impl SessionPaths {
     /// The two failures about the *file* and the *filesystem*, still there next time: a
     /// `<id>.lock` nothing can lock, and a run directory mounted read-only. Neither may
     /// be answered by going ahead ([`SpawnLock`]).
-    fn acquire(&self, operation: FlockOperation) -> io::Result<Option<SpawnLock>> {
+    fn acquire(&self) -> io::Result<Option<SpawnLock>> {
         let path = self.lock();
         for _ in 0..LOCK_ATTEMPTS {
             // `RDONLY`: `flock(2)` needs no access mode, and asking for write would refuse
@@ -586,7 +580,7 @@ impl SessionPaths {
                 return Err(self.not_a_lock_file(&path));
             }
             loop {
-                match rustix::fs::flock(&fd, operation) {
+                match rustix::fs::flock(&fd, FlockOperation::NonBlockingLockExclusive) {
                     // A signal landing on a blocking `flock` is not an answer; ask again.
                     Err(rustix::io::Errno::INTR) => {}
                     Ok(()) => break,
