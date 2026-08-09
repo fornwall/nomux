@@ -195,8 +195,7 @@ struct Daemon {
     /// The size this daemon last *successfully* gave the PTY, so a pass that decoded a
     /// hundred `Resize` frames still issues at most one `TIOCSWINSZ`. What was sent,
     /// never what the terminal is — `stty rows` in the session needs no permission from
-    /// this daemon — and every `Hello` clears it, which keeps § 2.2's authoritative
-    /// winsize true of a reattach at an unchanged size.
+    /// this daemon — which is why [`Daemon::on_hello`] clears it.
     applied_win: Option<WinSize>,
     /// Whether a `SIGCHLD` has arrived that no `waitpid` has been spent on yet. Set by the
     /// pass that empties [`Daemon::child_pipe`] and cleared by the ask it pays for, in that
@@ -1208,10 +1207,9 @@ impl Daemon {
     /// has just been handed to.
     fn on_hello(&mut self, hello: &Hello<'_>) {
         self.win = hello.win;
-        // Restated to the terminal rather than assumed (§ 2.2): the child may have moved
-        // the master itself since the last `Hello` — `stty rows` needs no permission from
-        // this daemon — and a reattach at an unchanged size is the only chance to put that
-        // right, so it may not be the pass that skips the ioctl.
+        // Every `Hello` re-issues `TIOCSWINSZ`, even at an unchanged size: the child may
+        // have moved the master itself since the last one, and a reattach is the only
+        // chance to put that right.
         self.applied_win = None;
 
         if self.pty.is_none() {
