@@ -610,11 +610,10 @@ refusal: those bytes can never become a frame, and keeping their connection atta
 disable idle reaping indefinitely. Six things end an *established* connection without a
 refusal: a queued write that fails; § 4.1's `ABANDON_PENDING_WRITE`; the `Exit` going out to a
 half-closed peer with nothing left owed; `POLLHUP` or `POLLERR`; a read that fails before
-end of file; and a `Detach` frame. The third is what ends `nomux attach <id> < script`: past
-the child's exit the master leaves the poll set, so a ring read to its end stays read to its
-end. Read as a departure, that end of file cost the script every byte its child produced
-after it ran out. A half-closed client holds the session as an attached silent one does,
-bounded by that same 8 MiB.
+end of file; and a `Detach` frame. The third is what ends `nomux attach <id> < script`,
+whose stdin runs out long before its child does: read as a departure, that end of file
+would cost the script every byte produced after it. A half-closed client holds the session
+as an attached silent one does, bounded by that same 8 MiB.
 
 Beside those stand nine kinds of refusal, each carrying a final `Error` — the takeover and
 conditional occupied-slot refusal above, four malformations, a version this daemon cannot
