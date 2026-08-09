@@ -27,7 +27,7 @@
 
 mod harness;
 
-use std::io::{ErrorKind, Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -36,7 +36,7 @@ use std::{fs, thread};
 use nomux_protocol::{Frame, RESUME_FROM_START};
 
 use harness::{
-    Rng, SETTLE, Session, Spawned, control, control_with_shell, daemon_reaper, entries,
+    Rng, SETTLE, Session, Spawned, collect, control, control_with_shell, daemon_reaper, entries,
     has_unread_bytes, hello_frame, join_before, nomux, nomux_with_shell, poll_by, poll_until,
     read_uninterrupted, run_root, stderr, stdout, still_serving, succeeded, wedge_socket,
     while_nothing_forks, write_frame,
@@ -116,6 +116,59 @@ fn spawn_timeout_does_not_claim_the_session_is_absent() {
     assert!(
         root.join("nomux/run/nostart.lock").exists(),
         "a late daemon must not inherit an unlinked lock"
+    );
+}
+
+/// A `spawn` that could not launch a daemon *at all* is the other half of the row above,
+/// and the one refusal with nothing of anyone's behind it: the probe said the id was
+/// free, the fork never happened, so 127 tells the client what it would tell it about an
+/// absent session, and the lock name this call took is given straight back.
+///
+/// `RLIMIT_NPROC` is the lever because the launch is one `fork` and one `exec` of the
+/// relay's own inode, with nothing between them a test can reach: the uid is already
+/// over the limit the child sets on itself, so `Command::spawn` answers `EAGAIN` before
+/// it has started anything. `startup-failure` had no test of the seven, and § 10's table
+/// still claims it also covers a daemon that missed its publication deadline — which is
+/// the test above, and is `uncertain` precisely because a late daemon may yet bind.
+#[test]
+fn a_spawn_that_cannot_launch_a_daemon_reports_startup_failure() {
+    use std::os::unix::process::CommandExt as _;
+
+    let root = run_root("spawn_nofork");
+    let mut command = nomux_with_shell(&root, &["spawn", "nofork"]);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: the closure runs in the forked child before exec, so it must be
+    // async-signal-safe. `setrlimit` is, and nothing here allocates or takes a lock.
+    unsafe {
+        command.pre_exec(|| {
+            let alone = libc::rlimit {
+                rlim_cur: 1,
+                rlim_max: 1,
+            };
+            if libc::setrlimit(libc::RLIMIT_NPROC, &raw const alone) == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        });
+    }
+
+    let refused = collect(&mut command);
+    // No phrase: the wording is `fork`'s own errno, and the class is the row under test.
+    refuses(
+        &refused,
+        127,
+        Some("startup-failure"),
+        "",
+        "spawn that could not fork a daemon",
+    );
+    assert!(
+        !root.join("nomux/run/nofork.lock").exists(),
+        "no daemon was started and the probe found nobody serving the id, so the lock \
+         name this call made is this call's to give back (§ 6.6)"
     );
 }
 
@@ -666,7 +719,7 @@ fn the_relay_exits_when_its_stdout_dies_with_nothing_owed_to_it() {
     // Before a single byte has crossed, so the direction is idle: nothing buffered,
     // and so stdout not in the poll set at all.
     let broken = while_nothing_forks(|| {
-        let (reader, writer) = std::io::pipe().expect("a pipe for the relay's stdout");
+        let (reader, writer) = io::pipe().expect("a pipe for the relay's stdout");
         drop(reader);
         writer
     });
@@ -927,7 +980,7 @@ fn a_blocked_stdout_does_not_block_relay_input() {
     /// traffic the parked relay is failing to serve.
     const MARKER: &[u8] = b"NOMUX-OTHER-DIRECTION";
 
-    let (reader, mut relay_stdout) = std::io::pipe().expect("a pipe for relay stdout");
+    let (reader, mut relay_stdout) = io::pipe().expect("a pipe for relay stdout");
     // SAFETY: `fcntl` is given the live pipe descriptor the borrow above keeps open.
     let capacity = unsafe { libc::fcntl(relay_stdout.as_raw_fd(), libc::F_GETPIPE_SZ) };
     assert!(

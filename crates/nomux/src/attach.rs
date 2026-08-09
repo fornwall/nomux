@@ -98,7 +98,9 @@ pub(crate) enum FailureClass {
     Uncertain,
     /// `attach` found no session at the requested id.
     MissingSession,
-    /// `spawn` established that no daemon became reachable.
+    /// `spawn` proved the id free and could not launch a daemon at all. A daemon that
+    /// *was* launched and then missed its publication deadline is [`Self::Uncertain`]:
+    /// nothing here can prove it will not bind the socket a moment later.
     StartupFailure,
     /// The relay reached the session and subsequently failed locally.
     PostConnect,
