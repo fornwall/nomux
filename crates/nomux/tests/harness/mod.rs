@@ -189,6 +189,14 @@ pub(crate) struct Session {
     /// belonged to — and a test that starts one per row of a table then fails
     /// identically for every row.
     name: String,
+    /// Appended to every failure raised by a [`Client`] of this session.
+    ///
+    /// For what only the test knows and no harness failure could otherwise say — the
+    /// seed a randomised test promises to print with each one (`IMPLEMENTATION.md`
+    /// § 9). Held by the session rather than set on each client, because the clients a
+    /// chaos test fails in are the ones it did not write down: the reconnect inside
+    /// [`reconnect_until_gap`], the fresh one per round. One setting covers all of them.
+    context: String,
 }
 
 /// Ring capacity for tests that do not name one.
@@ -239,6 +247,7 @@ impl Session {
             socket,
             id,
             name: name.to_owned(),
+            context: String::new(),
         }
     }
 
@@ -276,7 +285,18 @@ impl Session {
             socket,
             id,
             name: name.to_owned(),
+            context: String::new(),
         }
+    }
+
+    /// Appends `context` to every failure any client of this session raises.
+    ///
+    /// See [`Session::context`]. Written to read as part of the construction:
+    /// `Session::start(..).in_context(format!(" (seed {seed})"))`.
+    #[must_use]
+    pub(crate) fn in_context(mut self, context: String) -> Self {
+        self.context = context;
+        self
     }
 
     pub(crate) fn connect(&self) -> Client {
@@ -285,8 +305,9 @@ impl Session {
         // refusal here is a daemon that has stopped answering since — which is a
         // failure whatever else the test was about, and this is where a test that
         // starts a session per case learns which of them it was.
-        let stream = UnixStream::connect(&self.socket)
-            .unwrap_or_else(|err| panic!("connect to session {:?}: {err}", self.name));
+        let stream = UnixStream::connect(&self.socket).unwrap_or_else(|err| {
+            panic!("connect to session {:?}: {err}{}", self.name, self.context)
+        });
         stream
             .set_read_timeout(Some(SOCKET_POLL))
             .expect("set read timeout");
@@ -297,6 +318,7 @@ impl Session {
             in_offset: 0,
             out_offset: 0,
             deadline: Instant::now() + FRAME_PATIENCE,
+            context: self.context.clone(),
         }
     }
 
@@ -453,9 +475,10 @@ pub(crate) fn reconnect_until_gap(
         assert!(
             Instant::now() < deadline,
             "the ring never overflowed while detached: base={} in_applied={} \
-             (resuming from {out_offset})",
+             (resuming from {out_offset}){}",
             resumed.resume_from,
-            resumed.in_applied
+            resumed.in_applied,
+            session.context
         );
         thread::sleep(POLL_INTERVAL);
     }
@@ -1052,6 +1075,8 @@ pub(crate) struct Client {
     /// [`FRAME_PATIENCE`] from the moment it connected, spent across every wait it
     /// makes rather than minted per wait, for [`poll_by`]'s reason.
     deadline: Instant,
+    /// [`Session::context`], appended to every failure this client raises.
+    context: String,
 }
 
 /// Where the two streams stand once the child is ready. See [`Client::make_ready`].
@@ -1213,7 +1238,7 @@ impl Client {
     /// [`Client::next_of_awaiting`]'s reason.
     pub(crate) fn frame_owed(&mut self, awaiting: &str) -> (FrameType, Vec<u8>) {
         self.frame_before(self.deadline, awaiting)
-            .unwrap_or_else(|| out_of_time(awaiting))
+            .unwrap_or_else(|| out_of_time(awaiting, &self.context))
     }
 
     /// The next frame, or `None` once `deadline` has passed without one.
@@ -1242,12 +1267,18 @@ impl Client {
             }
             let mut chunk = [0u8; 8192];
             match read_uninterrupted(&mut self.stream, &mut chunk) {
-                Ok(0) => panic!("the daemon closed the connection while awaiting {awaiting}"),
+                Ok(0) => panic!(
+                    "the daemon closed the connection while awaiting {awaiting}{}",
+                    self.context
+                ),
                 Ok(n) => self.pending.extend_from_slice(&chunk[..n]),
                 // What a read timeout is reported as; the deadline above is the one
                 // that ends this loop.
                 Err(err) if err.kind() == ErrorKind::WouldBlock => {}
-                Err(err) => panic!("reading from the daemon while awaiting {awaiting}: {err}"),
+                Err(err) => panic!(
+                    "reading from the daemon while awaiting {awaiting}: {err}{}",
+                    self.context
+                ),
             }
         }
     }
@@ -1371,10 +1402,13 @@ impl Client {
                 Ok(0) => return,
                 Ok(n) => self.pending.extend_from_slice(&chunk[..n]),
                 Err(err) if err.kind() == ErrorKind::WouldBlock => {}
-                Err(err) => panic!("reading after {after}: {err}"),
+                Err(err) => panic!("reading after {after}: {err}{}", self.context),
             }
             if Instant::now() >= self.deadline {
-                out_of_time(&format!("the daemon to close the connection after {after}"));
+                out_of_time(
+                    &format!("the daemon to close the connection after {after}"),
+                    &self.context,
+                );
             }
         }
     }
@@ -1457,13 +1491,14 @@ impl Client {
     /// The body of both, differing only in whether a `Gap` moves the stream on or
     /// fails the test.
     fn read_until_inner(&mut self, needle: &str, from: u64, follow_gaps: bool) -> (String, u64) {
+        let context = self.context.clone();
         let mut seen = Vec::new();
         let mut offset = from;
         let awaiting = format!("{needle:?} in the session's output");
         while let Some((ty, payload)) = self.frame_before(self.deadline, &awaiting) {
             match Frame::decode(ty, &payload).expect("decode frame") {
                 Frame::Output { offset: at, data } => {
-                    assert_eq!(at, offset, "output offsets must be contiguous");
+                    assert_eq!(at, offset, "output offsets must be contiguous{context}");
                     offset += data.len() as u64;
                     seen.extend_from_slice(data);
                     if String::from_utf8_lossy(&seen).contains(needle) {
@@ -1475,19 +1510,22 @@ impl Client {
                     assert!(
                         new_base_offset > offset,
                         "a Gap must move output forward: current offset {offset}, new base \
-                         {new_base_offset}"
+                         {new_base_offset}{context}"
                     );
                     offset = new_base_offset;
                     seen.clear();
                 }
                 Frame::InputAck { .. } | Frame::Pong => {}
-                other => panic!("unexpected frame while awaiting {needle:?}: {other:?}"),
+                other => panic!("unexpected frame while awaiting {needle:?}: {other:?}{context}"),
             }
         }
-        out_of_time(&format!(
-            "{awaiting}, having seen {:?}",
-            String::from_utf8_lossy(&seen)
-        ));
+        out_of_time(
+            &format!(
+                "{awaiting}, having seen {:?}",
+                String::from_utf8_lossy(&seen)
+            ),
+            &context,
+        );
     }
 }
 
@@ -1498,10 +1536,12 @@ impl Client {
 /// (`.config/nextest.toml`) could only say the test was slow. *Shared*, because an
 /// earlier wait may have spent most of it: what is named is the wait that did not
 /// finish rather than necessarily the slow one.
-fn out_of_time(awaiting: &str) -> ! {
+///
+/// `context` is [`Session::context`] — the seed, where a test set one.
+fn out_of_time(awaiting: &str, context: &str) -> ! {
     panic!(
         "timed out waiting for {awaiting}; the deadline this client shares between its \
-         waits is spent"
+         waits is spent{context}"
     );
 }
 
