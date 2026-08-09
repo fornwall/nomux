@@ -91,33 +91,10 @@ fn a_child_killed_by_a_signal_is_reported_as_signalled_rather_than_as_a_status()
     );
 }
 
-/// Regression: the status is turned into a frame on the pass that collects it, not
-/// on whatever pass happens to wake up next.
-///
-/// `pump_output` is the only place the `Exit` frame is built, and `collect_outcome`
-/// used to run at the top of `event_loop` — one whole iteration earlier.
-/// `poll_timeout` carries a wakeup at `OUTCOME_GRACE` only while the outcome is still
-/// outstanding, so the pass that finally collected one no longer qualified for it,
-/// and by then the master had already left the poll set with the child.
-///
-/// A session outlives its child on the idle rule alone (§ 6.5), and nothing between
-/// the exit and that deadline wakes the daemon: with the master out of the poll set,
-/// `SIGCHLD` at its default disposition and no client traffic, the next wakeup is
-/// `IDLE_TICK` — an hour away. The user is left holding a session whose shell has
-/// finished, with no status and no reason given, until they type something at it.
-///
-/// Driven down the `OUTCOME_GRACE` path rather than through an ordinary `exit`, which
-/// reaches the same bug only when `waitpid` is not ready at PTY end of file — a coin
-/// toss rather than a test. A child that closes the terminal *without* exiting reaches
-/// it every time: the master reports end of file at once, and `waitpid` has nothing to
-/// give up because the process is still there, so the status can only come from the
-/// two-second unknown-outcome deadline in `collect_outcome`.
-///
-/// `exec <command>` rather than bare redirections, because redirecting 0, 1 and 2 away
-/// from the slave does not take the last descriptor onto it: an interactive shell
-/// keeps one more for job control — `/dev/tty` on fd 10, under the `dash` this suite
-/// pins as `SHELL` — and the master goes on waiting. Replacing the process closes that
-/// one, since it is close-on-exec.
+/// The status frame must be built on the pass that collects the outcome. A child that
+/// closes its terminal without exiting forces the two-second unknown-outcome path;
+/// after the master leaves the poll set, only that deadline wakes the daemon.
+/// `exec` also closes the shell's extra job-control descriptor onto the terminal.
 ///
 /// The child waits on a cue rather than sleeping, so this also carries the tail that used
 /// to be a second test: a child answered for as unknown is still the session's identity,
@@ -259,13 +236,9 @@ fn the_child_inherits_only_its_stdio() {
     );
 }
 
-/// The rest of what `Pty::spawn` puts into the child (§ 6.1): a login shell's
-/// `argv[0]`, the terminal the client named, and the session's own id.
-///
-/// Of the five it sets, only `SSH_AUTH_SOCK` was ever checked. Losing `.arg0()`
-/// silently stops `~/.profile` being read for every user, and losing `TERM` breaks
-/// every full-screen program. The format string is echoed by the line discipline
-/// unexpanded, so only the child's own answer can satisfy the read.
+/// The login shell gets its login `argv[0]`, terminal type and session id (§ 6.1).
+/// The line discipline echoes the format string unexpanded, so only the child's
+/// answer can satisfy the read.
 #[test]
 fn the_child_is_a_login_shell_told_its_terminal_and_its_session() {
     let (session, mut client, ok) = Session::attached("spawn_env");
@@ -1058,23 +1031,9 @@ fn stdio_is_silenced(targets: &[PathBuf]) -> bool {
     targets.iter().all(|path| path == Path::new("/dev/null"))
 }
 
-/// A daemon spawned by a connection that died mid-handshake must reap itself — and a
-/// session somebody has actually used must not.
-///
-/// Every reaping rule is only checked when `poll` returns, so this is really a test
-/// that a wakeup is armed for the 30-second first-attach deadline rather than only
-/// for the hour-long backstop. Waiting out that deadline is the only way to observe
-/// it from outside, which is why this is `#[ignore]`d: 30 seconds is unreasonable
-/// in a suite that otherwise finishes in two, and CI runs it with
-/// `--run-ignored all`.
-///
-/// Both halves, because `Daemon::detach_deadline` is a *choice* — 30 seconds where no
-/// PTY was ever started, seven days once one was — and the rule was the untested one
-/// of the two. A regression returning `FIRST_ATTACH_TIMEOUT` for both would reap
-/// every real user's session half a minute after they shut their laptop, and nothing
-/// in the suite would go red: the timeout half would pass, being what the regression
-/// does everywhere. The other branch rides along at no cost in wall clock, since the
-/// wait is the same wait.
+/// An unused daemon reaps after the first-attach deadline; a used session stays on the
+/// seven-day idle rule. Both run together to pin the deadline choice. This is ignored
+/// by default because observing it requires the full 30-second deadline.
 #[test]
 #[ignore = "waits out the 30-second first-attach timeout; run in CI, not on every commit"]
 fn a_daemon_nobody_ever_attaches_to_reaps_itself() {
