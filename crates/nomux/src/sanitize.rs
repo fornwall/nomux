@@ -35,17 +35,17 @@ pub(crate) fn sanitize_text(text: &str) -> String {
     text.chars().filter(|ch| !is_deceptive(*ch)).collect()
 }
 
-/// Whether `ch` can forge terminal layout or render invisibly. ZWJ and ZWNJ are retained
-/// because they are part of ordinary emoji and Indic text. The Hangul fillers draw nothing
-/// while occupying a cell, which `trim` does not take back and no tab title reaches by
-/// accident.
+/// Whether `ch` can forge terminal layout or render invisibly. This covers Unicode 17's
+/// default-ignorable code points except ZWJ and ZWNJ, which ordinary emoji and Indic text use.
 const fn is_deceptive(ch: char) -> bool {
     ch.is_control()
         || matches!(ch,
-            '\u{ad}' | '\u{61c}' | '\u{115f}'..='\u{1160}' | '\u{180e}' | '\u{200b}'
-            | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{206f}' | '\u{3164}' | '\u{ffa0}' | '\u{feff}'
-            | '\u{e0000}'..='\u{e007f}')
+            '\u{ad}' | '\u{34f}' | '\u{61c}' | '\u{115f}'..='\u{1160}'
+            | '\u{17b4}'..='\u{17b5}' | '\u{180b}'..='\u{180f}' | '\u{200b}'
+            | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{206f}'
+            | '\u{3164}' | '\u{fe00}'..='\u{fe0f}' | '\u{feff}' | '\u{ffa0}'
+            | '\u{fff0}'..='\u{fff8}' | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}' | '\u{e0000}'..='\u{e0fff}')
 }
 
 /// Trims a client-supplied label to what the frozen layout permits: one line of printable
@@ -131,7 +131,11 @@ mod tests {
             '\u{2068}',
             '\u{2069}',
             '\u{ad}',
+            '\u{34f}',
             '\u{180e}',
+            '\u{17b4}',
+            '\u{180b}',
+            '\u{180f}',
             '\u{200b}',
             '\u{2060}',
             '\u{2061}',
@@ -141,12 +145,23 @@ mod tests {
             '\u{115f}',
             '\u{1160}',
             '\u{3164}',
+            '\u{fe00}',
+            '\u{fe0f}',
             '\u{ffa0}',
             '\u{feff}',
+            '\u{fff0}',
+            '\u{fff8}',
+            '\u{1bca0}',
+            '\u{1bca3}',
+            '\u{1d173}',
+            '\u{1d17a}',
             '\u{e0000}',
             '\u{e0001}',
             '\u{e0020}',
             '\u{e007f}',
+            '\u{e0080}',
+            '\u{e0100}',
+            '\u{e0fff}',
         ] {
             assert!(
                 !sneaky.is_control(),
@@ -167,13 +182,10 @@ mod tests {
         assert_eq!(hidden.chars().count(), 9, "the fixture must encode as tags");
         assert_eq!(sanitize_label(&format!("build{hidden}")), "build");
 
-        assert_eq!(
-            sanitize_label("\u{61b}a\u{2065}a\u{2070}"),
-            "\u{61b}a\u{2065}a\u{2070}"
-        );
+        assert_eq!(sanitize_label("\u{61b}a\u{2070}"), "\u{61b}a\u{2070}");
         assert_eq!(sanitize_label("a\u{200c}\u{200d}b"), "a\u{200c}\u{200d}b");
-        assert_eq!(sanitize_label("a\u{205f}b\u{2065}c"), "a\u{205f}b\u{2065}c");
-        assert_eq!(sanitize_label("\u{dffff}a\u{e0080}"), "\u{dffff}a\u{e0080}");
+        assert_eq!(sanitize_label("a\u{205f}b\u{2070}c"), "a\u{205f}b\u{2070}c");
+        assert_eq!(sanitize_label("\u{dffff}a\u{e1000}"), "\u{dffff}a\u{e1000}");
     }
 
     /// `trim` takes back whitespace, but a Hangul filler is not whitespace and draws
@@ -181,7 +193,10 @@ mod tests {
     /// as a name — and one appended to a real label would pass for it.
     #[test]
     fn a_label_that_draws_nothing_is_no_label() {
-        assert_eq!(sanitize_label("\u{3164}\u{115f} \u{ffa0}"), "");
+        assert_eq!(
+            sanitize_label("\u{3164}\u{34f}\u{fe0f}\u{e0100} \u{ffa0}"),
+            ""
+        );
         assert_eq!(sanitize_label("build\u{3164}"), sanitize_label("build"));
     }
 

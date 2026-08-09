@@ -9,22 +9,7 @@ on:
   # No `paths-ignore`: a job a pull request skips leaves a required check sitting "expected" for
   # ever, and a documentation-only commit is exactly what scripts/check-references.sh is for.
   pull_request:
-  # The advisory database moves while this tree stands still and Dependabot bumps daily, so
-  # without a timer an advisory published on Tuesday waits for whoever pushes next. Weekly, two
-  # direct dependencies not earning a daily run of anything. The timer exists for `cargo deny
-  # check advisories` alone: `fuzz` and `release` skip scheduled runs below, `publish` is
-  # tag-gated already.
-  #
-  # What neither this timer nor Dependabot covers: the six tool versions pinned literally in this
-  # file — cargo-deny, cargo-nextest, prek and shellcheck on the `install-action` line, actionlint
-  # and its checksum in the step below it, cargo-fuzz in the `fuzz` job. Dependabot's
-  # `github-actions` ecosystem bumps `uses:` refs and nothing else, so these drift until somebody
-  # looks. scripts/nightly-version is the pattern that solves this for the one shared pin, and it
-  # works because shell scripts read it at run time; these six sit in `with:` and `env:`, which
-  # are evaluated before any step could read a file. Consolidating them means a step writing
-  # $GITHUB_OUTPUT and every use becoming a `format()` over `steps.*.outputs.*` — less readable
-  # than the literals, and a mistyped key would expand to `cargo-deny@` rather than fail. Left
-  # inline deliberately; bump them by hand.
+  # Check the moving advisory database weekly. Tool versions embedded below are manual pins.
   schedule:
     - cron: '17 4 * * 1'
   # The release job's artifacts expire and nothing else produces the per-architecture binaries or
@@ -121,6 +106,10 @@ jobs:
       # two the file says exactly what the root deny.toml says.
       - run: cargo deny --locked --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check advisories
 
+      # probe/ is a third workspace and lockfile. Its path dependency intentionally falls outside
+      # the root wildcard ban, but its resolved registry dependencies still need checking.
+      - run: cargo deny --locked --manifest-path e2e-tests/probe/Cargo.toml --config deny.toml check advisories sources
+
       # The released binary, by checksum: from source it needs a Go toolchain, and the image's Go
       # is an unpinned input — a release raising its Go floor would break hook *installation* and
       # take clippy, doc and the tests below with it before any of them run.
@@ -153,9 +142,8 @@ jobs:
         run: cargo test --locked --doc --workspace
 
       # The cargo-nextest hook's command plus the two flags that only make sense here.
-      # `--run-ignored all`: the one ignored test sits out a real 30 s first-attach reaping
-      # timeout, too slow for a hook. `--no-fail-fast`: one failure should not hide the state of
-      # everything else, which is most of the value of a CI run over a local one.
+      # `--run-ignored all`: the two deadline tests are too slow for a hook. `--no-fail-fast`:
+      # one failure should not hide the state of everything else.
       - if: github.event_name != 'schedule'
         run: cargo nextest run --locked --workspace --run-ignored all --no-fail-fast
 
@@ -170,8 +158,7 @@ jobs:
           done
 
   # Sixty seconds is not a search and this job does not pretend to be one: it checks that fuzz/
-  # still compiles and still passes over its committed seeds, which is what rots in a workspace
-  # sitting outside the root one and so outside every hook but `cargo fmt`. No corpus is carried
+  # still compiles and still passes over its committed seeds. No corpus is carried
   # between runs — a cache restored from the last green commit would make what this job covers a
   # function of what happened to be cached. Release-gating: the time budget changes how much is
   # explored, not whether a crash already found in this run is safe to publish alongside.
@@ -245,17 +232,7 @@ jobs:
     # Behind the gate, as `fuzz` is and for its reason: a tree that cannot pass clippy has
     # nothing worth booting six containers for.
     needs: check
-    # Six containers each booting systemd, plus two musl builds. e2e-tests/run.sh measured 206 s
-    # here for the ten cells this matrix used to have and should sit near two minutes for six; a
-    # cold cache adds the crate's and the probe's musl builds and the Debian image on top.
-    #
-    # The generous remainder is deliberate and is not headroom for the measurement. run.sh bounds
-    # every failure it can diagnose — 90 s for a cell to accept a login, 60 s for a hold to report
-    # ready, 90 s for a blackholed login to die — and dies on the first cell to exceed one, with a
-    # paragraph about which. Roughly seven minutes covers a full run plus one cell exhausting all
-    # three, so the timeout stays above that: a cancelled job says nothing, and this check now
-    # blocks merges. What is left for it to catch is the one thing run.sh cannot bound — a
-    # `compose up --build` or an ssh to a wedged sshd that simply never returns.
+    # Covers cold builds plus the per-cell login and teardown deadlines.
     timeout-minutes: 15
     steps:
       # `persist-credentials: false`, for the reason the check job gives.
@@ -270,29 +247,14 @@ jobs:
       # than the runner's glibc. run.sh refuses rather than guesses if this is missing.
       - run: rustup target add x86_64-unknown-linux-musl
 
-      # Two workspaces: the crate under test and e2e-tests/probe, which is separate for the
-      # reason fuzz/ is. No `key:` of its own, unlike `fuzz` and `release`. Those two build with
-      # the nightly from scripts/nightly-version, which rust-cache cannot see and so cannot key
-      # on; this job builds with the stable pin from rust-toolchain.toml, which rust-cache reads
-      # itself, and with the two lock files it already hashes. A key naming the container files
-      # was strictly worse than none: rust-cache carries the user key into its restore key too,
-      # so it has no fallback, and every edit to the Dockerfile or the compose file threw away a
-      # 26 MB cache that has nothing to do with either. Five consecutive runs logged
-      # "No cache found." and three separate lineages were written and never read.
+      # Cache both independently resolved workspaces.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             .
             e2e-tests/probe
 
-      # The only lint pass e2e-tests/probe gets, exactly as the fuzz job's clippy is the only one
-      # fuzz/ gets: the clippy hook reaches the root workspace alone, and until this the third
-      # workspace had `cargo fmt --check` and nothing else. Whether the probe is correct decides
-      # whether the matrix below means anything, so it is the wrong file to lint least. Here and
-      # not in `check` because this job already caches that workspace's target directory; measured
-      # at about five seconds against a warm one. Before `run.sh`, so a lint failure costs nothing
-      # rather than six booted containers. The deny rides on the command, this job having no
-      # job-level RUSTFLAGS to put it in.
+      # Probe correctness determines the matrix verdicts; lint its independent workspace.
       - run: cargo clippy --locked --manifest-path e2e-tests/probe/Cargo.toml --all-targets -- -D warnings
 
       # Fails on any cell whose measured verdict differs from matrix.tsv's prediction, in either

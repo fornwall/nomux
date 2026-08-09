@@ -737,11 +737,11 @@ impl Pump {
             // failure — so what was owed it is dropped and the answer comes back as
             // `false`. Which direction that ends is `relay`'s to say, not this
             // method's, and only one of the two stops the loop.
-            Err(rustix::io::Errno::PIPE) => {
+            Err(err) if err.kind() == io::ErrorKind::BrokenPipe => {
                 self.buf.clear();
                 Ok(false)
             }
-            outcome => outcome.map(|()| true).map_err(Into::into),
+            outcome => outcome.map(|()| true),
         }
     }
 }

@@ -739,8 +739,18 @@ impl SessionPaths {
     /// the session and the file — § 6.6 says why absence is success and why anything
     /// else has to reach `kill`.
     pub(crate) fn unlink_all_locked(&self, _lock: &SpawnLock) -> io::Result<()> {
+        self.unlink_locked(true)
+    }
+
+    /// Removes published session files while leaving the spawn mutex named.
+    pub(crate) fn unlink_published_locked(&self, _lock: &SpawnLock) -> io::Result<()> {
+        self.unlink_locked(false)
+    }
+
+    fn unlink_locked(&self, include_lock: bool) -> io::Result<()> {
         let (order, mut failure) = self.removal_order();
-        for path in order {
+        let count = order.len().saturating_sub(usize::from(!include_lock));
+        for path in order.into_iter().take(count) {
             if let Err(err) = remove_node(&path)
                 && err.kind() != io::ErrorKind::NotFound
                 && failure.is_ok()
@@ -1372,15 +1382,8 @@ mod tests {
         let root = Scratch::new("rundir-inherit");
         let paths = SessionPaths::in_dir(root.path(), "tab_7").expect("resolve paths");
 
-        // A number that was a descriptor and is not one now. Nothing else runs in this
-        // process to reuse it.
-        let closed = {
-            let file = fs::File::open("/dev/null").expect("a descriptor to close again");
-            file.as_raw_fd()
-        };
-
         let err = paths
-            .inherit_spawn_lock(closed)
+            .inherit_spawn_lock(i32::MAX)
             .expect_err("a closed number is no capability");
         assert_ne!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
         let text = err.to_string();

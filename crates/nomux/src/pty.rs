@@ -223,10 +223,7 @@ impl Pty {
         Ok(Some(outcome))
     }
 
-    /// Terminates everything the session started, then the child itself.
-    ///
-    /// Two reaches — the child's process group, then its whole session — because neither
-    /// alone covers it. An unreaped child keeps both numeric identities reserved.
+    /// Terminates the child's process group and everything else in its session.
     pub(crate) fn terminate(&mut self) {
         let raw = as_pid(self.child.id());
         if let Some(pid) = Pid::from_raw(raw)
@@ -240,15 +237,8 @@ impl Pty {
                 }
                 signal_session(raw, Signal::HUP);
 
-                // Real grace, not a formality: checking microseconds after the signal
-                // finds everything still running, so `SIGKILL` would follow at once and
-                // no shell would run its exit trap. The condition is the *session*
-                // emptying, not the direct child exiting.
                 let deadline = std::time::Instant::now() + HANGUP_GRACE;
                 while std::time::Instant::now() < deadline {
-                    // A zombie still makes its group look alive, so settlement is the
-                    // `/proc` walk alone: it filters zombies and sees every background
-                    // process in the session, including those in groups of their own.
                     group_alive = rustix::process::test_kill_process_group(pid).is_ok();
                     if session_is_empty(raw) {
                         settled = true;
@@ -261,7 +251,14 @@ impl Pty {
                 if group_alive {
                     reach(Reach::Group(pid), Signal::KILL);
                 }
-                signal_session(raw, Signal::KILL);
+                let deadline = std::time::Instant::now() + HANGUP_GRACE;
+                loop {
+                    signal_session(raw, Signal::KILL);
+                    if session_is_empty(raw) || std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(HANGUP_POLL_INTERVAL);
+                }
             }
         }
         if !self.reaped {

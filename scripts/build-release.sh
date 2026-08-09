@@ -2,12 +2,8 @@
 # Builds the two shipping binaries and the checksums the client pins them by. Runs from anywhere
 # in the tree; artifacts land in target/dist/.
 #
-# nomux uploads itself over whatever link the user's ssh session is riding, so IMPLEMENTATION.md
-# § 8 caps it at 400 KiB per architecture. The cap alone is not enough — one commit grew a target
-# 46% and nothing said a word, because the result still fitted — so scripts/size-baseline holds a
-# figure per target and growth past 3% fails too. A shrink never does, however large.
-# NOMUX_UPDATE_BASELINE=1 rewrites the baseline and skips the gate, which puts an accepted
-# regression in a diff a reviewer reads.
+# IMPLEMENTATION.md § 8 caps each upload at 400 KiB; the baseline also rejects growth past 3%.
+# NOMUX_UPDATE_BASELINE=1 records an accepted increase in the reviewable baseline.
 set -eu
 
 die() {
@@ -16,23 +12,14 @@ die() {
 }
 
 max_bytes=409600 # 400 KiB
-# Well above ordinary drift — a compiler bump or a few match arms move these by tenths of a
-# percent — and well below the 46% jump the gate was written for. Around 5.5 KiB on x86_64: loose
-# enough that nobody learns to rerun with the escape hatch by habit.
+# Allows ordinary compiler drift without hiding material growth.
 max_growth_pct=3
 
 targets='x86_64-unknown-linux-musl
 aarch64-unknown-linux-musl'
 
-# cargo resolves the workspace and .cargo/config.toml — where rust-lld is pinned for both targets
-# — by walking up from where it was started, and rustup reads rust-toolchain.toml the same way;
-# from another crate's directory that walk lands on that crate. The cd is what makes "runs from
-# anywhere" above true. `pwd -P` rather than the logical path, for the reason $target_root below
-# resolves one too: rustc records the physical path it opened a file through, and both uses of
-# $repo are held against that record — the --remap-path-prefix that has to cover it, and the
-# check_leaks needle that has to find it if the remap missed. Through a symlinked checkout the
-# logical path names a directory rustc never wrote down, so the real path would ship unremapped
-# and unreported.
+# Resolve the physical root so cargo configuration, path remapping and leak checks agree even
+# through a symlinked checkout.
 repo=$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd -P)
 cd "$repo"
 
@@ -41,12 +28,8 @@ baseline_file="$repo/scripts/size-baseline"
 nightly_file="$repo/scripts/nightly-version"
 update_baseline="${NOMUX_UPDATE_BASELINE:-0}"
 
-# Nightly, because the released std does not fit: rebuilding it with -Cpanic=immediate-abort
-# is the only configuration that ships. Dated rather than floating, because the SHA-256 the
-# client pins would drift under a name that moves. Read from the same tracked file as fuzz/run.sh,
-# so advancing either workflow advances both and shows up in `git status`; an environment override
-# would do neither. A bump is that file and, if its size review accepts material growth, a refreshed
-# baseline.
+# Rebuilding std with immediate-abort needs nightly. A tracked date keeps release and fuzz builds
+# reproducible and advances them together.
 read -r nightly < "$nightly_file" || die "could not read a toolchain name from $nightly_file"
 case "$nightly" in
 nightly-[0-9][0-9][0-9][0-9]-[01][0-9]-[0-3][0-9]) ;;
@@ -62,12 +45,7 @@ baseline_for() {
         $1 == t && NF == 2 && $2 ~ /^[0-9]+$/ { print $2; exit }' "$baseline_file"
 }
 
-# Installed rather than detected and complained about: past the compiler this needs std's sources
-# (-Zbuild-std compiles it here), both musl rust-std components (that build still links their CRT
-# objects and libc.a) and llvm-tools (the $readobj every run checks a binary with). One idempotent
-# command, so a runner and a laptop provision identically; the target list is joined out of
-# $targets, so what is installed cannot drift from what is built. Chatter to stderr, stdout being
-# the size table's.
+# Provision every component this script uses; keep stdout for the size table.
 rustup toolchain install "$nightly" --profile minimal --no-self-update \
     --component rust-src,llvm-tools \
     --target "$(printf '%s' "$targets" | tr '\n' ',')" >&2

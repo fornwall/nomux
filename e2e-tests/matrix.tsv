@@ -1,86 +1,9 @@
-# The cells of PLAN.md item 1, and what each is predicted to do. Tab-separated;
-# `#` comments and blank lines ignored. run.sh measures each and fails on any cell
-# whose measured verdict differs from `expect` — in *either* direction, because a
-# prediction that turns out too pessimistic is as much a finding as one too optimistic.
-#
-# `expect` is `survives` or `dies`: whether the session created in one SSH login is
-# still there in the next, after the first has been logged out.
-#
-# nomux reads none of these axes any more. `spawn` launches the daemon directly and
-# always, so the daemon lands in whatever cgroup its login already had, and the only axis
-# that can decide its fate is KillUserProcesses — which is a host policy nomux never sees.
-# `pam_systemd` decides whether there is a login session to be in at all, and `linger` is
-# now predicted to change nothing. `logout` is an axis of a different kind — not how the
-# host is configured but how the login ends, `clean` for an orderly `ssh host 'cmd'` return
-# and `abrupt` for a connection blackholed at the wire. See run.sh's `abrupt_login`.
-#
-# Six cells, and the count is deliberate: this job is a required check, so every row here
-# is paid for by every pull request from now on. A row earns its place by being the only
-# way to learn something, not by completing a grid. Four combinations that used to be here
-# were each a second witness to a fact another row already establishes, and the section
-# below each survivor says what its own fact is.
-#
+# Tab-separated systemd logout cells. `expect` is whether a session remains after logout;
+# comments and blank lines are ignored, and run.sh fails on a mismatch in either direction.
 # cell	port	kill_user_processes	linger	pam_systemd	logout	expect
-#
-# --------------------------------------------------------------- the clean logout half
-#
-# No pam_systemd: no session scope, no $XDG_RUNTIME_DIR, no user bus. Nothing on the host
-# is managing logins, so the daemon inherits sshd's own unit and nothing kills it whatever
-# KillUserProcesses says. The only cell that reaches run.sh's `no-logind` classification,
-# which is the whole reason to keep it: `survives` here and `survives` on the row below are
-# the same word for two different facts, and this is the row that makes the LAUNCH column
-# have to tell them apart.
 no-user-bus	2201	no	no	no	clean	survives
-#
-# The forgiving host, and the one most distributions ship: the daemon is left in the login
-# session's scope and the session scope is not killed at logout.
 kup-off-linger-off	2202	no	no	yes	clean	survives
-#
-# The cell the whole exercise is for, and the only row here that measures a `dies`. The
-# daemon is launched directly into `session-N.scope`, and logind kills that scope's contents
-# at the final logout.
 kup-on-linger-off	2204	yes	no	yes	clean	dies
-#
-# The one linger cell. Predicted `dies`, and this row is the scope launch's own regression
-# test: it recorded `survives` while `spawn` detected a lingering user manager and launched
-# through `systemd-run --user --scope`, which put the daemon in a manager-owned transient
-# scope outside the login session. That launcher is gone, so linger now buys nothing and the
-# daemon dies with its linger-off twin. It is kept over the three other linger combinations
-# because it is the only one whose *verdict* ever moved; the others predicted the same thing
-# with and without the scope launch, so a run of them proved the launcher had not come back
-# only in the sense that any green run does.
-#
-# Note what does the real work there, though. run.sh fails any cell whose daemon lands in a
-# `nomux-*.scope`, and that check runs on all six rows — it catches the scope launch even on
-# a host where the verdict happens not to move, which is strictly more than this row can do
-# alone. This row is here because a lingering `user@UID.service` is a real host state worth
-# having one measurement of, not because it is the guard.
 kup-on-linger-on	2205	yes	yes	yes	clean	dies
-#
-# -------------------------------------------------------------- the dropped-wire half
-#
-# The same hosts, logged out of by having the network taken away rather than by saying
-# goodbye — the case nomux exists for, and the one teardown path the clean half cannot
-# reach. sshd learns of it only when `ClientAliveInterval` expires, and reaches the logout
-# through `cleanup_exit` rather than through an orderly channel close.
-#
-# Both are predicted to repeat their clean twin's verdict, and the prediction is a claim
-# about *where* the two paths converge rather than a guess that nothing differs. What sshd
-# does differently is only how it learns the client has gone; what it does next — PAM's
-# `session close`, so pam_systemd's release of the session, so logind stopping
-# `session-N.scope` and applying KillUserProcesses to whatever is still in it — is the same
-# code on both paths. So the daemon's fate should turn on the cgroup it is in and nothing
-# else, exactly as in the clean half.
-#
-# Which is why two rows settle it and five did not settle it better. The claim is that the
-# paths converge at `session close`; the two rows below put the convergence to the test in
-# both directions, once where the scope survives the logout and once where it does not. The
-# retired `drop-` rows varied linger and pam_systemd on top of that — axes on the far side
-# of the convergence point, which the timeout path cannot reach differently from the orderly
-# one without the two rows below already disagreeing with their clean twins.
-#
-# A deviation here would be the more interesting result of the two: it would mean sshd's
-# timeout path skips a teardown step the orderly path takes, and that `survives` on a clean
-# logout is not the promise nomux is actually making to a dropped connection.
 drop-kup-off-linger-off	2207	no	no	yes	abrupt	survives
 drop-kup-on-linger-off	2209	yes	no	yes	abrupt	dies

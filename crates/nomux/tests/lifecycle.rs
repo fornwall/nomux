@@ -701,6 +701,53 @@ fn a_daemon_that_inherits_a_pending_stop_signal_still_runs_its_shutdown() {
     );
 }
 
+/// A failed stop pipe must leave an inherited stop signal blocked until startup cleans up.
+#[test]
+fn a_failed_stop_pipe_does_not_release_a_pending_signal_into_its_default() {
+    use std::os::unix::process::CommandExt as _;
+
+    let root = run_root("pending_term_nofile");
+    let dir = root.join("nomux/run");
+    fs::create_dir_all(&dir).expect("create the run directory");
+    let before = entries(&dir);
+
+    let mut command = nomux_with_shell(&root, &["daemon", "pending"]);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    arrives_with_a_stop_signal_pending(&mut command);
+    // stdio, lock, /dev/null, listener and the SIGCHLD pipe consume descriptors 0..=7.
+    // One free slot is not enough for the atomic stop-pipe creation.
+    // SAFETY: `setrlimit` is async-signal-safe and the pre-exec closure does nothing else.
+    unsafe {
+        command.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: 9,
+                rlim_max: 9,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+
+    let finished = harness::collect(&mut command);
+    assert_eq!(
+        finished.status.signal(),
+        None,
+        "the pipe failure unblocked SIGTERM before startup cleanup"
+    );
+    assert_eq!(finished.status.code(), Some(1), "the stop pipe had to fail");
+    assert_eq!(
+        entries(&dir),
+        before,
+        "the default signal disposition bypassed startup cleanup"
+    );
+}
+
 /// Hands what `command` starts a `SIGTERM` that is blocked *and already pending*, the
 /// state `exec` preserves and § 6.2's arming has to survive.
 ///
