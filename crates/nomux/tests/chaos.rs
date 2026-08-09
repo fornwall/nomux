@@ -24,9 +24,7 @@
 #![allow(
     clippy::panic,
     clippy::expect_used,
-    reason = "clippy.toml's allow-panic-in-tests and allow-expect-in-tests reach \
-              `#[test]` bodies, not the helpers an integration test crate keeps \
-              beside them"
+    reason = "integration test crate; clippy.toml's allow-*-in-tests reaches only #[cfg(test)]"
 )]
 
 mod harness;
