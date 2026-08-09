@@ -483,18 +483,18 @@ impl SessionPaths {
         write_private(&self.pid(), format!("{}\n", std::process::id()).as_bytes())
     }
 
-    /// Removes the pidfile a previous incarnation of this id left behind.
-    ///
-    /// For the daemon, at the point where it has established that no live one is on the
-    /// socket — `daemon::bind_socket` says why that is the moment. Absent is a state
-    /// `control::resolve` already waits out; stale is the one it cannot tell from current.
+    /// Removes the pidfile a previous incarnation of this id left behind, as
+    /// [`Self::clear_label`] does the label. Apart only because [`Self::write_label`]
+    /// clears the second on its own; `daemon::bind_socket` calls both, at the point where
+    /// it has established no live daemon is on the socket, and says why that is the
+    /// moment. Absent is a state `control::resolve` waits out; stale is the one it cannot
+    /// tell from current, and a stale label answers in `list` for whoever took the id
+    /// over (§ 6.6).
     pub(crate) fn clear_pid(&self) {
         drop(fs::remove_file(self.pid()));
     }
 
-    /// Removes the label a previous incarnation of this id left behind, beside
-    /// [`Self::clear_pid`] and for its reason: a session started over a killed one's
-    /// files must not inherit the dead session's name in `list` (§ 6.6).
+    /// The label half of [`Self::clear_pid`].
     pub(crate) fn clear_label(&self) {
         drop(fs::remove_file(self.label()));
     }
