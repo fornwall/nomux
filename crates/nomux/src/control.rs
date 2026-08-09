@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal, test_kill_process};
 
 use crate::rundir::{
-    MAX_PID_LEN, MAX_SESSION_ID_LEN, SessionPaths, SpawnLock, check_run_dir, parse_pid, read_label,
+    MAX_PID_LEN, MAX_SESSION_ID_LEN, SessionPaths, check_run_dir, parse_pid, read_label,
     read_prefix, run_dir, session_ids,
 };
 use crate::usock::{Liveness, liveness};
@@ -133,8 +133,9 @@ pub(crate) fn kill(session_id: &str) -> io::Result<()> {
     }
     // Held from here to the end of the function (§ 6.6): without it, an attach that starts a
     // fresh daemon between the signal below and the unlink that follows loses its socket to a
-    // kill it was never the target of.
-    let lock = hold_spawn_lock(&paths)?;
+    // kill it was never the target of. Bounded rather than a blocking `flock`, because a
+    // process that stopped letting go is no reason for the escape hatch to hang forever.
+    let lock = paths.lock_spawn_until(Instant::now() + GRACE)?;
     if let Some(chosen) = resolve(&paths)? {
         chosen.signal(Signal::TERM);
         // Liveness first, deadline second, so a daemon that let go on the last interval is
@@ -174,36 +175,6 @@ pub(crate) fn kill(session_id: &str) -> io::Result<()> {
         Liveness::Stale(_) => paths.unlink_all_locked(&lock),
         Liveness::Alive(_) => Err(bound_since(&paths)),
         Liveness::Unknown(err) => Err(unprobeable(&paths, &err)),
-    }
-}
-
-/// Takes the spawn lock for the whole of a `kill`, waiting briefly for it (§ 6.6).
-///
-/// Bounded rather than a blocking `flock` because a process that stopped holding it is
-/// not a reason for the escape hatch to hang forever.
-///
-/// # Errors
-///
-/// Reports [`io::ErrorKind::ResourceBusy`] when the lock is still held at the deadline,
-/// rather than claim a postcondition it did not establish — and passes on the refusal a
-/// host that can hold no lock at all earns, which polling would only turn into that same
-/// busy message about a process that does not exist.
-fn hold_spawn_lock(paths: &SessionPaths) -> io::Result<SpawnLock> {
-    let deadline = Instant::now() + GRACE;
-    loop {
-        if let Some(lock) = paths.try_lock_spawn_or_refuse()? {
-            return Ok(lock);
-        }
-        if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::ResourceBusy,
-                format!(
-                    "session {} is being started or removed by another process",
-                    paths.id()
-                ),
-            ));
-        }
-        thread::sleep(POLL_INTERVAL);
     }
 }
 
