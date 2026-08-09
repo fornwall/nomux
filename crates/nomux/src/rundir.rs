@@ -745,8 +745,8 @@ impl SessionPaths {
     /// the session and the file — § 6.6 says why absence is success and why anything
     /// else has to reach `kill`.
     pub(crate) fn unlink_all_locked(&self, _lock: &SpawnLock) -> io::Result<()> {
-        let mut failure = Ok(());
-        for path in self.removal_order(&mut failure) {
+        let (order, mut failure) = self.removal_order();
+        for path in order {
             if let Err(err) = remove_node(&path)
                 && err.kind() != io::ErrorKind::NotFound
                 && failure.is_ok()
@@ -765,16 +765,19 @@ impl SessionPaths {
     }
 
     /// Every `<id>.*` in the run directory, in the order [`Self::unlink_all_locked`]
-    /// removes them. Split out so the order can be asserted directly.
+    /// removes them, and whether the scan that found them completed. Split out so the
+    /// order can be asserted directly.
     ///
     /// The named files lead and are attempted whatever the directory says: a `read_dir`
-    /// this call could not make is not a session with nothing left to remove (§ 6.6).
-    /// The scan adds every *other* name sharing the id.
-    fn removal_order(&self, failure: &mut io::Result<()>) -> Vec<PathBuf> {
+    /// this call could not make is not a session with nothing left to remove (§ 6.6), so
+    /// the incomplete scan is reported beside the list rather than instead of it. The
+    /// scan adds every *other* name sharing the id.
+    fn removal_order(&self) -> (Vec<PathBuf>, io::Result<()>) {
         /// The extensions the named paths already cover.
         const ALREADY: [&str; 5] = ["sock", "pid", "label", "agent", "lock"];
 
         let mut order = vec![self.socket(), self.pid(), self.label(), self.agent()];
+        let mut failure = Ok(());
         let scan_failure = |err: io::Error| {
             io::Error::new(
                 err.kind(),
@@ -788,7 +791,7 @@ impl SessionPaths {
         let entries = match fs::read_dir(&self.dir) {
             Ok(entries) => Some(entries),
             Err(err) => {
-                *failure = Err(scan_failure(err));
+                failure = Err(scan_failure(err));
                 None
             }
         };
@@ -797,7 +800,7 @@ impl SessionPaths {
                 Ok(entry) => entry,
                 Err(err) => {
                     if failure.is_ok() {
-                        *failure = Err(scan_failure(err));
+                        failure = Err(scan_failure(err));
                     }
                     continue;
                 }
@@ -812,7 +815,7 @@ impl SessionPaths {
         // `<id>.lock` last (§ 6.3), load-bearing: unlinks after it would land on a
         // session somebody else has legitimately brought up.
         order.push(self.lock());
-        order
+        (order, failure)
     }
 
     /// Removes every file belonging to this session, if the spawn lock can be had this
@@ -1192,8 +1195,7 @@ mod tests {
             fs::write(dir.join(name), b"").unwrap();
         }
 
-        let mut scanned = Ok(());
-        let order = paths.removal_order(&mut scanned);
+        let (order, scanned) = paths.removal_order();
         scanned.expect("scan the run directory");
         assert_eq!(
             order.last(),
