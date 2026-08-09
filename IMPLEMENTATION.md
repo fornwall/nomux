@@ -130,10 +130,9 @@ of the terminal, elapsed against a monotonic clock and saturating at `u32::MAX`.
 `Ping` is the client's alone: the daemon never sends one, answers every one it decodes with
 a `Pong`, and holds no inactivity deadline over an attached client — § 6.4's six endings
 carry no timer between them, and the 5 s `PENDING_HELLO_TIMEOUT` bounds a *pending*
-connection only. So a `Pong` that does not come back is no evidence about liveness, only
-that what was queued ahead of it has not drained: § 4.1 has a client's own `Ping` queueing
-behind its own stalled input, and the daemon's answers queueing past `MAX_PENDING_WRITE`
-unmeasured.
+connection only. What the pair is for is a round trip that changes nothing, which is what
+§ 9's suite fences on to know that everything sent ahead of it has been decoded; how far
+the *child* has got is `InputAck.applied_through` (§ 3) and never a `Pong`.
 
 ### 2.3 Flags
 
