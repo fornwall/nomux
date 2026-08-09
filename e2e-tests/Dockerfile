@@ -5,9 +5,11 @@ FROM debian:bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive
 # `dbus-user-session` is load-bearing and easy to miss: without it there is a
-# `$XDG_RUNTIME_DIR` but no `$XDG_RUNTIME_DIR/bus`, so `user@UID.service` never comes up,
-# `launcher::user_manager_reachable` declines, and every cell silently measures the
-# direct path no matter what its linger axis says. Plain `dbus` is the system bus only.
+# `$XDG_RUNTIME_DIR` but no `$XDG_RUNTIME_DIR/bus`, so a linger=on cell has no user
+# session bus and only half the user manager its axis claims for it. Nothing in nomux
+# consults that bus any more, but the linger cells are there to show a full, lingering
+# user manager saving nothing, and a cell missing one would be showing less than it says.
+# Plain `dbus` is the system bus only.
 #
 # `iptables` is what makes the abrupt-disconnect cells abrupt: the runner blackholes port
 # 22 inside the container so sshd's packets go nowhere and no FIN or RST can reach it,

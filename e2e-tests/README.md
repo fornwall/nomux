@@ -4,14 +4,17 @@
 
 > Does a session created in one SSH login still exist after that login has logged out?
 
-The answer is not nomux's to give. `setsid` and `fork` move the daemon off the controlling
-terminal but not out of sshd's `session-N.scope` cgroup ([`startup.rs`'s
-`detach_from_controlling_terminal`](../crates/nomux/src/startup.rs) says so), so on a host
-with `KillUserProcesses=yes` logind kills it at the final logout. The mitigation —
-`systemd-run --user --scope`, chosen by
-[`launcher.rs`](../crates/nomux/src/launcher.rs) — only helps when a lingering user manager
-is there to own the scope. Whether each combination behaves as predicted is a fact about
-logind, and the only way to learn it is to log in, log out, and look.
+The answer is not nomux's to give, and it is no longer nomux's to influence either.
+`setsid` and `fork` move the daemon off the controlling terminal but not out of sshd's
+`session-N.scope` cgroup ([`startup.rs`'s
+`detach_from_controlling_terminal`](../crates/nomux/src/startup.rs) says so), and
+[`launcher.rs`](../crates/nomux/src/launcher.rs) now launches the daemon **directly and
+always** — there is no scope to escape into, nothing is probed before the launch, and the
+daemon's fate is decided by `logind.conf`'s `KillUserProcesses` and by nothing else. That
+makes the matrix a measurement of host policy rather than of a choice nomux makes, which
+is a smaller claim but the same amount of work to check: whether each combination behaves
+as predicted is a fact about logind, and the only way to learn it is to log in, log out,
+and look.
 
 So each cell here is a container running **systemd as PID 1, a real logind, a real sshd and
 a real PAM stack**, and the harness logs in over SSH twice: once to create a session, once
@@ -47,24 +50,64 @@ record of measured behaviour, not a wishlist.
 |---|---|---|---|---|---|---|
 | `no-user-bus` | no | no | **no** | clean | no-logind | survives |
 | `kup-off-linger-off` | no | no | yes | clean | direct | survives |
-| `kup-off-linger-on` | no | yes | yes | clean | scope | survives |
+| `kup-off-linger-on` | no | yes | yes | clean | direct | survives |
 | `kup-on-linger-off` | **yes** | no | yes | clean | direct | **dies** |
-| `kup-on-linger-on` | **yes** | yes | yes | clean | scope | survives |
+| `kup-on-linger-on` | **yes** | yes | yes | clean | direct | **dies** |
 | `drop-no-user-bus` | no | no | **no** | **abrupt** | no-logind | survives |
 | `drop-kup-off-linger-off` | no | no | yes | **abrupt** | direct | survives |
-| `drop-kup-off-linger-on` | no | yes | yes | **abrupt** | scope | survives |
+| `drop-kup-off-linger-on` | no | yes | yes | **abrupt** | direct | survives |
 | `drop-kup-on-linger-off` | **yes** | no | yes | **abrupt** | direct | **dies** |
-| `drop-kup-on-linger-on` | **yes** | yes | yes | **abrupt** | scope | survives |
+| `drop-kup-on-linger-on` | **yes** | yes | yes | **abrupt** | direct | **dies** |
 
-`kup-on-linger-off` is the gap the README already warns about, now pinned rather than
-suspected: no linger means `launcher::spawn_daemon` declines the scope path, the direct
-fallback leaves the daemon in the login session's scope, and logind kills it. **On a strict
-host, nomux needs `loginctl enable-linger`**; without it the promise does not hold, and
-this row is what stops that regressing quietly into "probably fine".
+The finding is the `KillUserProcesses` column and nothing else: **on a host that sets
+`KillUserProcesses=yes`, a nomux session does not survive the final logout**, and no
+configuration of the other two axes changes that. Where `pam_systemd` is out of the way
+there is no login session to be killed in, and where `KillUserProcesses=no` — the default
+nearly everywhere, and the reason a direct launch is survivable in practice — logind sees
+the logout and leaves the scope's contents alone. This is the position `tmux` and GNU
+`screen` are in, and on this axis nomux is now neither better nor worse than they are.
+Somebody who needs persistence on a strict host arranges it above nomux: `loginctl
+enable-linger` **plus a scope of their own**, or a `systemd-run --user --scope` wrapper
+around the `spawn` command.
 
-Each run also records the daemon's cgroup, so `survives` under a scope launch is told apart
-from `survives` on a host that would never have killed anything — the same word for two
-quite different facts.
+### What the linger cells are for now
+
+Nothing in nomux reads linger any more, so the four linger cells no longer exercise a
+nomux code path. They are kept because that is the claim worth pinning, and because the
+measurement is cheap — one environment variable and a container that would be booted
+anyway.
+
+`kup-on-linger-on` earns its place twice over. It read `survives` until the launcher was
+deleted: `spawn` used to detect a lingering user manager and start the daemon through
+`systemd-run --user --scope`, which put it in a manager-owned transient scope that outlived
+the login session and so outlived `KillUserProcesses`. With the scope gone, linger buys
+nothing — a lingering `user@UID.service` owns nothing the daemon is in — and the cell dies
+with its linger-off twin. It is now the regression test for the deletion itself: a
+`survives` measured here again means a scope launch has come back, and `run.sh` fails on a
+verdict that is better than predicted exactly as readily as on one that is worse.
+`kup-off-linger-on` is its control, and says a `survives` under linger is not evidence
+that linger did anything.
+
+The cells make that argument only if the lingering user manager is really there, which is
+why `session-create.sh` still reports `LINGER`, `XDG_RUNTIME_DIR` and `USER-BUS` although
+nothing consults them: a cell that dies with `LINGER=yes` and a live user bus has measured
+linger being irrelevant, and one whose linger marker quietly failed to take has measured
+nothing at all.
+
+### The `LAUNCH` column
+
+Each run still records the daemon's cgroup, and the column still separates two real
+states. `direct` is a daemon inside a logind-managed `session-N.scope`, where `survives`
+means logind saw the logout and chose not to kill; `no-logind` is a daemon in sshd's own
+unit with no session around it, where `survives` means nothing would ever have killed it.
+That is the same word for two quite different facts, and only this column tells them apart.
+
+Its third value, `scope`, is now unreachable: no launcher asks for a transient scope. It
+is kept as a value to *recognise* rather than to report, and `run.sh` **fails the run** on
+seeing one, along with any cgroup the classification does not recognise at all. A cell can
+reach the verdict it predicted down a path that no longer exists — `kup-on-linger-on` did
+precisely that for as long as the scope launch was there — so the launch path is checked
+on its own and not folded into the verdict.
 
 ### The dropped-wire half
 
@@ -73,8 +116,8 @@ they settle is that the two teardowns converge: sshd differs only in *how* it le
 client has gone, and what it does next — PAM's `session close`, pam_systemd's release of
 the session, logind stopping `session-N.scope` and applying `KillUserProcesses` to whatever
 is still in it — is the same code either way. So the daemon's fate turns on the cgroup it
-is in and nothing else, and `survives` on a clean logout is a promise nomux also keeps to a
-connection that vanishes.
+is in and nothing else, and a verdict on a clean logout is the same promise nomux makes to
+a connection that vanishes.
 
 Which makes these five cells easy to fake, and that is the thing to be careful about.
 A cell that *believes* it disconnected abruptly but really produced an orderly close is a
@@ -89,22 +132,24 @@ The two paths are nowhere near each other, so the floor is not a close call. One
 followed it in the same container:
 
 ```
-11:49:48.532 sshd[78]:  pam_unix(sshd:session): session opened for user nomuxer
-11:49:48.659 systemd[63]: Started nomux-celldropkuponlingeron-88.scope - ...
-                          # the wire goes here, and twenty seconds of nothing follow
-11:50:08.709 sshd[84]:  Timeout, client not responding from user nomuxer ... port 47342
-11:50:08.711 sshd[78]:  pam_unix(sshd:session): session closed for user nomuxer
-11:50:08.723 systemd[1]: Stopping session-380.scope - Session 380 of User nomuxer...
+12:35:03.286 sshd[78]:   pam_unix(sshd:session): session opened for user nomuxer
+12:35:03.305 systemd[1]: Started session-463.scope - Session 463 of User nomuxer.
+                         # the wire goes here, and twenty seconds of nothing follow
+12:35:23.453 sshd[84]:   Timeout, client not responding from user nomuxer ... port 54128
+12:35:23.455 sshd[78]:   pam_unix(sshd:session): session closed for user nomuxer
+12:35:23.460 systemd[1]: Stopping session-463.scope - Session 463 of User nomuxer...
 
-11:50:15.715 sshd[266]: pam_unix(sshd:session): session opened for user nomuxer
-11:50:15.795 sshd[272]: Received disconnect from ... port 50870:11: disconnected by user
-11:50:15.796 sshd[266]: pam_unix(sshd:session): session closed for user nomuxer
+12:35:30.238 sshd[263]:  pam_unix(sshd:session): session opened for user nomuxer
+12:35:30.329 sshd[269]:  Received disconnect from ... port 50406:11: disconnected by user
+12:35:30.330 sshd[263]:  pam_unix(sshd:session): session closed for user nomuxer
 ```
 
-`Timeout, client not responding` against `Received disconnect`, and 20s against 80ms. That
+`Timeout, client not responding` against `Received disconnect`, and 20s against 90ms. That
 is the whole difference between the two halves of the matrix, and `kill -9` on the local ssh
 client produces the second line, not the first. The `TEARDOWN` column in the run's output is
-that gap measured, and it is the reason to believe the row.
+that gap measured, and it is the reason to believe the row. `Stopping session-463.scope` is
+also where this cell's daemon went: `spawn` put it in that scope, the user was lingering,
+and lingering saved nothing that was not inside `user@UID.service`.
 
 ## What this does not prove
 
@@ -121,9 +166,9 @@ that gap measured, and it is the reason to believe the row.
   proves less than one that survives here, because nothing was torn down at all.
 - **One distro, one architecture.** Debian bookworm on x86-64. Distros differ in their
   `logind.conf` default and their PAM stack.
-- **Not the second half of the plan item.** Whether the best-effort failures in
-  `release_startup_state` — `chdir`, the `/dev/null` descriptors — may stay silent is a
-  decision informed by these results, not settled by them.
+- **Nothing about arranging persistence above nomux.** The matrix measures what a strict
+  host does to a directly launched daemon; that a user-owned scope or a lingering wrapper
+  would carry it through is the reasoning behind the advice above, not a row here.
 - **The client is a stub.** `probe/` speaks just enough protocol to greet a session, type a
   marker and re-attach. It is not the reference client `PLAN.md` item 2 wants, though it is
   a start on one.
