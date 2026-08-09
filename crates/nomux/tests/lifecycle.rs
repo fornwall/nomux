@@ -279,6 +279,29 @@ fn the_child_is_a_login_shell_told_its_terminal_and_its_session() {
     );
 }
 
+#[test]
+fn the_child_does_not_inherit_ignored_signal_dispositions() {
+    let session = Session::start_with_ignored_usr1("ignored_signal");
+    let mut client = session.connect();
+    client.hello(RESUME_FROM_START);
+
+    let child = shell_of(&session);
+    let status = fs::read_to_string(format!("/proc/{child}/status"))
+        .expect("read the session child's signal state");
+    let ignored = status
+        .lines()
+        .find_map(|line| line.strip_prefix("SigIgn:"))
+        .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+        .expect("parse SigIgn");
+    let usr1 = 1_u64 << (libc::SIGUSR1 - 1);
+
+    assert_eq!(
+        ignored & usr1,
+        0,
+        "the session child inherited SIGUSR1 as ignored: {ignored:#018x}"
+    );
+}
+
 /// The pid of the shell `session` is running.
 ///
 /// Waited for rather than looked up once: a session is up when its daemon answers,
