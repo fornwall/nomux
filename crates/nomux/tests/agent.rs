@@ -708,9 +708,12 @@ fn a_failed_write_on_a_closed_agent_channel_is_never_announced() {
 /// sleeping one none, so the threshold below sits an order of magnitude under one core.
 #[test]
 fn a_closed_agent_channel_whose_peer_stopped_reading_leaves_the_daemon_asleep() {
-    /// Five ticks is 50 ms against [`SPIN_WINDOW`]: a tenth of one core, where the bug
-    /// is a whole one and the fix is exactly zero.
-    const TOLERATED: u64 = 5;
+    /// One tick, which is the smallest figure `/proc` can report at all. Five was a tenth
+    /// of one core, and a daemon spinning on a tenth of a core is this bug — the threshold
+    /// rests on the other answer, the one [`SPIN_WINDOW`] is written around: a daemon
+    /// asleep in `poll` is charged nothing, and no amount of load moves nothing. So this
+    /// is strictly stronger and no more flaky than the figure it replaces.
+    const TOLERATED: u64 = 1;
 
     let Overqueued {
         session,

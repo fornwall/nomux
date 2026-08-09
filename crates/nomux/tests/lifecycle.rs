@@ -55,7 +55,7 @@ const PATIENCE: Duration = Duration::from_secs(30);
 /// This client stays attached, unlike
 /// [`a_session_whose_child_has_exited_keeps_its_files_and_its_status_with_nobody_attached`],
 /// so what it pins is the frame the daemon builds on the pass that collects the
-/// status — which makes it the place to pin `since_terminal_closed_secs` at zero. That
+/// status — which makes it the place to pin `since_terminal_closed_secs` near zero. That
 /// field is how a client tells a shell that has just finished from one that finished
 /// while the laptop was shut (§ 6.5), and only a client that watched the exit happen
 /// can say what the answer must be. A daemon that stamped the frame when it *built*
@@ -1087,9 +1087,12 @@ fn a_session_whose_child_has_exited_keeps_its_files_and_its_status_with_nobody_a
     /// bit, because the clock the daemon would have measured starts at the end of file
     /// it reports and this one starts at `/proc` agreeing the child has gone.
     const UNATTENDED: Duration = Duration::from_secs(6);
-    /// Five ticks is 50 ms of processor time against the half second [`SPIN_WINDOW`]
-    /// covers: a tenth of a core, unreachable by a daemon that is asleep.
-    const TOLERATED: u64 = 5;
+    /// One tick, which is the smallest figure `/proc` can report at all. Five was a
+    /// tenth of a core, and a daemon spinning on a tenth of a core is the bug — the
+    /// threshold rests on the other answer, the one [`SPIN_WINDOW`] is written around: a
+    /// daemon asleep in `poll` is charged nothing, and no amount of load moves nothing.
+    /// So this is strictly stronger and no more flaky than the figure it replaces.
+    const TOLERATED: u64 = 1;
 
     let (session, mut client, _) = Session::attached("outlives_child");
     let shell = shell_of(&session);
