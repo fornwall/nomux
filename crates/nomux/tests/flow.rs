@@ -386,7 +386,7 @@ fn a_half_closed_client_is_served_to_the_end_and_let_go_there() {
     const STATUS: i32 = 7;
     /// [`a_daemon_that_cannot_accept_stands_back_rather_than_spinning`]'s figure, for
     /// its reason and against the same window.
-    const TOLERATED: u64 = 5;
+    const TOLERATED: u64 = 1;
 
     let session = Session::start("halfclose_serve");
     let daemon = session.child.id();
@@ -905,13 +905,16 @@ fn blaster(session: &Session) -> UnixStream {
 /// exactly the state a host out of descriptors puts it in. Measured as processor
 /// time for the reason
 /// [`a_closed_agent_channel_whose_peer_stopped_reading_leaves_the_daemon_asleep`]
-/// gives, against the same window and the same tolerance.
+/// gives, against the same window.
 #[test]
 fn a_daemon_that_cannot_accept_stands_back_rather_than_spinning() {
-    /// Five ticks is 50 ms of processor time against the half second [`SPIN_WINDOW`]
-    /// covers: a tenth of one core, well under the lowest spin figure seen and
-    /// unreachable by a daemon that is asleep.
-    const TOLERATED: u64 = 5;
+    /// One tick of headroom over the only other answer there is.
+    ///
+    /// Not a share of a core to be calibrated: a daemon asleep in `poll` is charged
+    /// nothing at all over [`SPIN_WINDOW`], and no amount of load moves zero. Five ticks
+    /// — a tenth of a core — is a figure a *partially* spinning daemon passes, and there
+    /// is no such daemon this test would want to accept.
+    const TOLERATED: u64 = 1;
 
     let session = Session::start("emfile");
     let daemon = session.child.id();
