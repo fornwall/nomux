@@ -77,6 +77,13 @@ fn checked_term(term: &str) -> Result<(), ProtoError> {
     Ok(())
 }
 
+fn checked_exit(status: i32, kind: ExitKind) -> Result<(), ProtoError> {
+    if kind == ExitKind::Unknown && status != 0 {
+        return Err(ProtoError::Malformed("Unknown exit status is not zero"));
+    }
+    Ok(())
+}
+
 /// Opening frame: what the client already has, and how big its terminal is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Hello<'a> {
@@ -353,6 +360,7 @@ impl<'a> Frame<'a> {
                 kind,
                 since_terminal_closed_secs,
             } => {
+                checked_exit(status, kind)?;
                 out.extend_from_slice(&status.to_be_bytes());
                 out.push(kind.as_wire());
                 out.extend_from_slice(&since_terminal_closed_secs.to_be_bytes());
@@ -443,6 +451,7 @@ impl<'a> Frame<'a> {
                 let status = r.i32()?;
                 let kind = ExitKind::from_wire(r.u8()?)
                     .ok_or(ProtoError::Malformed("unknown exit kind"))?;
+                checked_exit(status, kind)?;
                 let since_terminal_closed_secs = r.u32()?;
                 Self::Exit {
                     status,
@@ -620,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_discriminants_are_rejected() {
+    fn invalid_closed_values_are_rejected() {
         assert_eq!(
             Frame::decode(FrameType::Exit, &[0, 0, 0, 0, 7]),
             Err(ProtoError::Malformed("unknown exit kind"))
@@ -628,6 +637,20 @@ mod tests {
         assert_eq!(
             Frame::decode(FrameType::Error, &[0xff, 0xff]),
             Err(ProtoError::Malformed("unknown error code"))
+        );
+
+        let invalid_unknown = [0, 0, 0, 1, ExitKind::Unknown.as_wire(), 0, 0, 0, 0];
+        let error = ProtoError::Malformed("Unknown exit status is not zero");
+        assert_eq!(Frame::decode(FrameType::Exit, &invalid_unknown), Err(error));
+        let mut encoded = Vec::new();
+        assert_eq!(
+            Frame::Exit {
+                status: 1,
+                kind: ExitKind::Unknown,
+                since_terminal_closed_secs: 0,
+            }
+            .encode(&mut encoded),
+            Err(error)
         );
     }
 

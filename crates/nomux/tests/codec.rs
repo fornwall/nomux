@@ -304,11 +304,15 @@ mod generated {
             6 => OwnedFrame::copied(Frame::Gap {
                 new_base_offset: rng.u64(),
             }),
-            7 => OwnedFrame::copied(Frame::Exit {
-                status: rng.i32(),
-                kind: rng.pick(&ExitKind::ALL, ExitKind::Exited),
-                since_terminal_closed_secs: rng.u32(),
-            }),
+            7 => {
+                let status = rng.i32();
+                let kind = rng.pick(&ExitKind::ALL, ExitKind::Exited);
+                OwnedFrame::copied(Frame::Exit {
+                    status: if kind == ExitKind::Unknown { 0 } else { status },
+                    kind,
+                    since_terminal_closed_secs: rng.u32(),
+                })
+            }
             8 => OwnedFrame::copied(Frame::Detach),
             9 => OwnedFrame::copied(Frame::Ping),
             10 => OwnedFrame::copied(Frame::Pong),
