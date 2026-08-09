@@ -22,48 +22,41 @@ pub(crate) fn spawn_daemon(
     label: Option<&str>,
     spawn_lock: &SpawnLock,
 ) -> io::Result<Option<ChildStderr>> {
-    let lock_fd = spawn_lock.raw_fd();
-    let mut command = direct_command(session_id, label, lock_fd)?;
-    configure_stdio_and_lock(&mut command, lock_fd);
-    command.spawn().map(|mut child| child.stderr.take())
+    daemon_command(session_id, label, spawn_lock.raw_fd())?
+        .spawn()
+        .map(|mut child| child.stderr.take())
 }
 
+/// The daemon `spawn_daemon` starts, up to the `fork`.
+///
 /// Execs the exact inode this relay is already running rather than whatever the install
 /// path names by the time the child gets there — between the two loads that path decides
 /// what the daemon *is*. `arg0` puts the ordinary name back on the command line, so what
 /// `ps` shows is the program rather than the link it was reached through.
-fn direct_command(session_id: &str, label: Option<&str>, lock_fd: i32) -> io::Result<Command> {
+fn daemon_command(session_id: &str, label: Option<&str>, lock_fd: i32) -> io::Result<Command> {
     let mut command = Command::new("/proc/self/exe");
-    command.arg0(env::current_exe()?);
-    daemon_args(&mut command, session_id, label, lock_fd);
-    Ok(command)
-}
-
-fn daemon_args(command: &mut Command, session_id: &str, label: Option<&str>, lock_fd: i32) {
     command
+        .arg0(env::current_exe()?)
         .arg("daemon")
         .arg(session_id)
         .arg("--lock-fd")
-        .arg(lock_fd.to_string());
+        .arg(lock_fd.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        // The caller reads this pipe only if publication misses its deadline.
+        .stderr(Stdio::piped());
+    // Cut and escaped on this side of the exec: the daemon records the label it is given
+    // (§ 6.6), so the bound is the launcher's to spend.
     let label = label
         .map(crate::sanitize::sanitize_label)
         .filter(|label| !label.is_empty());
     if let Some(label) = label.as_deref() {
         command.arg("--label").arg(label);
     }
-}
-
-fn configure_stdio_and_lock(command: &mut Command, lock_fd: i32) {
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        // The caller reads this pipe only if publication misses its deadline.
-        .stderr(Stdio::piped());
-
     let pre_exec = move || -> io::Result<()> {
         rustix::process::setsid()?;
         // `SpawnLock` opens `CLOEXEC`. Clear it only in the forked child, so the descriptor
-        // survives the exec below. The daemon validates it against the current lock path and
+        // survives the exec. The daemon validates it against the current lock path and
         // restores `CLOEXEC` before the shell.
         // SAFETY: `lock_fd` belongs to the lock held across `Command::spawn` by the caller.
         let lock = unsafe { BorrowedFd::borrow_raw(lock_fd) };
@@ -74,6 +67,7 @@ fn configure_stdio_and_lock(command: &mut Command, lock_fd: i32) {
     unsafe {
         command.pre_exec(pre_exec);
     }
+    Ok(command)
 }
 
 #[cfg(test)]
@@ -92,7 +86,7 @@ mod tests {
         assert!(expected.len() <= crate::sanitize::MAX_LABEL_LEN);
         assert!(label.len() > crate::sanitize::MAX_LABEL_LEN, "cut nothing");
 
-        let direct = direct_command("session", Some(&label), 19).unwrap();
+        let direct = daemon_command("session", Some(&label), 19).unwrap();
         assert_eq!(
             direct.get_args().last().and_then(OsStr::to_str),
             Some(&*expected)
@@ -101,7 +95,7 @@ mod tests {
 
     #[test]
     fn the_daemon_command_line_carries_the_lock_and_the_raw_label() {
-        let command = direct_command("session", Some("cost $5"), 23).unwrap();
+        let command = daemon_command("session", Some("cost $5"), 23).unwrap();
         let args: Vec<_> = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
