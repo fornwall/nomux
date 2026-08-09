@@ -237,11 +237,18 @@ impl Foreign {
 ///
 /// Defence in depth behind the `0700` run directory and `0600` sockets (§ 6.3), for where
 /// modes do not hold. Nothing is ever sent back to the refused peer.
+/// uid 0 is turned away with everyone else: root has `/proc`, `setuid` and `ptrace`
+/// whatever this answers.
 pub(crate) fn foreign_peer(peer: BorrowedFd<'_>) -> Option<Foreign> {
     // The `getuid` § 6.3's run-directory check is written against, so that "this uid"
     // means one thing across the tree; nothing here is ever setuid, so the real uid it
     // answers with is also the one that owns the socket.
-    classify_peer(peer_uid(peer), rustix::process::getuid().as_raw())
+    let ours = rustix::process::getuid().as_raw();
+    match peer_uid(peer) {
+        Ok(uid) if uid == ours => None,
+        Ok(uid) => Some(Foreign::Uid(uid)),
+        Err(err) => Some(Foreign::Unnamed(err)),
+    }
 }
 
 /// [`foreign_peer`] for the session's two listeners, whose refusal has no reader but syslog
@@ -295,57 +302,9 @@ fn peer_uid(fd: BorrowedFd<'_>) -> io::Result<u32> {
     Ok(cred.uid)
 }
 
-/// The credentials `peer` came back with against `ours`, which is the one uid a session
-/// belongs to (§ 6.3). uid 0 is turned away with everyone else: root has `/proc`, `setuid`
-/// and `ptrace` whatever this answers.
-fn classify_peer(peer: io::Result<u32>, ours: u32) -> Option<Foreign> {
-    match peer {
-        Ok(uid) if uid == ours => None,
-        Ok(uid) => Some(Foreign::Uid(uid)),
-        Err(err) => Some(Foreign::Unnamed(err)),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// § 6.3's peer-credential rule at the three edges a suite running as one uid
-    /// cannot put in front of a live daemon: another user, root, and an answer the
-    /// kernel never gave. Against [`classify_peer`], which both listeners and
-    /// [`connect_within`] reach.
-    ///
-    /// The refusal is here rather than end to end because a real mismatched peer needs
-    /// a second uid, which the suite has no way to become. What a daemon *can* be shown
-    /// is the other direction, in `tests/session.rs`:
-    /// `a_connection_from_this_uid_is_admitted_and_reports_its_credentials`, and every
-    /// other test in the suite, since a check that refused everybody would take no
-    /// clients at all.
-    #[test]
-    fn only_this_uid_may_have_the_session() {
-        let ours = rustix::process::getuid().as_raw();
-        assert!(
-            classify_peer(Ok(ours), ours).is_none(),
-            "the uid that started the session is the one it is for"
-        );
-        assert!(
-            classify_peer(Ok(ours.wrapping_add(1)), ours).is_some(),
-            "another user's connection is refused however it reached the socket"
-        );
-        // Stated as a consequence rather than a case, so the assertion says the same
-        // thing under a suite run as root: uid 0 is refused by the general rule and
-        // admitted only where it is itself the uid that owns the session.
-        assert_eq!(
-            classify_peer(Ok(0), ours).is_none(),
-            ours == 0,
-            "root gets no exemption; it has `/proc` and `setuid` and needs none"
-        );
-        let unanswered = io::Error::from_raw_os_error(libc::ENOPROTOOPT);
-        assert!(
-            classify_peer(Err(unanswered), ours).is_some(),
-            "a uid the kernel would not report is not a uid that matches"
-        );
-    }
 
     /// What [`connect_within`] hands a caller that has a user to answer: the uid that
     /// actually owns the socket, and not the `EACCES` a `connect` refused by the
@@ -355,6 +314,9 @@ mod tests {
     /// uid, which the suite has no way to become — so this pins the two halves the
     /// relay's message is built out of: the sentence, and the kind
     /// `attach::resume_probe_class` reads to call the host unsafe rather than uncertain.
+    /// The admitting direction is end to end in `tests/session.rs`:
+    /// `a_connection_from_this_uid_is_admitted_and_reports_its_credentials`, and in every
+    /// other test in the suite, a check that refused everybody taking no clients at all.
     #[test]
     fn a_socket_bound_by_another_user_is_refused_as_that_and_not_as_a_bare_errno() {
         let refusal = Foreign::Uid(4242).refusal();
@@ -373,7 +335,7 @@ mod tests {
     ///
     /// It pins the call rather than the policy, and that is the half worth pinning. A
     /// wrong level, option or struct answers `Err` for every connection, which
-    /// [`uid_is_ours`] then refuses — a session socket that admits nobody, which is
+    /// [`foreign_peer`] then refuses — a session socket that admits nobody, which is
     /// the realistic way this goes wrong.
     #[test]
     fn the_kernel_reports_the_uid_of_a_peer_this_process_owns() {
