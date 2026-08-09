@@ -233,8 +233,7 @@ fn no_such_session(paths: &SessionPaths) -> Failure {
     Failure::new(
         FailureClass::MissingSession,
         io::Error::other(format!(
-            "no session {id}: nothing answers on {sock}. `nomux spawn {id}` starts one, \
-             and `nomux list` says what this host is holding",
+            "no session {id}: nothing answers on {sock}. `nomux spawn {id}` starts one",
             id = paths.id(),
             sock = paths.socket().display(),
         )),
@@ -250,8 +249,7 @@ fn unattachable(paths: &SessionPaths, err: &io::Error) -> Failure {
     Failure::new(
         resume_probe_class(err),
         io::Error::other(format!(
-            "session {id} could not be joined: {err}. `nomux list` says what this host \
-             is holding",
+            "session {id} could not be joined: {err}. `nomux list` says what this host holds",
             id = paths.id(),
         )),
     )
@@ -289,8 +287,8 @@ fn already_running(paths: &SessionPaths) -> Failure {
     Failure::new(
         FailureClass::Collision,
         io::Error::other(format!(
-            "session {id} already exists: something answers on {sock}. `nomux attach {id}` \
-             joins it, and `nomux kill {id}` ends it",
+            "session {id} already exists: something answers on {sock}. \
+             `nomux attach {id}` joins it",
             id = paths.id(),
             sock = paths.socket().display(),
         )),
@@ -299,15 +297,13 @@ fn already_running(paths: &SessionPaths) -> Failure {
 
 /// `spawn` on an id whose socket answered neither death nor life: [`already_running`]'s
 /// kind on weaker evidence, `spawn` being allowed to create only an id it can say is free.
+/// The error is quoted for [`unattachable`]'s reason.
 fn may_be_running(paths: &SessionPaths, err: &io::Error) -> Failure {
     Failure::new(
         FailureClass::Uncertain,
         io::Error::other(format!(
-            "session {id} may already exist: {sock} could not be probed, so that it is \
-             free was never established: {err}. `nomux attach {id}` joins it if it is \
-             there, and `nomux list` says what this host is holding",
+            "session {id} may already exist: {err}. `nomux attach {id}` joins it if so",
             id = paths.id(),
-            sock = paths.socket().display(),
         )),
     )
 }
