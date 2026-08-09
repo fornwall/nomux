@@ -142,9 +142,8 @@ struct Attached {
 }
 
 impl Attached {
-    /// The connection promoted by a `Hello` that has not been answered yet.
-    /// [`Daemon::on_hello`] decides all but `terminal_end_sent` off that same greeting:
-    /// a connection hears the end once, and only a fresh one starts owed it.
+    /// The connection a `Hello` has promoted. [`Daemon::on_hello`] settles all but
+    /// `terminal_end_sent` off that same greeting, which only a fresh connection is owed.
     const fn greeting(conn: Conn) -> Self {
         Self {
             conn,
