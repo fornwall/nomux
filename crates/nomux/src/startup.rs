@@ -75,21 +75,14 @@ pub(crate) fn arm_stop_signals() -> io::Result<OwnedFd> {
             read
         });
 
-    // Clearing an inherited mask at all is the point: a disposition is nothing without
-    // delivery, and the mask is the half that survives `exec`. A daemon started from a shell
-    // holding `SIGTERM` blocked would install the handlers above and never hear from them,
-    // so `nomux kill` would wait out its grace and `SIGKILL` — no exit trap run and § 6.5's
-    // shutdown not run at all.
+    // A disposition is nothing without delivery, and the mask is the half that survives
+    // `exec`: with `SIGTERM` inherited blocked, the handlers above are never heard from and
+    // `nomux kill` reaches `SIGKILL` with § 6.5's shutdown unrun. After the loop for § 6.2's
+    // ordering rule, and unconditional — a mask left set is one nothing later can clear.
     //
-    // Strictly after the loop above for § 6.2's reason, and unconditional even so: with no
-    // pipe there is no handler, and a pending `SIGTERM` at `SIG_DFL` is what the next
-    // `nomux kill` produces anyway, where a mask left set is one nothing can ever clear.
-    //
-    // Cleared whole rather than unblocking [`STOP_SIGNALS`] alone, because the mask is
-    // inherited twice over: `std` documents that it does *not* reset one across
+    // Cleared whole rather than [`STOP_SIGNALS`] alone: `std` does not reset the mask across
     // `Command::spawn`, so whatever is blocked here is blocked in the session's login shell
-    // for its whole life. A parent's blocked `SIGTSTP` would cost the child `Ctrl-Z` exactly
-    // as an inherited `SIG_IGN` would (`pty.rs`), the larger of the two harms.
+    // for its whole life — a parent's `SIGTSTP` costs the child `Ctrl-Z` (`pty.rs`).
     //
     // SAFETY: `sigemptyset` initialises the set this frame owns, which `sigprocmask` is then
     // handed along with a null pointer for the old mask it is not being asked for.
@@ -106,19 +99,14 @@ pub(crate) fn arm_stop_signals() -> io::Result<OwnedFd> {
 /// Routes `SIGCHLD` into a descriptor of its own for the poll set, and hands back its
 /// read end. What the daemon then does with it is `daemon.rs`'s `collect_outcome`.
 ///
-/// A second pipe rather than a second byte down [`arm_stop_signals`]'s, for § 6.5's reason.
-/// What sharing would have cost is a drain handing the shutdown decision bytes to classify,
-/// on the one path with no second chance: a stop misread as a child costs `nomux kill` its
-/// whole grace and the user's shell its exit trap.
-///
-/// Handled rather than ignored for the child's sake (§ 6.2, and `pty.rs` for the five
-/// dispositions that do need putting back). The window between the `fork` and the `exec` is
-/// not one either: the copy has no children of its own to be told about.
+/// A second pipe rather than a second byte down [`arm_stop_signals`]'s (§ 6.5), and handled
+/// rather than ignored for the child's sake (§ 6.2, with `pty.rs` for the five dispositions
+/// that do need putting back).
 ///
 /// Called *before* [`arm_stop_signals`], which is the call that clears an inherited mask, so
-/// § 6.2's rule about arming ahead of that clear is what fixes the order. What it costs here
-/// is the milder half, `SIGCHLD`'s default being to ignore: not a daemon that dies but a
-/// notification dropped — and `collect_outcome` reaps only when notified.
+/// § 6.2's rule about arming ahead of that clear is what fixes the order. `SIGCHLD` goes
+/// first because it is the milder half to lose: its default is to ignore, so a gap here
+/// drops a notification rather than the daemon.
 pub(crate) fn arm_child_signal() -> io::Result<OwnedFd> {
     // `CLOEXEC` and the leaked write end are [`arm_stop_signals`]'s, for its reasons.
     let (read, write) = rustix::pipe::pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK)?;
@@ -144,16 +132,14 @@ pub(crate) fn arm_child_signal() -> io::Result<OwnedFd> {
 /// (§ 6.2 for the order, the two shapes that need the fork, and the `SIGHUP` ignored ahead
 /// of all of it).
 ///
-/// This prevents a terminal or SSH-channel hangup from reaching the daemon. It deliberately
-/// makes no stronger systemd claim: `setsid` and `fork` do not move a process out of its
-/// `session-*.scope`, so host policy may still terminate that scope at logout.
+/// This prevents a terminal or SSH-channel hangup from reaching the daemon, and is no
+/// systemd claim: § 6.2 has what a `session-*.scope` still does at logout.
 ///
 /// `TIOCNOTTY` would drop the terminal without a fork and is deliberately not used — § 6.2
 /// delegates the argument here. Issued by a session leader it sends `SIGHUP` and `SIGCONT`
 /// to the foreground process group, which in the case being fixed *is* this process, and it
 /// strips the controlling terminal from every other process in the session too, which is not
 /// this program's to take.
-///
 pub(crate) fn detach_from_controlling_terminal() -> io::Result<()> {
     // SAFETY: `signal` with SIG_IGN on a single-threaded process with no handler installed;
     // reset in the child before `exec` (`pty::Pty::spawn`), so it still dies on hangup.
@@ -203,14 +189,10 @@ fn has_controlling_terminal() -> bool {
 }
 
 /// Lets go of the directory the daemon inherited (§ 6.2), which would otherwise keep a
-/// removable or network mount busy for the life of the session.
+/// removable or network mount busy for [`crate::daemon`]'s whole idle life, a week (§ 6.5).
 ///
 /// Called *before* the socket and pidfile publish this session, which is the whole of why it
-/// can fail out loud. Past publication the caller has already been answered and an `Err` has
-/// nowhere left to go, so this was once silent — and a pinned mount was the cheaper of the
-/// two outcomes only while the daemon might be killed at logout anyway. `e2e-tests/` now
-/// measures that on a host that lets its sessions outlive their login it is not, so the
-/// mount stays busy for [`crate::daemon`]'s whole idle life, a week.
+/// can fail out loud; § 6.2 has why that beats the silence it used to keep.
 ///
 /// The child does not follow. `pty::child_dir` captured where it starts before this ran.
 ///
@@ -226,10 +208,9 @@ pub(crate) fn leave_startup_directory() -> io::Result<()> {
 /// Opens the `/dev/null` that [`silence_standard_descriptors`] will point stdio at.
 ///
 /// Split from the redirection it feeds, and for [`leave_startup_directory`]'s reason: the
-/// *open* is what can fail, so it happens while a failure can still be reported, and the
-/// `dup2`s that cannot be reported are left with nothing to fail at. A host with no
-/// `/dev/null` used to get a daemon holding the login's descriptors open for a week —
-/// silently, and with the terminal case (§ 6.2's `nomux daemon x`) the worst of it.
+/// *open* is the half that can fail, so it happens while a failure still reaches somebody
+/// (§ 6.2). A host with no `/dev/null` used to get a daemon silently holding the login's
+/// descriptors open for a week.
 ///
 /// # Errors
 ///
@@ -239,20 +220,17 @@ pub(crate) fn open_null_device() -> io::Result<OwnedFd> {
     rustix::fs::open("/dev/null", OFlags::RDWR | OFlags::CLOEXEC, Mode::empty()).map_err(Into::into)
 }
 
-/// Points the three standard descriptors at `null`, last of all for the reason § 6.2 gives:
-/// this is the call that takes the daemon's voice away, so nothing that might need to
-/// explain itself may run after it.
+/// Points the three standard descriptors at `null`, last of all (§ 6.2).
 ///
-/// Still silent, and now trivially so — [`open_null_device`] already proved the descriptor,
-/// and `dup2` onto a valid one fails for nothing this process can cause.
+/// Silent, and trivially so — [`open_null_device`] already proved the descriptor, and `dup2`
+/// onto a valid one fails for nothing this process can cause.
 ///
-/// What makes pointing the three at `/dev/null` safe is not the ordering, which cannot help:
-/// by here the daemon has bound its socket and armed its stop pipe, and nothing below can
-/// tell an inherited terminal from a descriptor of its own. It is that these three numbers
-/// were never free — std's runtime opens `/dev/null` onto any of them that `main` would have
-/// inherited closed, and aborts rather than starting without them, so the lowest free number
-/// a `bind` here can be given is 3. Without that, § 6.2's `nomux daemon x 0<&- 1>&- 2>&-`
-/// would land the listener on fd 1 and the pipe's read end on fd 2 for the `dup2`s below to
+/// What makes this safe is not the ordering, which cannot help: by here the socket is bound
+/// and the stop pipe armed, and nothing below can tell an inherited terminal from a
+/// descriptor of its own. It is that these three numbers were never free — std's runtime
+/// opens `/dev/null` onto any of them `main` inherited closed, and aborts rather than start
+/// without them, so the lowest number a `bind` here can be given is 3. Without that, § 6.2's
+/// `nomux daemon x 0<&- 1>&- 2>&-` would land the listener on fd 1 for the `dup2`s below to
 /// silence — an id claimed by a daemon nothing can ever reach. `tests/session.rs` starts one
 /// that way and greets it.
 pub(crate) fn silence_standard_descriptors(null: &OwnedFd) {

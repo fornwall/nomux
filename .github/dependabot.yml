@@ -47,3 +47,26 @@ updates:
         applies-to: security-updates
         patterns: ["*"]
         update-types: ["patch"]
+
+  # e2e-tests/probe/ is the third workspace and lockfile, and until this entry it was the only
+  # one nothing kept current. Its one dependency is a path into crates/nomux, so what this
+  # watches is the lock file rather than a manifest: the probe resolves the crate's transitive
+  # dependencies independently of the root workspace, and a drift there means the job that
+  # measures the logout matrix builds nomux against different versions from the ones the test
+  # suite ran on. Weekly rather than daily, there being no direct registry dependency to bump.
+  #
+  # Grouped, so a bump arrives as one pull request, but named so it does *not* match
+  # auto-merge.yml's `dependabot/cargo/(fuzz/)?(patch|security-patch)-(fuzz-)?cargo-` branch
+  # test. That is the point: widening what merges without a human is a separate decision from
+  # keeping a lock file current, and it is not made here.
+  - package-ecosystem: cargo
+    directory: /e2e-tests/probe
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:47"
+      timezone: Europe/Stockholm
+    groups:
+      probe-cargo:
+        patterns: ["*"]
+        update-types: ["patch", "minor"]

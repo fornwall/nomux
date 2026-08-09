@@ -4,8 +4,12 @@ on:
   pull_request_target:
     branches: [main]
     types: [opened, reopened, synchronize, edited, ready_for_review]
+  # Every fifteen minutes, which is as fast as anything here turns over: dependabot opens its
+  # pull requests at 05:17, 05:27 and 05:37, and the two jobs below only have work when one of
+  # those exists or has gone stale behind main. Every five was 288 runs a day of each. The `3/`
+  # offset stays — GitHub queues scheduled workflows worst at the top of the hour.
   schedule:
-    - cron: '3/5 * * * *'
+    - cron: '3/15 * * * *'
   workflow_dispatch:
 
 permissions: {}
@@ -37,7 +41,13 @@ jobs:
 
   dependencies:
     name: enable safe dependency updates
-    if: github.event_name != 'pull_request_target' && github.actor != 'dependabot[bot]'
+    # The schedule and the manual run, never the pull request event: this job goes and finds its
+    # own candidates rather than being handed one. It carries no `github.actor` clause, and the
+    # one it used to carry was worse than redundant — the only event dependabot can be the actor
+    # of is `pull_request_target`, which the test above already excludes, while on `schedule`
+    # `github.actor` is whoever last modified this file. A dependabot pull request touching
+    # auto-merge.yml would therefore have switched both scheduled jobs off for good, silently.
+    if: github.event_name != 'pull_request_target'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -80,7 +90,8 @@ jobs:
 
   refresh:
     name: refresh the oldest stale trusted PR
-    if: github.event_name != 'pull_request_target' && github.actor != 'dependabot[bot]'
+    # No `github.actor` clause, for the reason the job above gives.
+    if: github.event_name != 'pull_request_target'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     concurrency:

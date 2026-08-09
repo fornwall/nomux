@@ -2,7 +2,15 @@
 [profile.default]
 slow-timeout = { period = "20s", terminate-after = 2 }
 
-# This ignored test intentionally waits through the 30-second first-attach timeout.
+# This ignored test intentionally waits through the 30-second first-attach timeout,
+# and measures 33 s doing it. Three periods is 60 s: room for a loaded machine, and
+# not the 100 s that would let a genuine hang sit for a minute and a half.
 [[profile.default.overrides]]
 filter = 'test(=a_daemon_nobody_ever_attaches_to_reaps_itself)'
-slow-timeout = { period = "20s", terminate-after = 5 }
+slow-timeout = { period = "20s", terminate-after = 3 }
+
+# The same bargain one timeout up: this ignored test waits through the 60-second agent
+# idle timeout and measures 60.2 s, so six periods leave it the same room to be slow in.
+[[profile.default.overrides]]
+filter = 'test(=a_stalled_agent_channel_is_given_up_so_the_next_peer_gets_its_turn)'
+slow-timeout = { period = "20s", terminate-after = 6 }

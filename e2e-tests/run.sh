@@ -55,8 +55,11 @@ echo "building nomux and the probe for $arch..." >&2
 rustup target list --installed | grep -qx "$arch" ||
     die "the $arch target is not installed: rustup target add $arch"
 
-( cd "$repo" && cargo build --release --target "$arch" --bin nomux ) >&2
-( cd "$here/probe" && cargo build --release --target "$arch" ) >&2
+# `--locked` on both, as every other cargo invocation in the tree has it: what this harness
+# measures is the behaviour of a committed tree, and a resolver quietly moving past either lock
+# file would make the run a fact about whatever crates.io held that morning.
+( cd "$repo" && cargo build --locked --release --target "$arch" --bin nomux ) >&2
+( cd "$here/probe" && cargo build --locked --release --target "$arch" ) >&2
 
 mkdir -p "$here/bin"
 cp "$target/$arch/release/nomux" "$here/bin/nomux"
@@ -143,6 +146,35 @@ await_ssh() {
         "      cgroup or PID 1 failures rather than assuming nomux is at fault."
 }
 
+# What the container on the other end of this port actually booted with, against what the
+# row asked for. `image/cell-entrypoint.sh` writes /run-cell.env after applying the three
+# axes and before handing over to PID 1, so it is the configuration itself rather than the
+# compose file's request for one.
+#
+# This is the harness's one silent-wrong failure mode closed. Everything else here fails
+# loudly: a cell that will not boot, a login that will not die, a cgroup nothing recognises.
+# But a port swapped between matrix.tsv and docker-compose.yml produces a run where every
+# login works, every verdict is a real measurement, and each one is filed against another
+# cell's axes — and if the two rows happen to predict the same thing, it passes.
+confirm_axes() {
+    cid=$(docker compose ps -q "$1")
+    [ -n "$cid" ] || die "$1: no running container to read /run-cell.env from"
+    booted=$(docker exec "$cid" cat /run-cell.env) ||
+        die "$1: the container never wrote /run-cell.env, so it did not get through" \
+            "      image/cell-entrypoint.sh and its axes are whatever the image defaults to."
+    # `asked` rather than `wanted`: a function's variables are this shell's, and `wanted` is
+    # already the cell name from the command line up at the top of the file.
+    asked="CELL_KILL_USER_PROCESSES=$2
+CELL_LINGER=$3
+CELL_PAM_SYSTEMD=$4"
+    [ "$booted" = "$asked" ] || die \
+        "$1: the container on port $5 booted axes this row did not ask for." \
+        "      matrix.tsv:    $(printf '%s' "$asked" | tr '\n' ' ')" \
+        "      the container: $(printf '%s' "$booted" | tr '\n' ' ')" \
+        "      A port that disagrees between matrix.tsv and docker-compose.yml looks exactly" \
+        "      like this. Reconcile the two files; do not adjust the prediction."
+}
+
 # ------------------------------------------------------------------- the dropped wire
 
 # sshd's unprivileged child for the one login a cell makes — `sshd: nomuxer@notty`. It is
@@ -195,6 +227,17 @@ abrupt_login() {
     }
 
     out=$(mktemp)
+    client=''
+    # A trap of this subshell's own. `abrupt_login` is called from a command substitution, and
+    # a POSIX subshell starts with every trap its parent caught reset to the default — so the
+    # run's INT/TERM handler is not installed in here, and nothing else in this function is
+    # reached on a signal. What would be left behind is not only the temporary file: the
+    # background ssh client below holds a login open inside the container, which is exactly
+    # what the next cell in that container would measure. `abrupt_abort` removes both, which
+    # is why `client` is emptied above rather than left unset for it to trip over. The
+    # parent's trap still runs afterwards and still takes the containers down.
+    trap 'abrupt_abort "$name: interrupted before the disconnect was measured"; exit 130' \
+        INT TERM HUP
     # `exec`, so `$!` is ssh itself rather than a subshell holding it. This client has to be
     # killed by hand at the end — it is talking to a blackhole and will never learn
     # otherwise — and killing a wrapper would leave the connection open behind it.
@@ -274,14 +317,25 @@ while IFS='	' read -r name port kup linger pam logout expect; do
     printf '\n=== %s (KillUserProcesses=%s linger=%s pam_systemd=%s %s logout, expect %s)\n' \
         "$name" "$kup" "$linger" "$pam" "$logout" "$expect" >&2
     await_ssh "$port" "$name"
+    confirm_axes "$name" "$kup" "$linger" "$pam" "$port"
 
     id="cell$(printf '%s' "$name" | tr -cd 'a-z0-9')"
     # One login: create the session, report which path the launcher took, then end — by
     # logging out, or by losing the network under it. That difference is the whole of the
     # `logout` axis; everything from here down is the same measurement either way.
     if [ "$logout" = abrupt ]; then
-        created=$(abrupt_login "$port" "$name" "$id" 2>&1) || die \
-            "$name: the abrupt-disconnect login did not get as far as a disconnect."
+        # No `2>&1` on this branch, unlike the clean one below. `abrupt_login` has five
+        # distinct explanations for giving up and writes every one of them to stderr, so
+        # merging them into `$created` would leave `die` printing the generic line below and
+        # nothing else — on a CI runner, with the containers already torn down, that is the
+        # whole of what there is to go on. Letting them stream out live is also what keeps
+        # the invariant `abrupt_login`'s own redirections exist for: its stdout is the cell's
+        # report and gets parsed for TEARDOWN-SECONDS and DAEMON-CGROUP below, and the
+        # `iptables -D` at the end of it is `|| true`, so its complaints have somewhere to go
+        # that is not the parsed stream.
+        if ! created=$(abrupt_login "$port" "$name" "$id"); then
+            die "$name: the abrupt-disconnect login did not get as far as a disconnect."
+        fi
     elif ! created=$(ssh_to "$port" "nomux-cell-create $id" 2>&1); then
         printf '%s\n' "$created" | sed 's/^/    /' >&2
         die "$name: could not create a session to test"

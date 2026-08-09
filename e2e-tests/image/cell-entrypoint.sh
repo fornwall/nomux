@@ -57,6 +57,9 @@ fi
 
 # Recorded where the runner can read it back, so a cell's verdict is filed against the
 # configuration it actually booted with rather than the one the compose file requested.
+# `confirm_axes` in run.sh reads this over `docker exec` before every cell and dies on a
+# mismatch, which is what keeps a port disagreeing between matrix.tsv and docker-compose.yml
+# from producing a run that measures the right thing and labels it the wrong one.
 cat > /run-cell.env <<EOF
 CELL_KILL_USER_PROCESSES=$cell_kill
 CELL_LINGER=$cell_linger

@@ -28,16 +28,13 @@ const _: () = assert!(
 /// session reallocates the queue down and back up on every pass.
 const RETAINED_CAPACITY: usize = 128 * 1024;
 
-/// The same for the receive buffer, and three orders of magnitude smaller because the
-/// argument above is the send side's alone: this direction carries keystrokes and control
-/// frames, and only a paste ever takes it past a page.
+/// The same for the receive buffer, three orders of magnitude smaller: this direction
+/// carries keystrokes and control frames, and only a paste takes it past a page.
 const RETAINED_INPUT: usize = 4096;
 
 /// Reclaims the consumed prefix of a cursor-and-`Vec` buffer, keeping `floor` bytes of
-/// capacity where it empties one. The empty case is separated because clearing is free
-/// where draining is not, and the surviving case moves on a *ratio*: a fixed threshold
-/// moves about `n²/2c` bytes over a queue of `n` drained in `c`-byte writes, where
-/// halving is O(1) amortised however the writes fall.
+/// capacity where it empties one. The surviving case moves on a *ratio* rather than a
+/// fixed threshold, which is what makes it O(1) amortised however the writes fall.
 fn compact(buf: &mut Vec<u8>, pos: &mut usize, floor: usize) {
     if *pos == buf.len() {
         buf.clear();
@@ -53,7 +50,6 @@ fn compact(buf: &mut Vec<u8>, pos: &mut usize, floor: usize) {
 const FINAL_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// A client connection carrying partially read and partially written frames.
-#[derive(Debug)]
 pub(crate) struct Conn {
     stream: UnixStream,
     rx: Vec<u8>,
@@ -65,6 +61,21 @@ pub(crate) struct Conn {
     /// of the stream.
     preamble_queued: bool,
     eof: bool,
+}
+
+impl std::fmt::Debug for Conn {
+    /// Sizes and flags, never bytes: `rx` and `tx` are deliberately left out. Derived,
+    /// this would hand both buffers to whatever printed a `Conn` — the megabyte § 4.1
+    /// lets each of them reach, of session output and of whatever the peer last typed —
+    /// and the only place this binary prints to is syslog.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Conn")
+            .field("buffered", &self.buffered())
+            .field("queued", &self.queued())
+            .field("preamble_queued", &self.preamble_queued)
+            .field("eof", &self.eof)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Conn {
@@ -164,20 +175,14 @@ impl Conn {
     /// [`MAX_PENDING_READ`] still undecoded.
     ///
     /// `chunk` is the caller's, and is only ever written to: a buffer of its own would be
-    /// zeroed on every call, and the daemon already carries one.
+    /// zeroed on every call, and the daemon already carries one. It must be non-empty —
+    /// `read` into a zero-length slice answers `Ok(0)`, which is taken for the peer's end
+    /// of file. Both callers hand over the daemon's whole 64 KiB read buffer.
     ///
     /// # Errors
     ///
     /// Propagates read failures other than `EWOULDBLOCK` and `EINTR`.
     pub(crate) fn fill(&mut self, chunk: &mut [u8]) -> io::Result<()> {
-        // `Read::read` answers `Ok(0)` for an empty destination without consulting the
-        // socket. That is not the peer's EOF, and recording it as one would permanently
-        // take this connection out of the event loop's read set. Production hands over a
-        // 64 KiB buffer; keeping the helper sound for every slice costs one branch per
-        // fill rather than a latent lifecycle trap for its next caller.
-        if chunk.is_empty() {
-            return Ok(());
-        }
         while self.buffered() < MAX_PENDING_READ {
             let room = MAX_PENDING_READ - self.buffered();
             let read_len = chunk.len().min(room);
@@ -319,15 +324,25 @@ mod tests {
         (peer, Conn::new(ours).expect("a connection"))
     }
 
+    /// The rendering pinned exactly, so a `#[derive(Debug)]` cannot come back silently:
+    /// derived, both buffers go wherever a `Conn` is printed, and in this binary that is
+    /// syslog. Frames on both sides, so a derive would have contents to leak.
     #[test]
-    fn an_empty_read_buffer_does_not_invent_end_of_file() {
-        let (_peer, mut conn) = pair();
+    fn the_debug_rendering_carries_no_buffer_contents() {
+        let (mut peer, mut conn) = pair();
+        conn.send(&Frame::Output {
+            offset: 0,
+            data: b"queued output",
+        });
+        let typed = encoded(&Frame::Input {
+            offset: 0,
+            data: b"typed input",
+        });
+        feed(&mut peer, &mut conn, &typed);
 
-        conn.fill(&mut []).expect("an empty fill is a no-op");
-
-        assert!(
-            !conn.is_eof(),
-            "a zero-length destination says nothing about whether the peer is open"
+        assert_eq!(
+            format!("{conn:?}"),
+            "Conn { buffered: 23, queued: 37, preamble_queued: true, eof: false, .. }"
         );
     }
 

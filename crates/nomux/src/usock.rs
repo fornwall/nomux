@@ -10,7 +10,7 @@
 //! Through `libc` rather than rustix, whose sockets sit behind a `net` feature § 8's
 //! budget is why this crate does not enable.
 
-use std::ffi::OsStr;
+use std::fmt;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
@@ -63,11 +63,8 @@ const PROBE_RETRY: Duration = Duration::from_millis(10);
 /// Propagates the `connect`, so [`nothing_is_listening`] still divides a dead daemon from
 /// everything else, and reports [`io::ErrorKind::TimedOut`] for a backlog that never
 /// drained — neither death nor an answer, and licence for no unlink.
-pub(crate) fn connect_within(path: &Path, within: Duration) -> io::Result<UnixStream> {
+fn connect_within(path: &Path, within: Duration) -> io::Result<UnixStream> {
     let addr = unix_address(path)?;
-    // The `<id>` of `<id>.sock`, which is all the refusal below needs a name for; an id is
-    // a `String` (§ 6.3), so the fallback is for a path no `SessionPaths` can produce.
-    let id = path.file_stem().and_then(OsStr::to_str).unwrap_or_default();
     let deadline = Instant::now() + within;
     loop {
         match connect_once(&addr) {
@@ -78,12 +75,16 @@ pub(crate) fn connect_within(path: &Path, within: Duration) -> io::Result<UnixSt
                     err.kind(),
                     io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                 ) => {}
-            // Refused as `EACCES`, which [`liveness`] reads as [`Liveness::Unknown`] —
-            // neither death nor an answer, so the refusal licenses no unlink.
-            Ok(stream) if !peer_is_ours(stream.as_fd(), id) => {
-                return Err(io::Error::from_raw_os_error(libc::EACCES));
+            // This caller has a user to answer, so the refusal is returned rather than
+            // logged, and [`liveness`] reads it as [`Liveness::Unknown`]: a socket with an
+            // owner is not a dead one, so it licenses no unlink.
+            Ok(stream) => {
+                if let Some(foreign) = foreign_peer(stream.as_fd()) {
+                    return Err(foreign.refusal());
+                }
+                return Ok(stream);
             }
-            outcome => return outcome,
+            Err(err) => return Err(err),
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -111,16 +112,13 @@ pub(crate) enum Liveness {
     Stale(io::Error),
     /// The `connect` failed for a reason that is not death, carrying it.
     ///
-    /// § 6.3's "`EACCES` is not staleness": the same conservative answer as
-    /// [`Self::Alive`] for the *unlink*, and its opposite everywhere else, since only an
-    /// accepted connection may escalate to `SIGKILL`.
+    /// Answers as conservatively as [`Self::Alive`] for the *unlink*, and its opposite
+    /// everywhere else, since only an accepted connection may escalate to `SIGKILL`.
     Unknown(io::Error),
 }
 
-/// Probes the socket. A refused connection means the daemon is gone; the socket file
-/// outlives the process that bound it.
-///
-/// Through [`connect_within`], which owns the argument for the deadline.
+/// Probes the socket, through [`connect_within`], which owns the argument for the
+/// deadline and [`nothing_is_listening`], which owns what a failure means.
 pub(crate) fn liveness(socket: &Path, within: Duration) -> Liveness {
     match connect_within(socket, within) {
         Ok(stream) => Liveness::Alive(stream),
@@ -199,27 +197,64 @@ fn unix_address(path: &Path) -> io::Result<libc::sockaddr_un> {
     Ok(addr)
 }
 
-/// Whether a connection just off one of the session's two listeners is this user's, and
-/// so may be heard at all (§ 6.3); a refusal is reported against `id`.
+/// Why the process at the other end of a session socket is not one this uid may speak to
+/// (§ 6.3).
+pub(crate) enum Foreign {
+    /// Another user's uid.
+    Uid(u32),
+    /// A peer the kernel would not describe. A `getsockopt` that failed is evidence of
+    /// nothing, and nothing is not a match.
+    Unnamed(io::Error),
+}
+
+impl fmt::Display for Foreign {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Uid(uid) => write!(formatter, "uid {uid}"),
+            Self::Unnamed(err) => write!(formatter, "a uid this host would not report ({err})"),
+        }
+    }
+}
+
+impl Foreign {
+    /// This refusal as an error for a caller that has somewhere to report it.
+    ///
+    /// `PermissionDenied` because that is what it is, and because [`nothing_is_listening`]
+    /// must never read a socket that has an owner as a dead one (§ 6.3).
+    pub(crate) fn refusal(&self) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("bound by {self}, not by this user"),
+        )
+    }
+}
+
+/// Whether the peer at the other end of `peer` is somebody else, and so may not be heard at
+/// all (§ 6.3); `Some` carries why, for the caller to report where it can.
 ///
 /// Defence in depth behind the `0700` run directory and `0600` sockets (§ 6.3), for where
-/// modes do not hold. Nothing is sent back to the refused peer; syslog hears it instead
-/// (§ 11).
-pub(crate) fn peer_is_ours(peer: BorrowedFd<'_>, id: &str) -> bool {
-    let uid = peer_uid(peer);
+/// modes do not hold. Nothing is ever sent back to the refused peer.
+/// uid 0 is turned away with everyone else: root has `/proc`, `setuid` and `ptrace`
+/// whatever this answers.
+pub(crate) fn foreign_peer(peer: BorrowedFd<'_>) -> Option<Foreign> {
     // The `getuid` § 6.3's run-directory check is written against, so that "this uid"
     // means one thing across the tree; nothing here is ever setuid, so the real uid it
     // answers with is also the one that owns the socket.
-    if uid_is_ours(&uid, rustix::process::getuid().as_raw()) {
-        return true;
+    let ours = rustix::process::getuid().as_raw();
+    match peer_uid(peer) {
+        Ok(uid) if uid == ours => None,
+        Ok(uid) => Some(Foreign::Uid(uid)),
+        Err(err) => Some(Foreign::Unnamed(err)),
     }
-    crate::sanitize::error(
-        id,
-        &match uid {
-            Ok(uid) => format!("refused a connection from uid {uid}"),
-            Err(err) => format!("refused a connection whose uid could not be read: {err}"),
-        },
-    );
+}
+
+/// [`foreign_peer`] for the session's two listeners, whose refusal has no reader but syslog
+/// (§ 11): `startup::silence_standard_descriptors` has already taken the daemon's stderr.
+pub(crate) fn peer_is_ours(peer: BorrowedFd<'_>, id: &str) -> bool {
+    let Some(foreign) = foreign_peer(peer) else {
+        return true;
+    };
+    crate::sanitize::error(id, &format!("refused a connection from {foreign}"));
     false
 }
 
@@ -264,52 +299,31 @@ fn peer_uid(fd: BorrowedFd<'_>) -> io::Result<u32> {
     Ok(cred.uid)
 }
 
-/// Whether the credentials `peer` came back with are `ours`, which is the one uid a session
-/// belongs to (§ 6.3). uid 0 is turned away with everyone else — root has `/proc`, `setuid`
-/// and `ptrace` whatever this answers — and so is a peer the kernel would not describe, a
-/// `getsockopt` that failed being evidence of nothing.
-const fn uid_is_ours(peer: &io::Result<u32>, ours: u32) -> bool {
-    matches!(peer, Ok(uid) if *uid == ours)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// § 6.3's peer-credential rule at the three edges a suite running as one uid
-    /// cannot put in front of a live daemon: another user, root, and an answer the
-    /// kernel never gave. Against [`uid_is_ours`], which both listeners reach through
-    /// [`peer_is_ours`].
+    /// What [`connect_within`] hands a caller that has a user to answer: the uid that
+    /// actually owns the socket, and not the `EACCES` a `connect` refused by the
+    /// directory's modes would have produced.
     ///
-    /// The refusal is here rather than end to end because a real mismatched peer needs
-    /// a second uid, which the suite has no way to become. What a daemon *can* be shown
-    /// is the other direction, in `tests/session.rs`:
-    /// `a_connection_from_this_uid_is_admitted_and_reports_its_credentials`, and every
-    /// other test in the suite, since a check that refused everybody would take no
-    /// clients at all.
+    /// Constructed rather than provoked — a socket owned by another uid needs a second
+    /// uid, which the suite has no way to become — so this pins the two halves the
+    /// relay's message is built out of: the sentence, and the kind
+    /// `attach::resume_probe_class` reads to call the host unsafe rather than uncertain.
+    /// The admitting direction is end to end in `tests/session.rs`:
+    /// `a_connection_from_this_uid_is_admitted_and_reports_its_credentials`, and in every
+    /// other test in the suite, a check that refused everybody taking no clients at all.
     #[test]
-    fn only_this_uid_may_have_the_session() {
-        let ours = rustix::process::getuid().as_raw();
+    fn a_socket_bound_by_another_user_is_refused_as_that_and_not_as_a_bare_errno() {
+        let refusal = Foreign::Uid(4242).refusal();
+        assert_eq!(refusal.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(refusal.to_string(), "bound by uid 4242, not by this user");
+
+        let unnamed = Foreign::Unnamed(io::Error::from_raw_os_error(libc::ENOPROTOOPT)).refusal();
         assert!(
-            uid_is_ours(&Ok(ours), ours),
-            "the uid that started the session is the one it is for"
-        );
-        assert!(
-            !uid_is_ours(&Ok(ours.wrapping_add(1)), ours),
-            "another user's connection is refused however it reached the socket"
-        );
-        // Stated as a consequence rather than a case, so the assertion says the same
-        // thing under a suite run as root: uid 0 is refused by the general rule and
-        // admitted only where it is itself the uid that owns the session.
-        assert_eq!(
-            uid_is_ours(&Ok(0), ours),
-            ours == 0,
-            "root gets no exemption; it has `/proc` and `setuid` and needs none"
-        );
-        let unanswered = io::Error::from_raw_os_error(libc::ENOPROTOOPT);
-        assert!(
-            !uid_is_ours(&Err(unanswered), ours),
-            "a uid the kernel would not report is not a uid that matches"
+            unnamed.to_string().contains("would not report"),
+            "a peer the kernel would not describe is refused as that too: {unnamed}"
         );
     }
 
@@ -318,7 +332,7 @@ mod tests {
     ///
     /// It pins the call rather than the policy, and that is the half worth pinning. A
     /// wrong level, option or struct answers `Err` for every connection, which
-    /// [`uid_is_ours`] then refuses — a session socket that admits nobody, which is
+    /// [`foreign_peer`] then refuses — a session socket that admits nobody, which is
     /// the realistic way this goes wrong.
     #[test]
     fn the_kernel_reports_the_uid_of_a_peer_this_process_owns() {

@@ -7,13 +7,25 @@
 use std::collections::{TryReserveError, VecDeque};
 
 /// A rolling window over the tail of the output stream.
-#[derive(Debug)]
 pub(crate) struct Ring {
     buf: VecDeque<u8>,
     /// Not `buf.capacity()`: the allocation may hold more than was asked for, so reading
     /// the window back off it would silently enlarge the protocol-visible retention.
     capacity: usize,
     base: u64,
+}
+
+/// Shape only, never contents: the window is `NOMUX_RING_BYTES` wide — a gibibyte is a
+/// legal setting — and a derived `Debug` would put all of it through syslog the first
+/// time anything above it is formatted with `{:?}`.
+impl core::fmt::Debug for Ring {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Ring")
+            .field("base", &self.base)
+            .field("len", &self.buf.len())
+            .field("capacity", &self.capacity)
+            .finish()
+    }
 }
 
 impl Ring {
@@ -58,9 +70,8 @@ impl Ring {
     /// Discarding is not reported here; whether a *reader* lost anything is derived
     /// per client from [`Ring::base`], for the reason `IMPLEMENTATION.md` § 4 gives.
     pub(crate) fn push(&mut self, data: &[u8]) {
-        // One number for both sides of the eviction: what falls out of the window is
-        // `retained + new - capacity` however it splits between the buffer's head and
-        // this write's own, and `base` advances by the whole of it.
+        // One number for both sides of the eviction, however it splits between the
+        // buffer's head and this write's own: `base` advances by the whole of it.
         let overflow = self
             .buf
             .len()
@@ -200,6 +211,17 @@ mod tests {
         );
         assert_eq!(read_from(&ring, ring.base()), b"defghi");
         assert_eq!(read_from(&ring, 5), b"fghi");
+    }
+
+    #[test]
+    fn debug_reports_the_shape_and_not_the_window() {
+        let mut ring = Ring::new(4);
+        ring.push(b"abcd");
+        let shown = format!("{ring:?}");
+        assert_eq!(
+            shown, "Ring { base: 0, len: 4, capacity: 4 }",
+            "retained bytes must not be reachable by formatting a struct that holds a ring"
+        );
     }
 
     /// Chunks run past the ring's own capacity, so the oversized-write branch is

@@ -2,6 +2,13 @@
 
 [advisories]
 ignore = []
+# The same scope for both, which they did not have: `unmaintained` was left at its default while
+# `unsound` was widened, so an unmaintained advisory against a crate nothing here names directly
+# went unreported. Both take "all" | "workspace" | "transitive" | "none", and the default has
+# already moved once between cargo-deny releases — a reason to name it rather than inherit it.
+# "all" is affordable because the whole graph is eight crates: there is no long tail here for a
+# transitive advisory to be unactionable in.
+unmaintained = "all"
 unsound = "all"
 yanked = "deny"
 

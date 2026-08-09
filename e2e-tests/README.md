@@ -8,8 +8,8 @@ The answer is not nomux's to give, and it is no longer nomux's to influence eith
 `setsid` and `fork` move the daemon off the controlling terminal but not out of sshd's
 `session-N.scope` cgroup ([`startup.rs`'s
 `detach_from_controlling_terminal`](../crates/nomux/src/startup.rs) says so), and
-[`launcher.rs`](../crates/nomux/src/launcher.rs) now launches the daemon **directly and
-always** — there is no scope to escape into, nothing is probed before the launch, and the
+[`attach.rs`'s `spawn_daemon`](../crates/nomux/src/attach.rs) now launches the daemon
+**directly and always** — there is no scope to escape into, nothing is probed before the launch, and the
 daemon's fate is decided by `logind.conf`'s `KillUserProcesses` and by nothing else. That
 makes the matrix a measurement of host policy rather than of a choice nomux makes, which
 is a smaller claim but the same amount of work to check: whether each combination behaves
@@ -20,11 +20,18 @@ So each cell here is a container running **systemd as PID 1, a real logind, a re
 a real PAM stack**, and the harness logs in over SSH twice: once to create a session, once
 to ask whether it is still there. `docker exec` would bypass all four and prove nothing.
 
-And half the cells never log out at all. The case nomux exists for is a connection that
+And two of the cells never log out at all. The case nomux exists for is a connection that
 **drops** — a closed lid, a dead NAT entry — which sshd learns of only when its
 `ClientAlive` timer expires, and which reaches the logout down a different path from an
 orderly channel close. Those cells hold the login open and then blackhole port 22 inside
 the container, so nothing can tell sshd the client has gone.
+
+There are six cells, and the number is a decision rather than an accident. `systemd logout
+matrix` is a required status check, so every row here is booted, logged into and waited on
+by every pull request; a `drop-` row in particular costs the run sshd's whole `ClientAlive`
+timeout in wall clock. A row earns its place by being the only way to learn something. The
+matrix had ten and four of them were second witnesses — `matrix.tsv` says, per surviving
+row, what its own fact is and what the retired ones were duplicating.
 
 ## Running it
 
@@ -50,14 +57,10 @@ record of measured behaviour, not a wishlist.
 |---|---|---|---|---|---|---|
 | `no-user-bus` | no | no | **no** | clean | no-logind | survives |
 | `kup-off-linger-off` | no | no | yes | clean | direct | survives |
-| `kup-off-linger-on` | no | yes | yes | clean | direct | survives |
 | `kup-on-linger-off` | **yes** | no | yes | clean | direct | **dies** |
 | `kup-on-linger-on` | **yes** | yes | yes | clean | direct | **dies** |
-| `drop-no-user-bus` | no | no | **no** | **abrupt** | no-logind | survives |
 | `drop-kup-off-linger-off` | no | no | yes | **abrupt** | direct | survives |
-| `drop-kup-off-linger-on` | no | yes | yes | **abrupt** | direct | survives |
 | `drop-kup-on-linger-off` | **yes** | no | yes | **abrupt** | direct | **dies** |
-| `drop-kup-on-linger-on` | **yes** | yes | yes | **abrupt** | direct | **dies** |
 
 The finding is the `KillUserProcesses` column and nothing else: **on a host that sets
 `KillUserProcesses=yes`, a nomux session does not survive the final logout**, and no
@@ -70,26 +73,28 @@ Somebody who needs persistence on a strict host arranges it above nomux: `loginc
 enable-linger` **plus a scope of their own**, or a `systemd-run --user --scope` wrapper
 around the `spawn` command.
 
-### What the linger cells are for now
+### The one linger cell
 
-Nothing in nomux reads linger any more, so the four linger cells no longer exercise a
-nomux code path. They are kept because that is the claim worth pinning, and because the
-measurement is cheap — one environment variable and a container that would be booted
-anyway.
+Nothing in nomux reads linger any more, so `kup-on-linger-on` no longer exercises a nomux
+code path. It is the one linger cell left of four, and the one kept because it is the only
+one whose *verdict* ever moved. It read `survives` until the launcher was deleted: `spawn`
+used to detect a lingering user manager and start the daemon through `systemd-run --user
+--scope`, which put it in a manager-owned transient scope that outlived the login session
+and so outlived `KillUserProcesses`. With the scope gone, linger buys nothing — a lingering
+`user@UID.service` owns nothing the daemon is in — and the cell dies with its linger-off
+twin.
 
-`kup-on-linger-on` earns its place twice over. It read `survives` until the launcher was
-deleted: `spawn` used to detect a lingering user manager and start the daemon through
-`systemd-run --user --scope`, which put it in a manager-owned transient scope that outlived
-the login session and so outlived `KillUserProcesses`. With the scope gone, linger buys
-nothing — a lingering `user@UID.service` owns nothing the daemon is in — and the cell dies
-with its linger-off twin. It is now the regression test for the deletion itself: a
-`survives` measured here again means a scope launch has come back, and `run.sh` fails on a
-verdict that is better than predicted exactly as readily as on one that is worse.
-`kup-off-linger-on` is its control, and says a `survives` under linger is not evidence
-that linger did anything.
+It used to be described here as the regression test for that deletion. It is not, quite,
+and the distinction is what let three more linger cells sit in the matrix looking useful.
+The actual regression test is in the section below: `run.sh` fails the run on **any** cell
+whose daemon lands in a `nomux-*.scope`, and that check runs on all six rows. It catches a
+returning scope launch even on a host where the verdict happens not to move, which is
+strictly more than any single row can do. What this row adds on top is one measurement
+taken on a host where a lingering user manager is really running — a real state to have
+covered once, not the guard.
 
-The cells make that argument only if the lingering user manager is really there, which is
-why `session-create.sh` still reports `LINGER`, `XDG_RUNTIME_DIR` and `USER-BUS` although
+That argument holds only if the lingering user manager really is there, which is why
+`session-create.sh` still reports `LINGER`, `XDG_RUNTIME_DIR` and `USER-BUS` although
 nothing consults them: a cell that dies with `LINGER=yes` and a live user bus has measured
 linger being irrelevant, and one whose linger marker quietly failed to take has measured
 nothing at all.
@@ -109,9 +114,14 @@ reach the verdict it predicted down a path that no longer exists — `kup-on-lin
 precisely that for as long as the scope launch was there — so the launch path is checked
 on its own and not folded into the verdict.
 
+This is the strongest thing in the harness and the reason the matrix could afford to lose
+four rows. It is a per-cell assertion rather than a per-row prediction: it fires on the
+first cell to launch into a transient scope, whatever that cell's verdict was supposed to
+be, so covering the axes twice over bought nothing it does not already give for free.
+
 ### The dropped-wire half
 
-The `drop-` rows repeat the five hosts with the login taken away rather than ended. What
+The `drop-` rows repeat two of the hosts with the login taken away rather than ended. What
 they settle is that the two teardowns converge: sshd differs only in *how* it learns the
 client has gone, and what it does next — PAM's `session close`, pam_systemd's release of
 the session, logind stopping `session-N.scope` and applying `KillUserProcesses` to whatever
@@ -119,7 +129,16 @@ is still in it — is the same code either way. So the daemon's fate turns on th
 is in and nothing else, and a verdict on a clean logout is the same promise nomux makes to
 a connection that vanishes.
 
-Which makes these five cells easy to fake, and that is the thing to be careful about.
+Two rows and not five, because the claim is about the *convergence point*. `session close`
+is where the paths meet, and everything the other three `drop-` rows varied — linger,
+`pam_systemd` — is on the far side of it: reached by the same code, from the same call, in
+both halves. The two kept rows straddle the only thing that can differ before that point,
+once where the session scope survives the logout and once where logind kills it. If the
+timeout path skipped a teardown step, these two are where it would show; if it somehow
+skipped one only under linger, that would first require these two to have disagreed with
+their clean twins.
+
+Which makes these cells easy to fake, and that is the thing to be careful about.
 A cell that *believes* it disconnected abruptly but really produced an orderly close is a
 silent duplicate of its clean twin: it passes, it proves nothing, and it reads exactly like
 coverage. In particular **killing the local ssh client is not a disconnect** — the host
@@ -127,9 +146,10 @@ kernel still closes the socket and sshd sees an ordinary logout. So `abrupt_logi
 blackholes port 22 in both directions inside the container, and `run.sh` times the login's
 death and fails the run if it came too quickly to have been a timeout.
 
-The two paths are nowhere near each other, so the floor is not a close call. One
-`drop-kup-on-linger-on` run's journal, the blackholed login and then the check login that
-followed it in the same container:
+The two paths are nowhere near each other, so the floor is not a close call. One journal
+from a `drop-` run — recorded on `drop-kup-on-linger-on`, a cell since retired, which is
+why the last paragraph below still talks about linger — showing the blackholed login and
+then the check login that followed it in the same container:
 
 ```
 12:35:03.286 sshd[78]:   pam_unix(sshd:session): session opened for user nomuxer
@@ -166,6 +186,14 @@ and lingering saved nothing that was not inside `user@UID.service`.
   proves less than one that survives here, because nothing was torn down at all.
 - **One distro, one architecture.** Debian bookworm on x86-64. Distros differ in their
   `logind.conf` default and their PAM stack.
+- **Not every combination of the three axes.** Six of the twelve are measured. The four
+  dropped were `kup-off-linger-on`, `drop-no-user-bus`, `drop-kup-off-linger-on` and
+  `drop-kup-on-linger-on`, and what is given up with them is the *direct* evidence that
+  linger changes nothing on a `KillUserProcesses=no` host, and that the dropped-wire path
+  converges for a host with no login session at all. Both are held instead by the argument
+  in `matrix.tsv` plus the per-cell cgroup check, which is a weaker kind of coverage than a
+  measurement. The trade was made on purpose: this job gates every merge, and a row that
+  re-derives another row's fact is paid for on every pull request forever.
 - **Nothing about arranging persistence above nomux.** The matrix measures what a strict
   host does to a directly launched daemon; that a user-owned scope or a lingering wrapper
   would carry it through is the reasoning behind the advice above, not a row here.
@@ -179,7 +207,7 @@ and lingering saved nothing that was not inside `user@UID.service`.
 |---|---|
 | `run.sh` | builds, boots the cells, measures each, prints the table |
 | `matrix.tsv` | the cells and their predicted verdicts |
-| `docker-compose.yml` | one service per cell; ports match `matrix.tsv` |
+| `docker-compose.yml` | one service per cell; ports and axes match `matrix.tsv`, and `run.sh` checks that they do |
 | `Dockerfile` | Debian + systemd + sshd + PAM + `iptables` to cut the wire with |
 | `image/` | per-cell configuration applied before PID 1, and the in-session scripts |
 | `probe/` | a separate cargo workspace: the minimal protocol client |
@@ -189,10 +217,19 @@ has nothing to do with the shipping binary's size budget or lint set.
 
 ## Adding a cell
 
-Add a row to `matrix.tsv` with an unused port (2201-2210 are taken), add the matching
-service to `docker-compose.yml`, and give `image/cell-entrypoint.sh` the axis if it is a new
-one. Predict the verdict *before* running it; a matrix that is written down after the fact
-records what happened rather than what was expected, which is a much weaker thing.
+Add a row to `matrix.tsv` with an unused port (2201, 2202, 2204, 2205, 2207 and 2209 are
+taken; 2203, 2206, 2208 and 2210 belonged to retired cells and are best left alone rather
+than given a second meaning), add the matching service to `docker-compose.yml`, and give
+`image/cell-entrypoint.sh` the axis if it is a new one. The port and the three axes have to
+agree between the two files — `confirm_axes` in `run.sh` reads `/run-cell.env` back out of
+each container and dies on a mismatch, because a swapped port would otherwise measure one
+host and file the verdict under another row's name.
+
+Predict the verdict *before* running it; a matrix that is written down after the fact
+records what happened rather than what was expected, which is a much weaker thing. And
+answer the other question first: what does this row learn that no existing row does? Four
+were removed for having no answer, and `systemd logout matrix` is a required check, so the
+cost of a new one is paid by every pull request from here on.
 
 An axis that is about the *run* rather than about the host — `logout` is the one such axis
 so far — belongs in `run.sh` instead, and needs its own answer to "how would I know this

@@ -47,9 +47,9 @@ pub(crate) fn read(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<usize, Errno> {
 /// Every other errno is preserved: a failed PTY must not become a clean terminal ending and
 /// an invented process outcome.
 ///
-/// An empty `buf` answers [`ReadOutcome::WouldBlock`]: `read(fd, &mut [])` is `Ok(0)`, which
-/// every caller here reads as the peer having gone — `daemon.rs`'s `on_child_exit` would
-/// declare a session over with its child still alive. Both callers hand over the whole 64 KiB.
+/// An empty `buf` answers [`ReadOutcome::WouldBlock`] rather than `read`'s `Ok(0)`, which
+/// every caller reads as the peer having gone — a session declared over with its child
+/// still alive. No caller passes one; this is what keeps that from having to be checked.
 pub(crate) fn read_or_eof(fd: BorrowedFd<'_>, buf: &mut [u8]) -> ReadOutcome {
     if buf.is_empty() {
         return ReadOutcome::WouldBlock;
@@ -64,19 +64,16 @@ pub(crate) fn read_or_eof(fd: BorrowedFd<'_>, buf: &mut [u8]) -> ReadOutcome {
 
 /// Writes as much of `queue` as `fd` will take, removing what it accepted.
 ///
-/// A non-empty queue on return is normal, not a failure: come back on `POLLOUT` (§ 4.1).
-///
-/// One write, not a loop until `EAGAIN`: an event-loop destination gets one fair share
-/// of a pass, and the stdout worker does not make a second unpromised blocking write
-/// after a short first one.
+/// A non-empty queue or an `Ok(0)` on return is normal, not a failure: come back on
+/// `POLLOUT` (`IMPLEMENTATION.md` § 4.1). One write and not a loop until `EAGAIN`, so an
+/// event-loop destination gets one fair share of a pass and the stdout worker makes no
+/// second unpromised blocking write; a zero can therefore only mean nothing moved here,
+/// unlike the `WriteZero` `Conn::flush_some` makes of the same count.
 ///
 /// One `writev` over both halves rather than a write apiece, load-bearing rather than
 /// an optimisation: a wrapped `VecDeque` served back-first delivers transposed
 /// keystrokes rather than an error anybody could see, and an empty front handed to
 /// `write` alone comes back `Ok(0)`, after which the queue never drains again.
-///
-/// `Ok(0)` on a non-empty queue is "come back on `POLLOUT`", deliberately not the `WriteZero`
-/// `Conn::flush_some` makes of the same count: here a zero can only mean nothing moved.
 pub(crate) fn drain_to(queue: &mut VecDeque<u8>, fd: BorrowedFd<'_>) -> Result<(), Errno> {
     if queue.is_empty() {
         return Ok(());

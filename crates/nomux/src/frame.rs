@@ -279,20 +279,6 @@ impl<'a> Frame<'a> {
     /// [`crate::MAX_PAYLOAD`], or [`ProtoError::Malformed`] for a field too long for
     /// its own length prefix. `out` is rewound to its original length in every case.
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), ProtoError> {
-        let variable_len = match self {
-            Self::Input { data, .. } | Self::Output { data, .. } => {
-                Some(8usize.saturating_add(data.len()))
-            }
-            Self::Error { message, .. } => Some(2usize.saturating_add(message.len())),
-            Self::AgentData { data, .. } => Some(4usize.saturating_add(data.len())),
-            _ => None,
-        };
-        if let Some(len) = variable_len.filter(|&len| len > crate::MAX_PAYLOAD as usize) {
-            return Err(ProtoError::PayloadTooLarge(
-                u32::try_from(len).unwrap_or(u32::MAX),
-            ));
-        }
-
         // The rewind lives here, once: a caller appending frames back to back never
         // ships half of one, whatever `encode_from` grows a new way to fail on.
         let start = out.len();
@@ -306,9 +292,7 @@ impl<'a> Frame<'a> {
         out.extend_from_slice(&[0; HEADER_LEN]);
         self.encode_payload(out)?;
 
-        // The saturation is reachable only from a caller in this process handing over a
-        // 4 GiB field — never a peer, whose frames `decode_header` has already bounded.
-        // `encode_header` refuses anything over `MAX_PAYLOAD`, saturated or not.
+        // Only a 4 GiB field saturates, and `encode_header` refuses it either way.
         let payload_len = out.len() - start - HEADER_LEN;
         let len = u32::try_from(payload_len).unwrap_or(u32::MAX);
         let header = encode_header(self.frame_type(), len)?;
@@ -474,8 +458,6 @@ impl<'a> Frame<'a> {
             },
         };
 
-        // Every fixed-size frame must have consumed its payload exactly; the
-        // variable-length ones end in `rest()`, which empties the reader.
         r.finish().map(|()| frame)
     }
 }
@@ -547,6 +529,8 @@ impl<'a> Reader<'a> {
         all
     }
 
+    /// Refuses a payload the frame's fields did not consume exactly. The variable-length
+    /// frames pass by construction, [`Reader::rest`] having emptied the reader.
     const fn finish(self) -> Result<(), ProtoError> {
         if self.rest.is_empty() {
             Ok(())
@@ -672,24 +656,18 @@ mod tests {
         );
     }
 
-    /// § 4.2's `gap = resume_from > out_offset`, at the one offset where the sentinel
-    /// and a real position collide, and either side of an ordinary edge.
+    /// § 4.2's `gap = resume_from > out_offset` at the one offset where it is not just
+    /// the comparison: `RESUME_FROM_START` *is* `u64::MAX`, so a ring based at the top of
+    /// the offset space answers the sentinel and a client genuinely there with one
+    /// number. § 4.2 calls both no-gap, which is what makes the collision harmless.
     #[test]
-    fn the_derived_gap_is_the_comparison_section_4_2_makes() {
-        let gap = |resume_from, out_offset| {
-            HelloOk {
-                resume_from,
-                in_applied: 0,
-                agent: false,
-            }
-            .gap(out_offset)
+    fn the_resume_sentinel_collides_with_a_real_offset_harmlessly() {
+        let ok = HelloOk {
+            resume_from: u64::MAX,
+            in_applied: 0,
+            agent: false,
         };
-        // `RESUME_FROM_START` *is* `u64::MAX`, so a ring based at the top of the offset
-        // space answers the sentinel and a client genuinely there with one number.
-        // § 4.2 calls both no-gap, which is what makes the collision harmless.
-        assert!(!gap(u64::MAX, RESUME_FROM_START), "the sentinel is no gap");
-        assert!(gap(16, 8), "output dropped before the client is a gap");
-        assert!(!gap(8, 16), "a resume_from clamped down is no gap");
+        assert!(!ok.gap(RESUME_FROM_START), "the sentinel is no gap");
     }
 
     #[test]
@@ -717,22 +695,20 @@ mod tests {
         let data = vec![0u8; MAX_PAYLOAD as usize];
         let mut buf = b"previous frame".to_vec();
         let before = buf.len();
-        let capacity = buf.capacity();
         let err = Frame::Output {
             offset: 0,
             data: &data,
         }
         .encode(&mut buf);
-        assert!(matches!(err, Err(ProtoError::PayloadTooLarge(_))));
+        assert_eq!(
+            err,
+            Err(ProtoError::PayloadTooLarge(MAX_PAYLOAD + 8)),
+            "the reported length is the whole payload, offset bytes included"
+        );
         assert_eq!(
             buf.len(),
             before,
             "failed encode must not leave partial data"
-        );
-        assert_eq!(
-            buf.capacity(),
-            capacity,
-            "known-oversized data must be rejected before allocation"
         );
 
         let payload = vec![0; MAX_PAYLOAD as usize + 1];

@@ -15,25 +15,29 @@
 //! | probe             | `attach`, wanting a session            | `spawn`, wanting a free id |
 //! |-------------------|-----------------------------------------|----------------------------|
 //! | refused or absent | [`MissingSession`][FailureClass], 127   | start a daemon             |
-//! | accepted          | relay to it                             | [`Collision`][FailureClass], 126 |
+//! | accepted, this uid's | relay to it                          | [`Collision`][FailureClass], 126 |
+//! | accepted, another uid's | [`UnsafeHost`][FailureClass], 126 | [`Uncertain`][FailureClass], 126 |
 //! | neither           | [`Retryable`][FailureClass] or [`Uncertain`][FailureClass], 126 | [`Uncertain`][FailureClass], 126 |
 //!
-//! [`crate::usock::connect_within`] has why the last row is the wedged daemon rather than
-//! an absent one.
+//! `usock::connect_within`, behind [`crate::usock::liveness`], has why the last row is the
+//! wedged daemon rather than an absent one, and why the third is not an accepted
+//! connection at all.
 
 use std::collections::VecDeque;
+use std::env;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::mem::{MaybeUninit, size_of};
 use std::net::Shutdown;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
-use std::process::ChildStderr;
+use std::os::unix::process::CommandExt;
+use std::process::{ChildStderr, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags};
 
-use crate::rundir::{SessionPaths, check_run_dir, ensure_run_dir};
+use crate::rundir::{SessionPaths, SpawnLock, check_run_dir, ensure_run_dir};
 use crate::usock::{Liveness, liveness};
 
 /// Legacy status for a runtime refusal that does not establish absence.
@@ -49,9 +53,9 @@ const SPAWN_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// How long any one `connect` to the session socket waits out a full backlog.
 ///
-/// [`crate::usock::connect_within`] has why every `connect` here is bounded and this
-/// one is not a plain `UnixStream::connect` (§ 6.3). Short, because the state it waits
-/// out clears in one `accept` and this is on the path of every attach.
+/// `usock::connect_within` has why every `connect` here is bounded and this one is not a
+/// plain `UnixStream::connect` (§ 6.3). Short, because the state it waits out clears in
+/// one `accept` and this is on the path of every attach.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Delay between checks for the pidfile the daemon publishes just after its socket.
@@ -61,10 +65,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// of every session creation.
 const PUBLISH_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
-/// Largest transfer either direction makes in one call, and the whole of what a [`Pump`]
-/// can be holding: a direction is polled for reading only while [`Pump::has_data`] is
-/// false, so it reads again only once what it read last has gone, which is why neither of
-/// the two needs a cap of its own.
+/// Largest transfer either direction makes in one call, and — by [`Pump::has_data`]'s
+/// invariant — the whole of what a [`Pump`] can be holding.
 const RELAY_CHUNK: usize = 16 * 1024;
 
 /// Whether this invocation may bring the session into being — the whole of the
@@ -98,7 +100,9 @@ pub(crate) enum FailureClass {
     Uncertain,
     /// `attach` found no session at the requested id.
     MissingSession,
-    /// `spawn` established that no daemon became reachable.
+    /// `spawn` proved the id free and could not launch a daemon at all. A daemon that
+    /// *was* launched and then missed its publication deadline is [`Self::Uncertain`]:
+    /// nothing here can prove it will not bind the socket a moment later.
     StartupFailure,
     /// The relay reached the session and subsequently failed locally.
     PostConnect,
@@ -231,29 +235,30 @@ fn no_such_session(paths: &SessionPaths) -> Failure {
     Failure::new(
         FailureClass::MissingSession,
         io::Error::other(format!(
-            "no session {id}: nothing answers on {sock}. `nomux spawn {id}` starts one, \
-             and `nomux list` says what this host is holding",
+            "no session {id}: nothing answers on {sock}. `nomux spawn {id}` starts one",
             id = paths.id(),
             sock = paths.socket().display(),
         )),
     )
 }
 
-/// `attach` on an id whose socket answered neither death nor life.
+/// `attach` on an id whose socket did not answer with life or death.
+///
+/// The error is quoted rather than summarised: it is the whole of what was established,
+/// and it is not always about a probe that failed — a socket somebody else bound answered
+/// perfectly well (`usock::Foreign`).
 fn unattachable(paths: &SessionPaths, err: &io::Error) -> Failure {
     Failure::new(
         resume_probe_class(err),
         io::Error::other(format!(
-            "session {id} could not be joined: {sock} could not be probed, so that nothing \
-             is serving it was never established: {err}. `nomux list` says what this host \
-             is holding",
+            "session {id} could not be joined: {err}. `nomux list` says what this host holds",
             id = paths.id(),
-            sock = paths.socket().display(),
         )),
     )
 }
 
-/// Transient resource pressure under which repeating an `attach` is safe.
+/// Transient resource pressure under which repeating an `attach` is safe, and the one
+/// refusal that establishes something instead: a socket this uid may not speak to.
 fn resume_probe_class(err: &io::Error) -> FailureClass {
     let transient_kind = matches!(
         err.kind(),
@@ -268,6 +273,11 @@ fn resume_probe_class(err: &io::Error) -> FailureClass {
     );
     if transient_kind || transient_errno {
         FailureClass::Retryable
+    } else if err.kind() == io::ErrorKind::PermissionDenied {
+        // A socket bound by another uid, or one this uid may not reach through the run
+        // directory's modes: either way the boundary § 6.3 requires is not there, which is
+        // a fact about the host and not an outcome that a retry could settle.
+        FailureClass::UnsafeHost
     } else {
         FailureClass::Uncertain
     }
@@ -279,8 +289,8 @@ fn already_running(paths: &SessionPaths) -> Failure {
     Failure::new(
         FailureClass::Collision,
         io::Error::other(format!(
-            "session {id} already exists: something answers on {sock}. `nomux attach {id}` \
-             joins it, and `nomux kill {id}` ends it",
+            "session {id} already exists: something answers on {sock}. \
+             `nomux attach {id}` joins it",
             id = paths.id(),
             sock = paths.socket().display(),
         )),
@@ -289,15 +299,13 @@ fn already_running(paths: &SessionPaths) -> Failure {
 
 /// `spawn` on an id whose socket answered neither death nor life: [`already_running`]'s
 /// kind on weaker evidence, `spawn` being allowed to create only an id it can say is free.
+/// The error is quoted for [`unattachable`]'s reason.
 fn may_be_running(paths: &SessionPaths, err: &io::Error) -> Failure {
     Failure::new(
         FailureClass::Uncertain,
         io::Error::other(format!(
-            "session {id} may already exist: {sock} could not be probed, so that it is \
-             free was never established: {err}. `nomux attach {id}` joins it if it is \
-             there, and `nomux list` says what this host is holding",
+            "session {id} may already exist: {err}. `nomux attach {id}` joins it if so",
             id = paths.id(),
-            sock = paths.socket().display(),
         )),
     )
 }
@@ -343,7 +351,7 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> Result<UnixStream, Failu
         Liveness::Unknown(err) => return Err(may_be_running(paths, &err)),
     }
 
-    let complaint = match crate::launcher::spawn_daemon(paths.id(), label, &spawn_lock) {
+    let complaint = match spawn_daemon(paths.id(), label, &spawn_lock) {
         Ok(complaint) => complaint,
         // The one failure with nothing of anyone's behind it: no daemon was started, and
         // the probe above has just said nobody else is serving the id either, so the
@@ -576,10 +584,13 @@ impl StdoutWorker {
         // orphan it — a process's exit takes its threads with it — and the main loop's
         // death notification is the socketpair itself, the far endpoint closing when
         // the copy returns, which does not care what was holding it.
-        // `std::thread::spawn` brings roughly 20–24 KiB of generic thread machinery into
-        // these static release binaries. libc's pthread entry point is already the whole
-        // primitive this one fixed worker needs and keeps the upload inside § 8's
-        // growth budget.
+        // Hand-rolled against `std::thread::Builder::spawn`, whose generic thread
+        // machinery this measured at +21_488 bytes on x86_64 and +24_688 on aarch64
+        // (nightly-2026-08-07, `scripts/build-release.sh`) — 5% of § 8's 400 KiB on a
+        // binary that is uploaded over the link the user is already waiting on. libc's
+        // pthread entry point is the whole primitive one fixed worker needs. Remeasure
+        // before deciding this is still true; the four `unsafe` blocks below are what it
+        // costs.
         let worker_channel = Box::into_raw(Box::new(worker_channel));
         let mut worker = MaybeUninit::uninit();
         // SAFETY: `worker_channel` owns a valid, Send `UnixStream` allocation which the
@@ -735,12 +746,110 @@ impl Pump {
     }
 }
 
+/// Starts the session daemon as a direct child, while `spawn_lock` continues to serialise
+/// this session id.
+///
+/// Nothing here tries to leave the login session the relay was started in: `setsid(2)` and
+/// the daemon's own fork are the whole of the detachment, and host policy at logout is the
+/// host's to decide (`startup::detach_from_controlling_terminal`).
+///
+/// # Errors
+///
+/// Propagates command construction and process-spawn failures.
+fn spawn_daemon(
+    session_id: &str,
+    label: Option<&str>,
+    spawn_lock: &SpawnLock,
+) -> io::Result<Option<ChildStderr>> {
+    daemon_command(session_id, label, spawn_lock.raw_fd())?
+        .spawn()
+        .map(|mut child| child.stderr.take())
+}
+
+/// The daemon [`spawn_daemon`] starts, up to the `fork`.
+///
+/// Execs the exact inode this relay is already running rather than whatever the install
+/// path names by the time the child gets there — between the two loads that path decides
+/// what the daemon *is*. `arg0` puts the ordinary name back on the command line, so what
+/// `ps` shows is the program rather than the link it was reached through.
+fn daemon_command(session_id: &str, label: Option<&str>, lock_fd: i32) -> io::Result<Command> {
+    let mut command = Command::new("/proc/self/exe");
+    command
+        .arg0(env::current_exe()?)
+        .arg("daemon")
+        .arg(session_id)
+        .arg("--lock-fd")
+        .arg(lock_fd.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        // The caller reads this pipe only if publication misses its deadline.
+        .stderr(Stdio::piped());
+    // Cut and escaped on this side of the exec: the daemon records the label it is given
+    // (§ 6.6), so the bound is this side's to spend.
+    let label = label
+        .map(crate::sanitize::sanitize_label)
+        .filter(|label| !label.is_empty());
+    if let Some(label) = label.as_deref() {
+        command.arg("--label").arg(label);
+    }
+    let pre_exec = move || -> io::Result<()> {
+        rustix::process::setsid()?;
+        // `SpawnLock` opens `CLOEXEC`. Clear it only in the forked child, so the descriptor
+        // survives the exec. The daemon validates it against the current lock path and
+        // restores `CLOEXEC` before the shell.
+        // SAFETY: `lock_fd` belongs to the lock held across `Command::spawn` by the caller.
+        let lock = unsafe { BorrowedFd::borrow_raw(lock_fd) };
+        rustix::io::fcntl_setfd(lock, rustix::io::FdFlags::empty())?;
+        Ok(())
+    };
+    // SAFETY: the closure runs after fork and calls only async-signal-safe operations.
+    unsafe {
+        command.pre_exec(pre_exec);
+    }
+    Ok(command)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::fs::File;
     use std::io::{self, Write as _};
 
-    use super::{ChildStderr, FailureClass, daemon_complaint, resume_probe_class};
+    use super::{
+        ChildStderr, FailureClass, SessionPaths, daemon_command, daemon_complaint,
+        resume_probe_class, unattachable,
+    };
+    use crate::usock::Foreign;
+
+    /// The caller's label reaches `exec` already cut and already stripped of the terminal
+    /// control it arrived with — the daemon records what it is given, so the bound and the
+    /// escaping both have to be spent on this side of the handoff.
+    #[test]
+    fn launched_labels_are_bounded_before_the_daemon_exec() {
+        let label = format!("\u{1b}]0;ignored\u{7}  $HOME/{}", "é".repeat(200));
+        let expected = crate::sanitize::sanitize_label(&label);
+        assert!(expected.len() <= crate::sanitize::MAX_LABEL_LEN);
+        assert!(label.len() > crate::sanitize::MAX_LABEL_LEN, "cut nothing");
+
+        let direct = daemon_command("session", Some(&label), 19).unwrap();
+        assert_eq!(
+            direct.get_args().last().and_then(OsStr::to_str),
+            Some(&*expected)
+        );
+    }
+
+    #[test]
+    fn the_daemon_command_line_carries_the_lock_and_the_raw_label() {
+        let command = daemon_command("session", Some("cost $5"), 23).unwrap();
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            ["daemon", "session", "--lock-fd", "23", "--label", "cost $5"]
+        );
+    }
 
     #[test]
     fn failure_classes_have_stable_tokens_and_legacy_statuses() {
@@ -770,8 +879,32 @@ mod tests {
             assert_eq!(resume_probe_class(&err), FailureClass::Retryable);
         }
         assert_eq!(
-            resume_probe_class(&io::Error::from_raw_os_error(libc::EACCES)),
+            resume_probe_class(&io::Error::from_raw_os_error(libc::ENOTRECOVERABLE)),
             FailureClass::Uncertain
+        );
+    }
+
+    /// A session socket somebody else bound is reported as that, to the stderr this mode
+    /// still has, rather than as a probe that established nothing.
+    ///
+    /// The refusal is `usock`'s own — the suite cannot become a second uid to provoke one
+    /// — and the two halves that were wrong are both here: the class, which said the host
+    /// was fine and the answer unknown, and the sentence, which said the socket could not
+    /// be probed when it had been probed and had answered.
+    #[test]
+    fn a_socket_another_user_bound_names_that_user_rather_than_an_unprobeable_socket() {
+        let paths = SessionPaths::in_dir(std::path::Path::new("/run/nomux"), "work").unwrap();
+        let failure = unattachable(&paths, &Foreign::Uid(4242).refusal());
+        let said = failure.to_string();
+
+        assert_eq!(failure.class(), FailureClass::UnsafeHost);
+        assert!(
+            said.contains("uid 4242"),
+            "the one fact established is whose socket this is: {said:?}"
+        );
+        assert!(
+            !said.contains("could not be probed"),
+            "it was probed, and it answered: {said:?}"
         );
     }
 
