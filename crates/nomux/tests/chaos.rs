@@ -110,6 +110,28 @@ fn an_unreadable_seed_is_fatal_rather_than_the_default() {
     let _ = parse_seed(Some("0xnope"));
 }
 
+/// Every seed is its own run, which is the whole of what § 9 asks the generator for.
+///
+/// `Rng::new` used to force the low bit on, so seeds 2 and 3 were one run and no even
+/// seed could be asked for at all — half the space silently aliased onto the other
+/// half, in the one place a reader is told to vary a number to explore interleavings.
+#[test]
+fn neighbouring_seeds_are_different_runs() {
+    let run = |seed| Rng::new(seed).bytes(64);
+    assert_eq!(
+        run(DEFAULT_SEED),
+        run(DEFAULT_SEED),
+        "a seed replays its run"
+    );
+    assert_ne!(run(2), run(3), "an odd seed is not its even neighbour");
+    assert_ne!(run(0), run(1), "zero is a seed like any other");
+    assert_ne!(
+        run(DEFAULT_SEED),
+        run(DEFAULT_SEED + 1),
+        "the seed this file names is not shared with the one above it"
+    );
+}
+
 /// The next frame, bounded by the whole test's `deadline` rather than by one frame's
 /// (`harness::poll_by`), and saying which seed the stall was under.
 fn frame_by(

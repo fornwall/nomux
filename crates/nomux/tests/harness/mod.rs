@@ -1925,10 +1925,20 @@ impl Drop for Reaper {
 pub(crate) struct Rng(u64);
 
 impl Rng {
-    /// The low bit is forced on because zero is the one state xorshift cannot leave,
-    /// and a seed can arrive from an environment variable.
+    /// Zero is the one state xorshift cannot leave, and a seed can arrive from an
+    /// environment variable, so that single value is mapped aside.
+    ///
+    /// Only that one. Forcing the low bit on instead made every even seed unreachable
+    /// and every odd seed the answer to two of them — seeds 2 and 3 replaying the same
+    /// run — which is a promise of reproducibility that quietly halves the space it is
+    /// reproducing from. Every other seed is its own state, and xorshift is a bijection
+    /// on the states, so distinct seeds give distinct streams.
     pub(crate) const fn new(seed: u64) -> Self {
-        Self(seed | 1)
+        Self(if seed == 0 {
+            0x9e37_79b9_7f4a_7c15
+        } else {
+            seed
+        })
     }
 
     pub(crate) const fn next_u64(&mut self) -> u64 {
