@@ -7,7 +7,6 @@
 /// Deterministic generated coverage of field extremes, cross-type payloads and mutations.
 /// Committed fuzz seeds are replayed here so sanitizer findings remain release gates.
 mod generated {
-    use std::collections::HashSet;
     use std::path::Path;
     use std::{fs, io};
 
@@ -146,16 +145,6 @@ mod generated {
             (0..len).map(|_| self.char()).collect()
         }
 
-        /// [`Rng::text`] minus U+0000, which the codec refuses in `Hello.term` by design
-        /// — valid UTF-8 that `execve` will not take, so not a well-formed frame. This
-        /// generator's job is the frames that encode; the refusal is covered by the
-        /// mutation property below and by a unit test beside the check.
-        ///
-        /// Rewritten rather than redrawn, so the ASCII draw keeps its whole range.
-        fn term(&mut self, max: usize) -> String {
-            self.text(max).replace('\0', "\u{fffd}")
-        }
-
         /// A bounded opaque payload.
         fn bytes(&mut self, max: usize) -> Vec<u8> {
             let len = self.below(max + 1);
@@ -269,7 +258,9 @@ mod generated {
     /// One arm per [`FrameType`], picked uniformly. The arm list is the one list here
     /// still written by hand, and a variant missing from it is never round-tripped; the
     /// modulus is [`FrameType::ALL`]'s length, so a variant added to the protocol falls
-    /// into the last arm and [`every_frame_type_is_generated`] says so.
+    /// into the last arm and is never round-tripped over its own fields, which is what
+    /// [`every_frame_round_trips`] closes by sweeping [`FrameType::ALL`] against what it
+    /// generated.
     ///
     /// The closed sets are drawn from their own `ALL`, so a value added to one of those is
     /// generated without anyone remembering to come here.
@@ -285,7 +276,7 @@ mod generated {
                     win: rng.win(),
                     term: "",
                 }),
-                rng.term(MAX_GENERATED_LEN),
+                rng.text(MAX_GENERATED_LEN),
             ),
             1 => OwnedFrame::copied(Frame::HelloOk(HelloOk {
                 resume_from: rng.u64(),
@@ -341,6 +332,26 @@ mod generated {
             _ => OwnedFrame::copied(Frame::AgentClose {
                 generation: rng.u32(),
             }),
+        }
+    }
+
+    /// What the encoder refuses `frame` for, where it has to refuse it at all.
+    ///
+    /// The one shape [`frame`] generates that has no encoding: a `Hello` whose `term`
+    /// carries a NUL. It is valid UTF-8 that `execve` will not take, and the daemon hands
+    /// `term` straight to the child's environment — so § 2.2 has both ends refuse it, and
+    /// a codec that quietly encoded one would put a `TERM` on the wire that only fails
+    /// much later, inside somebody's session.
+    ///
+    /// The generator draws it rather than stepping around it, which is what puts the
+    /// refusal under the same sweep as everything else: reaching it by mutation means
+    /// flipping a byte of a term to exactly zero, which is a few draws in ten thousand.
+    /// The message is compared rather than merely the variant, `Malformed` being what
+    /// every other complaint in this encoder is spelled as too.
+    fn refused_by_design(frame: Frame<'_>) -> Option<&'static str> {
+        match frame {
+            Frame::Hello(hello) if hello.term.contains('\0') => Some("TERM contains a NUL byte"),
+            _ => None,
         }
     }
 
@@ -455,37 +466,46 @@ mod generated {
         Ok(())
     }
 
-    /// [`frame`] generates every frame type.
-    ///
-    /// Its arms are the one list here still written by hand, and a variant missing from
-    /// them is never round-tripped. The sweeps below take arbitrary payloads to every type
-    /// and so reach a new variant's decoder, but never its field domain.
-    ///
-    /// This asserts coverage of the generator rather than a property of the codec, and
-    /// coverage that passes by luck is worse than none — hence the one stream, long enough
-    /// that a variant reachable at all is reached.
-    #[test]
-    fn every_frame_type_is_generated() {
-        let mut rng = Rng::new(case_seed(0x0001, 0));
-        let mut seen = HashSet::new();
-        for _ in 0..4096 {
-            seen.insert(frame(&mut rng).frame().frame_type());
-        }
-
-        for ty in FrameType::ALL {
-            assert!(seen.contains(&ty), "the generator never produces {ty:?}");
-        }
-    }
-
     /// Encoding then decoding is the identity, for every variant over its whole field
     /// domain — including the extremes a fixed value per field cannot reach, such as a
     /// `u64` offset truncated to 32 bits or a signed exit status losing its sign.
+    ///
+    /// Except for the frames [`refused_by_design`] names, which have no encoding to come
+    /// back from: those are asserted to be refused, and refused for the stated reason
+    /// rather than by some other check the frame also happens to trip.
+    ///
+    /// What the cases *reached* is stated at the foot, both for the refusal and for the
+    /// variants, because coverage that passes by luck is worse than none and this sweep is
+    /// the only thing that takes a frame type over its own field domain. [`frame`]'s arms
+    /// are the one list in this file still written by hand, so a variant added to the
+    /// protocol falls into the last of them and is generated by nothing — and every
+    /// property here would go on passing over the fourteen that were already covered.
     #[test]
     fn every_frame_round_trips() {
+        let mut refused = 0u32;
+        let mut generated = Vec::new();
         for case in 0..CASES {
             let seed = case_seed(0x0002, case);
             let owned = frame(&mut Rng::new(seed));
             let frame = owned.frame();
+            generated.push(frame.frame_type());
+            if let Some(saying) = refused_by_design(frame) {
+                refused += 1;
+                let mut buf = b"previous frame".to_vec();
+                let before = buf.len();
+                assert_eq!(
+                    frame.encode(&mut buf),
+                    Err(ProtoError::Malformed(saying)),
+                    "the encoder took {frame:?} (seed {seed:#018x})"
+                );
+                assert_eq!(
+                    buf.len(),
+                    before,
+                    "a refused frame left bytes behind it in the stream (seed \
+                     {seed:#018x})"
+                );
+                continue;
+            }
             let payload = checked!(encode_and_split(frame), seed);
             let decoded = checked!(
                 Frame::decode(frame.frame_type(), &payload)
@@ -495,6 +515,24 @@ mod generated {
             assert_eq!(
                 decoded, frame,
                 "round trip changed the frame (seed {seed:#018x})"
+            );
+        }
+        // The refusals above are reached by a NUL turning up in a generated `term`, which
+        // is a property of [`Rng::text`] rather than of anything asserted — three of the
+        // 2048 cases at this seed, deterministically. Stated here because a generator that
+        // stopped producing one would leave the arm above green and never entered, which
+        // is how the refusal came to be untested in the first place.
+        assert!(
+            refused > 0,
+            "no case reached the encoder's refusal of a NUL in `term`, so the generator \
+             no longer draws one and the arm above asserts nothing"
+        );
+        for ty in FrameType::ALL {
+            assert!(
+                generated.contains(&ty),
+                "no case above was a {ty:?}, so nothing here round-trips one — it has an \
+                 arm missing from `frame`, and the sweeps in this file reach its decoder \
+                 with arbitrary payloads but never its fields"
             );
         }
     }
@@ -582,6 +620,11 @@ mod generated {
             let seed = case_seed(0x0006, case);
             let mut rng = Rng::new(seed);
             let owned = frame(&mut rng);
+            // Nothing to mutate where nothing encodes; the round-trip sweep is where
+            // those cases are spent.
+            if refused_by_design(owned.frame()).is_some() {
+                continue;
+            }
             let position = rng.u16();
             // Never zero: a flip of no bits is a case this test already has 2048 of.
             let flip = rng.u8().max(1);

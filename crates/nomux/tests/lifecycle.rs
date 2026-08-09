@@ -10,9 +10,7 @@
 #![allow(
     clippy::expect_used,
     clippy::panic,
-    reason = "the allow-*-in-tests settings in clippy.toml reach `#[test]` bodies \
-              and `#[cfg(test)]` modules, not the helpers an integration test crate \
-              keeps beside them"
+    reason = "integration test crate; clippy.toml's allow-*-in-tests reaches only #[cfg(test)]"
 )]
 
 mod harness;
@@ -20,6 +18,7 @@ mod harness;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -54,7 +53,7 @@ const PATIENCE: Duration = Duration::from_secs(30);
 /// This client stays attached, unlike
 /// [`a_session_whose_child_has_exited_keeps_its_files_and_its_status_with_nobody_attached`],
 /// so what it pins is the frame the daemon builds on the pass that collects the
-/// status — which makes it the place to pin `since_terminal_closed_secs` at zero. That
+/// status — which makes it the place to pin `since_terminal_closed_secs` near zero. That
 /// field is how a client tells a shell that has just finished from one that finished
 /// while the laptop was shut (§ 6.5), and only a client that watched the exit happen
 /// can say what the answer must be. A daemon that stamped the frame when it *built*
@@ -78,12 +77,14 @@ fn a_child_killed_by_a_signal_is_reported_as_signalled_rather_than_as_a_status()
         "a child killed by SIGKILL must arrive as the signal that killed it, not as \
          a status a process chose"
     );
-    // Whole seconds, so this is not a tight bound wearing a loose one: the daemon
-    // collects the status on the pass that finds `waitpid` ready, microseconds after
-    // the end of file it measures from, and a whole second would have to pass before
-    // this could read as anything but zero.
-    assert_eq!(
-        replay.since_terminal_closed_secs, 0,
+    // Whole seconds, and one of them allowed: what this separates is a field measured
+    // from the end of file from one stamped when the frame was built or counted from the
+    // session's own start, and those differ by however long this test has been running —
+    // seconds at least. Zero exactly is the same assertion wearing a race, since the two
+    // readings the field is the difference of straddle a whole-second boundary about as
+    // often as the machine is loaded.
+    assert!(
+        replay.since_terminal_closed_secs <= 1,
         "the client that watched the exit happen was told the shell had been gone \
          for {} s, so the field measures something other than the end of file",
         replay.since_terminal_closed_secs
@@ -117,6 +118,12 @@ fn a_child_killed_by_a_signal_is_reported_as_signalled_rather_than_as_a_status()
 /// keeps one more for job control — `/dev/tty` on fd 10, under the `dash` this suite
 /// pins as `SHELL` — and the master goes on waiting. Replacing the process closes that
 /// one, since it is close-on-exec.
+///
+/// The child waits on a cue rather than sleeping, so this also carries the tail that used
+/// to be a second test: a child answered for as unknown is still the session's identity,
+/// and stays waitable until shutdown rather than being released the moment the daemon
+/// spoke for it. That cost a second `OUTCOME_GRACE` of its own to reach the state this one
+/// is already in, and asserted nothing about the frame it took off the wire and dropped.
 #[test]
 fn an_unknown_outcome_is_sent_on_the_pass_that_decides_it() {
     /// Comfortably above the two-second `OUTCOME_GRACE`, and nowhere near the hour the
@@ -124,16 +131,18 @@ fn an_unknown_outcome_is_sent_on_the_pass_that_decides_it() {
     /// pass under nextest's full-core parallelism, and small enough to be a bound.
     const BOUND: Duration = Duration::from_secs(10);
 
-    let (_session, mut client, ok) = Session::attached("outcome_unknown");
+    let (session, mut client, ok) = Session::attached("outcome_unknown");
+    let child = shell_of(&session);
+    let cue = Cue::new(&session.root);
 
     // The marker is the last thing the child writes, and the `exec` on its heels is
     // what closes the terminal — so the clock below starts within one shell statement
-    // of the end of file the daemon reacts to. The process it leaves behind is alive
-    // for far longer than this test runs, which is what leaves `waitpid` with nothing
-    // to report and forces the explicit unknown outcome.
+    // of the end of file the daemon reacts to. The process it leaves behind waits on a
+    // cue this test holds, which is what leaves `waitpid` with nothing to report and
+    // forces the explicit unknown outcome.
     client.make_ready(
         "-echo",
-        Some("exec sleep 300 0</dev/null 1>/dev/null 2>/dev/null"),
+        Some("exec sh -c 'read go < cue' 0</dev/null 1>/dev/null 2>/dev/null"),
         ok.resume_from,
     );
     let began = Instant::now();
@@ -158,6 +167,21 @@ fn an_unknown_outcome_is_sent_on_the_pass_that_decides_it() {
         "the Exit frame took {elapsed:?}: the status was collected at the two-second \
          grace and then held for a pass that never came, which is a terminal that \
          hangs until its user types at it on every exit `waitpid` is not ready for"
+    );
+
+    // And the child the daemon has already answered for is still the session's identity:
+    // it exits on cue and stays waitable rather than being released, which is what
+    // reserves the pid — and the id behind it — until shutdown.
+    cue.release();
+    assert!(
+        poll_until(SETTLE, || !process_alive(child)),
+        "the child never took the cue and exited, so nothing below is about a status \
+         that outlived its process"
+    );
+    assert_eq!(
+        process_state(child),
+        Some('Z'),
+        "the daemon released pid {child} before session shutdown"
     );
 }
 
@@ -197,40 +221,6 @@ fn an_exited_shell_reserves_its_live_background_session() {
         poll_until(SETTLE, || !process_alive(raw)),
         "the signalled daemon never exited, so the job it was collecting is still \
          running"
-    );
-}
-
-/// A child answered for as unknown stays waitable until session shutdown.
-///
-/// The other half of [`an_exited_shell_reserves_its_live_background_session`]: this child
-/// closes its terminal, receives an unknown outcome, then exits on cue. `SIGCHLD` still
-/// drives outcome observation, but the child remains waitable as the session's identity.
-#[test]
-fn a_child_that_exits_after_an_unknown_outcome_keeps_its_identity() {
-    let (session, mut client, ok) = Session::attached("zombie_synth");
-    let child = shell_of(&session);
-    let cue = Cue::new(&session.root);
-
-    client.make_ready(
-        "-echo",
-        Some("exec sh -c 'read go < cue' 0</dev/null 1>/dev/null 2>/dev/null"),
-        ok.resume_from,
-    );
-    // Two seconds of `OUTCOME_GRACE` later, and the daemon has told this client that the
-    // transcript ended without a known outcome while the child still waits below.
-    drop(client.next_of(FrameType::Exit));
-
-    cue.release();
-    assert!(
-        poll_until(SETTLE, || !process_alive(child)),
-        "the child never took the cue and exited, so nothing below is about a status \
-         that outlived its process"
-    );
-
-    assert_eq!(
-        process_state(child),
-        Some('Z'),
-        "the daemon released pid {child} before session shutdown"
     );
 }
 
@@ -296,20 +286,37 @@ fn the_child_is_a_login_shell_told_its_terminal_and_its_session() {
 /// every caller here would lose occasionally and blame on something else.
 fn shell_of(session: &Session) -> u32 {
     let daemon = session.child.id();
-    let mut shell = None;
+    let mut children = Vec::new();
     assert!(
         poll_until(SETTLE, || {
-            shell = child_of(daemon);
-            shell.is_some()
+            children = children_of(daemon);
+            !children.is_empty()
         }),
         "the daemon never started a shell"
     );
-    shell.expect("the shell the wait above returned for")
+    // Every caller here means *the* session's shell, and § 6.1 gives a daemon exactly one
+    // child. Asserted rather than assumed because the alternative is silent: taking the
+    // first entry `/proc` happens to be read in would answer a second daemon child with
+    // whichever pid sorted low, and every assertion downstream would then be about a
+    // process this test never meant.
+    assert_eq!(
+        children.len(),
+        1,
+        "the daemon has more than one child ({children:?}), so `shell_of` has no way to \
+         say which of them the session's shell is"
+    );
+    children
+        .first()
+        .copied()
+        .expect("the one child the assertion above left")
 }
 
-/// The pid of `parent`'s first child, from `/proc`.
-fn child_of(parent: u32) -> Option<u32> {
-    let entries = fs::read_dir("/proc").ok()?;
+/// The pids of every child `parent` has, from `/proc`.
+fn children_of(parent: u32) -> Vec<u32> {
+    let mut children = Vec::new();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return children;
+    };
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(pid) = name.to_str().and_then(|name| name.parse::<u32>().ok()) else {
@@ -321,10 +328,10 @@ fn child_of(parent: u32) -> Option<u32> {
             .find_map(|line| line.strip_prefix("PPid:"))
             .and_then(|value| value.trim().parse::<u32>().ok());
         if parent_of_pid == Some(parent) {
-            return Some(pid);
+            children.push(pid);
         }
     }
-    None
+    children
 }
 
 /// A child that exits while the daemon is still holding input it never read must not
@@ -644,8 +651,15 @@ fn a_spawn_whose_socket_cannot_be_bound_leaves_no_lock_behind() {
 /// kills the process between `bind_socket` and the event loop, and `<id>.sock` and
 /// `<id>.lock` are left for the next daemon and for `list` to read as a live session.
 ///
-/// The directory is what is asserted, rather than the exit status: both orders end the
-/// process, and only one of them ends it having tidied up.
+/// The directory alone will not do, and used to be all this asserted. `before` is the
+/// listing of a directory created empty three lines above it, so *every* way of failing
+/// before `bind_socket` — a mistyped argument, an unusable shell, an exec that never
+/// happened — leaves it empty and satisfies the comparison. How the process ended is what
+/// separates those from the fault this is named for: a `SIGTERM` that landed on `SIG_DFL`
+/// leaves `signal()` reporting it, and a refusal on the way up leaves a status and a
+/// sentence on standard error. Only a daemon that reached the event loop and left through
+/// § 6.5's shutdown exits cleanly, so the two together say the directory was emptied
+/// rather than never filled.
 #[test]
 fn a_daemon_that_inherits_a_pending_stop_signal_still_runs_its_shutdown() {
     let root = run_root("pending_term");
@@ -662,6 +676,22 @@ fn a_daemon_that_inherits_a_pending_stop_signal_still_runs_its_shutdown() {
     let finished = harness::collect(&mut command);
 
     let complaint = harness::stderr(&finished);
+    // The signal first, that being the regression: with the mask cleared ahead of the
+    // handlers this process dies *as* the `SIGTERM` rather than because of it, and
+    // `signal()` is the only thing that tells those two endings apart.
+    assert_eq!(
+        finished.status.signal(),
+        None,
+        "the inherited SIGTERM killed the daemon at its default disposition, between \
+         `bind_socket` and the event loop, with § 6.5's shutdown never run: {complaint:?}"
+    );
+    assert_eq!(
+        finished.status.code(),
+        Some(0),
+        "the daemon did not reach the shutdown this is about; every failure on the way up \
+         also leaves the directory below empty, so without this the comparison would pass \
+         over a daemon that never bound anything: {complaint:?}"
+    );
     assert_eq!(
         entries(&dir),
         before,
@@ -1061,9 +1091,12 @@ fn a_session_whose_child_has_exited_keeps_its_files_and_its_status_with_nobody_a
     /// bit, because the clock the daemon would have measured starts at the end of file
     /// it reports and this one starts at `/proc` agreeing the child has gone.
     const UNATTENDED: Duration = Duration::from_secs(6);
-    /// Five ticks is 50 ms of processor time against the half second [`SPIN_WINDOW`]
-    /// covers: a tenth of a core, unreachable by a daemon that is asleep.
-    const TOLERATED: u64 = 5;
+    /// One tick, which is the smallest figure `/proc` can report at all. Five was a
+    /// tenth of a core, and a daemon spinning on a tenth of a core is the bug — the
+    /// threshold rests on the other answer, the one [`SPIN_WINDOW`] is written around: a
+    /// daemon asleep in `poll` is charged nothing, and no amount of load moves nothing.
+    /// So this is strictly stronger and no more flaky than the figure it replaces.
+    const TOLERATED: u64 = 1;
 
     let (session, mut client, _) = Session::attached("outlives_child");
     let shell = shell_of(&session);
