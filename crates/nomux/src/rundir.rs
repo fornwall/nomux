@@ -665,13 +665,10 @@ impl SessionPaths {
     /// non-blocking (which succeeds on the inherited open-file description), checked
     /// against the current `<id>.lock` name, and put back under `CLOEXEC` before the
     /// login shell can be spawned.
+    ///
+    /// `raw` must be past `STDERR_FILENO`, which `main::parse_lock_fd` is where every
+    /// caller gets it from: adopting a standard stream would close it on the way out.
     pub(crate) fn inherit_spawn_lock(&self, raw: i32) -> io::Result<SpawnLock> {
-        if raw <= libc::STDERR_FILENO {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "inherited spawn-lock descriptor is not usable",
-            ));
-        }
         // This number came from argv, including on a direct `nomux daemon` invocation.
         // Validate it before `OwnedFd::from_raw_fd`: constructing an `OwnedFd` for a
         // closed number violates its safety contract, and its drop is an I/O-safety abort
@@ -1363,6 +1360,28 @@ mod tests {
             "a name this acquisition did not make may be a mutex another process still \
              has standing on, so a failed startup leaves it exactly where it is"
         );
+    }
+
+    /// A `--lock-fd` this daemon cannot adopt is a bad *descriptor* and never a bad id:
+    /// § 10 reserves [`io::ErrorKind::InvalidInput`] to [`SessionPaths::in_dir`], since
+    /// `main::report` scores it as the 64 a client caches as its own typo.
+    #[test]
+    fn a_malformed_lock_fd_is_never_reported_as_a_malformed_id() {
+        let root = Scratch::new("rundir-inherit");
+        let paths = SessionPaths::in_dir(root.path(), "tab_7").expect("resolve paths");
+
+        // A number that was a descriptor and is not one now. Nothing else runs in this
+        // process to reuse it.
+        let closed = {
+            let file = fs::File::open("/dev/null").expect("a descriptor to close again");
+            file.as_raw_fd()
+        };
+
+        let err = paths
+            .inherit_spawn_lock(closed)
+            .expect_err("a closed number is no capability");
+        assert_eq!(err.raw_os_error(), Some(libc::EBADF), "{err}");
+        assert_ne!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
     }
 
     #[test]
