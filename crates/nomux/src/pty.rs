@@ -107,30 +107,18 @@ impl Pty {
         // Bound out here rather than written inside the `unsafe` block below, and
         // load-bearing for it: unsafe context reaches lexically into a closure body, so
         // the calls in here would need no block of their own for the lint to fire on.
+        let max_signal = libc::SIGRTMAX();
         let pre_exec = move || {
             rustix::process::setsid()?;
             // SAFETY: `slave_fd` is open in the child, inherited across fork.
             let slave = unsafe { BorrowedFd::borrow_raw(slave_fd) };
             rustix::process::ioctl_tiocsctty(slave)?;
-            // Every disposition this process may be *ignoring*, put back to default:
-            // exec resets handled dispositions but preserves ignored ones, so § 6.2's
-            // own SIGHUP would be shrugged off by the child `terminate` sends it to —
-            // and POSIX has a non-interactive shell set `SIGINT`/`SIGQUIT` to `SIG_IGN`
-            // around a background job, so `nomux spawn work &` in a script would hand
-            // the user a shell that ignores `Ctrl-\` for good, the job-control three
-            // with it. `SIGINT`, `SIGTERM` and `SIGCHLD` are absent because `startup`
-            // *handles* them, and exec already resets a handler.
-            for signum in [
-                libc::SIGHUP,
-                libc::SIGQUIT,
-                libc::SIGTSTP,
-                libc::SIGTTIN,
-                libc::SIGTTOU,
-            ] {
-                // SAFETY: `signal` is async-signal-safe and SIG_DFL is a valid handler
-                // value.
-                if unsafe { libc::signal(signum, libc::SIG_DFL) } == libc::SIG_ERR {
-                    return Err(io::Error::last_os_error());
+            // Exec preserves ignored dispositions. Give the login shell defaults rather
+            // than a launcher's signal policy; skip the two uncatchable signals.
+            for signum in 1..=max_signal {
+                if !matches!(signum, libc::SIGKILL | libc::SIGSTOP) {
+                    // SAFETY: `signal` is async-signal-safe and SIG_DFL is a valid handler.
+                    unsafe { libc::signal(signum, libc::SIG_DFL) };
                 }
             }
             Ok(())
