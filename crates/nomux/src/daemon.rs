@@ -769,16 +769,14 @@ impl Daemon {
         }
 
         self.apply_win();
-        // Here rather than only on the master's `POLLOUT`, which [`Daemon::watch_for`]
-        // decided before `read_client` had queued anything: every keystroke would otherwise
-        // cost a whole extra pass. That `POLLOUT` still wakes the pass for a master that
-        // had no room, which is the case this one cannot serve.
+        // Not only on the master's `POLLOUT`, which [`Daemon::watch_for`] decided before
+        // `read_client` had queued anything: every keystroke would otherwise cost a whole
+        // extra pass.
         self.write_pty();
-        // Again for what that drain un-blocked: `client_ready` was decided before it, and a
-        // pass ending on a decodable frame with the master out of the poll set sleeps for
-        // [`IDLE_TICK`]. In the pass rather than as a [`Daemon::poll_timeout`] term, which
-        // would spin — [`Conn::buffered`] counts a half-arrived frame too. Nothing is left
-        // owed: this stops on the cap, which owes a `POLLOUT`, or on a frame `POLLIN` ends.
+        // Again for what that drain un-blocked, or a pass ending on a decodable frame with
+        // the master out of the poll set sleeps for [`IDLE_TICK`]. Here rather than as a
+        // [`Daemon::poll_timeout`] term, which would spin: [`Conn::buffered`] counts a
+        // half-arrived frame too.
         if self.input_backlog() {
             self.read_client(read_buf, scratch);
         }
