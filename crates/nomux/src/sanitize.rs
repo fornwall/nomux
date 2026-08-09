@@ -1,5 +1,5 @@
 //! One filter over text somebody else chose, and the journal that is the daemon's only
-//! voice once `startup::release_startup_state` has pointed its three descriptors at
+//! voice once `startup::silence_standard_descriptors` has pointed its three descriptors at
 //! `/dev/null`.
 //!
 //! The two live here together because the journal *is* one of the filter's two surfaces
