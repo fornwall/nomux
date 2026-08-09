@@ -545,12 +545,14 @@ The two copies can still drift, and that is affordable for one reason only: a wr
 directory is a `direct-streamlocal` sshd refuses, and § 5.3 answers a refusal with the exec
 relay, which resolves the path in the daemon's own code.
 
-A `sun_path` is 108 bytes including its terminator, so the directory, a `/`, the id and a
-six-byte suffix — `.label` and `.agent`, the joint longest of the five — have to fit in
-107. Under `/run/user/1000/nomux`, the directory the code builds, that allows an id of 80 and
-the 64-byte ceiling binds first; under the fallback the longest is `77 - len($HOME)`. **A
-refused id is therefore not necessarily a bad id**, which § 10 turns into an exit code and a
-client must not cache as a property of the id. The refusal lands before the `bind`, since
+A `sun_path` is 108 bytes including its terminator, so the directory, a `/`, the id and
+`.agent` — the longer of the two names this layout *binds*, `.sock` being the other — have
+to fit in 107. A plain file's name is never measured; `.label` is the same six bytes and
+costs nothing. Under `/run/user/1000/nomux`, the directory the code builds, that allows an
+id of 80 and the 64-byte ceiling binds first; under the fallback the longest is
+`77 - len($HOME)`. **A refused id is therefore not necessarily a bad id**, which § 10 turns
+into an exit code and a client must not cache as a property of the id. The refusal lands
+before the `bind`, since
 `list` and `kill` read an unbindable address as a *live* session whose files they must not
 unlink.
 
