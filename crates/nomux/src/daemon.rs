@@ -285,9 +285,13 @@ fn start(session_id: &str, label: Option<&str>, inherited_lock_fd: Option<i32>) 
     let (stop_pipe, child_pipe) = match publish(&paths, label) {
         Ok(pipes) => pipes,
         Err(err) => {
-            // Still the publication authority: cleaning through it avoids releasing the
-            // lock and then parking behind the parent waiting for this startup to finish.
-            drop(paths.unlink_all_locked(&publishing));
+            if inherited_lock_fd.is_some() {
+                // The spawning parent still holds this open-file description. Removing
+                // its name would let another spawn create and lock a different inode.
+                drop(paths.unlink_published_locked(&publishing));
+            } else {
+                drop(paths.unlink_all_locked(&publishing));
+            }
             return Err(err);
         }
     };

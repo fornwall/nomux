@@ -28,6 +28,7 @@
 mod harness;
 
 use std::io::{self, ErrorKind, Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -92,6 +93,56 @@ fn a_daemon_that_cannot_publish_its_pidfile_refuses_to_start() {
         !run_dir.join("nopid.sock").exists(),
         "the socket the refusal left bound is stale by § 6.6's own test — a refused \
          connect — so `list` must have collected it"
+    );
+}
+
+/// A daemon that fails after binding must not unlink the spawn mutex its parent still holds.
+#[test]
+fn failed_publication_keeps_concurrent_spawns_on_one_lock() {
+    let root = run_root("publish_lock");
+    let dir = root.join("nomux/run");
+    fs::create_dir_all(dir.join("same.pid")).expect("block pidfile publication");
+    let lock_path = dir.join("same.lock");
+
+    let mut first = Spawned::spawn(
+        nomux_with_shell(&root, &["spawn", "same"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    );
+    assert!(
+        poll_until(SETTLE, || lock_path.exists()),
+        "the first spawn never published its lock"
+    );
+    let locked = fs::metadata(&lock_path).expect("stat the first spawn lock");
+
+    // Publication fails immediately, while the parent deliberately waits out its
+    // five-second startup deadline with the lock still held.
+    thread::sleep(Duration::from_millis(250));
+    assert!(
+        first.is_running(),
+        "the first spawn left before its deadline"
+    );
+    let named = fs::metadata(&lock_path).expect("the held lock stays named");
+    assert_eq!(
+        (named.dev(), named.ino()),
+        (locked.dev(), locked.ino()),
+        "failed publication replaced the lock while its parent still held it"
+    );
+
+    // Make a later daemon startable. It must remain behind the first lock rather than
+    // create a second inode and publish a session concurrently.
+    let mut second = Spawned::spawn(
+        nomux_with_shell(&root, &["spawn", "same"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    );
+    thread::sleep(Duration::from_millis(250));
+    assert!(second.is_running(), "the concurrent spawn did not wait");
+    assert!(
+        !dir.join("same.sock").exists(),
+        "a concurrent spawn started through a different lock inode"
     );
 }
 
