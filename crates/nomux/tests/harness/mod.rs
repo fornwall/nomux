@@ -607,15 +607,9 @@ fn intern(name: &str) -> String {
 }
 
 /// Held shared by every `fork` this process performs, and exclusively by a test that
-/// needs a descriptor of its own to be closed *process-wide*.
-///
-/// `fork` copies the whole descriptor table, so a child started by one test carries a
-/// duplicate of everything every other test had open at that instant, and keeps it
-/// until it reaches `exec`. Until then a pipe or socket the other test has closed on
-/// purpose is not closed at all: it still has a reader, and a peer writing to it gets
-/// its bytes taken rather than the `EPIPE` the test set up. A duplicate of an `flock`ed
-/// descriptor is the same hazard in its mild form, holding the lock alive. All of it is
-/// invisible under `cargo nextest`, which gives each test a process of its own.
+/// needs a descriptor of its own to be closed *process-wide* — for `cargo test`, which
+/// `README.md` tells contributors to run and which puts every test in one process, where
+/// another test's `fork` would otherwise duplicate that descriptor and keep it open.
 static FORKS: RwLock<()> = RwLock::new(());
 
 /// Starts `command`, holding [`FORKS`] across the `fork` it performs.
@@ -733,6 +727,28 @@ pub(crate) fn collect(command: &mut Command) -> Output {
         .expect("start the process")
         .wait_with_output()
         .expect("collect what the process said")
+}
+
+/// [`collect`] against a deadline the caller shares between several runs, handing back
+/// `None` for a process that never came back — and killing it on the way out.
+///
+/// For the modes whose defect *is* a wait with no end: a plain `wait` there hangs the
+/// run instead of failing it, and the runner's own kill (`.config/nextest.toml`) reports
+/// a slow test rather than which call never returned. The deadline is the caller's per
+/// [`poll_by`], and the stdio is set here because every caller wants the same three.
+pub(crate) fn collect_by(command: &mut Command, deadline: Instant) -> Option<Output> {
+    let mut running = Spawned::spawn(
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
+    poll_by(deadline, || !running.is_running()).then(|| {
+        running
+            .into_exited()
+            .wait_with_output()
+            .expect("collect what the process said")
+    })
 }
 
 /// Fails with `what` unless the process exited successfully, quoting whatever it
@@ -889,7 +905,7 @@ pub(crate) fn process_alive(pid: u32) -> bool {
 /// The connection costs the session nothing: § 6.4 has the daemon promote a connection
 /// on its `Hello` and never on the `connect`, so this is not an attach and does not
 /// stop the clock an attach stops.
-pub(crate) fn wait_until_answering(path: &Path) {
+fn wait_until_answering(path: &Path) {
     let answered = poll_until(SETTLE, || UnixStream::connect(path).is_ok());
     assert!(answered, "the daemon never answered on {}", path.display());
 }
@@ -1348,8 +1364,7 @@ impl Client {
     /// [`Client::expect_error`] for a connection the session is also writing output
     /// to, where the refusal is not the only thing that can be in flight.
     pub(crate) fn expect_error_among_output(&mut self, code: ErrorCode, what: &str) {
-        let payload = self.next_of_awaiting(FrameType::Error, &format!("a refusal ({what})"));
-        assert_refusal(FrameType::Error, &payload, code, None, what);
+        self.expect_refusal_among_output(code, None, what);
     }
 
     /// [`Client::expect_error_among_output`] where the caller also knows a distinctive
@@ -1365,8 +1380,13 @@ impl Client {
     /// rather than the whole sentence, so a site that rewords itself around what it is
     /// still saying does not fail every row that named it.
     pub(crate) fn expect_error_saying(&mut self, code: ErrorCode, saying: &str, what: &str) {
+        self.expect_refusal_among_output(code, Some(saying), what);
+    }
+
+    /// The body of both, differing only in whether the daemon's words are read too.
+    fn expect_refusal_among_output(&mut self, code: ErrorCode, saying: Option<&str>, what: &str) {
         let payload = self.next_of_awaiting(FrameType::Error, &format!("a refusal ({what})"));
-        assert_refusal(FrameType::Error, &payload, code, Some(saying), what);
+        assert_refusal(FrameType::Error, &payload, code, saying, what);
     }
 
     /// One past the last input byte this client has delivered.
@@ -1602,12 +1622,7 @@ fn assert_refusal(
 /// failure (`IMPLEMENTATION.md` § 9), and, where the model knows its own escape
 /// sequences, which one the boundary fell inside. A closure because only the comparison
 /// below knows the index there is anything to say about.
-pub(crate) fn assert_same_stream(
-    want: &[u8],
-    got: &[u8],
-    at: u64,
-    sits_in: impl FnOnce(usize) -> String,
-) {
+fn assert_same_stream(want: &[u8], got: &[u8], at: u64, sits_in: impl FnOnce(usize) -> String) {
     if want == got {
         return;
     }
