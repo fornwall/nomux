@@ -79,12 +79,14 @@ fn a_child_killed_by_a_signal_is_reported_as_signalled_rather_than_as_a_status()
         "a child killed by SIGKILL must arrive as the signal that killed it, not as \
          a status a process chose"
     );
-    // Whole seconds, so this is not a tight bound wearing a loose one: the daemon
-    // collects the status on the pass that finds `waitpid` ready, microseconds after
-    // the end of file it measures from, and a whole second would have to pass before
-    // this could read as anything but zero.
-    assert_eq!(
-        replay.since_terminal_closed_secs, 0,
+    // Whole seconds, and one of them allowed: what this separates is a field measured
+    // from the end of file from one stamped when the frame was built or counted from the
+    // session's own start, and those differ by however long this test has been running —
+    // seconds at least. Zero exactly is the same assertion wearing a race, since the two
+    // readings the field is the difference of straddle a whole-second boundary about as
+    // often as the machine is loaded.
+    assert!(
+        replay.since_terminal_closed_secs <= 1,
         "the client that watched the exit happen was told the shell had been gone \
          for {} s, so the field measures something other than the end of file",
         replay.since_terminal_closed_secs
