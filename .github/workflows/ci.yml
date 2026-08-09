@@ -312,6 +312,17 @@ jobs:
           "$binary" --version
           sh scripts/smoke-release.sh "$binary"
 
+  smoke-gate:
+    name: downloaded release smoke
+    runs-on: ubuntu-24.04
+    if: always() && github.event_name != 'schedule'
+    needs: smoke
+    steps:
+      - name: Require every native smoke test
+        env:
+          RESULT: ${{ needs.smoke.result }}
+        run: test "$RESULT" = success
+
   # The checksums need a permanent, public home; a workflow artifact expires after ninety days
   # and sits behind a login. Its own job because it needs every test and artifact job — so a
   # tag cannot publish a release whose tests failed — and because it is the only one that wants a
