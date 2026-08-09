@@ -37,8 +37,6 @@ it, and what nomux *sets* is §6.1.1's. `NOMUX_UPDATE_BASELINE` is tested for ex
 | `HOME` | every mode | Second choice (§6.3), and the child's working directory (§6.1.1) |
 | `XDG_RUNTIME_DIR` | every mode | Login-scoped fallback run directory (§6.3) |
 | `SHELL` | daemon | The child's login shell (§6.1.1) |
-| `NOMUX_LAUNCHER` | `spawn` | `auto` (default), `direct` or `systemd` daemon launch (§6.2) |
-| `INVOCATION_ID` | `spawn`, daemon | Preserved across a systemd scope handoff; otherwise untouched (§6.2) |
 | `NOMUX_RING_BYTES` | daemon | Ring capacity in bytes (§4) |
 | `NOMUX_CHAOS_SEED` | the chaos suite | Disconnect-point seed; unset is a fixed default, so a failure reproduces (§9) |
 | `NOMUX_UPDATE_BASELINE` | `scripts/build-release.sh` | Rewrite `scripts/size-baseline` from this build (§8) |
@@ -456,9 +454,10 @@ descriptor is the call that takes the daemon's voice away and nothing that might
 explain itself may follow it.
 
 Both were once silent, on the argument that a pinned mount is cheaper than a refused
-session. That held only while the daemon might be killed at logout anyway; `e2e-tests/`
-measures that a lingering user manager carries it through, so the mount would stay busy
-for the session's whole idle life — a week (§ 6.5) — with nothing said about it anywhere.
+session. That held only while the daemon might be killed at logout anyway, and on the
+ordinary host it is not: `KillUserProcesses=no` is what most distributions ship, so the
+daemon outlives the login and the mount would stay busy for the session's whole idle
+life — a week (§ 6.5) — with nothing said about it anywhere.
 
 The test is **no controlling terminal**, not "leads a session": a session leader may still
 hold one. `startup::detach_from_controlling_terminal` carries the rest. The fork happens after the socket
@@ -483,31 +482,37 @@ after: `exec` preserves a pending signal as well as a blocked one, so a signal b
 pending arrives the instant the mask clears, and a handler armed behind that is one it
 missed.
 
-This is POSIX terminal detachment, not escape from a service manager: on systemd, `setsid`
-and `fork` alone leave a process in the SSH `session-*.scope`, where `KillUserProcesses=yes`
-may stop it at logout. `spawn` therefore selects its launcher before starting anything:
+This is POSIX terminal detachment and nothing more — it is not escape from a service
+manager, and nomux no longer attempts one. `spawn` starts the daemon **directly**, always:
+one child from `/proc/self/exe`, so an atomic upgrade underneath a running relay still
+launches the exact inode that relay is executing, with the already-held spawn-lock
+descriptor inherited across the `exec`. There is no launcher to select and nothing is
+probed before the launch.
 
-- `NOMUX_LAUNCHER=auto` (also unset or empty) uses a transient `systemd-run --user --scope`
-  only when `systemd-run` exists at `/usr/bin` or `/bin`, an absolute
-  `$XDG_RUNTIME_DIR/bus` accepts a connection, and `loginctl show-user` says exactly
-  `Linger=yes`. Otherwise it takes the direct path above. A manager merely running now is
-  not a promise that it will survive the final logout.
-- `direct` forces that fallback; `systemd` forces the scope and reports startup failure if
-  the trusted executable or manager is unavailable. No executable is selected through
-  caller-controlled `PATH`.
-- The scope is manager-owned, named `nomux-<id>-<relay-pid>.scope`, and collected after it
-  empties. The already-held spawn-lock descriptor crosses `systemd-run`; the final command
-  resolves `/proc/<relay-pid>/exe`, retaining the exact running nomux inode across an atomic
-  upgrade. Labels cross that command line as ASCII hex, insulating them from systemd-run
-  releases that disagree about environment expansion. Its replacement `INVOCATION_ID` is
-  restored to the creator's raw value or absence before the PTY child is created, so the
-  launch policy does not otherwise rewrite the shell environment.
+The consequence, stated plainly: on systemd, `setsid` and `fork` leave the daemon in
+sshd's `session-*.scope` cgroup, so where `logind.conf` sets `KillUserProcesses=yes`
+logind stops it at the final logout and **the session does not survive**. Most
+distributions ship `KillUserProcesses=no`, which is why a direct launch is survivable in
+practice, and that is exactly the position `tmux` and GNU `screen` are in: on this axis
+nomux is now no better and no worse than they are.
 
-Automatic direct fallback is intentionally honest rather than optimistic: it supports hosts
-without systemd or linger, but promises no persistence under a policy that kills the SSH
-scope. Nothing on the wire reports logout policy, which the daemon could not turn into a
-survival statement anyway. [PLAN.md](PLAN.md) retains the real SSH logout matrix as required
-validation.
+A transient `systemd-run --user --scope` used to carry the daemon out of that cgroup where
+a reachable, lingering user manager could own the scope. It is gone, along with the
+`systemd-run` and `loginctl` probes that chose it, the `NOMUX_LAUNCHER` override, the
+`--systemd-scope` private option and the `INVOCATION_ID` restoration that undid the
+scope's rewrite of the environment. That is a deliberate subtraction and not an
+improvement: what it buys is less code and no bus connection, `loginctl` call or
+executable probe on the session-creation path, and what it gives up is logout persistence
+on a strict host.
+
+Somebody who needs that persistence arranges it above nomux — `loginctl enable-linger`
+plus a scope of their own, or a `systemd-run --user --scope` wrapper around the `spawn`
+command. The client ships as one versioned unit with this binary
+([DESIGN.md § 2](DESIGN.md#2-scope)), so it is a reasonable place for host policy to live,
+and it is the only side that knows which hosts it has been told to treat that way.
+Nothing on the wire reports logout policy, which the daemon could not turn into a survival
+statement anyway. [PLAN.md](PLAN.md) retains the real SSH logout matrix as required
+validation of what a directly launched daemon actually does.
 
 ### 6.3 Socket
 

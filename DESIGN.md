@@ -70,7 +70,6 @@ flowchart LR
   subgraph server["SSH server"]
     SSHD["sshd"]
     RELAY["nomux spawn / attach<br/>byte-blind relay"]
-    SYSTEMD["systemd user manager<br/>transient nomux scope"]
     DAEMON["nomux daemon<br/>protocol + PTY + output ring"]
     CHILD["login shell / TUI"]
   end
@@ -79,9 +78,7 @@ flowchart LR
   SSHD <-->|"direct-streamlocal<br/>warm resume"| DAEMON
   SSHD <-->|"exec stdio<br/>bootstrap / fallback"| RELAY
   RELAY <-->|"session unix socket"| DAEMON
-  RELAY -.->|"spawn: direct fallback"| DAEMON
-  RELAY -.->|"spawn: systemd-run --user --scope"| SYSTEMD
-  SYSTEMD -.->|"place daemon in scope"| DAEMON
+  RELAY -.->|"spawn: start daemon directly"| DAEMON
   DAEMON <-->|"PTY"| CHILD
 ```
 
@@ -274,6 +271,19 @@ one as a gap.
   client knows both what it forwarded and what it asked nomux for, which is why §5.3 leaves
   the warning there; the variable is inherited untouched
   ([IMPLEMENTATION.md § 6.1.1](IMPLEMENTATION.md#611-what-the-child-runs)).
+- **Placing the daemon in a systemd user scope.** Built, measured, and then removed. A
+  `setsid`ed daemon stays in sshd's `session-N.scope`, so `KillUserProcesses=yes` ends the
+  session at the final logout; a transient `systemd-run --user --scope` escaped that, but
+  only where a *lingering* user manager was there to own the scope, and establishing that
+  cost a bus connection, a `loginctl` call and two executable probes on every session
+  creation, plus an environment the scope rewrote and nomux then had to put back. The
+  launch is now always direct, which is the same ground `tmux` and `screen` stand on and
+  survivable for the same reason — `KillUserProcesses=no` is the shipped default nearly
+  everywhere. A strict host is a host policy question: `loginctl enable-linger` and a scope
+  belong to whoever administers or drives that host, and the client versions with this
+  binary (§2) so it can hold that per host without a wire change. What reopens it: strict
+  hosts turning out to be common enough that every user meets one
+  ([IMPLEMENTATION.md § 6.2](IMPLEMENTATION.md#62-terminal-detachment-and-logout-policy)).
 - **Automatic cross-device handover.** The wire now supplies the two safe primitives:
   unconditional takeover and `Hello.if_detached`, whose occupied-slot refusal lets a client
   ask the user before retrying. Automating a handover still needs product policy for when to

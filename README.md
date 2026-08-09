@@ -12,12 +12,14 @@ reporting and scrollback all work unchanged.
 > repository is the server half; the SSH client and terminal emulator that drive it are a
 > separate, unreleased project, and without that client there is no way to get a shell out
 > of this — the relay modes speak a binary frame protocol over stdio rather than driving a
-> terminal, so `nomux list` and `nomux kill` are what works standalone. On systemd hosts,
-> session creation uses a user-manager scope when a reachable lingering user manager makes
-> that a persistence promise; its direct fallback *is* killed at logout where
-> `KillUserProcesses=yes`, so a strict host needs `loginctl enable-linger`. The logout
-> matrix is exercised in containers ([e2e-tests/](e2e-tests/README.md)) but not yet on a
-> real host. AI-generated, and experimental.
+> terminal, so `nomux list` and `nomux kill` are what works standalone. The daemon is
+> started directly and stays in sshd's session cgroup, so on a host configured
+> `KillUserProcesses=yes` logind kills it at the final logout and **the session does not
+> survive** — the same footing `tmux` and `screen` are on, and survivable for the same
+> reason: `KillUserProcesses=no` is the default nearly everywhere. Persistence on a strict
+> host has to be arranged around nomux (`loginctl enable-linger` and a scope of your own).
+> The logout matrix is exercised in containers ([e2e-tests/](e2e-tests/README.md)) but not
+> yet on a real host. AI-generated, and experimental.
 
 `nomux <mode> [session-id]`. The binary-protocol modes are `daemon`, `spawn` and
 `attach`; `--label` is accepted only when creating through `daemon` or `spawn`.
