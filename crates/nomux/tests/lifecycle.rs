@@ -299,20 +299,37 @@ fn the_child_is_a_login_shell_told_its_terminal_and_its_session() {
 /// every caller here would lose occasionally and blame on something else.
 fn shell_of(session: &Session) -> u32 {
     let daemon = session.child.id();
-    let mut shell = None;
+    let mut children = Vec::new();
     assert!(
         poll_until(SETTLE, || {
-            shell = child_of(daemon);
-            shell.is_some()
+            children = children_of(daemon);
+            !children.is_empty()
         }),
         "the daemon never started a shell"
     );
-    shell.expect("the shell the wait above returned for")
+    // Every caller here means *the* session's shell, and § 6.1 gives a daemon exactly one
+    // child. Asserted rather than assumed because the alternative is silent: taking the
+    // first entry `/proc` happens to be read in would answer a second daemon child with
+    // whichever pid sorted low, and every assertion downstream would then be about a
+    // process this test never meant.
+    assert_eq!(
+        children.len(),
+        1,
+        "the daemon has more than one child ({children:?}), so `shell_of` has no way to \
+         say which of them the session's shell is"
+    );
+    children
+        .first()
+        .copied()
+        .expect("the one child the assertion above left")
 }
 
-/// The pid of `parent`'s first child, from `/proc`.
-fn child_of(parent: u32) -> Option<u32> {
-    let entries = fs::read_dir("/proc").ok()?;
+/// The pids of every child `parent` has, from `/proc`.
+fn children_of(parent: u32) -> Vec<u32> {
+    let mut children = Vec::new();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return children;
+    };
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(pid) = name.to_str().and_then(|name| name.parse::<u32>().ok()) else {
@@ -324,10 +341,10 @@ fn child_of(parent: u32) -> Option<u32> {
             .find_map(|line| line.strip_prefix("PPid:"))
             .and_then(|value| value.trim().parse::<u32>().ok());
         if parent_of_pid == Some(parent) {
-            return Some(pid);
+            children.push(pid);
         }
     }
-    None
+    children
 }
 
 /// A child that exits while the daemon is still holding input it never read must not
