@@ -118,12 +118,8 @@ const ABANDON_PENDING_WRITE: usize = 8 << 20;
 /// cap leaves the bytes in the kernel, where the peer blocks on them.
 pub(crate) const MAX_PENDING_READ: usize = 1 << 20;
 
-/// Capacity the decode scratch keeps between passes rather than hand back.
-const SCRATCH_RETAINED: usize = 64 * 1024;
-
-/// Capacity the PTY input queue keeps once drained, for [`SCRATCH_RETAINED`]'s reason.
-/// Small because this holds keystrokes; the paste the shrink exists for is four orders
-/// of magnitude above this floor.
+/// Capacity the PTY input queue keeps once drained: enough for keystrokes, so only the
+/// paste the shrink exists for ever pays a reallocation.
 const PENDING_INPUT_RETAINED: usize = 4096;
 
 /// The attached client, and the state that means nothing without one.
@@ -481,6 +477,10 @@ fn drain_signals(pipe: BorrowedFd<'_>) {
 
 impl Daemon {
     fn event_loop(&mut self) -> io::Result<()> {
+        // Both held for the session and neither given back: `read_buf` never moves, and
+        // `scratch` settles at the largest payload decoded, which `MAX_PAYLOAD` bounds at
+        // 256 KiB against a ring measured in megabytes. Shrinking it per pass would
+        // reallocate on every `Input` of a sustained paste. `take_frame` clears it.
         let mut scratch = Vec::new();
         let mut read_buf = vec![0u8; 64 * 1024];
 
@@ -490,13 +490,6 @@ impl Daemon {
             }
             let ready = self.wait()?;
             self.poll_once(&ready, &mut read_buf, &mut scratch);
-            // Given back so one large `Input` does not leave 256 KiB held for a week, and
-            // only down to [`SCRATCH_RETAINED`]: every pass reaches here. `read_buf` never
-            // moves.
-            scratch.clear();
-            if scratch.capacity() > SCRATCH_RETAINED {
-                scratch.shrink_to(SCRATCH_RETAINED);
-            }
         }
     }
 
