@@ -1,6 +1,9 @@
 # One container per cell of matrix.tsv, each booting systemd as PID 1 so there is a real
 # logind to have a policy and a real sshd to log out of. Keep the two files in step: the
-# port here is the port the matrix names.
+# port here is the port the matrix names, and the three environment variables are the axes
+# it predicts a verdict for. `confirm_axes` in run.sh enforces the second half of that by
+# reading back what the container booted with; the port is what binds a row to a service,
+# so a swapped one is what the check is really there to catch.
 
 x-cell: &cell
   build:
