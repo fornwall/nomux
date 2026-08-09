@@ -49,13 +49,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           candidates=$(gh pr list --repo "$GITHUB_REPOSITORY" --base main --state open --limit 100 \
-            --json number,url,author,baseRefName,headRefName,isCrossRepository,isDraft,autoMergeRequest \
+            --json number,url,headRefOid,author,baseRefName,headRefName,isCrossRepository,isDraft,autoMergeRequest \
             --jq 'map(select(.author.login == "app/dependabot" and .baseRefName == "main" and
                   (.isCrossRepository | not) and (.isDraft | not) and .autoMergeRequest == null and
                   (.headRefName |
                     test("^dependabot/cargo/(fuzz/)?(patch|security-patch)-(fuzz-)?cargo-")))) |
-                  sort_by(.number)[] | [.number, .url] | @tsv')
-          while IFS=$'\t' read -r number url; do
+                  sort_by(.number)[] | [.number, .url, .headRefOid] | @tsv')
+          while IFS=$'\t' read -r number url head_oid; do
             [ -n "$number" ] || continue
             files=$(gh api --paginate \
               "repos/$GITHUB_REPOSITORY/pulls/$number/files?per_page=100" --jq '.[].filename')
@@ -72,7 +72,8 @@ jobs:
               (.commit.message |
                 test("dependency-group: (patch|security-patch)-(fuzz-)?cargo(\\n|$)")))' \
               <<< "$commits" >/dev/null &&
-                gh pr merge --repo "$GITHUB_REPOSITORY" --auto --merge "$url"; then
+                gh pr merge --repo "$GITHUB_REPOSITORY" --auto --merge \
+                  --match-head-commit "$head_oid" "$url"; then
               exit 0
             fi
           done <<< "$candidates"

@@ -324,11 +324,12 @@ fn output_within(command: &mut Command, within: Duration) -> io::Result<Output> 
             }
             Ok(None) => {
                 drop(child.kill());
-                drop(child.try_wait());
+                drop(child.wait());
                 return Err(io::ErrorKind::TimedOut.into());
             }
             Err(err) => {
                 drop(child.kill());
+                drop(child.wait());
                 return Err(err);
             }
         }

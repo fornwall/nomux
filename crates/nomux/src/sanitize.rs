@@ -111,15 +111,35 @@ mod tests {
         assert_eq!(sanitize_label("\t\n"), "");
     }
 
-    /// The bidi overrides are `Cf` rather than `Cc`, so they went straight through the
-    /// filter above and out to the terminal `list` prints on — in a column the user
-    /// reads to decide which session to kill.
     #[test]
-    fn labels_lose_the_bidi_controls_that_are_not_control_characters() {
+    fn deceptive_non_controls_are_removed() {
         assert_eq!(sanitize_label("build\u{202e}gnp."), "buildgnp.");
         for sneaky in [
-            '\u{61c}', '\u{200e}', '\u{200f}', '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}',
-            '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+            '\u{61c}',
+            '\u{200e}',
+            '\u{200f}',
+            '\u{202a}',
+            '\u{202b}',
+            '\u{202c}',
+            '\u{202d}',
+            '\u{202e}',
+            '\u{2066}',
+            '\u{2067}',
+            '\u{2068}',
+            '\u{2069}',
+            '\u{ad}',
+            '\u{180e}',
+            '\u{200b}',
+            '\u{2060}',
+            '\u{2061}',
+            '\u{2062}',
+            '\u{2063}',
+            '\u{2064}',
+            '\u{feff}',
+            '\u{e0000}',
+            '\u{e0001}',
+            '\u{e0020}',
+            '\u{e007f}',
         ] {
             assert!(
                 !sneaky.is_control(),
@@ -131,51 +151,8 @@ mod tests {
                 "{sneaky:?} reached the terminal"
             );
         }
-        // Either side of the ranges, so the filter is not simply eating `Cf` — the line
-        // [`is_deceptive`] draws, and why it is drawn there.
-        assert_eq!(
-            sanitize_label("\u{61b}a\u{2065}a\u{2070}"),
-            "\u{61b}a\u{2065}a\u{2070}"
-        );
-        assert_eq!(sanitize_label("a\u{200d}b\u{200c}c"), "a\u{200d}b\u{200c}c");
-    }
-
-    /// The invisible `Cf` codepoints that are neither bidi nor tags, and the reason
-    /// `is_control` cannot be the whole filter: they occupy no width, so two sessions
-    /// whose labels differ by one of them are two rows a human cannot tell apart in the
-    /// listing they choose from.
-    #[test]
-    fn labels_lose_the_zero_width_characters_that_occupy_no_column() {
-        for sneaky in [
-            '\u{ad}', '\u{180e}', '\u{200b}', '\u{2060}', '\u{2061}', '\u{2062}', '\u{2063}',
-            '\u{2064}', '\u{feff}',
-        ] {
-            assert!(
-                !sneaky.is_control(),
-                "{sneaky:?} would already be dropped, so it says nothing about this"
-            );
-            assert_eq!(
-                sanitize_label(&format!("a{sneaky}b")),
-                "ab",
-                "{sneaky:?} reached the terminal"
-            );
-        }
-        // The whole of what that buys, stated as the collision it closes.
         assert_eq!(sanitize_label("bu\u{200b}ild"), sanitize_label("build"));
 
-        // And the deliberate exception, one codepoint away from U+200B: ZWJ and ZWNJ
-        // spell Indic scripts and emoji sequences, and a label is a human's own text.
-        assert_eq!(sanitize_label("a\u{200c}\u{200d}b"), "a\u{200c}\u{200d}b");
-        // Either side of the invisible operators, for the reason above: U+205F is a
-        // space that occupies one and U+2065 is unassigned.
-        assert_eq!(sanitize_label("a\u{205f}b\u{2065}c"), "a\u{205f}b\u{2065}c");
-    }
-
-    /// U+E0020..=U+E007F encode printable ASCII in codepoints that render as nothing,
-    /// so a label that `list` prints as `build` can carry an entire second string
-    /// behind it — invisible in the listing and plainly there in whatever pastes it.
-    #[test]
-    fn labels_lose_the_tag_characters_that_render_as_nothing() {
         let hidden: String = " rm -rf ~"
             .chars()
             .filter_map(|ch| char::from_u32(0xE_0000 + u32::from(ch)))
@@ -183,18 +160,12 @@ mod tests {
         assert_eq!(hidden.chars().count(), 9, "the fixture must encode as tags");
         assert_eq!(sanitize_label(&format!("build{hidden}")), "build");
 
-        for sneaky in ['\u{e0000}', '\u{e0001}', '\u{e0020}', '\u{e007f}'] {
-            assert!(
-                !sneaky.is_control(),
-                "{sneaky:?} would already be dropped, so it says nothing about this"
-            );
-            assert_eq!(
-                sanitize_label(&format!("a{sneaky}b")),
-                "ab",
-                "{sneaky:?} reached the terminal"
-            );
-        }
-        // Either side of the block, for the same reason as above.
+        assert_eq!(
+            sanitize_label("\u{61b}a\u{2065}a\u{2070}"),
+            "\u{61b}a\u{2065}a\u{2070}"
+        );
+        assert_eq!(sanitize_label("a\u{200c}\u{200d}b"), "a\u{200c}\u{200d}b");
+        assert_eq!(sanitize_label("a\u{205f}b\u{2065}c"), "a\u{205f}b\u{2065}c");
         assert_eq!(sanitize_label("\u{dffff}a\u{e0080}"), "\u{dffff}a\u{e0080}");
     }
 

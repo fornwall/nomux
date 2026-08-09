@@ -275,14 +275,18 @@ jobs:
           path: target/dist/
           if-no-files-found: ignore
 
-  # Downloads the exact artifact `publish` will consume, verifies its manifest, and only then
-  # executes it. The emulator package is deliberately installed before that download and in a
-  # separate job: a mutable root package install cannot touch bytes already hashed in the producer
-  # workspace or the stored artifact. Running this on every pull request rehearses the artifact
-  # boundary before auto-merge rather than for the first time on a tag.
+  # Download, verify and exercise the published artifact on both native architectures.
   smoke:
-    name: downloaded release smoke
-    runs-on: ubuntu-24.04
+    name: release smoke (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
     if: github.event_name != 'schedule'
     needs: release
     timeout-minutes: 15
@@ -290,9 +294,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-
-      - name: Install AArch64 user-mode emulation
-        run: sudo apt-get update -qq && sudo apt-get install -y qemu-user
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -303,15 +304,24 @@ jobs:
         working-directory: target/dist
         run: sha256sum -c SHA256SUMS
 
-      # The check job never builds `-Zbuild-std` with `-Cpanic=immediate-abort`. Both shipping
-      # architectures must at least execute; native x86_64 additionally greets a real PTY, drives
-      # a shell, detaches, replays through a second relay, checks Exit, then lists and kills it.
-      - name: Run the binaries that ship
+      # Covers the release-only std, panic and linker configuration through a real PTY lifecycle.
+      - name: Run the binary that ships
         run: |
-          chmod +x target/dist/nomux-x86_64-unknown-linux-musl target/dist/nomux-aarch64-unknown-linux-musl
-          target/dist/nomux-x86_64-unknown-linux-musl --version
-          qemu-aarch64 target/dist/nomux-aarch64-unknown-linux-musl --version
-          sh scripts/smoke-release.sh target/dist/nomux-x86_64-unknown-linux-musl
+          binary="target/dist/nomux-${{ matrix.target }}"
+          chmod +x "$binary"
+          "$binary" --version
+          sh scripts/smoke-release.sh "$binary"
+
+  smoke-gate:
+    name: downloaded release smoke
+    runs-on: ubuntu-24.04
+    if: always() && github.event_name != 'schedule'
+    needs: smoke
+    steps:
+      - name: Require every native smoke test
+        env:
+          RESULT: ${{ needs.smoke.result }}
+        run: test "$RESULT" = success
 
   # The checksums need a permanent, public home; a workflow artifact expires after ninety days
   # and sits behind a login. Its own job because it needs every test and artifact job — so a

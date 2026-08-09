@@ -22,7 +22,6 @@
 //! an absent one.
 
 use std::collections::VecDeque;
-use std::error::Error as StdError;
 use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -153,12 +152,6 @@ impl Failure {
 impl fmt::Display for Failure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.source.fmt(formatter)
-    }
-}
-
-impl StdError for Failure {
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        Some(&self.source)
     }
 }
 
