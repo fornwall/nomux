@@ -163,7 +163,8 @@ pub(crate) fn ensure_run_dir(dir: &Path) -> io::Result<()> {
 /// replace one with a symlink between validation and use. Every existing ancestor must be
 /// a real directory, owned by this uid or root, and not writable by group or other. A sticky
 /// shared parent is safe for a child owned by this uid or root, as the kernel forbids another
-/// uid from renaming that entry. Missing components are allowed here because
+/// uid from renaming that entry. Missing components are allowed here — the sticky parent's
+/// own child among them, there being no owner to weigh before the `mkdir` — because
 /// [`ensure_run_dir`] creates them and then runs this check again before returning.
 fn check_trusted_ancestors(dir: &Path) -> io::Result<()> {
     let us = rustix::process::getuid().as_raw();
@@ -192,8 +193,16 @@ fn check_trusted_ancestors(dir: &Path) -> io::Result<()> {
                 let mode = metadata.mode();
                 // The sticky bit is the one safe shared-directory exception: only the
                 // child owner, directory owner or root may rename the protected entry.
-                let sticky_protects_child = mode & 0o1000 != 0
-                    && child_owner.is_some_and(|owner| owner == us || owner == 0);
+                // A child that is not there yet is nothing that rule can speak for, and
+                // refusing it made a run directory under sticky `/tmp` impossible to
+                // *create* while an existing one was accepted — a permanent 126 on every
+                // host whose `XDG_STATE_HOME` points into one. [`ensure_run_dir`] makes
+                // the entry with an atomic `mkdir` and re-runs this check plus
+                // [`check_run_dir`]'s uid and mode on the entry that now exists, which is
+                // where a lost race is caught; every other caller reads the absence as
+                // "no session was ever created here" and touches nothing.
+                let sticky_protects_child =
+                    mode & 0o1000 != 0 && child_owner.is_none_or(|owner| owner == us || owner == 0);
                 if mode & 0o022 != 0 && !sticky_protects_child {
                     return Err(refuse(
                         path,
@@ -981,6 +990,71 @@ mod tests {
             ensure_run_dir(&dir).is_err(),
             "creation and the read-only list/attach/kill check must share the refusal"
         );
+
+        // Leave cleanup able to traverse the fixture even under a restrictive umask.
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// § 6.3's one shared-directory exception, taken where it used to fail: the entry a
+    /// sticky parent protects has no owner to weigh until the `mkdir` makes it, and
+    /// seeding the ancestor check from the missing one refused *creation* under `/tmp`,
+    /// `/var/tmp` or `/dev/shm` while accepting a directory already there — a permanent
+    /// 126 `unsafe-host` on every host whose `XDG_STATE_HOME` points into one, and one
+    /// the client caches per host. The other fixtures pre-create the entry, which is
+    /// exactly why they never saw it, so this one creates nothing.
+    #[test]
+    fn a_run_directory_is_created_under_a_sticky_parent_and_its_entry_is_still_weighed() {
+        let root = Scratch::new("rundir-sticky");
+        let shared = root.dir("shared");
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o1777)).unwrap();
+        assert_eq!(mode_of(&shared), 0o1777, "the fixture must take");
+        let dir = shared.join("nomux/run");
+
+        ensure_run_dir(&dir).unwrap();
+        assert_eq!(mode_of(&dir), DIR_MODE, "created owner-only");
+        // The call every attach after the first makes, now that the entry exists.
+        ensure_run_dir(&dir).unwrap();
+        assert!(
+            check_run_dir(&dir).unwrap(),
+            "and the read-only check agrees"
+        );
+
+        // The sticky bit buys the entry nothing: the post-create check still governs it,
+        // so a mode letting others create inside is refused exactly as under any parent.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+        let err = ensure_run_dir(&dir).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        assert!(
+            err.to_string()
+                .contains("lets other users create files in it"),
+            "{err}"
+        );
+        fs::set_permissions(&dir, fs::Permissions::from_mode(DIR_MODE)).unwrap();
+
+        // A name somebody else planted first is refused rather than followed, which is
+        // the answer to losing the `mkdir` race the leniency above allows.
+        let planted = shared.join("planted");
+        std::os::unix::fs::symlink(&dir, &planted).unwrap();
+        let err = ensure_run_dir(&planted).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotADirectory, "{err}");
+        assert!(err.to_string().contains("it is a symlink"), "{err}");
+
+        // And an entry belonging to another uid — the race in its plainest form. Only
+        // root can hand one away; as an ordinary user say so, since a silent skip is a
+        // pass nobody can see.
+        if rustix::process::getuid().is_root() {
+            rustix::fs::chown(&dir, Some(rustix::fs::Uid::from_raw(65_534)), None)
+                .expect("hand the created entry to another uid");
+            let err = ensure_run_dir(&dir).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+            rustix::fs::chown(&dir, Some(rustix::process::getuid()), None)
+                .expect("take it back, so the fixture can be removed");
+        } else {
+            eprintln!(
+                "partially skipped: only root can give the created entry to another uid, \
+                 so the planted symlink above stands for that half"
+            );
+        }
 
         // Leave cleanup able to traverse the fixture even under a restrictive umask.
         fs::set_permissions(&shared, fs::Permissions::from_mode(0o700)).unwrap();
