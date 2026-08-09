@@ -425,21 +425,8 @@ fn refuses(out: &Output, code: i32, class: Option<&str>, must_say: &str, what: &
     );
 }
 
-/// Exercises the path a real bootstrap takes: `nomux spawn` on an id nothing is
-/// serving, which must start a daemon under the flock and then carry the
-/// conversation.
-///
-/// The only end-to-end coverage of a session created over the relay. `Session::start`
-/// everywhere else in this suite runs `nomux daemon` directly, which is a fork this
-/// process performs and waits on — so the fork, the `setsid`, the flock and the
-/// wait-for-the-socket that `spawn` does on the user's behalf are exercised here and
-/// nowhere else.
-///
-/// Named for what it asserts. It used to say "relays transparently", and what it
-/// looks for is a substring in a byte stream — which says the frames got through in
-/// *some* form and nothing about transparency. That property has a test of its own
-/// and it is byte-exact; this one is about the spawn, and the round trip through the
-/// child is how it establishes that the daemon it started is really serving.
+/// `nomux spawn` starts a missing session under its lock and relays the conversation,
+/// covering the fork, detachment and socket-publication path end to end.
 #[test]
 fn spawn_starts_a_daemon_for_a_session_that_does_not_exist_yet() {
     use std::sync::mpsc;

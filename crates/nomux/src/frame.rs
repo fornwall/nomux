@@ -77,6 +77,13 @@ fn checked_term(term: &str) -> Result<(), ProtoError> {
     Ok(())
 }
 
+fn checked_exit(status: i32, kind: ExitKind) -> Result<(), ProtoError> {
+    if kind == ExitKind::Unknown && status != 0 {
+        return Err(ProtoError::Malformed("Unknown exit status is not zero"));
+    }
+    Ok(())
+}
+
 /// Opening frame: what the client already has, and how big its terminal is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Hello<'a> {
@@ -279,6 +286,19 @@ impl<'a> Frame<'a> {
     /// [`crate::MAX_PAYLOAD`], or [`ProtoError::Malformed`] for a field too long for
     /// its own length prefix. `out` is rewound to its original length in every case.
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), ProtoError> {
+        let payload_len = match *self {
+            Self::Input { data, .. } | Self::Output { data, .. } => {
+                8usize.saturating_add(data.len())
+            }
+            Self::Error { message, .. } => 2usize.saturating_add(message.len()),
+            Self::AgentData { data, .. } => 4usize.saturating_add(data.len()),
+            _ => 0,
+        };
+        if payload_len > crate::MAX_PAYLOAD as usize {
+            return Err(ProtoError::PayloadTooLarge(
+                u32::try_from(payload_len).unwrap_or(u32::MAX),
+            ));
+        }
         // The rewind lives here, once: a caller appending frames back to back never
         // ships half of one, whatever `encode_from` grows a new way to fail on.
         let start = out.len();
@@ -340,6 +360,7 @@ impl<'a> Frame<'a> {
                 kind,
                 since_terminal_closed_secs,
             } => {
+                checked_exit(status, kind)?;
                 out.extend_from_slice(&status.to_be_bytes());
                 out.push(kind.as_wire());
                 out.extend_from_slice(&since_terminal_closed_secs.to_be_bytes());
@@ -430,6 +451,7 @@ impl<'a> Frame<'a> {
                 let status = r.i32()?;
                 let kind = ExitKind::from_wire(r.u8()?)
                     .ok_or(ProtoError::Malformed("unknown exit kind"))?;
+                checked_exit(status, kind)?;
                 let since_terminal_closed_secs = r.u32()?;
                 Self::Exit {
                     status,
@@ -607,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_discriminants_are_rejected() {
+    fn invalid_closed_values_are_rejected() {
         assert_eq!(
             Frame::decode(FrameType::Exit, &[0, 0, 0, 0, 7]),
             Err(ProtoError::Malformed("unknown exit kind"))
@@ -615,6 +637,20 @@ mod tests {
         assert_eq!(
             Frame::decode(FrameType::Error, &[0xff, 0xff]),
             Err(ProtoError::Malformed("unknown error code"))
+        );
+
+        let invalid_unknown = [0, 0, 0, 1, ExitKind::Unknown.as_wire(), 0, 0, 0, 0];
+        let error = ProtoError::Malformed("Unknown exit status is not zero");
+        assert_eq!(Frame::decode(FrameType::Exit, &invalid_unknown), Err(error));
+        let mut encoded = Vec::new();
+        assert_eq!(
+            Frame::Exit {
+                status: 1,
+                kind: ExitKind::Unknown,
+                since_terminal_closed_secs: 0,
+            }
+            .encode(&mut encoded),
+            Err(error)
         );
     }
 
@@ -695,6 +731,7 @@ mod tests {
         let data = vec![0u8; MAX_PAYLOAD as usize];
         let mut buf = b"previous frame".to_vec();
         let before = buf.len();
+        let before_capacity = buf.capacity();
         let err = Frame::Output {
             offset: 0,
             data: &data,
@@ -710,6 +747,7 @@ mod tests {
             before,
             "failed encode must not leave partial data"
         );
+        assert_eq!(buf.capacity(), before_capacity, "or retain its allocation");
 
         let payload = vec![0; MAX_PAYLOAD as usize + 1];
         assert_eq!(

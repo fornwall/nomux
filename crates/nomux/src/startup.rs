@@ -189,8 +189,7 @@ fn has_controlling_terminal() -> bool {
 /// Lets go of the directory the daemon inherited (§ 6.2), which would otherwise keep a
 /// removable or network mount busy for [`crate::daemon`]'s whole idle life, a week (§ 6.5).
 ///
-/// Called *before* the socket and pidfile publish this session, which is the whole of why it
-/// can fail out loud; § 6.2 has why that beats the silence it used to keep.
+/// Called before the socket and pidfile publish, while a failure can still reach the caller.
 ///
 /// The child does not follow. `pty::child_dir` captured where it starts before this ran.
 ///
@@ -205,10 +204,7 @@ pub(crate) fn leave_startup_directory() -> io::Result<()> {
 
 /// Opens the `/dev/null` that [`silence_standard_descriptors`] will point stdio at.
 ///
-/// Split from the redirection it feeds, and for [`leave_startup_directory`]'s reason: the
-/// *open* is the half that can fail, so it happens while a failure still reaches somebody
-/// (§ 6.2). A host with no `/dev/null` used to get a daemon silently holding the login's
-/// descriptors open for a week.
+/// Split from the redirection it feeds so the fallible open happens before publication (§ 6.2).
 ///
 /// # Errors
 ///

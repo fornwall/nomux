@@ -191,19 +191,42 @@ impl Session {
     /// that can see § 6.2's ordering, every other session here being given a `HOME`
     /// that `child_dir` prefers.
     pub(crate) fn start_homeless_in(name: &str, cwd: &Path) -> Self {
-        Self::start_in(name, &DEFAULT_TEST_RING.to_string(), "/bin/sh", Some(cwd))
+        Self::start_in(
+            name,
+            &DEFAULT_TEST_RING.to_string(),
+            "/bin/sh",
+            Some(cwd),
+            None,
+        )
     }
 
     /// `ring_bytes` and `shell` reach `NOMUX_RING_BYTES` and `SHELL` verbatim however
     /// unusable, for the tests about a value the daemon cannot parse
     /// (`IMPLEMENTATION.md` § 4) and a session that cannot be created.
     pub(crate) fn start_with(name: &str, ring_bytes: &str, shell: &str) -> Self {
-        Self::start_in(name, ring_bytes, shell, None)
+        Self::start_in(name, ring_bytes, shell, None, None)
+    }
+
+    pub(crate) fn start_with_ignored_usr1(name: &str) -> Self {
+        // `cat` preserves the inherited mask; a shell may normalize it itself.
+        Self::start_in(
+            name,
+            &DEFAULT_TEST_RING.to_string(),
+            "/bin/cat",
+            None,
+            Some(libc::SIGUSR1),
+        )
     }
 
     /// The body every daemon in this suite goes through, so what each is told is said
     /// once.
-    fn start_in(name: &str, ring_bytes: &str, shell: &str, homeless_in: Option<&Path>) -> Self {
+    fn start_in(
+        name: &str,
+        ring_bytes: &str,
+        shell: &str,
+        homeless_in: Option<&Path>,
+        ignored_signal: Option<libc::c_int>,
+    ) -> Self {
         let root = run_root(name);
         let id = intern(name);
         let mut command = nomux_with_shell(&root, &["daemon", &id]);
@@ -223,6 +246,20 @@ impl Session {
             None => command.env("HOME", &root),
             Some(cwd) => command.env_remove("HOME").current_dir(cwd),
         };
+        if let Some(signal) = ignored_signal {
+            use std::os::unix::process::CommandExt as _;
+
+            // SAFETY: `signal` is async-signal-safe between fork and exec.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::signal(signal, libc::SIG_IGN) == libc::SIG_ERR {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+        }
         let child = launch(&mut command).expect("spawn daemon");
 
         let socket = root.join("nomux/run").join(format!("{id}.sock"));
