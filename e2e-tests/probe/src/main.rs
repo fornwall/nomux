@@ -68,11 +68,11 @@ fn marker(id: &str) -> String {
     format!("NOMUX-MARK-{id}-OK")
 }
 
-/// The nomux binary to drive. Overridable so a matrix cell can point at a build under
-/// test rather than whatever is on `PATH`.
-fn nomux_bin() -> String {
-    std::env::var("NOMUX_BIN").unwrap_or_else(|_| "nomux".to_owned())
-}
+/// The nomux binary to drive. Resolved through `PATH` on purpose: `image/cell-entrypoint.sh`
+/// installs the build under test to `/usr/local/bin/nomux` before PID 1 starts, so there is
+/// exactly one `nomux` a cell can reach and naming another would be naming one that is not
+/// under test. An environment variable used to override this and nothing ever set it.
+const NOMUX_BIN: &str = "nomux";
 
 /// Greets a session into being and leaves it running with a marker in its ring.
 fn create(id: &str) -> Result<String, String> {
@@ -165,14 +165,13 @@ struct Relay {
 
 impl Relay {
     fn start(args: &[&str]) -> Result<Self, String> {
-        let bin = nomux_bin();
-        let mut child = Command::new(&bin)
+        let mut child = Command::new(NOMUX_BIN)
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|err| format!("could not run `{bin} {}`: {err}", args.join(" ")))?;
+            .map_err(|err| format!("could not run `{NOMUX_BIN} {}`: {err}", args.join(" ")))?;
 
         let stdin = child.stdin.take().ok_or("no stdin on the relay")?;
         let mut out = child.stdout.take().ok_or("no stdout on the relay")?;
