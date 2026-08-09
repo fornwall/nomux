@@ -713,14 +713,15 @@ The two plain files either mode reads by hand go through one bounded helper
 (`rundir::read_prefix`), which reads to the file's end or to that bound and never past it,
 and opens `O_NONBLOCK | O_NOFOLLOW` against a FIFO or a symlink left at either name. The two
 ends are deliberately asymmetric: a label that reaches its bound is truncated and costs a
-column, where a pid body reaching **32 bytes is refused outright**, a prefix ending
-mid-number being a smaller, plausible, live pid and not the number on disk.
+column, where a pid body reaching **32 bytes is refused outright** — `rundir::parse_pid`'s
+rule and not the helper's, a prefix ending mid-number being a smaller, plausible, live pid
+and not the number on disk.
 
-**The pidfile's trailing newline is enforced, not decorative.** A body that does not end in
-one is refused whatever else it holds, which is what makes the format self-delimiting for
-its one line: a short write leaving `3277` of `32770419\n` has no terminator and is rejected
-rather than signalled as a live pid it never named. A second implementation must write the
-newline.
+**The pidfile's trailing newline is `parse_pid`'s too, enforced and not decorative.** A
+body that does not end in one is refused whatever else it holds, which makes the format
+self-delimiting for its one line: a short write leaving `3277` of `32770419\n` has no
+terminator and is rejected rather than signalled as a live pid it never named. A second
+implementation must write the newline.
 
 - Both establish first that the run directory is this user's alone (§ 6.3), before any name in it is resolved. Neither creates it: on a host that has never run a session, `kill` reports the "no such session" that already holds and `list` prints nothing.
 - `list` reads the directory and probes each socket with `connect`; `ECONNREFUSED` — or a socket no longer there at all — means stale, and stale entries are unlinked. The probe is safe because connecting is not attaching (§ 6.4).
