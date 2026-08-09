@@ -36,13 +36,16 @@ pub(crate) fn sanitize_text(text: &str) -> String {
 }
 
 /// Whether `ch` can forge terminal layout or render invisibly. ZWJ and ZWNJ are retained
-/// because they are part of ordinary emoji and Indic text.
+/// because they are part of ordinary emoji and Indic text. The Hangul fillers draw nothing
+/// while occupying a cell, which `trim` does not take back and no tab title reaches by
+/// accident.
 const fn is_deceptive(ch: char) -> bool {
     ch.is_control()
         || matches!(ch,
-            '\u{ad}' | '\u{61c}' | '\u{180e}' | '\u{200b}' | '\u{200e}' | '\u{200f}'
-            | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}'
-            | '\u{feff}' | '\u{e0000}'..='\u{e007f}')
+            '\u{ad}' | '\u{61c}' | '\u{115f}'..='\u{1160}' | '\u{180e}' | '\u{200b}'
+            | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206f}' | '\u{3164}' | '\u{ffa0}' | '\u{feff}'
+            | '\u{e0000}'..='\u{e007f}')
 }
 
 /// Trims a client-supplied label to what the frozen layout permits: one line of printable
@@ -135,6 +138,10 @@ mod tests {
             '\u{2062}',
             '\u{2063}',
             '\u{2064}',
+            '\u{115f}',
+            '\u{1160}',
+            '\u{3164}',
+            '\u{ffa0}',
             '\u{feff}',
             '\u{e0000}',
             '\u{e0001}',
@@ -167,6 +174,15 @@ mod tests {
         assert_eq!(sanitize_label("a\u{200c}\u{200d}b"), "a\u{200c}\u{200d}b");
         assert_eq!(sanitize_label("a\u{205f}b\u{2065}c"), "a\u{205f}b\u{2065}c");
         assert_eq!(sanitize_label("\u{dffff}a\u{e0080}"), "\u{dffff}a\u{e0080}");
+    }
+
+    /// `trim` takes back whitespace, but a Hangul filler is not whitespace and draws
+    /// nothing, so without the filter a label rendering as blank cells would reach `list`
+    /// as a name — and one appended to a real label would pass for it.
+    #[test]
+    fn a_label_that_draws_nothing_is_no_label() {
+        assert_eq!(sanitize_label("\u{3164}\u{115f} \u{ffa0}"), "");
+        assert_eq!(sanitize_label("build\u{3164}"), sanitize_label("build"));
     }
 
     /// Truncation must not split a character, or `list` would print a replacement
