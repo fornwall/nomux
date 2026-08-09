@@ -483,37 +483,23 @@ after: `exec` preserves a pending signal as well as a blocked one, so a signal b
 pending arrives the instant the mask clears, and a handler armed behind that is one it
 missed.
 
-This is POSIX terminal detachment and nothing more — it is not escape from a service
-manager, and nomux no longer attempts one. `spawn` starts the daemon **directly**, always:
-one child from `/proc/self/exe`, so an atomic upgrade underneath a running relay still
-launches the exact inode that relay is executing, with the already-held spawn-lock
+This is POSIX terminal detachment and nothing more. `spawn` starts the daemon **directly**,
+always: one child from `/proc/self/exe`, so an atomic upgrade underneath a running relay
+still launches the exact inode that relay is executing, with the already-held spawn-lock
 descriptor inherited across the `exec`. There is no launcher to select and nothing is
 probed before the launch.
 
-The consequence, stated plainly: on systemd, `setsid` and `fork` leave the daemon in
-sshd's `session-*.scope` cgroup, so where `logind.conf` sets `KillUserProcesses=yes`
-logind stops it at the final logout and **the session does not survive**. Most
-distributions ship `KillUserProcesses=no`, which is why a direct launch is survivable in
-practice, and that is exactly the position `tmux` and GNU `screen` are in: on this axis
-nomux is now no better and no worse than they are.
-
-A transient `systemd-run --user --scope` used to carry the daemon out of that cgroup where
-a reachable, lingering user manager could own the scope. It is gone, along with the
-`systemd-run` and `loginctl` probes that chose it, the `NOMUX_LAUNCHER` override, the
-`--systemd-scope` private option and the `INVOCATION_ID` restoration that undid the
-scope's rewrite of the environment. That is a deliberate subtraction and not an
-improvement: what it buys is less code and no bus connection, `loginctl` call or
-executable probe on the session-creation path, and what it gives up is logout persistence
-on a strict host.
-
-Somebody who needs that persistence arranges it above nomux — `loginctl enable-linger`
-plus a scope of their own, or a `systemd-run --user --scope` wrapper around the `spawn`
-command. The client ships as one versioned unit with this binary
-([DESIGN.md § 2](DESIGN.md#2-scope)), so it is a reasonable place for host policy to live,
-and it is the only side that knows which hosts it has been told to treat that way.
-Nothing on the wire reports logout policy, which the daemon could not turn into a survival
-statement anyway. [PLAN.md](PLAN.md) retains the real SSH logout matrix as required
-validation of what a directly launched daemon actually does.
+The consequence, stated plainly: `setsid` and `fork` leave the daemon in sshd's
+`session-*.scope`, so where `logind.conf` sets `KillUserProcesses=yes` logind stops it at
+the final logout and **the session does not survive**. Most distributions ship
+`KillUserProcesses=no`, which is why a direct launch is survivable in practice, and it is
+exactly where `tmux` and GNU `screen` stand. Persistence on a strict host is arranged above
+nomux, by the client that ships as one versioned unit with this binary and is the only side
+that knows which hosts it has been told to treat that way —
+[DESIGN.md § 10](DESIGN.md#10-rejected-alternatives) has why the scope launcher that used to
+try is gone. Nothing on the wire reports logout policy, which the daemon could not turn into
+a survival statement anyway; [PLAN.md](PLAN.md) keeps the real SSH logout matrix as the
+validation.
 
 ### 6.3 Socket
 
