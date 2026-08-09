@@ -214,19 +214,32 @@ jobs:
   # The one job that tests the promise the program exists to make: a session created in one SSH
   # login is still there after that login has logged out. It cannot be a hook and it cannot be a
   # unit test — the answer belongs to logind, so it takes systemd as PID 1, a real sshd and a real
-  # PAM stack, which is why it is five privileged containers rather than a `cargo test`.
+  # PAM stack, which is why it is six privileged containers rather than a `cargo test`.
   # e2e-tests/README.md has what it proves and what it does not.
+  #
+  # `name:` below is the required status context on main and has to stay spelled exactly that
+  # way; renaming it leaves every pull request waiting for a check that never reports.
   e2e:
     name: systemd logout matrix
     runs-on: ubuntu-24.04
     # The weekly schedule exists for the advisory check alone; see the trigger comment above.
+    # Skipping a required check reports as success, which `fuzz` and `release` already rely on.
     if: github.event_name != 'schedule'
     # Behind the gate, as `fuzz` is and for its reason: a tree that cannot pass clippy has
-    # nothing worth booting five containers for.
+    # nothing worth booting six containers for.
     needs: check
-    # Five containers each booting systemd, plus two musl builds. Well clear of the ~4 minutes
-    # observed locally, and short enough that a wedged cell does not hold the runner.
-    timeout-minutes: 25
+    # Six containers each booting systemd, plus two musl builds. e2e-tests/run.sh measured 206 s
+    # here for the ten cells this matrix used to have and should sit near two minutes for six; a
+    # cold cache adds the crate's and the probe's musl builds and the Debian image on top.
+    #
+    # The generous remainder is deliberate and is not headroom for the measurement. run.sh bounds
+    # every failure it can diagnose — 90 s for a cell to accept a login, 60 s for a hold to report
+    # ready, 90 s for a blackholed login to die — and dies on the first cell to exceed one, with a
+    # paragraph about which. Roughly seven minutes covers a full run plus one cell exhausting all
+    # three, so the timeout stays above that: a cancelled job says nothing, and this check now
+    # blocks merges. What is left for it to catch is the one thing run.sh cannot bound — a
+    # `compose up --build` or an ssh to a wedged sshd that simply never returns.
+    timeout-minutes: 15
     steps:
       # `persist-credentials: false`, for the reason the check job gives.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
