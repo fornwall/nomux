@@ -435,9 +435,7 @@ enum Source {
     AgentChannel,
 }
 
-/// Every source that appears in the poll set at most once, in the order
-/// [`Daemon::watches`] registers them. This list is what registers them, so a source
-/// added here is one [`POLL_SLOTS`] has already accounted for.
+/// Every source the poll set can hold, in the order [`Daemon::watches`] registers them.
 const SINGLE_SOURCES: [Source; 8] = [
     Source::Listener,
     Source::Stop,
@@ -449,7 +447,6 @@ const SINGLE_SOURCES: [Source; 8] = [
     Source::AgentChannel,
 ];
 
-/// Slots the poll set can ever need at once, every source being a single one.
 const POLL_SLOTS: usize = SINGLE_SOURCES.len();
 
 /// What "this source has something to service" is, and the same for every source.
