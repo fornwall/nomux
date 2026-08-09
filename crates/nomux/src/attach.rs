@@ -18,8 +18,8 @@
 //! | accepted          | relay to it                             | [`Collision`][FailureClass], 126 |
 //! | neither           | [`Retryable`][FailureClass] or [`Uncertain`][FailureClass], 126 | [`Uncertain`][FailureClass], 126 |
 //!
-//! [`crate::usock::connect_within`] has why the last row is the wedged daemon rather than
-//! an absent one.
+//! `usock::connect_within`, behind [`crate::usock::liveness`], has why the last row is the
+//! wedged daemon rather than an absent one.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -49,9 +49,9 @@ const SPAWN_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// How long any one `connect` to the session socket waits out a full backlog.
 ///
-/// [`crate::usock::connect_within`] has why every `connect` here is bounded and this
-/// one is not a plain `UnixStream::connect` (§ 6.3). Short, because the state it waits
-/// out clears in one `accept` and this is on the path of every attach.
+/// `usock::connect_within` has why every `connect` here is bounded and this one is not a
+/// plain `UnixStream::connect` (§ 6.3). Short, because the state it waits out clears in
+/// one `accept` and this is on the path of every attach.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Delay between checks for the pidfile the daemon publishes just after its socket.

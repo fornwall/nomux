@@ -63,7 +63,7 @@ const PROBE_RETRY: Duration = Duration::from_millis(10);
 /// Propagates the `connect`, so [`nothing_is_listening`] still divides a dead daemon from
 /// everything else, and reports [`io::ErrorKind::TimedOut`] for a backlog that never
 /// drained — neither death nor an answer, and licence for no unlink.
-pub(crate) fn connect_within(path: &Path, within: Duration) -> io::Result<UnixStream> {
+fn connect_within(path: &Path, within: Duration) -> io::Result<UnixStream> {
     let addr = unix_address(path)?;
     let deadline = Instant::now() + within;
     loop {
