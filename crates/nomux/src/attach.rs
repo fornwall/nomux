@@ -582,10 +582,13 @@ impl StdoutWorker {
         // orphan it — a process's exit takes its threads with it — and the main loop's
         // death notification is the socketpair itself, the far endpoint closing when
         // the copy returns, which does not care what was holding it.
-        // `std::thread::spawn` brings roughly 20–24 KiB of generic thread machinery into
-        // these static release binaries. libc's pthread entry point is already the whole
-        // primitive this one fixed worker needs and keeps the upload inside § 8's
-        // growth budget.
+        // Hand-rolled against `std::thread::Builder::spawn`, whose generic thread
+        // machinery this measured at +21_488 bytes on x86_64 and +24_688 on aarch64
+        // (nightly-2026-08-07, `scripts/build-release.sh`) — 5% of § 8's 400 KiB on a
+        // binary that is uploaded over the link the user is already waiting on. libc's
+        // pthread entry point is the whole primitive one fixed worker needs. Remeasure
+        // before deciding this is still true; the four `unsafe` blocks below are what it
+        // costs.
         let worker_channel = Box::into_raw(Box::new(worker_channel));
         let mut worker = MaybeUninit::uninit();
         // SAFETY: `worker_channel` owns a valid, Send `UnixStream` allocation which the
