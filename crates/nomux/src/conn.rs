@@ -28,16 +28,13 @@ const _: () = assert!(
 /// session reallocates the queue down and back up on every pass.
 const RETAINED_CAPACITY: usize = 128 * 1024;
 
-/// The same for the receive buffer, and three orders of magnitude smaller because the
-/// argument above is the send side's alone: this direction carries keystrokes and control
-/// frames, and only a paste ever takes it past a page.
+/// The same for the receive buffer, three orders of magnitude smaller: this direction
+/// carries keystrokes and control frames, and only a paste takes it past a page.
 const RETAINED_INPUT: usize = 4096;
 
 /// Reclaims the consumed prefix of a cursor-and-`Vec` buffer, keeping `floor` bytes of
-/// capacity where it empties one. The empty case is separated because clearing is free
-/// where draining is not, and the surviving case moves on a *ratio*: a fixed threshold
-/// moves about `n²/2c` bytes over a queue of `n` drained in `c`-byte writes, where
-/// halving is O(1) amortised however the writes fall.
+/// capacity where it empties one. The surviving case moves on a *ratio* rather than a
+/// fixed threshold, which is what makes it O(1) amortised however the writes fall.
 fn compact(buf: &mut Vec<u8>, pos: &mut usize, floor: usize) {
     if *pos == buf.len() {
         buf.clear();
