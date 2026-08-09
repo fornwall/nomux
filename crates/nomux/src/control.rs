@@ -43,6 +43,12 @@ const KILL_GRACE: Duration = Duration::from_millis(500);
 
 /// How often to look again while waiting any of the graces out. One interval for all of
 /// them: each waits on another process reaching a point of its own.
+///
+/// It also bounds how many connections a stage can leave sitting in the daemon's backlog,
+/// which is `somaxconn` deep (`UnixListener::bind` asks the kernel for its maximum) and is
+/// drained by `accept` alone — a probe closing its end at once does *not* give the slot
+/// back. At 25 ms that is some 80 per stage against a modern default of 4096, so this is
+/// not a figure to tighten without counting.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// The kernel's longest path, which is as long as `argv[0]` gets for a daemon *this*
