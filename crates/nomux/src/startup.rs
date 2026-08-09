@@ -209,7 +209,7 @@ fn has_controlling_terminal() -> bool {
 /// can fail out loud. Past publication the caller has already been answered and an `Err` has
 /// nowhere left to go, so this was once silent — and a pinned mount was the cheaper of the
 /// two outcomes only while the daemon might be killed at logout anyway. `e2e-tests/` now
-/// measures that it is not: a lingering user manager carries the session through, so the
+/// measures that on a host that lets its sessions outlive their login it is not, so the
 /// mount stays busy for [`crate::daemon`]'s whole idle life, a week.
 ///
 /// The child does not follow. `pty::child_dir` captured where it starts before this ran.

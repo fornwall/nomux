@@ -18,10 +18,11 @@ cat > /etc/systemd/logind.conf.d/10-nomux-cell.conf <<EOF
 KillUserProcesses=$cell_kill
 EOF
 
-# Linger decides whether \`user@UID.service\` outlives the final logout, and so whether
-# the transient scope \`systemd-run --user --scope\` puts the daemon in outlives it too.
-# Written as the marker file logind reads at startup rather than through \`loginctl\`,
-# which needs a bus that does not exist yet.
+# Linger decides whether \`user@UID.service\` is running and outlives the final logout. It
+# once decided the launch path too; now nomux never asks, and the axis is here to measure
+# that a lingering user manager saves nothing that is not inside it. Written as the marker
+# file logind reads at startup rather than through \`loginctl\`, which needs a bus that
+# does not exist yet.
 if [ "$cell_linger" = yes ]; then
     mkdir -p /var/lib/systemd/linger
     touch "/var/lib/systemd/linger/$cell_user"
@@ -30,8 +31,9 @@ else
 fi
 
 # The third axis: a login with no pam_systemd is a login with no session scope, no
-# `$XDG_RUNTIME_DIR` and no user bus — the container and `UsePAM no` case, where
-# `launcher::user_manager_reachable` must decline and the direct path must be taken.
+# `$XDG_RUNTIME_DIR` and no user bus — the container and `UsePAM no` case, where there is
+# no logind-managed session for the daemon to be left in and so nothing for
+# KillUserProcesses to apply to.
 if [ "$cell_pam" = no ]; then
     sed -i 's/^\(session.*pam_systemd\.so\)/#\1/' /etc/pam.d/common-session
 else

@@ -261,6 +261,7 @@ abrupt_login() {
 
 results=''
 failed=''
+launch_bad=''
 measured_count=0
 expected_count=$(printf '%s\n' "$cells" | wc -l | tr -d ' ')
 nl='
@@ -326,14 +327,23 @@ while IFS='	' read -r name port kup linger pam logout expect; do
     esac
     printf '%s\n' "$checked" | sed 's/^/    /' >&2
 
+    # Where the daemon ended up, which is the whole of what decides its fate now that
+    # nothing is chosen at launch. Two of these are real states a host can be in and the
+    # third is one this product can no longer produce.
     scope=$(printf '%s\n' "$created" | sed -n 's/^DAEMON-CGROUP=//p' | head -1)
     case "$scope" in
-    # The transient scope `launcher::scope_command` asked for, under `user@UID.service`.
+    # A transient scope of nomux's own, under `user@UID.service`. No launcher asks for one
+    # any more, so this is not a state the matrix can reach — it is kept as a value to
+    # recognise rather than to report, and failed on below.
     *nomux-*.scope*) path=scope ;;
-    # Still in sshd's login session, so still whatever KillUserProcesses says it is.
+    # Still in sshd's login session, so still whatever KillUserProcesses says it is. The
+    # only thing a `spawn` on a pam_systemd host can now produce.
     *session-*.scope*) path=direct ;;
     # No pam_systemd, so no login session at all: the daemon inherits sshd's own unit.
-    # A direct launch too, but worth naming apart — nothing here is logind-managed.
+    # A direct launch too, and worth naming apart — nothing here is logind-managed, so
+    # `survives` means nothing would ever have killed it rather than that logind saw the
+    # logout and chose not to. The same word for two quite different facts, told apart
+    # only by this column.
     *ssh.service*) path=no-logind ;;
     *) path='?' ;;
     esac
@@ -343,6 +353,19 @@ while IFS='	' read -r name port kup linger pam logout expect; do
         verdict=DEVIATES
         failed=1
     fi
+    # A daemon in a transient `nomux-*.scope` means `systemd-run --user --scope` is back in
+    # the launcher, and a cgroup this does not recognise means the column has stopped
+    # telling `direct` from `no-logind` and is decorating the table rather than saying
+    # anything. Both are failures on their own, apart from the verdict: a cell can reach
+    # the predicted verdict down a path that no longer exists, and did — `kup-on-linger-on`
+    # read `survives` for exactly that reason until the scope launch was deleted.
+    case "$path" in
+    scope | '?')
+        verdict="$verdict/LAUNCH"
+        launch_bad="$launch_bad$(printf '  %-24s %s -> %s' "$name" "$path" "$scope")$nl"
+        failed=1
+        ;;
+    esac
     results="$results$(printf '%-24s %-4s %-7s %-4s %-7s %-9s %-9s %-9s %-9s %s' \
         "$name" "$kup" "$linger" "$pam" "$logout" "$path" "$teardown" \
         "$expect" "$measured" "$verdict")$nl"
@@ -368,10 +391,19 @@ printf '%-24s %-4s %-7s %-4s %-7s %-9s %-9s %-9s %-9s %s\n' \
 printf '%s' "$results"
 echo
 
+if [ -n "$launch_bad" ]; then
+    echo "FAIL: a daemon landed somewhere a direct launch cannot put it:" >&2
+    printf '%s' "$launch_bad" >&2
+    echo "      A nomux-*.scope means a transient systemd scope is back in the launcher," >&2
+    echo "      which would make a cell's verdict a fact about a code path that was" >&2
+    echo "      deleted; a '?' means this classification no longer recognises what it" >&2
+    echo "      measured, so the LAUNCH column has stopped telling direct from no-logind." >&2
+fi
 if [ -n "$failed" ]; then
-    echo "FAIL: a cell behaved differently from matrix.tsv's prediction." >&2
-    echo "      Either the prediction is wrong and the file should record what was" >&2
-    echo "      measured, or nomux changed and this is the regression the matrix is for." >&2
+    echo "FAIL: a cell behaved differently from matrix.tsv's prediction, or reached its" >&2
+    echo "      verdict by a launch path that no longer exists. Either the prediction is" >&2
+    echo "      wrong and the file should record what was measured, or nomux changed and" >&2
+    echo "      this is the regression the matrix is for." >&2
     exit 1
 fi
 echo "every cell matched its prediction in matrix.tsv"

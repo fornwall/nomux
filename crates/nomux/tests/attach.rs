@@ -36,7 +36,7 @@ use std::{fs, thread};
 use nomux_protocol::{Frame, RESUME_FROM_START};
 
 use harness::{
-    Rng, SETTLE, Session, Spawned, collect, control, control_with_shell, daemon_reaper, entries,
+    Rng, SETTLE, Session, Spawned, control, control_with_shell, daemon_reaper, entries,
     has_unread_bytes, hello_frame, join_before, nomux, nomux_with_shell, poll_by, poll_until,
     read_uninterrupted, run_root, stderr, stdout, still_serving, succeeded, wedge_socket,
     while_nothing_forks, write_frame,
@@ -116,30 +116,6 @@ fn spawn_timeout_does_not_claim_the_session_is_absent() {
     assert!(
         root.join("nomux/run/nostart.lock").exists(),
         "a late daemon must not inherit an unlinked lock"
-    );
-}
-
-/// A launcher failure happens after the id was proved free but before a daemon exists.
-///
-/// Its underlying `InvalidInput` describes launcher configuration, not malformed session
-/// input, so it must not leak through as exit 64 or omit the runtime classification.
-#[test]
-fn spawn_classifies_a_launcher_failure_as_startup_failure() {
-    let root = run_root("spawn_launcher_failure");
-    let refused = collect(
-        nomux_with_shell(&root, &["spawn", "launcher_failure"])
-            .env("NOMUX_LAUNCHER", "not-a-launcher")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
-    );
-
-    refuses(
-        &refused,
-        127,
-        Some("startup-failure"),
-        "NOMUX_LAUNCHER",
-        "spawn whose configured launcher could not be selected",
     );
 }
 
@@ -437,149 +413,6 @@ fn spawn_starts_a_daemon_for_a_session_that_does_not_exist_yet() {
         "spawn did not start a daemon and relay its output; saw {:?}",
         String::from_utf8_lossy(&seen)
     );
-}
-
-fn reachable_systemd_run() -> Option<&'static str> {
-    let systemd_run = ["/usr/bin/systemd-run", "/bin/systemd-run"]
-        .into_iter()
-        .find(|path| std::path::Path::new(path).is_file())?;
-    let probe = collect(
-        Command::new(systemd_run)
-            .args(["--user", "--scope", "--quiet", "--collect", "true"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()),
-    );
-    probe.status.success().then_some(systemd_run)
-}
-
-fn use_real_runtime_dir(command: &mut Command) {
-    match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(runtime) => {
-            command.env("XDG_RUNTIME_DIR", runtime);
-        }
-        None => {
-            command.env_remove("XDG_RUNTIME_DIR");
-        }
-    }
-}
-
-/// The optional systemd launcher changes only cgroup ownership, not the startup capability,
-/// label, or environment that the creating SSH connection gave the session.
-///
-/// Skipped on hosts with no reachable user manager. Linger is deliberately not required here:
-/// forced mode exercises the same scope handoff without changing the developer's login policy.
-#[test]
-fn a_systemd_scope_preserves_the_spawn_boundary() {
-    use std::sync::mpsc;
-
-    if reachable_systemd_run().is_none() {
-        return;
-    }
-
-    let root = run_root("systemd_scope");
-    let id = "systemd_scope";
-    let mut scoped = nomux_with_shell(&root, &["spawn", id, "--label", "cost $5"]);
-    scoped
-        .env("NOMUX_LAUNCHER", "systemd")
-        .env("INVOCATION_ID", "NOMUX-ORIGINAL")
-        // These are ordinary inherited names despite looking like an implementation
-        // detail; a wholesale environment must not reserve and overwrite either one.
-        .env("NOMUX_ORIGINAL_INVOCATION_ID", "keep-original-private")
-        .env(
-            "NOMUX_ORIGINAL_INVOCATION_ID_PRESENT",
-            "keep-present-private",
-        )
-        .env("PS1", "")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // The harness normally makes XDG_RUNTIME_DIR another isolated run-file source. Here
-    // systemd-run also needs its real value to find the already-probed user bus; state home
-    // still keeps every nomux file under `root`.
-    use_real_runtime_dir(&mut scoped);
-    let mut child = Spawned::spawn(&mut scoped);
-    let mut stdin = child.stdin.take().expect("relay stdin");
-    let mut relay_stdout = child.stdout.take().expect("relay stdout");
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
-    let pump = thread::spawn(move || {
-        let mut chunk = [0u8; 8192];
-        loop {
-            match relay_stdout.read(&mut chunk) {
-                Err(err) if err.kind() == ErrorKind::Interrupted => {}
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if tx.send(chunk[..n].to_vec()).is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    write_frame(&mut stdin, &hello_frame(false, false, RESUME_FROM_START));
-    let ready = b"stty -echo; printf 'NOMUX-SCOPE-%s\\n' READY\n";
-    write_frame(
-        &mut stdin,
-        &Frame::Input {
-            offset: 0,
-            data: ready,
-        },
-    );
-    stdin.flush().expect("flush the greeting and setup");
-
-    let (pid, _reaper) = daemon_reaper(&root, id);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut seen = Vec::new();
-    let became_ready = poll_by(deadline, || {
-        while let Ok(bytes) = rx.try_recv() {
-            seen.extend_from_slice(&bytes);
-        }
-        String::from_utf8_lossy(&seen).contains("NOMUX-SCOPE-READY")
-    });
-
-    let check = b"if [ \"$INVOCATION_ID\" = NOMUX-ORIGINAL ] && [ \"$NOMUX_ORIGINAL_INVOCATION_ID\" = keep-original-private ] && [ \"$NOMUX_ORIGINAL_INVOCATION_ID_PRESENT\" = keep-present-private ]; then printf 'NOMUX-SCOPE-%s-CLEAN\\n' \"$((6*9))\"; else printf 'NOMUX-SCOPE-ENV-BAD\\n'; fi\n";
-    write_frame(
-        &mut stdin,
-        &Frame::Input {
-            offset: ready.len() as u64,
-            data: check,
-        },
-    );
-    stdin.flush().expect("flush the environment check");
-    let answered = poll_by(deadline, || {
-        while let Ok(bytes) = rx.try_recv() {
-            seen.extend_from_slice(&bytes);
-        }
-        let seen = String::from_utf8_lossy(&seen);
-        seen.contains("NOMUX-SCOPE-54-CLEAN") || seen.contains("NOMUX-SCOPE-ENV-BAD")
-    });
-
-    let cgroup =
-        fs::read_to_string(format!("/proc/{pid}/cgroup")).expect("read the scoped daemon's cgroup");
-    let listed = control(&root, &["list"]);
-    drop(stdin);
-    drop(child);
-    drop(pump.join());
-    let killed = control(&root, &["kill", id]);
-
-    assert!(became_ready, "the scoped shell never became ready");
-    assert!(answered, "the scoped shell never answered: {seen:?}");
-    assert!(
-        String::from_utf8_lossy(&seen).contains("NOMUX-SCOPE-54-CLEAN"),
-        "systemd changed the shell environment: {seen:?}"
-    );
-    assert!(
-        cgroup.contains(&format!("/nomux-{id}-")) && cgroup.contains(".scope"),
-        "daemon was not moved into its nomux scope: {cgroup:?}"
-    );
-    succeeded(&listed, "list the scoped session");
-    assert!(
-        stdout(&listed).contains("\tcost $5\n"),
-        "systemd changed the label: {:?}",
-        stdout(&listed)
-    );
-    succeeded(&killed, "kill the scoped session");
 }
 
 /// `spawn` starts the binary it is running, not whatever is at the path it was

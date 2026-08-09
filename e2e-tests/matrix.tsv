@@ -6,36 +6,45 @@
 # `expect` is `survives` or `dies`: whether the session created in one SSH login is
 # still there in the next, after the first has been logged out.
 #
-# The three configuration axes are the three things `launcher::spawn_daemon` reads before
-# it chooses, plus the one thing it cannot see (KillUserProcesses) that decides whether its
-# choice was the right one. `logout` is a fourth axis of a different kind — not how the
-# host is configured but how the login ends, `clean` for an orderly `ssh host 'cmd'` return
-# and `abrupt` for a connection blackholed at the wire. See run.sh's `abrupt_login`.
+# nomux reads none of these axes any more. `spawn` launches the daemon directly and
+# always, so the daemon lands in whatever cgroup its login already had, and the only axis
+# that can decide its fate is KillUserProcesses — which is a host policy nomux never sees.
+# `pam_systemd` decides whether there is a login session to be in at all, and `linger` is
+# kept precisely because it is now predicted to change nothing: it used to be the axis that
+# turned `dies` into `survives`, and a cell that measures it no longer doing so is what
+# would catch a scope launch coming back. `logout` is an axis of a different kind — not how
+# the host is configured but how the login ends, `clean` for an orderly `ssh host 'cmd'`
+# return and `abrupt` for a connection blackholed at the wire. See run.sh's `abrupt_login`.
 #
 # cell	port	kill_user_processes	linger	pam_systemd	logout	expect
 #
 # --------------------------------------------------------------- the clean logout half
 #
-# No pam_systemd: no session scope, no $XDG_RUNTIME_DIR, no user bus. The launcher must
-# decline the scope path, and nothing on the host is managing logins, so nothing kills
-# the daemon whatever KillUserProcesses says.
+# No pam_systemd: no session scope, no $XDG_RUNTIME_DIR, no user bus. Nothing on the host
+# is managing logins, so the daemon inherits sshd's own unit and nothing kills it whatever
+# KillUserProcesses says.
 no-user-bus	2201	no	no	no	clean	survives
 #
-# The forgiving host. Direct launch (no linger), session scope not killed at logout.
+# The forgiving host, and the one most distributions ship: the daemon is left in the login
+# session's scope and the session scope is not killed at logout.
 kup-off-linger-off	2202	no	no	yes	clean	survives
 #
-# Linger on, so the scope path is taken; nothing would have killed it anyway. This cell
-# is what says the scope launch does not *itself* break a session that used to work.
+# Linger on, and it makes no difference: a lingering `user@UID.service` owns nothing the
+# daemon is in, and nothing would have killed it here anyway. The control for the pair
+# below — it says a `survives` under linger is not evidence linger did anything.
 kup-off-linger-on	2203	no	yes	yes	clean	survives
 #
-# The cell the whole exercise is for, and the one the README already warns about. The
-# launcher has no linger, so it falls back to the direct path, and the direct path leaves
-# the daemon in `session-N.scope` — which logind kills at the final logout.
+# The cell the whole exercise is for. The daemon is launched directly into
+# `session-N.scope`, and logind kills that scope's contents at the final logout.
 kup-on-linger-off	2204	yes	no	yes	clean	dies
 #
-# The configuration nomux actually wants on a strict host: linger enabled, so the daemon
-# goes into a manager-owned transient scope that outlives the login session.
-kup-on-linger-on	2205	yes	yes	yes	clean	survives
+# Predicted `dies`, and this row is the deletion's own regression test. It recorded
+# `survives` while `spawn` detected a lingering user manager and launched through
+# `systemd-run --user --scope`, which put the daemon in a manager-owned transient scope
+# outside the login session. That launcher is gone, so linger now buys nothing: the daemon
+# is in `session-N.scope` like its linger-off twin and dies with it. A `survives` measured
+# here again would mean a scope launch had come back into the product.
+kup-on-linger-on	2205	yes	yes	yes	clean	dies
 #
 # -------------------------------------------------------------- the dropped-wire half
 #
@@ -59,4 +68,4 @@ drop-no-user-bus	2206	no	no	no	abrupt	survives
 drop-kup-off-linger-off	2207	no	no	yes	abrupt	survives
 drop-kup-off-linger-on	2208	no	yes	yes	abrupt	survives
 drop-kup-on-linger-off	2209	yes	no	yes	abrupt	dies
-drop-kup-on-linger-on	2210	yes	yes	yes	abrupt	survives
+drop-kup-on-linger-on	2210	yes	yes	yes	abrupt	dies
