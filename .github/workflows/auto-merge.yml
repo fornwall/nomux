@@ -4,8 +4,12 @@ on:
   pull_request_target:
     branches: [main]
     types: [opened, reopened, synchronize, edited, ready_for_review]
+  # Every fifteen minutes, which is as fast as anything here turns over: dependabot opens its
+  # pull requests at 05:17, 05:27 and 05:37, and the two jobs below only have work when one of
+  # those exists or has gone stale behind main. Every five was 288 runs a day of each. The `3/`
+  # offset stays — GitHub queues scheduled workflows worst at the top of the hour.
   schedule:
-    - cron: '3/5 * * * *'
+    - cron: '3/15 * * * *'
   workflow_dispatch:
 
 permissions: {}
