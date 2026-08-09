@@ -326,21 +326,14 @@ the stream as one field, because a login shell sourcing an rc file gets there fi
 of hosts — the same chatter that would corrupt the frames on stdout, which is the other half
 of why the field is not there.
 
-The value is §6.3's precedence restated in `sh`, and it has to be that precedence exactly.
-Each source counts **only where it names an absolute path**, `rundir::absolute_env` testing
-nothing else — so unset, empty and relative are one answer and not three, and a `~/run` no
-shell expanded is relative like the rest, which is why `${VAR-}` and a `case` do the work
-where a `${VAR:-default}` would silently promote the relative ones. `$HOME` substitutes for
-`$XDG_STATE_HOME` takes the *same* `nomux/run`, under `.local/state`: a branch of one
-precedence, not a third directory. `${VAR%/}/` is the join — `PathBuf::push` adds a
-separator only where the last byte is not one, and stripping one to put one back is that
-rule to the byte, down to `XDG_RUNTIME_DIR=/` giving `/nomux` and not the `//nomux` POSIX
-leaves implementation-defined. What the shell reads is what the `exec` inherits, so a login
-shell that *materialises* one of these — `zsh` supplies and exports `$HOME` where the
-environment carried none, `dash`, `bash` and BusyBox `ash` do not — moves both answers or
-neither. Where no source qualifies, nothing is printed, which is the daemon's own answer
-(§6.3, §10) rather than a silence: a client that reads no line has learnt that there is no
-warm path here.
+The value is §6.3's precedence restated in `sh`, and it has to be that precedence to the
+byte. `rundir::absolute_env` counts a source **only where it names an absolute path**, so
+unset, empty and relative are one answer and not three — which is why `${VAR-}` and a `case`
+do the work a `${VAR:-default}` would get wrong by silently promoting the relative ones —
+and `${VAR%/}/` is `PathBuf::push`'s join spelled out, down to `XDG_RUNTIME_DIR=/` giving
+`/nomux` and not the `//nomux` POSIX leaves implementation-defined. Where no source
+qualifies nothing is printed, which is the daemon's own answer (§6.3, §10) rather than a
+silence: a client that reads no line has learnt there is no warm path here.
 
 `printf` and not `echo`: `NOMUX-BOOTSTRAP`'s fields are `uname`'s and cannot hold a
 backslash, a path can, and `echo`'s treatment of one is unspecified — in `dash` it is an
