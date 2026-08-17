@@ -28,8 +28,8 @@ baseline_file="$repo/scripts/size-baseline"
 nightly_file="$repo/scripts/nightly-version"
 update_baseline="${NOMUX_UPDATE_BASELINE:-0}"
 
-# Rebuilding std with immediate-abort needs nightly. A tracked date keeps release and fuzz builds
-# reproducible and advances them together.
+# Rebuilding std with immediate-abort and size-optimized algorithms needs nightly. A tracked date
+# keeps release and fuzz builds reproducible and advances them together.
 read -r nightly < "$nightly_file" || die "could not read a toolchain name from $nightly_file"
 case "$nightly" in
 nightly-[0-9][0-9][0-9][0-9]-[01][0-9]-[0-3][0-9]) ;;
@@ -77,11 +77,10 @@ us=$(printf '\037')
 # even though cargo already passes workspace paths relative, so a future path-dependent dependency
 # cannot quietly reintroduce the problem.
 sysroot=$(rustc --print sysroot)
-# Beside the toolchain's own `rust-lld`, so it is the same LLVM that linked and it reads every
-# target the cross builds emit: one of the two is cross-compiled, and a host binutils that cannot
-# read aarch64 is the ordinary case. `llvm-readobj` rather than `llvm-readelf`: llvm-tools ships
-# only the former, and it is the same program under another name.
-readobj="$(rustc --print target-libdir)/../bin/llvm-readobj"
+# Use the pinned toolchain's LLVM tools so the host does not need cross-binutils.
+llvm_bin="$(rustc --print target-libdir)/../bin"
+readobj="$llvm_bin/llvm-readobj"
+stripper="$llvm_bin/llvm-strip"
 # Resolved rather than taken as spelled: cargo accepts a *relative* $CARGO_TARGET_DIR and reads it
 # against this script's cwd, and both uses below need an absolute path — rustc matches a remap
 # prefix component-wise, and check_leaks greps the artifact for this literal. `pwd -P` also settles
@@ -102,8 +101,10 @@ remap="$remap$us--remap-path-prefix=$repo=/nomux"
 # this is belt and braces — but not every target this script has built did, and the failure it
 # prevents is a binary with runtime dependencies on a host we know nothing about, discovered at a
 # user's shell rather than here.
-rustflags="-Clink-self-contained=yes$us-Ctarget-feature=+crt-static$us$remap"
-rustflags="$rustflags$us-Zunstable-options$us-Cpanic=immediate-abort"
+# Rust does not guarantee distinct addresses for distinct functions; fold identical code.
+rustflags="-Clink-self-contained=yes$us-Ctarget-feature=+crt-static$us-Clink-arg=--icf=all$us$remap"
+# Immediate-abort never unwinds; omit tables used only for external stack walking.
+rustflags="$rustflags$us-Zunstable-options$us-Cpanic=immediate-abort$us-Cforce-unwind-tables=no"
 
 rm -rf "$dist"
 mkdir -p "$dist"
@@ -156,12 +157,11 @@ check_leaks() {
     done
 }
 
-# The rustflags above ask for a static binary; this is what says one came out. Asking is not
-# getting — a target spec that ignored crt-static, a dependency that pulled in a dynamic libc —
-# and the failure lands at a stranger's shell rather than here. A static-pie carries neither a
-# PT_INTERP segment naming a loader nor a DT_NEEDED entry naming a library. Read into a variable
-# first, so a readobj that fails is `set -e` rather than a grep that calls the binary clean.
-check_static() {
+# The rustflags above ask for a hardened static PIE; this is what says one came out. Asking is not
+# getting — a target spec or linker default can drift, and that failure lands in the artifact
+# rather than in this script. Read into a variable first, so a readobj that fails is `set -e`
+# rather than a grep that calls the binary clean.
+check_elf() {
     elf=$("$readobj" --file-headers --program-headers --dynamic-table "$1")
     # That the output was parsed at all, before any weight is put on its silence: the verdict below
     # is drawn from two patterns *not* matching, which is equally what an empty output or a future
@@ -181,6 +181,43 @@ check_static() {
             "$(printf '%s\n' "$elf" | grep -E 'PT_INTERP|NEEDED')" \
             "      it needs those present on a host nobody has looked at."
     fi
+
+    # These are all present in today's output, so pin them before a linker or target-spec change
+    # can quietly make the next release weaker. A named GNU_STACK with no PF_X is the positive
+    # assertion: merely failing to find an executable-stack marker would also pass an ELF with no
+    # stack policy at all. RELRO is complete only with immediate binding.
+    if ! printf '%s\n' "$elf" | awk '
+        /Type: PT_GNU_STACK/ { in_stack = 1; found = 1 }
+        in_stack && /PF_X/ { executable = 1 }
+        in_stack && /^  }/ { in_stack = 0; closed = 1 }
+        END { exit !(found && closed && !executable) }
+    '; then
+        die "FAIL: ${1##*/} does not declare a non-executable stack."
+    fi
+    case "$elf" in
+    *'Type: PT_GNU_RELRO'*) ;;
+    *) die "FAIL: ${1##*/} has no GNU_RELRO segment." ;;
+    esac
+    case "$elf" in
+    *BIND_NOW*) ;;
+    *) die "FAIL: ${1##*/} does not request immediate binding for full RELRO." ;;
+    esac
+
+    # W^X for loadable segments. Checked block by block: the file necessarily has an executable
+    # load and a writable load, so searching the whole report for both flags would always fail.
+    if ! printf '%s\n' "$elf" | awk '
+        /Type: PT_LOAD/ { in_load = 1; loads++; writable = executable = 0 }
+        in_load && /PF_W/ { writable = 1 }
+        in_load && /PF_X/ { executable = 1 }
+        in_load && /^  }/ {
+            if (writable && executable) bad = 1
+            checked++
+            in_load = 0
+        }
+        END { exit bad || !loads || checked != loads }
+    '; then
+        die "FAIL: ${1##*/} has a writable and executable load segment."
+    fi
 }
 
 for target in $targets; do
@@ -197,10 +234,13 @@ for target in $targets; do
     esac
     CARGO_ENCODED_RUSTFLAGS="$target_rustflags" \
         cargo build --locked --release --target "$build_target" --bin nomux \
-        -Zbuild-std=std,panic_abort -Zjson-target-spec >&2
+        -Zbuild-std=std,panic_abort -Zbuild-std-features=optimize_for_size \
+        -Zjson-target-spec >&2
     cp "$target_root/$build_dir/release/nomux" "$dist/nomux-$target"
+    # Compiler provenance has no runtime purpose and costs bytes in every upload.
+    "$stripper" --remove-section=.comment "$dist/nomux-$target"
     check_leaks "$dist/nomux-$target"
-    check_static "$dist/nomux-$target"
+    check_elf "$dist/nomux-$target"
 done
 
 # `sha256sum -c` format, so a verifier needs no bespoke tooling. Listed target by target rather

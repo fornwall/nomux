@@ -6,8 +6,10 @@
 //! The socket probe all of this is written against is [`crate::usock::liveness`], where the
 //! daemon's bind and the attach paths reach it without reading a line of a file § 6.6 froze.
 
+use std::ffi::OsString;
 use std::io::{self, Write};
 use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -20,46 +22,26 @@ use crate::rundir::{
 };
 use crate::usock::{Liveness, liveness};
 
-/// How long a probe of a session socket waits for an answer: bounded because a `connect`
-/// to a full backlog blocks rather than being refused (§ 6.3), and deliberately *not*
-/// clamped to whatever grace remains (§ 6.6).
+/// A full listener backlog can make `connect` block rather than refuse.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// What `list` gives a probe instead. Nothing, because only [`Liveness::Stale`] changes
-/// what it does with a session, and every errno behind `Stale` is settled on the first
-/// attempt (`usock`'s connect) — waiting a full backlog out would cost two
-/// seconds per wedged daemon to print the same line.
+/// Listing need not wait because only settled [`Liveness::Stale`] errors change its result.
 const LIST_PROBE: Duration = Duration::ZERO;
 
-/// How long `kill` gives another process to reach a point of its own: the spawn lock to
-/// come free, `<id>.pid` to be published (§ 6.2's window), and a terminated daemon to
-/// exit before it is killed outright — one figure for the three (§ 6.6).
+/// Shared deadline for lock release, pid publication, and graceful shutdown.
 const GRACE: Duration = Duration::from_secs(2);
 
-/// How long a killed daemon has to actually go before `kill` concludes the pid signalled
-/// is not the process serving the socket, or that no signal went out at all (§ 6.6);
-/// [`still_answering`] words that refusal.
+/// Final wait after signalling before a socket is declared still live.
 const KILL_GRACE: Duration = Duration::from_millis(500);
 
-/// How often to look again while waiting any of the graces out. One interval for all of
-/// them: each waits on another process reaching a point of its own.
-///
-/// It also bounds how many connections a stage can leave sitting in the daemon's backlog,
-/// which is `somaxconn` deep (`UnixListener::bind` asks the kernel for its maximum) and is
-/// drained by `accept` alone — a probe closing its end at once does *not* give the slot
-/// back. At 25 ms that is some 80 per stage against a modern default of 4096, so this is
-/// not a figure to tighten without counting.
+/// Poll cadence, limiting each two-second stage to about 80 queued probes.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// The kernel's longest path, which is as long as `argv[0]` gets for a daemon *this*
 /// program starts: `spawn` sets it from `env::current_exe`, a path the kernel resolved.
 const PATH_MAX: usize = 4096;
 
-/// Longest `/proc/<pid>/cmdline` prefix [`is_daemon_for`] reads: enough for a well-formed
-/// `nomux daemon <id>`, which is a path of at most [`PATH_MAX`], the mode, and an id of at
-/// most [`MAX_SESSION_ID_LEN`], with a NUL after each. A bound on what this program
-/// *writes*: what settles a read that filled the buffer is [`is_daemon_for`]'s rule about
-/// `argv[1]`, never the size of it (§ 6.6).
+/// Bounded `/proc/<pid>/cmdline` prefix, long enough for complete `argv[0] daemon <id>`.
 const MAX_CMDLINE_LEN: usize = PATH_MAX + 1 + "daemon".len() + 1 + MAX_SESSION_ID_LEN + 1;
 
 /// Prints one line per live session and collects the dead ones, as § 6.6's `list output` has
@@ -88,7 +70,7 @@ pub(crate) fn list() -> io::Result<()> {
             // so this is the one session `list` can neither print nor collect.
             Err(err) => {
                 let complaint = format!("{err}; its files are left where they are");
-                eprintln!("nomux: {}", complaint.escape_debug());
+                crate::write_stderr(format_args!("nomux: {}\n", complaint.escape_debug()));
                 continue;
             }
         };
@@ -142,12 +124,12 @@ pub(crate) fn kill(session_id: &str) -> io::Result<()> {
     // process that stopped letting go is no reason for the escape hatch to hang forever.
     let lock = paths.lock_spawn_until(Instant::now() + GRACE)?;
     if let Some(chosen) = resolve(&paths)? {
-        chosen.signal(Signal::TERM);
+        let term = chosen.signal(Signal::TERM);
         // Liveness first, deadline second, so a daemon that let go on the last interval is
         // not signalled again — `SIGKILL` being the one signal nothing survives, and the
         // descriptor guaranteeing only that it lands on the process this call pinned.
         let mut deadline = Instant::now() + GRACE;
-        let mut killed = false;
+        let mut killed = None;
         loop {
             match liveness(&paths.socket(), PROBE_TIMEOUT) {
                 Liveness::Stale(_) => break,
@@ -161,11 +143,10 @@ pub(crate) fn kill(session_id: &str) -> io::Result<()> {
                 // Both graces out with the socket still answering — reached only from the arm
                 // above that accepted a connection. What the escalation actually did is
                 // [`still_answering`]'s to say rather than this call site's.
-                if killed {
-                    return Err(refuse(still_answering(paths.id(), &chosen)));
+                if let Some(kill) = &killed {
+                    return Err(refuse(still_answering(paths.id(), &chosen, &term, kill)));
                 }
-                chosen.signal(Signal::KILL);
-                killed = true;
+                killed = Some(chosen.signal(Signal::KILL));
                 deadline = Instant::now() + KILL_GRACE;
             }
             thread::sleep(POLL_INTERVAL);
@@ -245,68 +226,37 @@ fn pidfile<'a>(path: &Path, buf: &'a mut [u8; MAX_PID_LEN]) -> io::Result<(Optio
     Ok((pid, body))
 }
 
-/// The process `kill` acts on: the number the pidfile named, and a hold on the process
-/// that number meant when it was read.
-///
-/// The two are not the same thing, and that is the whole reason this is a struct. A pid is a
-/// number the kernel is free to reissue the moment its process is reaped, while [`kill`]
-/// signals twice with a [`GRACE`] in between and reads `/proc` before either.
+/// The pidfile number and a hold on the process it named before [`GRACE`] elapsed.
 #[derive(Debug)]
 struct Chosen {
-    /// What the refusals print and what `list` shows: a descriptor is nothing a user can
-    /// carry to another command, so the number is still the whole of what is reportable.
     pid: Pid,
-    /// What the signals go through, or the errno that gave none up — the only thing here
-    /// that ever signals, for [`pin`]'s reason. Where it is an error nothing is signalled and
-    /// [`kill`] settles the session by probing the socket alone; only [`still_answering`]
-    /// reads the errno, that being the one path where the difference is visible.
     reach: io::Result<OwnedFd>,
 }
 
 impl Chosen {
-    /// Signals the daemon, where [`pin`] got a descriptor to signal it through.
-    ///
-    /// The outcome is dropped because there is none worth reading: a process that took the
-    /// first signal and died answers the second with `ESRCH`, which is this working rather
-    /// than failing, and [`kill`] settles what happened by probing the socket either way.
-    fn signal(&self, sig: Signal) {
-        if let Ok(pidfd) = &self.reach {
-            let _ = pidfd_send_signal(pidfd, sig);
-        }
+    /// Signals through the pidfd; the later socket probe settles the outcome, while the
+    /// result is retained so a refusal never claims a syscall that failed was sent.
+    fn signal(&self, sig: Signal) -> io::Result<()> {
+        let pidfd = self
+            .reach
+            .as_ref()
+            .map_err(|err| io::Error::new(err.kind(), err.to_string()))?;
+        pidfd_send_signal(pidfd, sig).map_err(Into::into)
     }
 }
 
-/// Takes hold of the process a number names, before anything at all is established about
-/// it: pinning first is what makes [`chosen`]'s `/proc` check and the signal be about one
-/// process (§ 6.6). A descriptor is had without permission to signal, which is why
-/// [`pidfile`] still asks that separately.
-///
-/// A failure of any kind signals nothing at all, § 6.6 delegating the argument here. There is
-/// no falling back on the bare number: doing that accepts the reuse race this call exists to
-/// close, and the errno that most invites it — `ESRCH`, a process already reaped — is the one
-/// under which the race is not a risk but a certainty. A host with no `pidfd_open` therefore
-/// gets a `kill` that refuses and names the errno rather than one that signals a number it
-/// cannot vouch for — recoverable, where a signal delivered to a stranger's process is not.
+/// Pins a pid before validation; failure never falls back to the reusable bare number.
 fn pin(pid: Pid) -> io::Result<OwnedFd> {
     pidfd_open(pid, PidfdFlags::empty()).map_err(io::Error::from)
 }
 
-/// The published pid, where `/proc` does not rule it out.
-///
-/// Shared by both modes, so the number `list` prints is the number `kill` would signal —
-/// which matters most in the case `kill` refuses, since it recommends no repair there and a
-/// user who wants to act asks `list` what to signal. § 6.6 has the rest of the weighing.
+/// The published pid, unless `/proc` establishes it belongs to another process.
 fn identified(paths: &SessionPaths, filed: Option<Pid>) -> Option<Pid> {
     let pid = filed?;
     (is_daemon_for(pid, paths.id()) != Some(false)).then_some(pid)
 }
 
-/// [`identified`], held by the process rather than by the number ([`pin`]).
-///
-/// For `kill`, which is what needs the hold. These two lines are in that order for [`pin`]'s
-/// reason and no other: swapping them gives the window back. `list` prints a number and
-/// signals nothing, so it goes through [`identified`] alone rather than opening a descriptor
-/// per session to drop unread.
+/// Pins before identification so `/proc` validation and signals concern one process.
 fn chosen(paths: &SessionPaths, filed: Option<Pid>) -> Option<Chosen> {
     let reach = pin(filed?);
     identified(paths, filed).map(|pid| Chosen { pid, reach })
@@ -326,7 +276,7 @@ fn is_daemon_for(pid: Pid, id: &str) -> Option<bool> {
         .rposition(|byte| *byte == 0)
         .and_then(|end| body.get(..end))
         .unwrap_or(&[]);
-    if names_daemon_for(whole, id) {
+    if names_daemon_prefix(whole, id, body.len() == MAX_CMDLINE_LEN) {
         return Some(true);
     }
     // A full buffer is still a definitive "no" wherever `argv[1]` arrived whole — exactly
@@ -338,29 +288,34 @@ fn is_daemon_for(pid: Pid, id: &str) -> Option<bool> {
 ///
 /// Parsed the way [`main::parse_session_args`](crate::main) parses it rather than searched,
 /// which is § 6.6's rule and its reason.
-///
-/// Read against whatever `/proc` holds rather than against what this build can produce,
-/// which is why an `attach --label` still parses here after `main` stopped accepting one.
-fn names_daemon_for(whole: &[u8], id: &str) -> bool {
+/// If the read filled its buffer, a final bare option may have its value in the discarded
+/// tail; a valid placeholder preserves that one deliberately inconclusive case.
+fn names_daemon_prefix(whole: &[u8], id: &str, truncated: bool) -> bool {
     let mut args = whole.split(|byte| *byte == 0);
     args.next();
     if args.next() != Some(b"daemon".as_slice()) {
         return false;
     }
-    let mut session = None;
-    while let Some(arg) = args.next() {
-        if arg == b"--label" || arg == b"--lock-fd" {
-            // Option values are never session ids. `--lock-fd` is the private
-            // descriptor capability a relay hands its daemon at `exec`.
-            args.next();
-        } else if !arg.starts_with(b"--label=")
-            && !arg.starts_with(b"--lock-fd=")
-            && !arg.starts_with(b"-")
-        {
-            session.get_or_insert(arg);
+    let missing = if truncated {
+        match args.clone().next_back() {
+            Some(b"--label") => Some(OsString::new()),
+            Some(b"--lock-fd") => Some(OsString::from("3")),
+            _ => None,
         }
-    }
-    session == Some(id.as_bytes())
+    } else {
+        None
+    };
+    crate::parse_session_args(
+        args.map(|arg| OsString::from_vec(arg.to_vec()))
+            .chain(missing),
+        true,
+    )
+    .is_ok_and(|parsed| parsed.session.as_deref() == Some(id))
+}
+
+#[cfg(test)]
+fn names_daemon_for(whole: &[u8], id: &str) -> bool {
+    names_daemon_prefix(whole, id, false)
 }
 
 /// The shape every refusal here takes: something in the run directory said what this
@@ -411,21 +366,31 @@ fn unidentified(id: &str, filed: Option<Pid>, body: &[u8]) -> String {
     }
 }
 
-/// The refusal to collect a session that was answering still when both graces ran out, in
-/// the words the [`Chosen::reach`] it was escalated *through* earns (§ 6.6): a signal
-/// that went out through a descriptor says the pid is not the process serving the socket,
-/// and an errno that declined the descriptor says no signal went out at all — the errno
-/// being the one part anybody can repair.
-fn still_answering(id: &str, chosen: &Chosen) -> String {
+/// The refusal to collect a session that was answering still when both graces ran out,
+/// naming exactly which syscalls reached the pinned process and which failed (§ 6.6).
+fn still_answering(
+    id: &str,
+    chosen: &Chosen,
+    term: &io::Result<()>,
+    kill: &io::Result<()>,
+) -> String {
     let pid = chosen.pid.as_raw_nonzero();
-    match &chosen.reach {
-        Ok(_) => format!(
+    match (term, kill) {
+        (Ok(()), Ok(())) => format!(
             "session {id} is still answering after SIGTERM and SIGKILL to pid {pid}, so \
              that pid is not the process serving it"
         ),
-        Err(err) => format!(
-            "session {id} is still answering, and pid {pid} could not be held to be \
-             signalled ({err}), so neither SIGTERM nor SIGKILL was sent"
+        (Err(term), Err(kill)) => format!(
+            "session {id} is still answering, and neither SIGTERM nor SIGKILL was sent \
+             to pid {pid} (SIGTERM: {term}; SIGKILL: {kill})"
+        ),
+        (Ok(()), Err(kill)) => format!(
+            "session {id} is still answering after SIGTERM to pid {pid}; SIGKILL could \
+             not be sent ({kill})"
+        ),
+        (Err(term), Ok(())) => format!(
+            "session {id} is still answering after SIGKILL to pid {pid}, so that pid is \
+             not the process serving it; SIGTERM could not be sent ({term})"
         ),
     }
 }
@@ -484,7 +449,7 @@ mod tests {
     use std::{fs, io, thread};
 
     use rustix::io::Errno;
-    use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
+    use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open};
 
     use super::{
         Chosen, MAX_CMDLINE_LEN, bound_since, is_daemon_for, names_daemon_for, pin, still_answering,
@@ -541,9 +506,15 @@ mod tests {
         // Reaped, so the number is the kernel's to hand out again.
         child.wait().expect("reap the held process");
 
+        let chosen = Chosen {
+            pid,
+            reach: Ok(pidfd),
+        };
         assert_eq!(
-            pidfd_send_signal(&pidfd, Signal::CONT),
-            Err(Errno::SRCH),
+            chosen
+                .signal(Signal::CONT)
+                .map_err(|err| err.raw_os_error()),
+            Err(Some(libc::ESRCH)),
             "the signal reached something, so the descriptor is following the number \
              rather than the process it was opened on"
         );
@@ -557,13 +528,13 @@ mod tests {
     #[test]
     fn a_refusal_names_no_signal_that_was_never_sent() {
         let pid = Pid::from_raw(999_999_999).expect("a positive number is a pid");
-        let unheld = still_answering(
-            "one",
-            &Chosen {
-                pid,
-                reach: Err(Errno::MFILE.into()),
-            },
-        );
+        let unheld = Chosen {
+            pid,
+            reach: Err(Errno::MFILE.into()),
+        };
+        let term = unheld.signal(Signal::TERM);
+        let kill = unheld.signal(Signal::KILL);
+        let unheld = still_answering("one", &unheld, &term, &kill);
         assert!(
             !unheld.contains("SIGTERM and SIGKILL to"),
             "no signal went out, so none may be named as having gone out — that sentence \
@@ -583,13 +554,11 @@ mod tests {
         // this half can be asked of.
         if kernel_has_pidfds("nothing here signals, so the sentence goes unchecked") {
             let pidfd = pidfd_open(Pid::INIT, PidfdFlags::empty()).expect("hold pid 1");
-            let signalled = still_answering(
-                "one",
-                &Chosen {
-                    pid,
-                    reach: Ok(pidfd),
-                },
-            );
+            let signalled = Chosen {
+                pid,
+                reach: Ok(pidfd),
+            };
+            let signalled = still_answering("one", &signalled, &Ok(()), &Ok(()));
             assert!(
                 signalled.contains("still answering after SIGTERM and SIGKILL to pid 999999999"),
                 "a session that outlasted a signal that was sent says so, and names the \
@@ -736,6 +705,10 @@ mod tests {
             &cmdline(&["nomux", "daemon", "--lock-fd=7", "one"]),
             "one"
         ));
+        assert!(names_daemon_for(
+            &cmdline(&["nomux", "daemon", "one", "--lock-fd=7"]),
+            "one"
+        ));
         assert!(
             !names_daemon_for(&cmdline(&["nomux", "daemon", "--lock-fd", "7", "one"]), "7"),
             "the inherited descriptor number is not the session id"
@@ -747,5 +720,30 @@ mod tests {
         ));
         assert!(!names_daemon_for(&cmdline(&["nomux", "daemon"]), "one"));
         assert!(!names_daemon_for(&[], "one"));
+    }
+
+    /// Identification must reject every daemon-like command line the actual daemon
+    /// parser rejects, or `kill` can signal a process that only shares its argv prefix.
+    #[test]
+    fn malformed_daemon_command_lines_do_not_name_a_session() {
+        for argv in [
+            vec!["nomux", "daemon", "one", "extra"],
+            vec!["nomux", "daemon", "--unknown", "one"],
+            vec!["nomux", "daemon", "--label"],
+            vec!["nomux", "daemon", "--label=a", "--label=b", "one"],
+            vec!["nomux", "daemon", "--lock-fd=2", "one"],
+            vec!["nomux", "daemon", "--lock-fd=nope", "one"],
+            vec!["nomux", "daemon", "--lock-fd=7", "--lock-fd=8", "one"],
+        ] {
+            assert!(
+                !names_daemon_for(&cmdline(&argv), "one"),
+                "accepted malformed daemon argv: {argv:?}"
+            );
+        }
+
+        assert!(
+            !names_daemon_for(b"nomux\0daemon\0one\0--label\0\xff", "one"),
+            "accepted an argv value the command-line parser cannot decode"
+        );
     }
 }

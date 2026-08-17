@@ -181,7 +181,7 @@ wait_for_relay() {
     what=$2
     attempt=0
     while [ "$attempt" -lt 200 ]; do
-        state=$(awk '{ print $3 }' "/proc/$relay_pid/stat" 2>/dev/null || :)
+        state=$(awk '$1 == "State:" { print substr($2, 1, 1) }' "/proc/$relay_pid/status" 2>/dev/null || :)
         if [ -z "$state" ] || [ "$state" = Z ]; then
             if wait "$relay_pid"; then
                 return 0

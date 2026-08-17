@@ -25,8 +25,9 @@ use crate::nbio;
 use crate::pty::{self, Pty};
 use crate::rundir::{SessionPaths, ensure_run_dir};
 use crate::startup::{
-    arm_child_signal, arm_stop_signals, detach_from_controlling_terminal, leave_startup_directory,
-    open_null_device, silence_standard_descriptors,
+    arm_child_signal, arm_stop_signals, close_inherited_descriptors,
+    detach_from_controlling_terminal, leave_startup_directory, open_null_device,
+    silence_standard_descriptors,
 };
 use crate::usock::{Liveness, liveness};
 
@@ -137,7 +138,7 @@ struct Attached {
     /// Post-gap repaint policy, as this connection's `Hello` stated it (§ 4.3).
     repaint_ctrl_l: bool,
     /// Whether a gap reported to this connection is still owed its repaint (§ 4.3).
-    /// Cleared by [`Daemon::pump_output`] once this client holds the whole ring.
+    /// Cleared once this client holds the whole ring and the repaint is queued.
     repaint_due: bool,
 }
 
@@ -235,6 +236,9 @@ pub(crate) fn run(
 
 /// The body of [`run`], separated so that every way out of it is logged once.
 fn start(session_id: &str, label: Option<&str>, inherited_lock_fd: Option<i32>) -> io::Result<()> {
+    // Before opening anything of our own, and before a shell can inherit a descriptor the
+    // launcher never meant to give it. The one deliberate handoff is validated below.
+    close_inherited_descriptors(inherited_lock_fd)?;
     let paths = SessionPaths::new(session_id)?;
     ensure_run_dir(paths.dir())?;
 
@@ -280,9 +284,10 @@ fn start(session_id: &str, label: Option<&str>, inherited_lock_fd: Option<i32>) 
         }
     };
 
-    // One fallible region rather than a cleanup per call site: nothing past the bind can
-    // be reported, so whatever fails inside `publish`, what it published goes.
-    let (stop_pipe, child_pipe) = match publish(&paths, label) {
+    // One fallible region and one cleanup: stderr remains intact until its last `dup2`.
+    let published = publish(&paths, label)
+        .and_then(|pipes| silence_standard_descriptors(&null).map(|()| pipes));
+    let (stop_pipe, child_pipe) = match published {
         Ok(pipes) => pipes,
         Err(err) => {
             if inherited_lock_fd.is_some() {
@@ -298,10 +303,6 @@ fn start(session_id: &str, label: Option<&str>, inherited_lock_fd: Option<i32>) 
     // Never carried into the event loop: `kill` waits two seconds for this lock and then
     // reports a session it could not remove (§ 6.6).
     drop(publishing);
-
-    // The daemon's voice goes here and nowhere earlier (§ 6.2): everything above could
-    // still explain itself on the stderr `spawn` holds open, and nothing below has any.
-    silence_standard_descriptors(&null);
     drop(null);
 
     let mut daemon = Daemon {
@@ -404,7 +405,7 @@ fn bind_socket(paths: &SessionPaths) -> io::Result<UnixListener> {
 
     // Both names are a dead daemon's by the evidence that licensed removing the socket,
     // and both are cleared before the `bind` so there is no window: a `<id>.pid`
-    // outliving its socket satisfies `attach`'s wait for the path to *exist* and sends
+    // outliving its socket satisfies `attach`'s wait for a complete pidfile and sends
     // `kill` after an unrelated process, and until `write_pid`'s own clear — the far
     // side of § 6.2's fork — the label would answer for the id this daemon took over.
     paths.clear_pid();
@@ -1001,9 +1002,24 @@ impl Daemon {
     /// Observes the child's outcome without releasing an occupied session id (§ 6.5).
     fn collect_outcome(&mut self) {
         let observed = if self.worth_a_waitpid() {
-            self.pty
-                .as_mut()
-                .and_then(|pty| pty.try_outcome().ok().flatten())
+            match self.pty.as_mut().map(Pty::try_outcome) {
+                Some(Ok(outcome)) => outcome,
+                Some(Err(err)) => {
+                    // A failed wait is not "the child is still running". Before terminal
+                    // EOF the session can continue and a later notification may recover;
+                    // afterwards no truthful status can be promised, so end the transcript
+                    // as unknown rather than silently waiting out the ordinary grace.
+                    crate::sanitize::error(
+                        self.paths.id(),
+                        &format!("could not observe session shell: {err}"),
+                    );
+                    if self.terminal_closed_at.is_some() {
+                        self.outcome = Some((0, ExitKind::Unknown));
+                    }
+                    None
+                }
+                None => None,
+            }
         } else {
             None
         };
@@ -1232,9 +1248,9 @@ impl Daemon {
 
     /// Asks the child to redraw after a gap, by whichever means this client chose;
     /// `IMPLEMENTATION.md` § 4.3 has why the choice belongs to the client.
-    fn repaint(&mut self) {
+    fn repaint(&mut self) -> bool {
         if self.terminal_closed_at.is_some() {
-            return;
+            return true;
         }
         if self
             .client
@@ -1242,6 +1258,9 @@ impl Daemon {
             .is_some_and(|client| client.repaint_ctrl_l)
         {
             // Queued rather than written, and not client input: `in_applied` stays (§ 4.3).
+            if self.input_is_saturated() {
+                return false;
+            }
             self.pending_input.push_back(0x0c);
         } else if let Some(pty) = self.pty.as_ref() {
             // Two resizes, and a failure between them leaves the master a column narrow
@@ -1251,6 +1270,7 @@ impl Daemon {
                 self.applied_win = None;
             }
         }
+        true
     }
 
     /// Applies client input exactly once, trimming an overlapping replay (§ 3).
@@ -1331,9 +1351,11 @@ impl Daemon {
         // Coalesced onto the moment this client holds the whole ring rather than issued
         // per gap (§ 4.3).
         let repainting = client.repaint_due && client.sent_through >= end;
-        client.repaint_due &= !repainting;
-        if repainting {
-            self.repaint();
+        if repainting
+            && self.repaint()
+            && let Some(client) = self.client.as_mut()
+        {
+            client.repaint_due = false;
         }
     }
 
@@ -1626,6 +1648,39 @@ mod tests {
         .expect("spawn a shell on a pty")
     }
 
+    #[test]
+    fn ctrl_l_repaint_waits_for_input_queue_room() {
+        let root = Scratch::new("repaint-input-cap");
+        let mut daemon = blank(&root, "repaint");
+        let _peer = attach_peer(|conn| {
+            let mut client = Attached::greeting(conn);
+            client.repaint_ctrl_l = true;
+            client.repaint_due = true;
+            daemon.client = Some(client);
+        });
+        daemon.pending_input.resize(MAX_PENDING_INPUT, b'x');
+
+        daemon.pump_output();
+        assert_eq!(daemon.pending_input.len(), MAX_PENDING_INPUT);
+        assert!(
+            daemon
+                .client
+                .as_ref()
+                .is_some_and(|client| client.repaint_due)
+        );
+
+        daemon.pending_input.pop_front();
+        daemon.pump_output();
+        assert_eq!(daemon.pending_input.len(), MAX_PENDING_INPUT);
+        assert_eq!(daemon.pending_input.back(), Some(&0x0c));
+        assert!(
+            !daemon
+                .client
+                .as_ref()
+                .is_some_and(|client| client.repaint_due)
+        );
+    }
+
     /// Regression: a takeover keeps what the client it evicts had already delivered
     /// (`IMPLEMENTATION.md` § 6.4) — one `poll` can report both a readable client and,
     /// from the connection replacing it, the `Hello` that evicts it. Two deliberately
@@ -1813,6 +1868,9 @@ mod tests {
             .expect("close only the input half");
 
         let mut read_buf = vec![0u8; 64 * 1024];
+        daemon.read_client(&mut read_buf, &mut Vec::new());
+        // The first fair-share read takes the bytes; the second observes the EOF behind
+        // them, as `poll_once`'s buffered-input retry does in the same pass.
         daemon.read_client(&mut read_buf, &mut Vec::new());
 
         assert!(daemon.client.is_none(), "the invalid client kept the slot");

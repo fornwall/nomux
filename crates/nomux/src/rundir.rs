@@ -7,6 +7,7 @@
 
 use std::io::{self, Write as _};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -337,8 +338,10 @@ fn is_valid_session_id(id: &str) -> bool {
 /// **first** `.`, and a name with no `.` is nobody's. The one rule by which anything here
 /// reads a filename (§ 6.6) — its two readers are [`session_id_of`] and
 /// [`SessionPaths::removal_order`].
-fn split_run_name(path: &Path) -> Option<(&str, &str)> {
-    path.file_name()?.to_str()?.split_once('.')
+fn split_run_name(path: &Path) -> Option<(&str, &[u8])> {
+    let name = path.file_name()?.as_bytes();
+    let dot = name.iter().position(|byte| *byte == b'.')?;
+    Some((str::from_utf8(name.get(..dot)?).ok()?, name.get(dot + 1..)?))
 }
 
 /// The session a name in the run directory belongs to, if it belongs to one — the inverse of
@@ -361,12 +364,12 @@ pub(crate) fn session_ids(dir: &Path) -> io::Result<Vec<String>> {
     let mut ids = Vec::new();
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
-        if let Some(id) = session_id_of(&path) {
-            ids.push(id.to_owned());
+        if let Some(id) = session_id_of(&path)
+            && let Err(at) = ids.binary_search_by(|known: &String| known.as_str().cmp(id))
+        {
+            ids.insert(at, id.to_owned());
         }
     }
-    ids.sort_unstable();
-    ids.dedup();
     Ok(ids)
 }
 
@@ -778,7 +781,7 @@ impl SessionPaths {
     /// scan adds every *other* name sharing the id.
     fn removal_order(&self) -> (Vec<PathBuf>, io::Result<()>) {
         /// The extensions the named paths already cover.
-        const ALREADY: [&str; 5] = ["sock", "pid", "label", "agent", "lock"];
+        const ALREADY: [&[u8]; 5] = [b"sock", b"pid", b"label", b"agent", b"lock"];
 
         let mut order = vec![self.socket(), self.pid(), self.label(), self.agent()];
         let mut failure = Ok(());
@@ -956,6 +959,8 @@ pub(crate) fn parse_pid(body: &[u8]) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
@@ -1251,6 +1256,8 @@ mod tests {
         for name in mine.into_iter().chain(theirs) {
             fs::write(dir.join(name), b"").unwrap();
         }
+        let opaque = OsString::from_vec(b"tab_7.\xff".to_vec());
+        fs::write(dir.join(&opaque), b"").expect("plant a non-UTF-8 session file");
 
         let paths = SessionPaths::in_dir(dir, "tab_7")
             .expect("a directory of the test's own naming a session");
@@ -1260,6 +1267,10 @@ mod tests {
             .try_lock_spawn()
             .expect("the spawn lock, in a directory of this test's own");
         paths.unlink_all_locked(&lock).unwrap();
+        assert!(
+            !dir.join(&opaque).exists(),
+            "an opaque extension is still below the validated ASCII id"
+        );
 
         let mut left: Vec<String> = fs::read_dir(dir)
             .unwrap()
@@ -1442,6 +1453,15 @@ mod tests {
         assert!(!is_valid_session_id(&"x".repeat(MAX_SESSION_ID_LEN + 1)));
     }
 
+    #[test]
+    fn session_ids_are_sorted_and_deduplicated() {
+        let root = Scratch::new("rundir-session-ids");
+        for name in ["z.pid", "a.sock", "z.label", "m.agent", "a.lock", "invalid"] {
+            fs::write(root.join(name), []).unwrap();
+        }
+        assert_eq!(session_ids(root.path()).unwrap(), ["a", "m", "z"]);
+    }
+
     /// The bound held against the document rather than against itself: the client is a
     /// separate codebase built from § 6.3, so a re-tune here mints ids the daemon
     /// refuses.
@@ -1484,6 +1504,12 @@ mod tests {
         // Past the 64 bytes § 6.3 allows, which `is_valid_session_id` is what refuses.
         let long = format!("{}.sock", "x".repeat(65));
         assert_eq!(session_id_of(Path::new(&long)), None);
+        let opaque = PathBuf::from(OsString::from_vec(b"tab_7.\xff".to_vec()));
+        assert_eq!(
+            session_id_of(&opaque),
+            Some("tab_7"),
+            "only the id has to be UTF-8; an opaque suffix must not escape its cleanup"
+        );
     }
 
     /// The pidfile's format, at the bound the refusal quotes and at the newline that says

@@ -913,9 +913,9 @@ fn a_daemon_started_with_an_over_long_label_is_still_recognised_as_one() {
 /// `<id>.pid` and the stranger goes unsignalled however much it looks like a daemon —
 /// a rule that read the socket for a number would signal it here. The socket is still
 /// what says whether the session *stopped*, and it is somebody else's and goes on
-/// answering after both signals, so `kill` unlinks nothing. This is the one path in
-/// § 6.6 that reaches "still answering after SIGTERM and SIGKILL" with every clause of
-/// that sentence true.
+/// answering after the target has gone, so `kill` unlinks nothing. The refusal must say
+/// that `SIGTERM` reached the pinned target and that the later `SIGKILL` found it gone;
+/// the socket cannot turn either observation into a claim about the stranger serving it.
 ///
 /// The shape is built rather than provoked: the real creator `_exit`s, so a second
 /// daemon's socket is moved over this session's instead.
@@ -962,11 +962,12 @@ fn kill_signals_what_the_pidfile_names_even_when_another_daemon_answers_on_the_s
     );
     assert!(
         stderr(&killed).contains(&format!(
-            "still answering after SIGTERM and SIGKILL to pid {}",
+            "still answering after SIGTERM to pid {}; SIGKILL could not be sent \
+             (No such process",
             session.pid
         )),
-        "and it must name the number it signalled and say the session outlived it, which \
-         is the whole of what was established: {:?}",
+        "and it must name the signal that reached the pinned target without claiming the \
+         failed escalation was sent: {:?}",
         stderr(&killed)
     );
     assert_eq!(
@@ -1656,6 +1657,50 @@ fn version_and_usage_report_what_a_client_keys_off() {
             refused.stdout.is_empty(),
             "{what} put {:?} on stdout, where a client parses output",
             stdout(&refused)
+        );
+    }
+
+    // Output is an I/O boundary too. Rust's print macros panic on these writes; the release
+    // profile turns that into an abort, obscuring the mode's stable status with signal death.
+    for mode in ["--version", "--help"] {
+        let full = OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("open a sink that refuses writes");
+        let mut command = nomux(&root, &[mode]);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(full))
+            .stderr(Stdio::null());
+        let failed = collect(&mut command);
+        assert_eq!(
+            failed.status.code(),
+            Some(1),
+            "{mode} must report its failed stdout without panicking"
+        );
+    }
+
+    // Each stderr reporter keeps the status its caller acts on when the diagnostic itself
+    // cannot be delivered: argv usage, a classified relay refusal, and a runtime usage error.
+    for (args, expected) in [
+        (["frobnicate"].as_slice(), 64),
+        (["attach", "missing"].as_slice(), 127),
+        (["kill", "bad.id"].as_slice(), 64),
+    ] {
+        let full = OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("open a sink that refuses writes");
+        let mut command = nomux(&root, args);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(full));
+        let failed = collect(&mut command);
+        assert_eq!(
+            failed.status.code(),
+            Some(expected),
+            "{args:?} lost its stable status when stderr failed"
         );
     }
 }

@@ -1,7 +1,7 @@
 # A host that can actually answer the question: systemd as PID 1, a real logind, a real
 # sshd, and a real PAM stack. `docker exec` would bypass all four, so the matrix logs in
 # over SSH and the logout it measures is a genuine one.
-FROM debian:bookworm
+FROM debian:bookworm@sha256:813017f3d62be4b5891a7acca6a01bdcd4b8513daa81b1ab99d3a50385b26931
 
 ENV DEBIAN_FRONTEND=noninteractive
 # `dbus-user-session` is load-bearing and easy to miss: without it there is a

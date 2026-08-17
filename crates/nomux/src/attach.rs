@@ -37,7 +37,9 @@ use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags};
 
-use crate::rundir::{SessionPaths, SpawnLock, check_run_dir, ensure_run_dir};
+use crate::rundir::{
+    MAX_PID_LEN, SessionPaths, check_run_dir, ensure_run_dir, parse_pid, read_prefix,
+};
 use crate::usock::{Liveness, liveness};
 
 /// Legacy status for a runtime refusal that does not establish absence.
@@ -68,6 +70,9 @@ const PUBLISH_POLL_INTERVAL: Duration = Duration::from_millis(1);
 /// Largest transfer either direction makes in one call, and — by [`Pump::has_data`]'s
 /// invariant — the whole of what a [`Pump`] can be holding.
 const RELAY_CHUNK: usize = 16 * 1024;
+
+/// Maximum final wait for inherited stdout to drain after the session closes.
+const STDOUT_FLUSH_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Whether this invocation may bring the session into being — the whole of the
 /// distinction between the two modes (`DESIGN.md` § 5.1).
@@ -109,28 +114,26 @@ pub(crate) enum FailureClass {
 }
 
 impl FailureClass {
+    const fn details(self) -> (&'static str, u8) {
+        match self {
+            Self::Collision => ("collision", EXIT_UNATTACHABLE),
+            Self::Retryable => ("retryable", EXIT_UNATTACHABLE),
+            Self::UnsafeHost => ("unsafe-host", EXIT_UNATTACHABLE),
+            Self::Uncertain => ("uncertain", EXIT_UNATTACHABLE),
+            Self::MissingSession => ("missing-session", EXIT_NO_SESSION),
+            Self::StartupFailure => ("startup-failure", EXIT_NO_SESSION),
+            Self::PostConnect => ("post-connect", 1),
+        }
+    }
+
     /// Token carried by the versioned stderr record.
     pub(crate) const fn token(self) -> &'static str {
-        match self {
-            Self::Collision => "collision",
-            Self::Retryable => "retryable",
-            Self::UnsafeHost => "unsafe-host",
-            Self::Uncertain => "uncertain",
-            Self::MissingSession => "missing-session",
-            Self::StartupFailure => "startup-failure",
-            Self::PostConnect => "post-connect",
-        }
+        self.details().0
     }
 
     /// Existing process status retained for clients that do not read the stderr record.
     pub(crate) const fn exit_code(self) -> u8 {
-        match self {
-            Self::Collision | Self::Retryable | Self::UnsafeHost | Self::Uncertain => {
-                EXIT_UNATTACHABLE
-            }
-            Self::MissingSession | Self::StartupFailure => EXIT_NO_SESSION,
-            Self::PostConnect => 1,
-        }
+        self.details().1
     }
 }
 
@@ -351,7 +354,10 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> Result<UnixStream, Failu
         Liveness::Unknown(err) => return Err(may_be_running(paths, &err)),
     }
 
-    let complaint = match spawn_daemon(paths.id(), label, &spawn_lock) {
+    let complaint = match daemon_command(paths.id(), label, spawn_lock.raw_fd())
+        .and_then(|mut command| command.spawn())
+        .map(|mut child| child.stderr.take())
+    {
         Ok(complaint) => complaint,
         // The one failure with nothing of anyone's behind it: no daemon was started, and
         // the probe above has just said nobody else is serving the id either, so the
@@ -366,21 +372,14 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> Result<UnixStream, Failu
     loop {
         match liveness(&socket, CONNECT_TIMEOUT) {
             Liveness::Alive(stream) => {
-                await_publication(paths, deadline);
-                return Ok(stream);
+                if await_publication(paths, deadline) {
+                    return Ok(stream);
+                }
+                return Err(start_timed_out(paths, complaint));
             }
             Liveness::Stale(_) => {
                 if Instant::now() >= deadline {
-                    let id = paths.id();
-                    let complaint = daemon_complaint(complaint).map_or_else(
-                        || format!("daemon for session {id} did not start"),
-                        |said| format!("daemon for session {id} did not start: {said}"),
-                    );
-                    let refusal = Failure::new(
-                        FailureClass::Uncertain,
-                        io::Error::new(io::ErrorKind::TimedOut, complaint),
-                    );
-                    return Err(refusal);
+                    return Err(start_timed_out(paths, complaint));
                 }
                 std::thread::sleep(SPAWN_POLL_INTERVAL);
             }
@@ -392,6 +391,19 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> Result<UnixStream, Failu
     }
 }
 
+/// A daemon that did not finish publishing before the spawn deadline.
+fn start_timed_out(paths: &SessionPaths, complaint: Option<ChildStderr>) -> Failure {
+    let id = paths.id();
+    let complaint = daemon_complaint(complaint).map_or_else(
+        || format!("daemon for session {id} did not finish starting"),
+        |said| format!("daemon for session {id} did not finish starting: {said}"),
+    );
+    Failure::new(
+        FailureClass::Uncertain,
+        io::Error::new(io::ErrorKind::TimedOut, complaint),
+    )
+}
+
 /// Keeps the spawn lock until the daemon this spawn started has published
 /// `<id>.pid`.
 ///
@@ -401,14 +413,24 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> Result<UnixStream, Failu
 /// and a `kill` taking the lock inside that window finds a live daemon and no pid,
 /// which § 6.6 forbids it to unlink over.
 ///
-/// Bounded by the caller's own deadline and never fatal: a daemon that never writes
-/// one still gets its client, and `control::resolve` is what answers for it.
-fn await_publication(paths: &SessionPaths, deadline: Instant) {
+/// Bounded by the caller's own deadline. A successful `connect` alone is not publication:
+/// the listener is bound before the daemon arms its signals and writes the pidfile, so any
+/// failure in that window closes a stream the relay would otherwise already have returned.
+/// A complete pidfile is the frozen control surface's witness that startup finished.
+fn await_publication(paths: &SessionPaths, deadline: Instant) -> bool {
     // Built once. `SessionPaths::pid` allocates, and this loop runs every
     // millisecond for as long as the caller's deadline allows.
     let pid = paths.pid();
-    while !pid.exists() && Instant::now() < deadline {
-        std::thread::sleep(PUBLISH_POLL_INTERVAL);
+    let mut buf = [0u8; MAX_PID_LEN];
+    loop {
+        if read_prefix(&pid, &mut buf).is_ok_and(|body| parse_pid(body).is_some()) {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        std::thread::sleep(PUBLISH_POLL_INTERVAL.min(remaining));
     }
 }
 
@@ -444,16 +466,12 @@ fn daemon_complaint(stderr: Option<ChildStderr>) -> Option<String> {
 
 /// Moves bytes between stdio and the socket until either side closes.
 fn relay(stream: &UnixStream) -> io::Result<()> {
-    // Everything below reads `EAGAIN` as "not now", and the speculative write towards the
-    // socket depends on it: a blocking socket would park the whole relay inside one write
-    // with the other direction unserved.
+    // A blocking socket could park one direction while leaving the other unserved.
     stream.set_nonblocking(true)?;
 
     let stdin = io::stdin();
-    // stdout is the one inherited descriptor this process cannot safely make
-    // non-blocking: its open-file description may be shared with the caller's shell.
-    // A bounded socketpair gives this loop a non-blocking destination while the one
-    // worker allowed to block owns the actual write (§ 7).
+    // stdout may share its open-file description with the caller's shell, so a worker
+    // owns its blocking writes behind a bounded, non-blocking socketpair (§ 7).
     let stdout = StdoutWorker::spawn()?;
     let stdin_fd = stdin.as_fd();
     let stdout_fd = stdout.fd();
@@ -461,14 +479,11 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
 
     let mut to_socket = Pump::default();
     let mut to_stdout = Pump::default();
-    // One buffer for both directions, which never transfer within the same call, and
-    // hoisted out of the loop: it is handed by reference to an opaque syscall wrapper,
-    // so a fresh one per read is a memset nothing can elide — 32 KiB per keystroke.
+    // Neither direction transfers during the other's call, so one buffer serves both.
     let mut chunk = [0u8; RELAY_CHUNK];
     let mut stdin_open = true;
     let mut socket_open = true;
-    // The only one of the three about a *destination*: the session's output having
-    // nowhere left to go ends the loop the way the two above do.
+    // Unlike the other two, this describes a destination.
     let mut stdout_open = true;
 
     while stdout_open && (socket_open || to_stdout.has_data()) {
@@ -498,16 +513,13 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
                 watched += 1;
             }
         }
-        // No deadline of our own: the relay lives exactly as long as the channel,
-        // and every wakeup it can act on is a readiness event.
+        // The live relay has no deadline; every wakeup it needs is a readiness event.
         match rustix::event::poll(fds.get_mut(..watched).unwrap_or(&mut []), None) {
             Ok(_) => {}
             Err(rustix::io::Errno::INTR) => continue,
             Err(err) => return Err(err.into()),
         }
-        // Read back by position, which is safe only because the three masks that
-        // decided whether each entry was taken are reused below rather than
-        // recomputed: a `Pump` that changed state during `poll` cannot shift it.
+        // Reuse the registration masks so state changes cannot shift these positions.
         let mut events = fds.iter().map(PollFd::revents);
         let mut revents = |registered: bool| {
             if registered {
@@ -557,10 +569,8 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
         }
     }
 
-    // Closing the channel hands the worker EOF behind every byte already queued. Wait
-    // only on this normal path: if the relay itself failed, returning must not wait on
-    // a worker that may be blocked forever in the stdout the relay is abandoning —
-    // the channel is dropped, and the process's own exit ends the detached thread.
+    // Closing the channel puts EOF behind queued bytes. Errors bypass this wait, and
+    // the process's exit ends a detached worker still blocked in abandoned stdout.
     stdout.finish()
 }
 
@@ -615,16 +625,22 @@ impl StdoutWorker {
         self.channel.as_fd()
     }
 
-    /// Closes the producer end after its queued bytes, then proves the worker delivered
-    /// them or reports why it could not.
+    /// Closes after queued bytes and waits briefly for proof they were delivered.
     fn finish(mut self) -> io::Result<()> {
-        // No more relay writes follow, so blocking here cannot stall the bidirectional
-        // pump. The worker sends its result back only after consuming this EOF and
-        // delivering everything before it.
+        // The deadline is across the whole status read; otherwise a live stdout that
+        // stops draining can keep an already-closed relay alive forever.
         self.channel.set_nonblocking(false)?;
+        self.channel.set_read_timeout(Some(STDOUT_FLUSH_TIMEOUT))?;
         drop(self.channel.shutdown(Shutdown::Write));
         let mut status = [0; size_of::<i32>()];
-        self.channel.read_exact(&mut status)?;
+        self.channel
+            .read_exact(&mut status)
+            .map_err(|err| match err.kind() {
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => {
+                    io::ErrorKind::TimedOut.into()
+                }
+                _ => err,
+            })?;
         match i32::from_ne_bytes(status) {
             0 => Ok(()),
             error if error > 0 => Err(io::Error::from_raw_os_error(error)),
@@ -737,27 +753,7 @@ impl Pump {
     }
 }
 
-/// Starts the session daemon as a direct child, while `spawn_lock` continues to serialise
-/// this session id.
-///
-/// Nothing here tries to leave the login session the relay was started in: `setsid(2)` and
-/// the daemon's own fork are the whole of the detachment, and host policy at logout is the
-/// host's to decide (`startup::detach_from_controlling_terminal`).
-///
-/// # Errors
-///
-/// Propagates command construction and process-spawn failures.
-fn spawn_daemon(
-    session_id: &str,
-    label: Option<&str>,
-    spawn_lock: &SpawnLock,
-) -> io::Result<Option<ChildStderr>> {
-    daemon_command(session_id, label, spawn_lock.raw_fd())?
-        .spawn()
-        .map(|mut child| child.stderr.take())
-}
-
-/// The daemon [`spawn_daemon`] starts, up to the `fork`.
+/// The daemon [`create`] starts, up to the `fork`.
 ///
 /// Execs the exact inode this relay is already running rather than whatever the install
 /// path names by the time the child gets there — between the two loads that path decides
@@ -803,13 +799,15 @@ fn daemon_command(session_id: &str, label: Option<&str>, lock_fd: i32) -> io::Re
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
-    use std::fs::File;
+    use std::fs::{self, File};
     use std::io::{self, Write as _};
+    use std::time::Instant;
 
     use super::{
-        ChildStderr, FailureClass, SessionPaths, daemon_command, daemon_complaint,
-        resume_probe_class, unattachable,
+        ChildStderr, FailureClass, SessionPaths, await_publication, daemon_command,
+        daemon_complaint, resume_probe_class, unattachable,
     };
+    use crate::scratch::Scratch;
     use crate::usock::Foreign;
 
     /// The caller's label reaches `exec` already cut and already stripped of the terminal
@@ -839,6 +837,39 @@ mod tests {
         assert_eq!(
             args,
             ["daemon", "session", "--lock-fd", "23", "--label", "cost $5"]
+        );
+    }
+
+    /// A socket can accept before the daemon has written the pidfile. Only the complete
+    /// regular-file body `kill` can later act on makes that connection a finished startup.
+    #[test]
+    fn publication_requires_a_complete_pidfile() {
+        let root = Scratch::new("attach-publication");
+        let paths = SessionPaths::in_dir(root.path(), "session").expect("resolve session paths");
+        let pid = paths.pid();
+
+        assert!(
+            !await_publication(&paths, Instant::now()),
+            "absence is not publication"
+        );
+        fs::create_dir(&pid).expect("plant a directory at the pidfile");
+        assert!(
+            !await_publication(&paths, Instant::now()),
+            "a node that merely exists is not publication"
+        );
+        fs::remove_dir(&pid).expect("remove the planted directory");
+
+        for incomplete in [b"".as_slice(), b"1234"] {
+            fs::write(&pid, incomplete).expect("write an incomplete pidfile");
+            assert!(
+                !await_publication(&paths, Instant::now()),
+                "an incomplete pidfile was accepted: {incomplete:?}"
+            );
+        }
+        fs::write(&pid, b"1234\n").expect("write a complete pidfile");
+        assert!(
+            await_publication(&paths, Instant::now()),
+            "the daemon's complete pidfile must publish it"
         );
     }
 

@@ -46,6 +46,66 @@ extern "C" fn note_child_signal(_signum: libc::c_int) {
     note_signal(&CHILD_PIPE);
 }
 
+/// Closes every descriptor the daemon inherited except standard I/O and `keep`.
+///
+/// A daemon outlives the process that launched it, and its login shell is less trusted than
+/// that launcher. Letting an arbitrary non-`CLOEXEC` descriptor cross either boundary can keep
+/// a mount busy for a week, or hand the shell a file, socket or capability it was never meant to
+/// have. This runs before the daemon opens anything of its own; `keep` is the spawn lock that is
+/// deliberately handed across `exec` and validated immediately afterwards.
+///
+/// `close_range(2)` is the small, constant-time path on Linux 5.9 and later. Sessions still work
+/// on older kernels, so `/proc/self/fd` is the fallback; procfs is already a project requirement
+/// for process identity and shutdown.
+pub(crate) fn close_inherited_descriptors(keep: Option<i32>) -> io::Result<()> {
+    let keep = keep.and_then(|fd| u32::try_from(fd).ok());
+    let closed = keep.map_or_else(
+        || close_range(libc::STDERR_FILENO as u32 + 1, u32::MAX),
+        |fd| {
+            close_range(libc::STDERR_FILENO as u32 + 1, fd.saturating_sub(1))
+                && close_range(fd.saturating_add(1), u32::MAX)
+        },
+    );
+    if closed {
+        return Ok(());
+    }
+
+    // Collect first: the directory iterator owns a descriptor that appears in its own
+    // listing. Dropping it before the closes makes that entry an ordinary `EBADF`, and avoids
+    // ending the scan part-way through by closing the descriptor it is reading from.
+    let mut inherited = Vec::new();
+    for entry in std::fs::read_dir("/proc/self/fd")? {
+        let entry = entry?;
+        let Some(fd) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if fd > libc::STDERR_FILENO && keep != u32::try_from(fd).ok() {
+            inherited.push(fd);
+        }
+    }
+    for fd in inherited {
+        // SAFETY: `fd` came from this process's descriptor directory. It may already be
+        // closed (notably the directory iterator's own descriptor), which is harmless.
+        unsafe {
+            libc::close(fd);
+        }
+    }
+    Ok(())
+}
+
+/// Closes one inclusive descriptor range, returning whether the kernel accepted it.
+fn close_range(first: u32, last: u32) -> bool {
+    if first > last {
+        return true;
+    }
+    // SAFETY: `close_range` takes three integer values and touches no userspace memory.
+    unsafe { libc::syscall(libc::SYS_close_range, first, last, 0) == 0 }
+}
+
 /// Routes [`STOP_SIGNALS`] into a descriptor the poll set can watch, and hands back
 /// its read end.
 ///
@@ -214,21 +274,48 @@ pub(crate) fn open_null_device() -> io::Result<OwnedFd> {
     rustix::fs::open("/dev/null", OFlags::RDWR | OFlags::CLOEXEC, Mode::empty()).map_err(Into::into)
 }
 
-/// Points the three standard descriptors at `null`, last of all (§ 6.2).
+/// Points the three standard descriptors at `null`, retrying interrupted `dup2`s (§ 6.2).
 ///
-/// Silent, and trivially so — [`open_null_device`] already proved the descriptor, and `dup2`
-/// onto a valid one fails for nothing this process can cause.
+/// These numbers were never free: std opens `/dev/null` onto any descriptor `main`
+/// inherited closed, so no listener or pipe can be silenced accidentally. Stderr goes
+/// last so any failure can still reach the launcher.
 ///
-/// What makes this safe is not the ordering, which cannot help: by here the socket is bound
-/// and the stop pipe armed, and nothing below can tell an inherited terminal from a
-/// descriptor of its own. It is that these three numbers were never free — std's runtime
-/// opens `/dev/null` onto any of them `main` inherited closed, and aborts rather than start
-/// without them, so the lowest number a `bind` here can be given is 3. Without that, § 6.2's
-/// `nomux daemon x 0<&- 1>&- 2>&-` would land the listener on fd 1 for the `dup2`s below to
-/// silence — an id claimed by a daemon nothing can ever reach. `tests/session.rs` starts one
-/// that way and greets it.
-pub(crate) fn silence_standard_descriptors(null: &OwnedFd) {
-    let _ = rustix::stdio::dup2_stdin(null);
-    let _ = rustix::stdio::dup2_stdout(null);
-    let _ = rustix::stdio::dup2_stderr(null);
+/// # Errors
+///
+/// Propagates a non-`EINTR` `dup2` failure.
+pub(crate) fn silence_standard_descriptors(null: &OwnedFd) -> io::Result<()> {
+    retry_intr(|| rustix::stdio::dup2_stdin(null))?;
+    retry_intr(|| rustix::stdio::dup2_stdout(null))?;
+    retry_intr(|| rustix::stdio::dup2_stderr(null))
+}
+
+fn retry_intr(mut op: impl FnMut() -> rustix::io::Result<()>) -> io::Result<()> {
+    loop {
+        match op() {
+            Err(rustix::io::Errno::INTR) => {}
+            result => return result.map_err(Into::into),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interrupted_operations_are_retried_but_other_errors_escape() {
+        let mut calls = 0;
+        retry_intr(|| {
+            calls += 1;
+            (calls > 1).then_some(()).ok_or(rustix::io::Errno::INTR)
+        })
+        .expect("retry an interruption");
+        assert_eq!(calls, 2);
+        assert_eq!(
+            retry_intr(|| Err(rustix::io::Errno::BADF))
+                .expect_err("propagate a permanent error")
+                .raw_os_error(),
+            Some(libc::EBADF)
+        );
+    }
 }

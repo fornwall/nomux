@@ -254,7 +254,7 @@ one as a gap.
   where a drain has no bound in the daemon and ends only when the producer pauses, which
   during a flood is never. Ctrl-C reaches the child through `write_pty` alone, so interrupt
   latency becomes the length of the drain, in exactly the situation a person is reaching
-  for Ctrl-C — the hazard `Conn::fill` already argues, answered there by `MAX_PENDING_READ`
+  for Ctrl-C — the hazard `Conn::fill` already answers with one 64 KiB read per call
   ([IMPLEMENTATION.md § 4.1](IMPLEMENTATION.md#41-backpressure)) and against the master by
   nothing at all. What reopens it: a measurement showing the per-pass `poll` is a material
   fraction of flood throughput, together with a bound below both `MAX_PENDING_WRITE` and

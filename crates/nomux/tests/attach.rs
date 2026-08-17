@@ -1,21 +1,7 @@
-//! End-to-end tests against `nomux spawn` and `nomux attach`: the bootstrap each of
-//! them does, and the relay they share.
+//! End-to-end tests for `spawn`/`attach` bootstrap and their shared relay.
 //!
-//! One relay and two answers to an id nothing is serving (`DESIGN.md` § 5.1), so the
-//! bootstrap half is per mode and is mostly a table of refusals: an id `spawn` finds
-//! taken, an id `attach` finds empty, and the exit status `IMPLEMENTATION.md` § 10
-//! owes each of them. The refusals these two share with `list` and `kill` — a run
-//! directory nobody may use, a socket whose backlog is full — are `control.rs`'s,
-//! where the whole table is in one place. What is left is the one creation this suite
-//! performs over the relay rather than by running `nomux daemon` directly — a daemon
-//! under the flock, and the conversation behind it.
-//!
-//! The relay half is § 7 and belongs to neither mode: the byte pipe between the
-//! client's stdio and the session socket, and every way it has to leave. Those tests
-//! start no daemon at all. The relay parses nothing, so a socket the test binds itself
-//! is a complete peer, the assertions are about bytes rather than about the protocol,
-//! and `attach` is what they run — a session is already there, which is exactly what
-//! that mode asks for.
+//! Bootstrap cases exercise creation and classified refusals. Relay cases bind their
+//! own session socket and assert byte movement and shutdown without parsing frames (§ 7).
 
 #![allow(
     clippy::expect_used,
@@ -996,40 +982,17 @@ fn a_session_that_ends_with_the_relays_input_unread_still_exits_clean() {
     );
 }
 
-/// Regression: a live stdout that stops draining must backpressure only session
-/// output, never the relay's independent stdin-to-session direction.
-///
-/// `poll(POLLOUT)` promises that a write can make some progress, not that this relay's
-/// whole 16 KiB write will return. Linux makes the failure deterministic for a pipe:
-/// leave exactly `PIPE_BUF` bytes free, then a larger blocking write fills that space
-/// and sleeps until its entire remainder can be accepted. The unread-byte count below
-/// proves the write reached that sleep before the marker is sent.
-///
-/// With stdout in the main poll loop, the marker cannot move. The bounded stdout
-/// worker keeps the blocked write and the backpressure but leaves the main loop free
-/// to forward it. Reading the pipe only after that assertion releases the worker and
-/// also proves normal shutdown flushes every queued output byte.
+/// A blocked stdout must backpressure only session output, not relay input. Leaving one
+/// `PIPE_BUF` free makes the worker's larger write fill the pipe and then sleep.
 #[test]
 fn a_blocked_stdout_does_not_block_relay_input() {
-    use std::os::fd::AsRawFd;
-
     const PUSH: usize = 16 * 1024;
     /// Sent the other way, and nothing to do with the write above: this is the
     /// traffic the parked relay is failing to serve.
     const MARKER: &[u8] = b"NOMUX-OTHER-DIRECTION";
 
-    let (reader, mut relay_stdout) = io::pipe().expect("a pipe for relay stdout");
-    // SAFETY: `fcntl` is given the live pipe descriptor the borrow above keeps open.
-    let capacity = unsafe { libc::fcntl(relay_stdout.as_raw_fd(), libc::F_GETPIPE_SZ) };
-    assert!(
-        capacity > i32::try_from(libc::PIPE_BUF).expect("PIPE_BUF fits i32"),
-        "stdout pipe capacity is not larger than PIPE_BUF: {capacity}"
-    );
-    let capacity = usize::try_from(capacity).expect("a positive pipe capacity fits usize");
-    let prefilled = capacity - libc::PIPE_BUF;
-    relay_stdout
-        .write_all(&vec![b'p'; prefilled])
-        .expect("prefill stdout to one atomic write short of full");
+    let (reader, relay_stdout, prefilled) = nearly_full_pipe();
+    let capacity = prefilled + libc::PIPE_BUF;
 
     let (mut child, mut peer, _listener) = relay_onto_a_socket_over(
         "relay_blocked_stdout",
@@ -1043,12 +1006,7 @@ fn a_blocked_stdout_does_not_block_relay_input() {
     peer.write_all(&pushed)
         .expect("write to the relay's socket");
     assert!(
-        poll_until(Duration::from_secs(10), || {
-            rustix::io::ioctl_fionread(&reader)
-                .ok()
-                .and_then(|held| usize::try_from(held).ok())
-                == Some(capacity)
-        }),
+        poll_until(Duration::from_secs(10), || pipe_is_full(&reader, capacity)),
         "the stdout write never filled the last PIPE_BUF and blocked"
     );
 
@@ -1098,11 +1056,74 @@ fn a_blocked_stdout_does_not_block_relay_input() {
     );
 }
 
-/// Whether `marker` has reached `peer` yet, keeping whatever else arrives on the way.
-///
-/// Everything read is kept and the answer is about the whole of it, so a marker split
-/// across two reads is still found — and so a look that comes back empty cannot
-/// discard what an earlier one collected.
+/// A session close must not leave the relay waiting forever on an open stdout that no
+/// longer drains. Unlike the test above, the full pipe stays full through shutdown.
+#[test]
+fn a_blocked_stdout_cannot_block_relay_shutdown() {
+    const PUSH: usize = 16 * 1024;
+    let (reader, relay_stdout, prefilled) = nearly_full_pipe();
+    let capacity = prefilled + libc::PIPE_BUF;
+
+    let (mut child, mut peer, _listener) = relay_onto_a_socket_over(
+        "relay_stdout_shutdown",
+        Stdio::null(),
+        Stdio::from(relay_stdout),
+        Stdio::piped(),
+    );
+    peer.write_all(&vec![b'x'; PUSH])
+        .expect("fill relay stdout");
+    assert!(
+        poll_until(Duration::from_secs(10), || pipe_is_full(&reader, capacity)),
+        "the stdout worker did not block in the full pipe"
+    );
+
+    drop(peer);
+    assert!(
+        poll_until(Duration::from_secs(3), || !child.is_running()),
+        "the relay stayed alive after its session closed on blocked stdout"
+    );
+    drop(reader);
+    let finished = child
+        .into_exited()
+        .wait_with_output()
+        .expect("collect the relay");
+    assert!(
+        !finished.status.success(),
+        "discarded output must be reported"
+    );
+    let complaints = stderr(&finished);
+    assert!(
+        complaints.contains("NOMUX-RELAY-ERROR 1 post-connect") && complaints.contains("timed out"),
+        "the relay did not classify its bounded flush failure: {complaints:?}"
+    );
+}
+
+fn nearly_full_pipe() -> (io::PipeReader, io::PipeWriter, usize) {
+    use std::os::fd::AsRawFd;
+
+    let (reader, mut writer) = io::pipe().expect("a pipe for relay stdout");
+    // SAFETY: `fcntl` is given the live pipe descriptor held by `writer`.
+    let capacity = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETPIPE_SZ) };
+    assert!(
+        capacity > i32::try_from(libc::PIPE_BUF).expect("PIPE_BUF fits i32"),
+        "stdout pipe capacity is not larger than PIPE_BUF: {capacity}"
+    );
+    let capacity = usize::try_from(capacity).expect("a positive pipe capacity fits usize");
+    let prefilled = capacity - libc::PIPE_BUF;
+    writer
+        .write_all(&vec![b'p'; prefilled])
+        .expect("prefill stdout");
+    (reader, writer, prefilled)
+}
+
+fn pipe_is_full(reader: &io::PipeReader, capacity: usize) -> bool {
+    rustix::io::ioctl_fionread(reader)
+        .ok()
+        .and_then(|held| usize::try_from(held).ok())
+        == Some(capacity)
+}
+
+/// Whether `marker` has arrived, retaining earlier reads so a split marker still matches.
 fn marker_arrived(peer: &mut UnixStream, seen: &mut Vec<u8>, marker: &[u8]) -> bool {
     let mut chunk = [0u8; 8192];
     while let Ok(read) = read_uninterrupted(peer, &mut chunk) {
@@ -1114,23 +1135,8 @@ fn marker_arrived(peer: &mut UnixStream, seen: &mut Vec<u8>, marker: &[u8]) -> b
     seen.windows(marker.len()).any(|window| window == marker)
 }
 
-/// A `nomux attach` relaying onto a socket the test holds the other end of, with
-/// its first connection already accepted.
-///
-/// The scaffolding every relay test needs and none of them is about: a run directory
-/// of the mode the binary insists on, a session socket bound by the test rather than
-/// by a daemon, and the relay started against it.
-///
-/// All three descriptors are the caller's to choose, because all three are what some
-/// test here is about. What is on the far end of stdin and stdout decides how a stdout
-/// reports its death — a pipe answers `POLLERR` and a `socketpair` answers `EPIPE` on
-/// the write — and the complaints go where the test can use them: the bulk test reads
-/// them into its failure messages, and the ones about the relay leaving have nobody
-/// left to read them.
-///
-/// The listener comes back with the rest because it has to outlive the relay: a
-/// connection arriving at a closed one is refused, and a refusal would look like the
-/// relay giving up rather than like the test having tidied away too early.
+/// Starts `attach` against a test-owned socket and returns its accepted peer. Callers
+/// choose all stdio endpoints; the listener is retained so it outlives the relay.
 fn relay_onto_a_socket_over(
     id: &str,
     input: Stdio,
@@ -1168,13 +1174,7 @@ fn relay_onto_a_socket_over(
     (child, peer, listener)
 }
 
-/// Accepts one connection, or fails saying what never arrived.
-///
-/// A blocking `accept` on a listener nothing connects to parks the thread for ever,
-/// and a test parked there never returns — so its [`Spawned`] guards never run and
-/// the whole run hangs instead of failing. The listener is put in non-blocking mode
-/// here rather than at the call site so that no caller can forget; the connection it
-/// hands back is blocking, as `accept` does not pass the flag on.
+/// Accepts without letting a failed relay park the test before its guards can run.
 fn accept_within(listener: &UnixListener, within: Duration, awaiting: &str) -> UnixStream {
     listener
         .set_nonblocking(true)
