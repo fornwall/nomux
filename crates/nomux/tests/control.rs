@@ -1659,6 +1659,50 @@ fn version_and_usage_report_what_a_client_keys_off() {
             stdout(&refused)
         );
     }
+
+    // Output is an I/O boundary too. Rust's print macros panic on these writes; the release
+    // profile turns that into an abort, obscuring the mode's stable status with signal death.
+    for mode in ["--version", "--help"] {
+        let full = OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("open a sink that refuses writes");
+        let mut command = nomux(&root, &[mode]);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(full))
+            .stderr(Stdio::null());
+        let failed = collect(&mut command);
+        assert_eq!(
+            failed.status.code(),
+            Some(1),
+            "{mode} must report its failed stdout without panicking"
+        );
+    }
+
+    // Each stderr reporter keeps the status its caller acts on when the diagnostic itself
+    // cannot be delivered: argv usage, a classified relay refusal, and a runtime usage error.
+    for (args, expected) in [
+        (["frobnicate"].as_slice(), 64),
+        (["attach", "missing"].as_slice(), 127),
+        (["kill", "bad.id"].as_slice(), 64),
+    ] {
+        let full = OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("open a sink that refuses writes");
+        let mut command = nomux(&root, args);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(full));
+        let failed = collect(&mut command);
+        assert_eq!(
+            failed.status.code(),
+            Some(expected),
+            "{args:?} lost its stable status when stderr failed"
+        );
+    }
 }
 
 /// A run directory holding one session, with nothing listening on its socket.

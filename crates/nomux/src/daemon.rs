@@ -408,7 +408,7 @@ fn bind_socket(paths: &SessionPaths) -> io::Result<UnixListener> {
 
     // Both names are a dead daemon's by the evidence that licensed removing the socket,
     // and both are cleared before the `bind` so there is no window: a `<id>.pid`
-    // outliving its socket satisfies `attach`'s wait for the path to *exist* and sends
+    // outliving its socket satisfies `attach`'s wait for a complete pidfile and sends
     // `kill` after an unrelated process, and until `write_pid`'s own clear — the far
     // side of § 6.2's fork — the label would answer for the id this daemon took over.
     paths.clear_pid();

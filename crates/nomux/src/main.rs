@@ -24,6 +24,7 @@ mod usock;
 
 use std::env;
 use std::ffi::OsString;
+use std::io::{self, Write as _};
 use std::process::ExitCode;
 
 /// `EX_USAGE`: malformed invocation. The one code borrowed from `sysexits.h`, and
@@ -63,17 +64,15 @@ fn main() -> ExitCode {
     match mode.to_str() {
         Some(word @ "list") => only(args, word, || report(control::list())),
         Some(word @ ("--version" | "-V")) => only(args, word, || {
-            println!(
-                "nomux {} (protocol {})",
+            write_stdout(format_args!(
+                "nomux {} (protocol {})\n",
                 env!("CARGO_PKG_VERSION"),
                 nomux_protocol::PROTOCOL_VERSION
-            );
-            ExitCode::SUCCESS
+            ))
         }),
-        Some(word @ ("--help" | "-h")) => only(args, word, || {
-            print!("{USAGE}");
-            ExitCode::SUCCESS
-        }),
+        Some(word @ ("--help" | "-h")) => {
+            only(args, word, || write_stdout(format_args!("{USAGE}")))
+        }
         Some(word @ "daemon") => with_session(word, args, true, |session, label, lock_fd| {
             report(daemon::run(session, label, lock_fd))
         }),
@@ -124,10 +123,32 @@ fn usage_error(message: Option<&str>) -> ExitCode {
         // of them quote is a word from `argv`, on its way to a terminal that would
         // act on an `ESC ]0;` in it. `escape_debug` leaves printable UTF-8 alone, so
         // an argument in any language still reads as what was typed.
-        eprintln!("nomux: {}\n", message.escape_debug());
+        write_stderr(format_args!("nomux: {}\n\n", message.escape_debug()));
     }
-    eprint!("{USAGE}");
+    write_stderr(format_args!("{USAGE}"));
     ExitCode::from(EXIT_USAGE)
+}
+
+/// Writes ordinary command output without turning a failed destination into a panic.
+fn write_stdout(arguments: std::fmt::Arguments<'_>) -> ExitCode {
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    if stdout
+        .write_fmt(arguments)
+        .and_then(|()| stdout.flush())
+        .is_ok()
+    {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// Best-effort diagnostics. Their exit status carries the machine-readable outcome when
+/// stderr itself is gone, full, or otherwise unwritable.
+fn write_stderr(arguments: std::fmt::Arguments<'_>) {
+    let stderr = io::stderr();
+    drop(stderr.lock().write_fmt(arguments));
 }
 
 /// The command line the four modes that take a session id share, parsed once and handed
@@ -246,7 +267,7 @@ fn parse_lock_fd(value: &str, slot: &mut Option<i32>) -> Result<(), String> {
 /// spelling, which is why a run file that cannot be read is `InvalidData`
 /// ([`rundir::read_prefix`]) and why `Hello.term` is refused for an interior NUL before
 /// it can reach `Command::env`.
-fn report(result: std::io::Result<()>) -> ExitCode {
+fn report(result: io::Result<()>) -> ExitCode {
     reported(result, ExitCode::FAILURE)
 }
 
@@ -261,8 +282,11 @@ fn report_relay(result: Result<(), attach::RunError>) -> ExitCode {
         Err(attach::RunError::Usage(err)) => reported(Err(err), ExitCode::from(EXIT_USAGE)),
         Err(attach::RunError::Classified(failure)) => {
             let class = failure.class();
-            eprintln!("NOMUX-RELAY-ERROR 1 {}", class.token());
-            eprintln!("nomux: {}", failure.to_string().escape_debug());
+            write_stderr(format_args!("NOMUX-RELAY-ERROR 1 {}\n", class.token()));
+            write_stderr(format_args!(
+                "nomux: {}\n",
+                failure.to_string().escape_debug()
+            ));
             ExitCode::from(class.exit_code())
         }
     }
@@ -270,7 +294,7 @@ fn report_relay(result: Result<(), attach::RunError>) -> ExitCode {
 
 /// The half the two share: success, the message on stderr, and § 10's one reserved kind.
 /// `failed` scores everything else, which is the whole of what the two tables differ by.
-fn reported(result: std::io::Result<()>, failed: ExitCode) -> ExitCode {
+fn reported(result: io::Result<()>, failed: ExitCode) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -278,9 +302,9 @@ fn reported(result: std::io::Result<()>, failed: ExitCode) -> ExitCode {
             // disk as well as static text. Apply the same terminal boundary as argv
             // errors: a hostile ESC or newline is data, never terminal control or a
             // forged second diagnostic.
-            eprintln!("nomux: {}", err.to_string().escape_debug());
+            write_stderr(format_args!("nomux: {}\n", err.to_string().escape_debug()));
             let kind = err.kind();
-            if kind == std::io::ErrorKind::InvalidInput {
+            if kind == io::ErrorKind::InvalidInput {
                 ExitCode::from(EXIT_USAGE)
             } else {
                 failed

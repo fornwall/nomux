@@ -70,7 +70,7 @@ pub(crate) fn list() -> io::Result<()> {
             // so this is the one session `list` can neither print nor collect.
             Err(err) => {
                 let complaint = format!("{err}; its files are left where they are");
-                eprintln!("nomux: {}", complaint.escape_debug());
+                crate::write_stderr(format_args!("nomux: {}\n", complaint.escape_debug()));
                 continue;
             }
         };

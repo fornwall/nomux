@@ -157,12 +157,11 @@ check_leaks() {
     done
 }
 
-# The rustflags above ask for a static binary; this is what says one came out. Asking is not
-# getting — a target spec that ignored crt-static, a dependency that pulled in a dynamic libc —
-# and the failure lands at a stranger's shell rather than here. A static-pie carries neither a
-# PT_INTERP segment naming a loader nor a DT_NEEDED entry naming a library. Read into a variable
-# first, so a readobj that fails is `set -e` rather than a grep that calls the binary clean.
-check_static() {
+# The rustflags above ask for a hardened static PIE; this is what says one came out. Asking is not
+# getting — a target spec or linker default can drift, and that failure lands in the artifact
+# rather than in this script. Read into a variable first, so a readobj that fails is `set -e`
+# rather than a grep that calls the binary clean.
+check_elf() {
     elf=$("$readobj" --file-headers --program-headers --dynamic-table "$1")
     # That the output was parsed at all, before any weight is put on its silence: the verdict below
     # is drawn from two patterns *not* matching, which is equally what an empty output or a future
@@ -181,6 +180,43 @@ check_static() {
         die "FAIL: ${1##*/} is dynamically linked:" \
             "$(printf '%s\n' "$elf" | grep -E 'PT_INTERP|NEEDED')" \
             "      it needs those present on a host nobody has looked at."
+    fi
+
+    # These are all present in today's output, so pin them before a linker or target-spec change
+    # can quietly make the next release weaker. A named GNU_STACK with no PF_X is the positive
+    # assertion: merely failing to find an executable-stack marker would also pass an ELF with no
+    # stack policy at all. RELRO is complete only with immediate binding.
+    if ! printf '%s\n' "$elf" | awk '
+        /Type: PT_GNU_STACK/ { in_stack = 1; found = 1 }
+        in_stack && /PF_X/ { executable = 1 }
+        in_stack && /^  }/ { in_stack = 0; closed = 1 }
+        END { exit !(found && closed && !executable) }
+    '; then
+        die "FAIL: ${1##*/} does not declare a non-executable stack."
+    fi
+    case "$elf" in
+    *'Type: PT_GNU_RELRO'*) ;;
+    *) die "FAIL: ${1##*/} has no GNU_RELRO segment." ;;
+    esac
+    case "$elf" in
+    *BIND_NOW*) ;;
+    *) die "FAIL: ${1##*/} does not request immediate binding for full RELRO." ;;
+    esac
+
+    # W^X for loadable segments. Checked block by block: the file necessarily has an executable
+    # load and a writable load, so searching the whole report for both flags would always fail.
+    if ! printf '%s\n' "$elf" | awk '
+        /Type: PT_LOAD/ { in_load = 1; loads++; writable = executable = 0 }
+        in_load && /PF_W/ { writable = 1 }
+        in_load && /PF_X/ { executable = 1 }
+        in_load && /^  }/ {
+            if (writable && executable) bad = 1
+            checked++
+            in_load = 0
+        }
+        END { exit bad || !loads || checked != loads }
+    '; then
+        die "FAIL: ${1##*/} has a writable and executable load segment."
     fi
 }
 
@@ -202,7 +238,7 @@ for target in $targets; do
         -Zjson-target-spec >&2
     cp "$target_root/$build_dir/release/nomux" "$dist/nomux-$target"
     check_leaks "$dist/nomux-$target"
-    check_static "$dist/nomux-$target"
+    check_elf "$dist/nomux-$target"
 done
 
 # `sha256sum -c` format, so a verifier needs no bespoke tooling. Listed target by target rather

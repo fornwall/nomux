@@ -288,10 +288,10 @@ case ${HOME-} in /*) r=${HOME%/}/.local/state/nomux/run ;; *)
 case ${XDG_RUNTIME_DIR-} in /*) r=${XDG_RUNTIME_DIR%/}/nomux ;; esac ;; esac ;; esac
 case $r in /*) printf 'NOMUX-RUNDIR %s\n' "$r" >&2 ;; esac
 [ -x "$p/nomux-$VER" ] && exec "$p/nomux-$VER" "$MODE" "$ID"
-echo "NOMUX-BOOTSTRAP $(uname -s) $(uname -m) $p"
+printf 'NOMUX-BOOTSTRAP %s %s %s\n' "$(uname -s)" "$(uname -m)" "$p"
 ```
 
-`exec` replaces the shell on success, so the `echo` is what a host with no usable binary
+`exec` replaces the shell on success, so the `printf` is what a host with no usable binary
 answers with — but only behind the `[ -x ]`. A bare `exec` whose argument cannot be executed
 exits a non-interactive shell where it stands, and the line after it never runs at all: dash,
 bash and BusyBox `ash` leave a shell status rather than reaching the fallback. The test is the

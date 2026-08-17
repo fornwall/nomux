@@ -37,7 +37,9 @@ use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags};
 
-use crate::rundir::{SessionPaths, check_run_dir, ensure_run_dir};
+use crate::rundir::{
+    MAX_PID_LEN, SessionPaths, check_run_dir, ensure_run_dir, parse_pid, read_prefix,
+};
 use crate::usock::{Liveness, liveness};
 
 /// Legacy status for a runtime refusal that does not establish absence.
@@ -370,21 +372,14 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> Result<UnixStream, Failu
     loop {
         match liveness(&socket, CONNECT_TIMEOUT) {
             Liveness::Alive(stream) => {
-                await_publication(paths, deadline);
-                return Ok(stream);
+                if await_publication(paths, deadline) {
+                    return Ok(stream);
+                }
+                return Err(start_timed_out(paths, complaint));
             }
             Liveness::Stale(_) => {
                 if Instant::now() >= deadline {
-                    let id = paths.id();
-                    let complaint = daemon_complaint(complaint).map_or_else(
-                        || format!("daemon for session {id} did not start"),
-                        |said| format!("daemon for session {id} did not start: {said}"),
-                    );
-                    let refusal = Failure::new(
-                        FailureClass::Uncertain,
-                        io::Error::new(io::ErrorKind::TimedOut, complaint),
-                    );
-                    return Err(refusal);
+                    return Err(start_timed_out(paths, complaint));
                 }
                 std::thread::sleep(SPAWN_POLL_INTERVAL);
             }
@@ -396,6 +391,19 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> Result<UnixStream, Failu
     }
 }
 
+/// A daemon that did not finish publishing before the spawn deadline.
+fn start_timed_out(paths: &SessionPaths, complaint: Option<ChildStderr>) -> Failure {
+    let id = paths.id();
+    let complaint = daemon_complaint(complaint).map_or_else(
+        || format!("daemon for session {id} did not finish starting"),
+        |said| format!("daemon for session {id} did not finish starting: {said}"),
+    );
+    Failure::new(
+        FailureClass::Uncertain,
+        io::Error::new(io::ErrorKind::TimedOut, complaint),
+    )
+}
+
 /// Keeps the spawn lock until the daemon this spawn started has published
 /// `<id>.pid`.
 ///
@@ -405,14 +413,24 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> Result<UnixStream, Failu
 /// and a `kill` taking the lock inside that window finds a live daemon and no pid,
 /// which § 6.6 forbids it to unlink over.
 ///
-/// Bounded by the caller's own deadline and never fatal: a daemon that never writes
-/// one still gets its client, and `control::resolve` is what answers for it.
-fn await_publication(paths: &SessionPaths, deadline: Instant) {
+/// Bounded by the caller's own deadline. A successful `connect` alone is not publication:
+/// the listener is bound before the daemon arms its signals and writes the pidfile, so any
+/// failure in that window closes a stream the relay would otherwise already have returned.
+/// A complete pidfile is the frozen control surface's witness that startup finished.
+fn await_publication(paths: &SessionPaths, deadline: Instant) -> bool {
     // Built once. `SessionPaths::pid` allocates, and this loop runs every
     // millisecond for as long as the caller's deadline allows.
     let pid = paths.pid();
-    while !pid.exists() && Instant::now() < deadline {
-        std::thread::sleep(PUBLISH_POLL_INTERVAL);
+    let mut buf = [0u8; MAX_PID_LEN];
+    loop {
+        if read_prefix(&pid, &mut buf).is_ok_and(|body| parse_pid(body).is_some()) {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        std::thread::sleep(PUBLISH_POLL_INTERVAL.min(remaining));
     }
 }
 
@@ -781,13 +799,15 @@ fn daemon_command(session_id: &str, label: Option<&str>, lock_fd: i32) -> io::Re
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
-    use std::fs::File;
+    use std::fs::{self, File};
     use std::io::{self, Write as _};
+    use std::time::Instant;
 
     use super::{
-        ChildStderr, FailureClass, SessionPaths, daemon_command, daemon_complaint,
-        resume_probe_class, unattachable,
+        ChildStderr, FailureClass, SessionPaths, await_publication, daemon_command,
+        daemon_complaint, resume_probe_class, unattachable,
     };
+    use crate::scratch::Scratch;
     use crate::usock::Foreign;
 
     /// The caller's label reaches `exec` already cut and already stripped of the terminal
@@ -817,6 +837,39 @@ mod tests {
         assert_eq!(
             args,
             ["daemon", "session", "--lock-fd", "23", "--label", "cost $5"]
+        );
+    }
+
+    /// A socket can accept before the daemon has written the pidfile. Only the complete
+    /// regular-file body `kill` can later act on makes that connection a finished startup.
+    #[test]
+    fn publication_requires_a_complete_pidfile() {
+        let root = Scratch::new("attach-publication");
+        let paths = SessionPaths::in_dir(root.path(), "session").expect("resolve session paths");
+        let pid = paths.pid();
+
+        assert!(
+            !await_publication(&paths, Instant::now()),
+            "absence is not publication"
+        );
+        fs::create_dir(&pid).expect("plant a directory at the pidfile");
+        assert!(
+            !await_publication(&paths, Instant::now()),
+            "a node that merely exists is not publication"
+        );
+        fs::remove_dir(&pid).expect("remove the planted directory");
+
+        for incomplete in [b"".as_slice(), b"1234"] {
+            fs::write(&pid, incomplete).expect("write an incomplete pidfile");
+            assert!(
+                !await_publication(&paths, Instant::now()),
+                "an incomplete pidfile was accepted: {incomplete:?}"
+            );
+        }
+        fs::write(&pid, b"1234\n").expect("write a complete pidfile");
+        assert!(
+            await_publication(&paths, Instant::now()),
+            "the daemon's complete pidfile must publish it"
         );
     }
 
