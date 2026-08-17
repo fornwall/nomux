@@ -269,10 +269,9 @@ impl Agent {
 
     /// Queues bytes from the client for the served connection's socket.
     ///
-    /// Bytes naming a connection this is no longer serving are dropped silently: it
-    /// closed while the frame was in flight, which is normal and not the client's fault.
-    /// `generation` is what makes that case distinguishable from bytes for whoever holds
-    /// the slot now, which is the one thing they must never be written into.
+    /// Bytes naming a connection this is no longer serving or is already closing are
+    /// dropped silently: they were in flight when it closed. `generation` keeps them out
+    /// of the connection that next takes the slot.
     ///
     /// Returns `false` if the data would take the queue past [`MAX_CHANNEL_QUEUE`],
     /// which means the caller should close the connection.
@@ -280,7 +279,7 @@ impl Agent {
         let Some(chan) = self
             .channel
             .as_mut()
-            .filter(|chan| chan.generation == generation)
+            .filter(|chan| chan.generation == generation && !chan.closing)
         else {
             return true;
         };
@@ -393,6 +392,21 @@ mod tests {
             panic!("a connection with a client attached and the slot free must be served");
         };
         (peer, generation)
+    }
+
+    /// Fills the peer's socket buffer, leaving data queued in `agent`.
+    fn stall(agent: &mut Agent, generation: u32) {
+        loop {
+            assert!(agent.deliver(generation, &vec![b'q'; 64 * 1024]));
+            assert_eq!(agent.flush(), Flush::Open);
+            if agent
+                .channel
+                .as_ref()
+                .is_some_and(|chan| !chan.pending.is_empty())
+            {
+                return;
+            }
+        }
     }
 
     /// The peak is the cap, never the cap plus a payload.
@@ -514,25 +528,7 @@ mod tests {
         let mut agent = bind_in(&root, "c.agent");
         let (_peer, live) = open(&mut agent);
 
-        // Filled until this host's socket buffer stops taking it, rather than to some
-        // number guessed at here: what the close below needs is a queue that cannot
-        // drain, and only the kernel knows when that is.
-        loop {
-            assert!(
-                agent.deliver(live, &vec![b'q'; 64 * 1024]),
-                "the queue is emptied every round, so the cap is never in question"
-            );
-            assert_eq!(agent.flush(), Flush::Open, "the peer is still there");
-            if !agent
-                .channel
-                .as_ref()
-                .expect("the served connection")
-                .pending
-                .is_empty()
-            {
-                break;
-            }
-        }
+        stall(&mut agent, live);
         agent.close_from_client(live);
         assert!(
             agent.is_serving(),
@@ -545,6 +541,33 @@ mod tests {
             "the slot comes back with nothing said about it"
         );
         assert!(!agent.is_serving(), "but it does come back");
+    }
+
+    #[test]
+    fn data_after_a_client_close_is_ignored() {
+        let root = Scratch::new("agent-data-after-close");
+        let mut agent = bind_in(&root, "c.agent");
+        let (_peer, live) = open(&mut agent);
+        stall(&mut agent, live);
+        agent.close_from_client(live);
+
+        let queued = agent
+            .channel
+            .as_ref()
+            .expect("still draining")
+            .pending
+            .len();
+        assert!(agent.deliver(live, b"late"), "late data is not a fault");
+        assert_eq!(
+            agent
+                .channel
+                .as_ref()
+                .expect("still draining")
+                .pending
+                .len(),
+            queued,
+            "data received after AgentClose was queued behind the closed stream"
+        );
     }
 
     /// The window is against the last byte, not against the accept: `ssh(1)` holds one
@@ -599,26 +622,7 @@ mod tests {
         let mut agent = bind_in(&root, "u.agent");
         let (_peer, live) = open(&mut agent);
 
-        // Filled until this host's socket buffer stops taking it, as
-        // `a_stalled_close_frees_the_slot_without_announcing_itself` does and for its
-        // reason: only the kernel knows when a write can no longer move anything.
-        loop {
-            assert!(
-                agent.deliver(live, &vec![b'q'; 64 * 1024]),
-                "the queue is emptied every round until it is not, so the cap is never \
-                 in question"
-            );
-            assert_eq!(agent.flush(), Flush::Open, "the peer is still there");
-            if !agent
-                .channel
-                .as_ref()
-                .expect("the served connection")
-                .pending
-                .is_empty()
-            {
-                break;
-            }
-        }
+        stall(&mut agent, live);
 
         // Read after the last write that moved something, so what follows has to leave
         // it exactly where it is.

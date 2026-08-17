@@ -15,7 +15,11 @@ repo=$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd -P)
 here="$repo/e2e-tests"
 cd "$here"
 
-target=${CARGO_TARGET_DIR:-$repo/target}
+target_dir=${CARGO_TARGET_DIR:-target}
+case "$target_dir" in
+    /*) root_target=$target_dir; probe_target=$target_dir ;;
+    *) root_target="$repo/$target_dir"; probe_target="$here/probe/$target_dir" ;;
+esac
 # The one architecture the compose images run. Static, so the Debian containers need no
 # toolchain and no matching libc.
 arch=x86_64-unknown-linux-musl
@@ -58,12 +62,12 @@ rustup target list --installed | grep -qx "$arch" ||
 # `--locked` on both, as every other cargo invocation in the tree has it: what this harness
 # measures is the behaviour of a committed tree, and a resolver quietly moving past either lock
 # file would make the run a fact about whatever crates.io held that morning.
-( cd "$repo" && cargo build --locked --release --target "$arch" --bin nomux ) >&2
-( cd "$here/probe" && cargo build --locked --release --target "$arch" ) >&2
+( cd "$repo" && cargo build --locked --release --target "$arch" --target-dir "$root_target" --bin nomux ) >&2
+( cd "$here/probe" && cargo build --locked --release --target "$arch" --target-dir "$probe_target" ) >&2
 
 mkdir -p "$here/bin"
-cp "$target/$arch/release/nomux" "$here/bin/nomux"
-cp "$here/probe/target/$arch/release/nomux-probe" "$here/bin/nomux-probe"
+cp "$root_target/$arch/release/nomux" "$here/bin/nomux"
+cp "$probe_target/$arch/release/nomux-probe" "$here/bin/nomux-probe"
 
 # ------------------------------------------------------------------------- throwaway key
 

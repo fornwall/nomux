@@ -2,21 +2,19 @@
 //!
 //! Entirely `#[cfg(test)]`, so none of it is compiled into a shipped build.
 //!
-//! The integration tests get `CARGO_TARGET_TMPDIR` and a run root of their own
-//! (`tests/harness/mod.rs`). Cargo sets that variable for integration tests and
-//! benches only — measured, not assumed: `option_env!` reads `None` from here — so
-//! the unit tests in `src/` have nowhere but the developer's ambient `$TMPDIR`,
-//! shared with everything else on the host. Both halves of the harness's naming
-//! argument are therefore load-bearing here.
+//! Unit tests lack the integration harness's `CARGO_TARGET_TMPDIR`, so their roots
+//! live in the ambient, shared `$TMPDIR` and must be created atomically.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 /// Mode a directory has to be in before it can be removed: readable to list, and
 /// executable to reach what is listed.
 const REMOVABLE: u32 = 0o700;
+static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 /// Serialises everything in this process whose result depends on the umask.
 ///
@@ -55,16 +53,23 @@ fn create_dir(dir: &Path) {
 pub(crate) struct Scratch(PathBuf);
 
 impl Scratch {
-    /// An empty scratch directory named for `name` and for this process.
-    ///
-    /// The wipe on the way in stays even though the name carries this process's pid,
-    /// for the reason the integration harness gives: pids are reused.
+    /// An empty scratch directory atomically claimed by this process.
     pub(crate) fn new(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("nomux-{}-{name}", std::process::id()));
-        make_removable(&dir);
-        drop(fs::remove_dir_all(&dir));
-        create_dir(&dir);
-        Self(dir)
+        loop {
+            let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("nomux-{}-{sequence}-{name}", std::process::id()));
+            let _umask = umask_lock();
+            match fs::DirBuilder::new().mode(REMOVABLE).create(&dir) {
+                Ok(()) => {
+                    fs::set_permissions(&dir, fs::Permissions::from_mode(REMOVABLE))
+                        .expect("secure a scratch directory");
+                    return Self(dir);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) => panic!("create a scratch directory: {err}"),
+            }
+        }
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -98,11 +103,9 @@ impl Drop for Scratch {
 ///
 /// Symlinks are not followed, which is the same promise `ensure_run_dir` makes. The
 /// recursion gets that from `read_dir`; the entry point has to buy it, because
-/// `set_permissions` is `chmod(2)`, which follows, and Linux has no `lchmod`. Both
-/// callers hand this a path somebody else may have replaced, so without the check a
-/// link planted at one of those names is a `chmod` of whatever it points at —
-/// successful as root, which `rundir`'s tests treat as a supported way to run this
-/// suite.
+/// `set_permissions` is `chmod(2)`, which follows, and Linux has no `lchmod`. A test may
+/// have replaced the root before drop, so a planted link would chmod its target when
+/// the suite runs as root.
 fn make_removable(dir: &Path) {
     // `symlink_metadata`, so the answer is about the name rather than about what it
     // resolves to.
@@ -126,6 +129,20 @@ fn make_removable(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scratch_roots_never_reuse_an_existing_name() {
+        let first = Scratch::new("scratch-unique");
+        let sentinel = first.join("sentinel");
+        fs::write(&sentinel, b"keep").expect("plant a sentinel");
+        let second = Scratch::new("scratch-unique");
+
+        assert_ne!(first.path(), second.path());
+        assert_eq!(
+            fs::read(sentinel).expect("preserve the first root"),
+            b"keep"
+        );
+    }
 
     /// Both directions of the guard at the top of [`make_removable`], because either
     /// one alone is a fault: a `chmod` that follows a link is somebody else's file at

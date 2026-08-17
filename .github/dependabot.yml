@@ -70,3 +70,12 @@ updates:
       probe-cargo:
         patterns: ["*"]
         update-types: ["patch", "minor"]
+
+  # Keep the digest pinned for the privileged e2e container current.
+  - package-ecosystem: docker
+    directory: /e2e-tests
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:57"
+      timezone: Europe/Stockholm

@@ -37,10 +37,8 @@ pub(crate) struct Spawn<'a> {
     pub agent_sock: Option<&'a Path>,
 }
 
-/// How long the child's group has to act on `SIGHUP` before `SIGKILL` follows.
-///
-/// Named for the signal actually sent: `control.rs` has a `GRACE` of its own for the
-/// different two seconds a *daemon* gets after `SIGTERM`.
+/// Budget for each HUP/KILL session-cleanup phase. `control.rs` separately gives the
+/// daemon two seconds after `SIGTERM`.
 const HANGUP_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Interval between liveness checks while waiting out [`HANGUP_GRACE`].
@@ -217,17 +215,17 @@ impl Pty {
             && !self.reaped
         {
             let mut group_alive = rustix::process::test_kill_process_group(pid).is_ok();
-            let mut settled = session_is_empty(raw);
+            let deadline = std::time::Instant::now() + HANGUP_GRACE;
+            let mut settled = session_is_empty(raw, Some(deadline));
             if !settled {
                 if group_alive {
                     reach(Reach::Group(pid), Signal::HUP);
                 }
-                signal_session(raw, Signal::HUP);
+                signal_session(raw, Signal::HUP, deadline);
 
-                let deadline = std::time::Instant::now() + HANGUP_GRACE;
                 while std::time::Instant::now() < deadline {
                     group_alive = rustix::process::test_kill_process_group(pid).is_ok();
-                    if session_is_empty(raw) {
+                    if session_is_empty(raw, Some(deadline)) {
                         settled = true;
                         break;
                     }
@@ -240,8 +238,10 @@ impl Pty {
                 }
                 let deadline = std::time::Instant::now() + HANGUP_GRACE;
                 loop {
-                    signal_session(raw, Signal::KILL);
-                    if session_is_empty(raw) || std::time::Instant::now() >= deadline {
+                    signal_session(raw, Signal::KILL, deadline);
+                    if session_is_empty(raw, Some(deadline))
+                        || std::time::Instant::now() >= deadline
+                    {
                         break;
                     }
                     std::thread::sleep(HANGUP_POLL_INTERVAL);
@@ -266,8 +266,8 @@ fn as_pid(id: u32) -> i32 {
 /// session form, and the point is precisely the groups job control created that nobody
 /// is tracking. Each member is pinned before the `stat` read that establishes membership
 /// and signalled through that pidfd, or the reuse window a numeric `kill(2)` has reopens.
-fn signal_session(sid: i32, signal: Signal) {
-    let _ = walk_session(sid, true, |_, pinned| {
+fn signal_session(sid: i32, signal: Signal, deadline: std::time::Instant) {
+    let _ = walk_session(sid, true, Some(deadline), |_, pinned| {
         // A missing pidfd is ambiguity, not licence to fall back to the number:
         // signalling nothing is safer than reaching a process that inherited it. The
         // child's own process-group reach remains.
@@ -323,9 +323,17 @@ thread_local! {
 /// One path and one read buffer for the whole walk: [`Pty::terminate`]'s grace loop
 /// reaches here every [`HANGUP_POLL_INTERVAL`] inside [`HANGUP_GRACE`].
 ///
-/// Returns whether `/proc` could be enumerated. A stopped visit is still a successful
-/// enumeration: the caller already learned what it asked.
-fn walk_session(sid: i32, pin: bool, mut visit: impl FnMut(i32, Option<&OwnedFd>) -> bool) -> bool {
+/// Returns whether `/proc` was fully enumerated before `deadline`. A stopped visit is
+/// successful: the caller already learned what it asked.
+fn walk_session(
+    sid: i32,
+    pin: bool,
+    deadline: Option<std::time::Instant>,
+    mut visit: impl FnMut(i32, Option<&OwnedFd>) -> bool,
+) -> bool {
+    if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
+        return false;
+    }
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return false;
     };
@@ -333,6 +341,9 @@ fn walk_session(sid: i32, pin: bool, mut visit: impl FnMut(i32, Option<&OwnedFd>
     let mut path = PathBuf::from("/proc");
     let mut stat = Vec::with_capacity(1024);
     for entry in entries {
+        if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
+            return false;
+        }
         let Ok(entry) = entry else {
             return false;
         };
@@ -375,9 +386,9 @@ fn walk_session(sid: i32, pin: bool, mut visit: impl FnMut(i32, Option<&OwnedFd>
 /// [`Pty::terminate`]'s grace loop asks this every [`HANGUP_POLL_INTERVAL`]. A `/proc`
 /// enumeration failure answers false, the safe direction: it must not suppress the
 /// group reach and final child kill on evidence it never obtained.
-fn session_is_empty(sid: i32) -> bool {
+fn session_is_empty(sid: i32, deadline: Option<std::time::Instant>) -> bool {
     let mut empty = true;
-    let scanned = walk_session(sid, false, |_, _| {
+    let scanned = walk_session(sid, false, deadline, |_, _| {
         empty = false;
         false
     });
@@ -517,6 +528,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_expired_session_walk_is_incomplete_not_empty() {
+        let deadline = std::time::Instant::now();
+        let mut visited = false;
+        assert!(!walk_session(0, false, Some(deadline), |_, _| {
+            visited = true;
+            true
+        }));
+        assert!(!visited);
+        assert!(!session_is_empty(0, Some(deadline)));
+    }
+
     /// The case the process-group kill cannot reach, and the reason for the `/proc`
     /// walk: a shell with job control gives each `&` job a process group of its own, so
     /// the only thing still holding them together is the session. `set -m` is what makes
@@ -607,7 +630,7 @@ mod tests {
                 .ok()
                 .and_then(|stat| stat_session(&stat))
                 .is_some_and(|(_, zombie)| zombie)
-                && session_is_empty(raw),
+                && session_is_empty(raw, None),
             "the observed shell must reserve an otherwise empty session"
         );
         drop(reaches_since());
@@ -643,7 +666,7 @@ mod tests {
              about cannot happen"
         );
         assert!(
-            session_is_empty(raw),
+            session_is_empty(raw, None),
             "the zombie must be all that is left, or the grace is owed either way"
         );
 
@@ -663,7 +686,7 @@ mod tests {
     /// at the first member.
     fn session_members(sid: i32) -> Vec<i32> {
         let mut members = Vec::new();
-        walk_session(sid, false, |pid, _| {
+        walk_session(sid, false, None, |pid, _| {
             members.push(pid);
             true
         });

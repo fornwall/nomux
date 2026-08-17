@@ -274,21 +274,48 @@ pub(crate) fn open_null_device() -> io::Result<OwnedFd> {
     rustix::fs::open("/dev/null", OFlags::RDWR | OFlags::CLOEXEC, Mode::empty()).map_err(Into::into)
 }
 
-/// Points the three standard descriptors at `null`, last of all (§ 6.2).
+/// Points the three standard descriptors at `null`, retrying interrupted `dup2`s (§ 6.2).
 ///
-/// Silent, and trivially so — [`open_null_device`] already proved the descriptor, and `dup2`
-/// onto a valid one fails for nothing this process can cause.
+/// These numbers were never free: std opens `/dev/null` onto any descriptor `main`
+/// inherited closed, so no listener or pipe can be silenced accidentally. Stderr goes
+/// last so any failure can still reach the launcher.
 ///
-/// What makes this safe is not the ordering, which cannot help: by here the socket is bound
-/// and the stop pipe armed, and nothing below can tell an inherited terminal from a
-/// descriptor of its own. It is that these three numbers were never free — std's runtime
-/// opens `/dev/null` onto any of them `main` inherited closed, and aborts rather than start
-/// without them, so the lowest number a `bind` here can be given is 3. Without that, § 6.2's
-/// `nomux daemon x 0<&- 1>&- 2>&-` would land the listener on fd 1 for the `dup2`s below to
-/// silence — an id claimed by a daemon nothing can ever reach. `tests/session.rs` starts one
-/// that way and greets it.
-pub(crate) fn silence_standard_descriptors(null: &OwnedFd) {
-    let _ = rustix::stdio::dup2_stdin(null);
-    let _ = rustix::stdio::dup2_stdout(null);
-    let _ = rustix::stdio::dup2_stderr(null);
+/// # Errors
+///
+/// Propagates a non-`EINTR` `dup2` failure.
+pub(crate) fn silence_standard_descriptors(null: &OwnedFd) -> io::Result<()> {
+    retry_intr(|| rustix::stdio::dup2_stdin(null))?;
+    retry_intr(|| rustix::stdio::dup2_stdout(null))?;
+    retry_intr(|| rustix::stdio::dup2_stderr(null))
+}
+
+fn retry_intr(mut op: impl FnMut() -> rustix::io::Result<()>) -> io::Result<()> {
+    loop {
+        match op() {
+            Err(rustix::io::Errno::INTR) => {}
+            result => return result.map_err(Into::into),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interrupted_operations_are_retried_but_other_errors_escape() {
+        let mut calls = 0;
+        retry_intr(|| {
+            calls += 1;
+            (calls > 1).then_some(()).ok_or(rustix::io::Errno::INTR)
+        })
+        .expect("retry an interruption");
+        assert_eq!(calls, 2);
+        assert_eq!(
+            retry_intr(|| Err(rustix::io::Errno::BADF))
+                .expect_err("propagate a permanent error")
+                .raw_os_error(),
+            Some(libc::EBADF)
+        );
+    }
 }

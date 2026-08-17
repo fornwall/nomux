@@ -138,7 +138,7 @@ struct Attached {
     /// Post-gap repaint policy, as this connection's `Hello` stated it (§ 4.3).
     repaint_ctrl_l: bool,
     /// Whether a gap reported to this connection is still owed its repaint (§ 4.3).
-    /// Cleared by [`Daemon::pump_output`] once this client holds the whole ring.
+    /// Cleared once this client holds the whole ring and the repaint is queued.
     repaint_due: bool,
 }
 
@@ -284,9 +284,10 @@ fn start(session_id: &str, label: Option<&str>, inherited_lock_fd: Option<i32>) 
         }
     };
 
-    // One fallible region rather than a cleanup per call site: nothing past the bind can
-    // be reported, so whatever fails inside `publish`, what it published goes.
-    let (stop_pipe, child_pipe) = match publish(&paths, label) {
+    // One fallible region and one cleanup: stderr remains intact until its last `dup2`.
+    let published = publish(&paths, label)
+        .and_then(|pipes| silence_standard_descriptors(&null).map(|()| pipes));
+    let (stop_pipe, child_pipe) = match published {
         Ok(pipes) => pipes,
         Err(err) => {
             if inherited_lock_fd.is_some() {
@@ -302,10 +303,6 @@ fn start(session_id: &str, label: Option<&str>, inherited_lock_fd: Option<i32>) 
     // Never carried into the event loop: `kill` waits two seconds for this lock and then
     // reports a session it could not remove (§ 6.6).
     drop(publishing);
-
-    // The daemon's voice goes here and nowhere earlier (§ 6.2): everything above could
-    // still explain itself on the stderr `spawn` holds open, and nothing below has any.
-    silence_standard_descriptors(&null);
     drop(null);
 
     let mut daemon = Daemon {
@@ -1251,9 +1248,9 @@ impl Daemon {
 
     /// Asks the child to redraw after a gap, by whichever means this client chose;
     /// `IMPLEMENTATION.md` § 4.3 has why the choice belongs to the client.
-    fn repaint(&mut self) {
+    fn repaint(&mut self) -> bool {
         if self.terminal_closed_at.is_some() {
-            return;
+            return true;
         }
         if self
             .client
@@ -1261,6 +1258,9 @@ impl Daemon {
             .is_some_and(|client| client.repaint_ctrl_l)
         {
             // Queued rather than written, and not client input: `in_applied` stays (§ 4.3).
+            if self.input_is_saturated() {
+                return false;
+            }
             self.pending_input.push_back(0x0c);
         } else if let Some(pty) = self.pty.as_ref() {
             // Two resizes, and a failure between them leaves the master a column narrow
@@ -1270,6 +1270,7 @@ impl Daemon {
                 self.applied_win = None;
             }
         }
+        true
     }
 
     /// Applies client input exactly once, trimming an overlapping replay (§ 3).
@@ -1350,9 +1351,11 @@ impl Daemon {
         // Coalesced onto the moment this client holds the whole ring rather than issued
         // per gap (§ 4.3).
         let repainting = client.repaint_due && client.sent_through >= end;
-        client.repaint_due &= !repainting;
-        if repainting {
-            self.repaint();
+        if repainting
+            && self.repaint()
+            && let Some(client) = self.client.as_mut()
+        {
+            client.repaint_due = false;
         }
     }
 
@@ -1643,6 +1646,39 @@ mod tests {
             agent_sock: None,
         })
         .expect("spawn a shell on a pty")
+    }
+
+    #[test]
+    fn ctrl_l_repaint_waits_for_input_queue_room() {
+        let root = Scratch::new("repaint-input-cap");
+        let mut daemon = blank(&root, "repaint");
+        let _peer = attach_peer(|conn| {
+            let mut client = Attached::greeting(conn);
+            client.repaint_ctrl_l = true;
+            client.repaint_due = true;
+            daemon.client = Some(client);
+        });
+        daemon.pending_input.resize(MAX_PENDING_INPUT, b'x');
+
+        daemon.pump_output();
+        assert_eq!(daemon.pending_input.len(), MAX_PENDING_INPUT);
+        assert!(
+            daemon
+                .client
+                .as_ref()
+                .is_some_and(|client| client.repaint_due)
+        );
+
+        daemon.pending_input.pop_front();
+        daemon.pump_output();
+        assert_eq!(daemon.pending_input.len(), MAX_PENDING_INPUT);
+        assert_eq!(daemon.pending_input.back(), Some(&0x0c));
+        assert!(
+            !daemon
+                .client
+                .as_ref()
+                .is_some_and(|client| client.repaint_due)
+        );
     }
 
     /// Regression: a takeover keeps what the client it evicts had already delivered
