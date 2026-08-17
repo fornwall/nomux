@@ -124,12 +124,12 @@ pub(crate) fn kill(session_id: &str) -> io::Result<()> {
     // process that stopped letting go is no reason for the escape hatch to hang forever.
     let lock = paths.lock_spawn_until(Instant::now() + GRACE)?;
     if let Some(chosen) = resolve(&paths)? {
-        chosen.signal(Signal::TERM);
+        let term = chosen.signal(Signal::TERM);
         // Liveness first, deadline second, so a daemon that let go on the last interval is
         // not signalled again — `SIGKILL` being the one signal nothing survives, and the
         // descriptor guaranteeing only that it lands on the process this call pinned.
         let mut deadline = Instant::now() + GRACE;
-        let mut killed = false;
+        let mut killed = None;
         loop {
             match liveness(&paths.socket(), PROBE_TIMEOUT) {
                 Liveness::Stale(_) => break,
@@ -143,11 +143,10 @@ pub(crate) fn kill(session_id: &str) -> io::Result<()> {
                 // Both graces out with the socket still answering — reached only from the arm
                 // above that accepted a connection. What the escalation actually did is
                 // [`still_answering`]'s to say rather than this call site's.
-                if killed {
-                    return Err(refuse(still_answering(paths.id(), &chosen)));
+                if let Some(kill) = &killed {
+                    return Err(refuse(still_answering(paths.id(), &chosen, &term, kill)));
                 }
-                chosen.signal(Signal::KILL);
-                killed = true;
+                killed = Some(chosen.signal(Signal::KILL));
                 deadline = Instant::now() + KILL_GRACE;
             }
             thread::sleep(POLL_INTERVAL);
@@ -235,11 +234,14 @@ struct Chosen {
 }
 
 impl Chosen {
-    /// Signals through the pidfd; the later socket probe settles the outcome.
-    fn signal(&self, sig: Signal) {
-        if let Ok(pidfd) = &self.reach {
-            let _ = pidfd_send_signal(pidfd, sig);
-        }
+    /// Signals through the pidfd; the later socket probe settles the outcome, while the
+    /// result is retained so a refusal never claims a syscall that failed was sent.
+    fn signal(&self, sig: Signal) -> io::Result<()> {
+        let pidfd = self
+            .reach
+            .as_ref()
+            .map_err(|err| io::Error::new(err.kind(), err.to_string()))?;
+        pidfd_send_signal(pidfd, sig).map_err(Into::into)
     }
 }
 
@@ -364,21 +366,31 @@ fn unidentified(id: &str, filed: Option<Pid>, body: &[u8]) -> String {
     }
 }
 
-/// The refusal to collect a session that was answering still when both graces ran out, in
-/// the words the [`Chosen::reach`] it was escalated *through* earns (§ 6.6): a signal
-/// that went out through a descriptor says the pid is not the process serving the socket,
-/// and an errno that declined the descriptor says no signal went out at all — the errno
-/// being the one part anybody can repair.
-fn still_answering(id: &str, chosen: &Chosen) -> String {
+/// The refusal to collect a session that was answering still when both graces ran out,
+/// naming exactly which syscalls reached the pinned process and which failed (§ 6.6).
+fn still_answering(
+    id: &str,
+    chosen: &Chosen,
+    term: &io::Result<()>,
+    kill: &io::Result<()>,
+) -> String {
     let pid = chosen.pid.as_raw_nonzero();
-    match &chosen.reach {
-        Ok(_) => format!(
+    match (term, kill) {
+        (Ok(()), Ok(())) => format!(
             "session {id} is still answering after SIGTERM and SIGKILL to pid {pid}, so \
              that pid is not the process serving it"
         ),
-        Err(err) => format!(
-            "session {id} is still answering, and pid {pid} could not be held to be \
-             signalled ({err}), so neither SIGTERM nor SIGKILL was sent"
+        (Err(term), Err(kill)) => format!(
+            "session {id} is still answering, and neither SIGTERM nor SIGKILL was sent \
+             to pid {pid} (SIGTERM: {term}; SIGKILL: {kill})"
+        ),
+        (Ok(()), Err(kill)) => format!(
+            "session {id} is still answering after SIGTERM to pid {pid}; SIGKILL could \
+             not be sent ({kill})"
+        ),
+        (Err(term), Ok(())) => format!(
+            "session {id} is still answering after SIGKILL to pid {pid}, so that pid is \
+             not the process serving it; SIGTERM could not be sent ({term})"
         ),
     }
 }
@@ -437,7 +449,7 @@ mod tests {
     use std::{fs, io, thread};
 
     use rustix::io::Errno;
-    use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
+    use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open};
 
     use super::{
         Chosen, MAX_CMDLINE_LEN, bound_since, is_daemon_for, names_daemon_for, pin, still_answering,
@@ -494,9 +506,15 @@ mod tests {
         // Reaped, so the number is the kernel's to hand out again.
         child.wait().expect("reap the held process");
 
+        let chosen = Chosen {
+            pid,
+            reach: Ok(pidfd),
+        };
         assert_eq!(
-            pidfd_send_signal(&pidfd, Signal::CONT),
-            Err(Errno::SRCH),
+            chosen
+                .signal(Signal::CONT)
+                .map_err(|err| err.raw_os_error()),
+            Err(Some(libc::ESRCH)),
             "the signal reached something, so the descriptor is following the number \
              rather than the process it was opened on"
         );
@@ -510,13 +528,13 @@ mod tests {
     #[test]
     fn a_refusal_names_no_signal_that_was_never_sent() {
         let pid = Pid::from_raw(999_999_999).expect("a positive number is a pid");
-        let unheld = still_answering(
-            "one",
-            &Chosen {
-                pid,
-                reach: Err(Errno::MFILE.into()),
-            },
-        );
+        let unheld = Chosen {
+            pid,
+            reach: Err(Errno::MFILE.into()),
+        };
+        let term = unheld.signal(Signal::TERM);
+        let kill = unheld.signal(Signal::KILL);
+        let unheld = still_answering("one", &unheld, &term, &kill);
         assert!(
             !unheld.contains("SIGTERM and SIGKILL to"),
             "no signal went out, so none may be named as having gone out — that sentence \
@@ -536,13 +554,11 @@ mod tests {
         // this half can be asked of.
         if kernel_has_pidfds("nothing here signals, so the sentence goes unchecked") {
             let pidfd = pidfd_open(Pid::INIT, PidfdFlags::empty()).expect("hold pid 1");
-            let signalled = still_answering(
-                "one",
-                &Chosen {
-                    pid,
-                    reach: Ok(pidfd),
-                },
-            );
+            let signalled = Chosen {
+                pid,
+                reach: Ok(pidfd),
+            };
+            let signalled = still_answering("one", &signalled, &Ok(()), &Ok(()));
             assert!(
                 signalled.contains("still answering after SIGTERM and SIGKILL to pid 999999999"),
                 "a session that outlasted a signal that was sent says so, and names the \

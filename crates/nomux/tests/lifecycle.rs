@@ -15,10 +15,11 @@
 
 mod harness;
 
-use std::fs;
+use std::fs::{self, File};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::os::unix::process::ExitStatusExt as _;
+use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -198,6 +199,58 @@ fn an_exited_shell_reserves_its_live_background_session() {
         poll_until(SETTLE, || !process_alive(raw)),
         "the signalled daemon never exited, so the job it was collecting is still \
          running"
+    );
+}
+
+/// A launcher may itself hold non-`CLOEXEC` descriptors: shell redirections, PAM helpers and
+/// embedding applications all create them. The daemon must not retain those for its week-long
+/// lifetime or hand their files and capabilities to the login shell.
+#[test]
+fn the_daemon_closes_unintended_inherited_descriptors() {
+    const INHERITED_FD: i32 = 200;
+
+    let root = run_root("inherited-fd");
+    let id = "inherited_fd";
+    let source = File::open("/dev/null").expect("open a descriptor to inherit");
+    let source_fd = source.as_raw_fd();
+    let mut command = nomux_with_shell(&root, &["daemon", id]);
+    command
+        .env("HOME", &root)
+        .env("NOMUX_RING_BYTES", "65536")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // `dup2` clears `CLOEXEC` on the target, producing the exact descriptor an ordinary
+    // launcher can accidentally pass. Done in the forked child so parallel tests never see it.
+    // SAFETY: the closure runs after fork and `dup2` is async-signal-safe; `source_fd` stays
+    // open in the parent until `spawn` returns.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(source_fd, INHERITED_FD) < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut daemon = Spawned::spawn(&mut command);
+    let pidfile = root.join("nomux/run").join(format!("{id}.pid"));
+    wait_for(&pidfile);
+    let pid: u32 = fs::read_to_string(&pidfile)
+        .expect("read the daemon pid")
+        .trim()
+        .parse()
+        .expect("the pidfile holds a pid");
+    assert_eq!(pid, daemon.id(), "the direct daemon unexpectedly forked");
+
+    let err = fs::read_link(format!("/proc/{pid}/fd/{INHERITED_FD}"))
+        .expect_err("the daemon retained the launcher's descriptor");
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+
+    succeeded(&control(&root, &["kill", id]), "stop the daemon");
+    assert!(
+        poll_by(Instant::now() + SETTLE, || !daemon.is_running()),
+        "the daemon did not stop"
     );
 }
 
@@ -903,7 +956,7 @@ fn a_daemon_holds_the_spawn_lock_while_it_claims_the_id() {
     fs::create_dir_all(&dir).expect("create the run directory");
     // Created here so the wait below has an inode to name; the daemon opens this same
     // path, and `SpawnLock` checks that what it locked is still the file at it.
-    let lock = fs::File::create(dir.join("claimed.lock")).expect("create the spawn lock");
+    let lock = File::create(dir.join("claimed.lock")).expect("create the spawn lock");
     let lock = lock.metadata().expect("stat the spawn lock");
 
     let _wedged = wedge_socket(&dir.join("claimed.sock"));

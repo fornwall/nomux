@@ -25,8 +25,9 @@ use crate::nbio;
 use crate::pty::{self, Pty};
 use crate::rundir::{SessionPaths, ensure_run_dir};
 use crate::startup::{
-    arm_child_signal, arm_stop_signals, detach_from_controlling_terminal, leave_startup_directory,
-    open_null_device, silence_standard_descriptors,
+    arm_child_signal, arm_stop_signals, close_inherited_descriptors,
+    detach_from_controlling_terminal, leave_startup_directory, open_null_device,
+    silence_standard_descriptors,
 };
 use crate::usock::{Liveness, liveness};
 
@@ -235,6 +236,9 @@ pub(crate) fn run(
 
 /// The body of [`run`], separated so that every way out of it is logged once.
 fn start(session_id: &str, label: Option<&str>, inherited_lock_fd: Option<i32>) -> io::Result<()> {
+    // Before opening anything of our own, and before a shell can inherit a descriptor the
+    // launcher never meant to give it. The one deliberate handoff is validated below.
+    close_inherited_descriptors(inherited_lock_fd)?;
     let paths = SessionPaths::new(session_id)?;
     ensure_run_dir(paths.dir())?;
 
@@ -1001,9 +1005,24 @@ impl Daemon {
     /// Observes the child's outcome without releasing an occupied session id (§ 6.5).
     fn collect_outcome(&mut self) {
         let observed = if self.worth_a_waitpid() {
-            self.pty
-                .as_mut()
-                .and_then(|pty| pty.try_outcome().ok().flatten())
+            match self.pty.as_mut().map(Pty::try_outcome) {
+                Some(Ok(outcome)) => outcome,
+                Some(Err(err)) => {
+                    // A failed wait is not "the child is still running". Before terminal
+                    // EOF the session can continue and a later notification may recover;
+                    // afterwards no truthful status can be promised, so end the transcript
+                    // as unknown rather than silently waiting out the ordinary grace.
+                    crate::sanitize::error(
+                        self.paths.id(),
+                        &format!("could not observe session shell: {err}"),
+                    );
+                    if self.terminal_closed_at.is_some() {
+                        self.outcome = Some((0, ExitKind::Unknown));
+                    }
+                    None
+                }
+                None => None,
+            }
         } else {
             None
         };
@@ -1813,6 +1832,9 @@ mod tests {
             .expect("close only the input half");
 
         let mut read_buf = vec![0u8; 64 * 1024];
+        daemon.read_client(&mut read_buf, &mut Vec::new());
+        // The first fair-share read takes the bytes; the second observes the EOF behind
+        // them, as `poll_once`'s buffered-input retry does in the same pass.
         daemon.read_client(&mut read_buf, &mut Vec::new());
 
         assert!(daemon.client.is_none(), "the invalid client kept the slot");

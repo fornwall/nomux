@@ -171,7 +171,7 @@ impl Conn {
         }
     }
 
-    /// Reads whatever the socket has available into the receive buffer, up to
+    /// Reads one fair share from the socket into the receive buffer, up to
     /// [`MAX_PENDING_READ`] still undecoded.
     ///
     /// `chunk` is the caller's, and is only ever written to: a buffer of its own would be
@@ -183,22 +183,26 @@ impl Conn {
     ///
     /// Propagates read failures other than `EWOULDBLOCK` and `EINTR`.
     pub(crate) fn fill(&mut self, chunk: &mut [u8]) -> io::Result<()> {
-        while self.buffered() < MAX_PENDING_READ {
-            let room = MAX_PENDING_READ - self.buffered();
-            let read_len = chunk.len().min(room);
-            let read_buf = chunk.get_mut(..read_len).unwrap_or_default();
+        if self.buffered() >= MAX_PENDING_READ {
+            return Ok(());
+        }
+        let room = MAX_PENDING_READ - self.buffered();
+        let read_len = chunk.len().min(room);
+        let read_buf = chunk.get_mut(..read_len).unwrap_or_default();
+        loop {
             match self.stream.read(read_buf) {
-                Ok(0) => {
-                    self.eof = true;
-                    return Ok(());
-                }
+                Ok(0) => self.eof = true,
                 Ok(n) => self.rx.extend_from_slice(chunk.get(..n).unwrap_or(&[])),
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 Err(err) => return Err(err),
             }
+            // A continuously readable peer gets one successful read per service call.
+            // Otherwise a stream of four-byte control frames can consume the whole 1 MiB
+            // receive allowance and delay PTY draining behind hundreds of thousands of
+            // decodes, despite every other source receiving a bounded share of the pass.
+            return Ok(());
         }
-        Ok(())
     }
 
     /// Writes as much of the send buffer as the socket accepts.
@@ -344,6 +348,22 @@ mod tests {
             format!("{conn:?}"),
             "Conn { buffered: 23, queued: 37, preamble_queued: true, eof: false, .. }"
         );
+    }
+
+    /// One ready socket gets one share per service call. In particular, a stream of
+    /// four-byte `Ping`s must not fill the whole megabyte receive allowance and spend
+    /// hundreds of thousands of decodes before the PTY is serviced again.
+    #[test]
+    fn one_fill_takes_one_read_bufferful() {
+        let (mut peer, mut conn) = pair();
+        peer.write_all(&[b'x'; 64]).expect("fill the socket");
+
+        let mut chunk = [0; 16];
+        conn.fill(&mut chunk).expect("take one fair share");
+        assert_eq!(conn.buffered(), chunk.len());
+
+        conn.fill(&mut chunk).expect("take the next fair share");
+        assert_eq!(conn.buffered(), 2 * chunk.len());
     }
 
     /// A payload whose every byte is a function of its position, so a compaction that
@@ -537,6 +557,14 @@ mod tests {
 
         let (mut peer, mut conn) = pair();
         feed(&mut peer, &mut conn, &wire[..preload]);
+        while conn.buffered() < preload {
+            let before = conn.buffered();
+            fill(&mut conn).expect("finish the preload one fair share at a time");
+            assert!(
+                conn.buffered() > before,
+                "the staged preload stopped moving"
+            );
+        }
         assert_eq!(conn.buffered(), preload, "every byte given must be kept");
         assert!(
             conn.buffered() < MAX_PENDING_READ,

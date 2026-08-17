@@ -913,9 +913,9 @@ fn a_daemon_started_with_an_over_long_label_is_still_recognised_as_one() {
 /// `<id>.pid` and the stranger goes unsignalled however much it looks like a daemon —
 /// a rule that read the socket for a number would signal it here. The socket is still
 /// what says whether the session *stopped*, and it is somebody else's and goes on
-/// answering after both signals, so `kill` unlinks nothing. This is the one path in
-/// § 6.6 that reaches "still answering after SIGTERM and SIGKILL" with every clause of
-/// that sentence true.
+/// answering after the target has gone, so `kill` unlinks nothing. The refusal must say
+/// that `SIGTERM` reached the pinned target and that the later `SIGKILL` found it gone;
+/// the socket cannot turn either observation into a claim about the stranger serving it.
 ///
 /// The shape is built rather than provoked: the real creator `_exit`s, so a second
 /// daemon's socket is moved over this session's instead.
@@ -962,11 +962,12 @@ fn kill_signals_what_the_pidfile_names_even_when_another_daemon_answers_on_the_s
     );
     assert!(
         stderr(&killed).contains(&format!(
-            "still answering after SIGTERM and SIGKILL to pid {}",
+            "still answering after SIGTERM to pid {}; SIGKILL could not be sent \
+             (No such process",
             session.pid
         )),
-        "and it must name the number it signalled and say the session outlived it, which \
-         is the whole of what was established: {:?}",
+        "and it must name the signal that reached the pinned target without claiming the \
+         failed escalation was sent: {:?}",
         stderr(&killed)
     );
     assert_eq!(

@@ -46,6 +46,66 @@ extern "C" fn note_child_signal(_signum: libc::c_int) {
     note_signal(&CHILD_PIPE);
 }
 
+/// Closes every descriptor the daemon inherited except standard I/O and `keep`.
+///
+/// A daemon outlives the process that launched it, and its login shell is less trusted than
+/// that launcher. Letting an arbitrary non-`CLOEXEC` descriptor cross either boundary can keep
+/// a mount busy for a week, or hand the shell a file, socket or capability it was never meant to
+/// have. This runs before the daemon opens anything of its own; `keep` is the spawn lock that is
+/// deliberately handed across `exec` and validated immediately afterwards.
+///
+/// `close_range(2)` is the small, constant-time path on Linux 5.9 and later. Sessions still work
+/// on older kernels, so `/proc/self/fd` is the fallback; procfs is already a project requirement
+/// for process identity and shutdown.
+pub(crate) fn close_inherited_descriptors(keep: Option<i32>) -> io::Result<()> {
+    let keep = keep.and_then(|fd| u32::try_from(fd).ok());
+    let closed = keep.map_or_else(
+        || close_range(libc::STDERR_FILENO as u32 + 1, u32::MAX),
+        |fd| {
+            close_range(libc::STDERR_FILENO as u32 + 1, fd.saturating_sub(1))
+                && close_range(fd.saturating_add(1), u32::MAX)
+        },
+    );
+    if closed {
+        return Ok(());
+    }
+
+    // Collect first: the directory iterator owns a descriptor that appears in its own
+    // listing. Dropping it before the closes makes that entry an ordinary `EBADF`, and avoids
+    // ending the scan part-way through by closing the descriptor it is reading from.
+    let mut inherited = Vec::new();
+    for entry in std::fs::read_dir("/proc/self/fd")? {
+        let entry = entry?;
+        let Some(fd) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if fd > libc::STDERR_FILENO && keep != u32::try_from(fd).ok() {
+            inherited.push(fd);
+        }
+    }
+    for fd in inherited {
+        // SAFETY: `fd` came from this process's descriptor directory. It may already be
+        // closed (notably the directory iterator's own descriptor), which is harmless.
+        unsafe {
+            libc::close(fd);
+        }
+    }
+    Ok(())
+}
+
+/// Closes one inclusive descriptor range, returning whether the kernel accepted it.
+fn close_range(first: u32, last: u32) -> bool {
+    if first > last {
+        return true;
+    }
+    // SAFETY: `close_range` takes three integer values and touches no userspace memory.
+    unsafe { libc::syscall(libc::SYS_close_range, first, last, 0) == 0 }
+}
+
 /// Routes [`STOP_SIGNALS`] into a descriptor the poll set can watch, and hands back
 /// its read end.
 ///

@@ -207,6 +207,12 @@ Four bounds, each enforced on its own queue:
 | `MAX_PENDING_INPUT` | 1 MiB | Past this queued for a child that is not reading, the daemon stops **accepting** input: it stops decoding `Input` frames and stops asking the socket for more. Dropping is not available, `in_applied` being exactly-once (§3), and `Error{INPUT_GAP}` would accuse a client that had done nothing wrong. The bytes wait in the kernel's buffer, where the peer blocks on them — §6.7's argument for a saturated agent connection |
 | `MAX_PENDING_READ` | 1 MiB | One connection's undecoded receive buffer, bounded by the daemon's own number rather than by whatever the peer set `SO_SNDBUF` to. Past it the socket is not read at all, and it is the *undecoded* count that is held there: `Conn::compact` reclaims a consumed prefix only once that prefix is half the buffer, so the allocation an administrator sizes a host by peaks just under 2 MiB — and `tx` the same way against `MAX_PENDING_WRITE`. Slowest of the four to fill, a stock host's send buffer being a fifth of it: the megabyte only accumulates across the passes in which the decode loop stopped short of what the pass before had read |
 
+`Conn::fill` takes at most one successful 64 KiB read per call. The stored-buffer ceiling is
+still 1 MiB for a decode loop held back by PTY input, but a peer sending only four-byte
+`Ping`s cannot make one pass read and decode a quarter-million of them before the PTY gets
+its turn. A readable socket wakes the next pass immediately, so the bound restores fairness
+without putting a timer on throughput.
+
 All four are chosen against each other and so live together in `daemon.rs`, which argues
 the arithmetic. `MAX_PENDING_WRITE` bites in three places: the output pump queues nothing
 at all above it, so the `Gap` opening a discontinuous replay is measured along with the
@@ -428,6 +434,7 @@ directory (§ 6.6) is the only fix, and only for variables that name a path.
 The `daemon` mode holds this itself instead of trusting whoever started it:
 
 ```
+close inherited fd >= 3, except the validated spawn lock
 chdir "/", open /dev/null   before publication, so either failing still reaches somebody
 ignore SIGHUP
 leads a session and holds no controlling terminal?  already detached; nothing to do
@@ -436,6 +443,14 @@ leads a session and holds no controlling terminal?  already detached; nothing to
 ...                      stop signals, <id>.pid, <id>.label, drop the lock
 0/1/2 → /dev/null
 ```
+
+The descriptor scrub is first, before the daemon owns any handles that could be mistaken for
+the launcher's. `close_range(2)` closes the two ranges around the inherited spawn-lock fd on
+Linux 5.9 and later; enumerating `/proc/self/fd` is the older-kernel fallback. A
+non-`CLOEXEC` file, mount, socket or capability from sshd, a shell redirection or an embedding
+application therefore reaches neither the week-long daemon nor the less-trusted login shell.
+The lock is the sole exception, checked against `<id>.lock` and restored to `CLOEXEC` before
+the shell is spawned (§6.3).
 
 The two releases are split across that sequence rather than taken together at the end,
 and the split is the point. What can *fail* — leaving the inherited directory, and opening
@@ -755,7 +770,7 @@ states do that:
 | --- | --- | --- |
 | The socket answers, identification yields nothing | the number, where it came from, what `/proc` said; no repair recommended | the repair that suggests itself — unlinking the files — takes a live session's socket away from the daemon holding the user's shell |
 | The socket could not be *probed* | the errno, the one part anybody can act on | § 6.3 makes that evidence of neither death nor life; only an accepted connection says a session is running |
-| Still answering half a second after `SIGKILL` — or with *neither* signal sent, `pidfd_open` having declined the process | which signals went out, or that none did and the errno that declined | the pid signalled is not the process serving the socket, or nothing established what is |
+| Still answering half a second after the `SIGKILL` attempt | exactly which of `SIGTERM` and `SIGKILL` went out, and the errno for each failed `pidfd_open`/`pidfd_send_signal` path | the pid signalled is not the process serving the socket, or nothing established what is |
 | The probe under the lock answers again | that a daemon bound the id since this call established it was gone | those files are that daemon's |
 | `<id>.lock` still held at the 2 s deadline | that another process is starting or removing the session | the postcondition was never established |
 
