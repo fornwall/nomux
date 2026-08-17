@@ -97,8 +97,6 @@ pub(crate) struct Agent {
     /// A name rather than a fence the daemon sends to flush the ended peer's frames out
     /// of the wire ahead of the next accept: `Ping` is client→daemon and `Pong`
     /// daemon→client, so the daemon has nothing it can send that forces a round trip.
-    ///
-    /// Monotonic for the life of the session, and a `u32` does not wrap inside one.
     next_generation: u32,
 }
 

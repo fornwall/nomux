@@ -258,12 +258,7 @@ fn report(result: std::io::Result<()>) -> ExitCode {
 fn report_relay(result: Result<(), attach::RunError>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
-        Err(attach::RunError::Usage(err)) => reported(
-            Err(err),
-            // `RunError::Usage` is constructed only from `InvalidInput`; keeping an
-            // explicit fallback makes that invariant harmless if its internals change.
-            ExitCode::from(EXIT_USAGE),
-        ),
+        Err(attach::RunError::Usage(err)) => reported(Err(err), ExitCode::from(EXIT_USAGE)),
         Err(attach::RunError::Classified(failure)) => {
             let class = failure.class();
             eprintln!("NOMUX-RELAY-ERROR 1 {}", class.token());

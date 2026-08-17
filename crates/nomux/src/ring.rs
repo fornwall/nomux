@@ -79,7 +79,9 @@ impl Ring {
             .saturating_sub(self.capacity);
         let from_buf = overflow.min(self.buf.len());
         self.base += overflow as u64;
-        self.buf.drain(..from_buf);
+        for _ in 0..from_buf {
+            self.buf.pop_front();
+        }
         self.buf
             .extend(data.get(overflow - from_buf..).unwrap_or_default());
     }

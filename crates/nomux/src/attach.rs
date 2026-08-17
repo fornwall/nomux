@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags};
 
-use crate::rundir::{SessionPaths, SpawnLock, check_run_dir, ensure_run_dir};
+use crate::rundir::{SessionPaths, check_run_dir, ensure_run_dir};
 use crate::usock::{Liveness, liveness};
 
 /// Legacy status for a runtime refusal that does not establish absence.
@@ -351,7 +351,10 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> Result<UnixStream, Failu
         Liveness::Unknown(err) => return Err(may_be_running(paths, &err)),
     }
 
-    let complaint = match spawn_daemon(paths.id(), label, &spawn_lock) {
+    let complaint = match daemon_command(paths.id(), label, spawn_lock.raw_fd())
+        .and_then(|mut command| command.spawn())
+        .map(|mut child| child.stderr.take())
+    {
         Ok(complaint) => complaint,
         // The one failure with nothing of anyone's behind it: no daemon was started, and
         // the probe above has just said nobody else is serving the id either, so the
@@ -737,27 +740,7 @@ impl Pump {
     }
 }
 
-/// Starts the session daemon as a direct child, while `spawn_lock` continues to serialise
-/// this session id.
-///
-/// Nothing here tries to leave the login session the relay was started in: `setsid(2)` and
-/// the daemon's own fork are the whole of the detachment, and host policy at logout is the
-/// host's to decide (`startup::detach_from_controlling_terminal`).
-///
-/// # Errors
-///
-/// Propagates command construction and process-spawn failures.
-fn spawn_daemon(
-    session_id: &str,
-    label: Option<&str>,
-    spawn_lock: &SpawnLock,
-) -> io::Result<Option<ChildStderr>> {
-    daemon_command(session_id, label, spawn_lock.raw_fd())?
-        .spawn()
-        .map(|mut child| child.stderr.take())
-}
-
-/// The daemon [`spawn_daemon`] starts, up to the `fork`.
+/// The daemon [`create`] starts, up to the `fork`.
 ///
 /// Execs the exact inode this relay is already running rather than whatever the install
 /// path names by the time the child gets there — between the two loads that path decides

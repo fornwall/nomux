@@ -28,8 +28,8 @@ baseline_file="$repo/scripts/size-baseline"
 nightly_file="$repo/scripts/nightly-version"
 update_baseline="${NOMUX_UPDATE_BASELINE:-0}"
 
-# Rebuilding std with immediate-abort needs nightly. A tracked date keeps release and fuzz builds
-# reproducible and advances them together.
+# Rebuilding std with immediate-abort and size-optimized algorithms needs nightly. A tracked date
+# keeps release and fuzz builds reproducible and advances them together.
 read -r nightly < "$nightly_file" || die "could not read a toolchain name from $nightly_file"
 case "$nightly" in
 nightly-[0-9][0-9][0-9][0-9]-[01][0-9]-[0-3][0-9]) ;;
@@ -197,7 +197,8 @@ for target in $targets; do
     esac
     CARGO_ENCODED_RUSTFLAGS="$target_rustflags" \
         cargo build --locked --release --target "$build_target" --bin nomux \
-        -Zbuild-std=std,panic_abort -Zjson-target-spec >&2
+        -Zbuild-std=std,panic_abort -Zbuild-std-features=optimize_for_size \
+        -Zjson-target-spec >&2
     cp "$target_root/$build_dir/release/nomux" "$dist/nomux-$target"
     check_leaks "$dist/nomux-$target"
     check_static "$dist/nomux-$target"

@@ -85,10 +85,10 @@ pub(crate) fn drain_to(queue: &mut VecDeque<u8>, fd: BorrowedFd<'_>) -> io::Resu
         return match written {
             Ok(0) => Err(io::ErrorKind::WriteZero.into()),
             Err(Errno::AGAIN) => Ok(()),
-            // Clamped like every returned count in this tree: `drain` past the end
-            // panics, and this binary is built `panic = "abort"`.
             Ok(n) => {
-                drop(queue.drain(..n.min(queue.len())));
+                for _ in 0..n.min(queue.len()) {
+                    queue.pop_front();
+                }
                 Ok(())
             }
             Err(Errno::INTR) => continue,

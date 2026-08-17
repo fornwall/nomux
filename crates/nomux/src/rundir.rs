@@ -361,12 +361,12 @@ pub(crate) fn session_ids(dir: &Path) -> io::Result<Vec<String>> {
     let mut ids = Vec::new();
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
-        if let Some(id) = session_id_of(&path) {
-            ids.push(id.to_owned());
+        if let Some(id) = session_id_of(&path)
+            && let Err(at) = ids.binary_search_by(|known: &String| known.as_str().cmp(id))
+        {
+            ids.insert(at, id.to_owned());
         }
     }
-    ids.sort_unstable();
-    ids.dedup();
     Ok(ids)
 }
 
@@ -1440,6 +1440,15 @@ mod tests {
         }
         assert!(is_valid_session_id(&"x".repeat(MAX_SESSION_ID_LEN)));
         assert!(!is_valid_session_id(&"x".repeat(MAX_SESSION_ID_LEN + 1)));
+    }
+
+    #[test]
+    fn session_ids_are_sorted_and_deduplicated() {
+        let root = Scratch::new("rundir-session-ids");
+        for name in ["z.pid", "a.sock", "z.label", "m.agent", "a.lock", "invalid"] {
+            fs::write(root.join(name), []).unwrap();
+        }
+        assert_eq!(session_ids(root.path()).unwrap(), ["a", "m", "z"]);
     }
 
     /// The bound held against the document rather than against itself: the client is a
