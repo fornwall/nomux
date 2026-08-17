@@ -155,8 +155,7 @@ impl Pty {
 
     /// Applies new dimensions, which delivers `SIGWINCH` to the foreground group.
     pub(crate) fn resize(&self, win: WinSize) -> io::Result<()> {
-        tcsetwinsize(&self.master, to_winsize(win))?;
-        Ok(())
+        tcsetwinsize(&self.master, to_winsize(win)).map_err(Into::into)
     }
 
     pub(crate) const fn needs_observation(&self) -> bool {

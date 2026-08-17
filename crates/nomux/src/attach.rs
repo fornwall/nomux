@@ -69,6 +69,9 @@ const PUBLISH_POLL_INTERVAL: Duration = Duration::from_millis(1);
 /// invariant — the whole of what a [`Pump`] can be holding.
 const RELAY_CHUNK: usize = 16 * 1024;
 
+/// Maximum final wait for inherited stdout to drain after the session closes.
+const STDOUT_FLUSH_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Whether this invocation may bring the session into being — the whole of the
 /// distinction between the two modes (`DESIGN.md` § 5.1).
 #[derive(Clone, Copy)]
@@ -109,28 +112,26 @@ pub(crate) enum FailureClass {
 }
 
 impl FailureClass {
+    const fn details(self) -> (&'static str, u8) {
+        match self {
+            Self::Collision => ("collision", EXIT_UNATTACHABLE),
+            Self::Retryable => ("retryable", EXIT_UNATTACHABLE),
+            Self::UnsafeHost => ("unsafe-host", EXIT_UNATTACHABLE),
+            Self::Uncertain => ("uncertain", EXIT_UNATTACHABLE),
+            Self::MissingSession => ("missing-session", EXIT_NO_SESSION),
+            Self::StartupFailure => ("startup-failure", EXIT_NO_SESSION),
+            Self::PostConnect => ("post-connect", 1),
+        }
+    }
+
     /// Token carried by the versioned stderr record.
     pub(crate) const fn token(self) -> &'static str {
-        match self {
-            Self::Collision => "collision",
-            Self::Retryable => "retryable",
-            Self::UnsafeHost => "unsafe-host",
-            Self::Uncertain => "uncertain",
-            Self::MissingSession => "missing-session",
-            Self::StartupFailure => "startup-failure",
-            Self::PostConnect => "post-connect",
-        }
+        self.details().0
     }
 
     /// Existing process status retained for clients that do not read the stderr record.
     pub(crate) const fn exit_code(self) -> u8 {
-        match self {
-            Self::Collision | Self::Retryable | Self::UnsafeHost | Self::Uncertain => {
-                EXIT_UNATTACHABLE
-            }
-            Self::MissingSession | Self::StartupFailure => EXIT_NO_SESSION,
-            Self::PostConnect => 1,
-        }
+        self.details().1
     }
 }
 
@@ -447,16 +448,12 @@ fn daemon_complaint(stderr: Option<ChildStderr>) -> Option<String> {
 
 /// Moves bytes between stdio and the socket until either side closes.
 fn relay(stream: &UnixStream) -> io::Result<()> {
-    // Everything below reads `EAGAIN` as "not now", and the speculative write towards the
-    // socket depends on it: a blocking socket would park the whole relay inside one write
-    // with the other direction unserved.
+    // A blocking socket could park one direction while leaving the other unserved.
     stream.set_nonblocking(true)?;
 
     let stdin = io::stdin();
-    // stdout is the one inherited descriptor this process cannot safely make
-    // non-blocking: its open-file description may be shared with the caller's shell.
-    // A bounded socketpair gives this loop a non-blocking destination while the one
-    // worker allowed to block owns the actual write (§ 7).
+    // stdout may share its open-file description with the caller's shell, so a worker
+    // owns its blocking writes behind a bounded, non-blocking socketpair (§ 7).
     let stdout = StdoutWorker::spawn()?;
     let stdin_fd = stdin.as_fd();
     let stdout_fd = stdout.fd();
@@ -464,14 +461,11 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
 
     let mut to_socket = Pump::default();
     let mut to_stdout = Pump::default();
-    // One buffer for both directions, which never transfer within the same call, and
-    // hoisted out of the loop: it is handed by reference to an opaque syscall wrapper,
-    // so a fresh one per read is a memset nothing can elide — 32 KiB per keystroke.
+    // Neither direction transfers during the other's call, so one buffer serves both.
     let mut chunk = [0u8; RELAY_CHUNK];
     let mut stdin_open = true;
     let mut socket_open = true;
-    // The only one of the three about a *destination*: the session's output having
-    // nowhere left to go ends the loop the way the two above do.
+    // Unlike the other two, this describes a destination.
     let mut stdout_open = true;
 
     while stdout_open && (socket_open || to_stdout.has_data()) {
@@ -501,16 +495,13 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
                 watched += 1;
             }
         }
-        // No deadline of our own: the relay lives exactly as long as the channel,
-        // and every wakeup it can act on is a readiness event.
+        // The live relay has no deadline; every wakeup it needs is a readiness event.
         match rustix::event::poll(fds.get_mut(..watched).unwrap_or(&mut []), None) {
             Ok(_) => {}
             Err(rustix::io::Errno::INTR) => continue,
             Err(err) => return Err(err.into()),
         }
-        // Read back by position, which is safe only because the three masks that
-        // decided whether each entry was taken are reused below rather than
-        // recomputed: a `Pump` that changed state during `poll` cannot shift it.
+        // Reuse the registration masks so state changes cannot shift these positions.
         let mut events = fds.iter().map(PollFd::revents);
         let mut revents = |registered: bool| {
             if registered {
@@ -560,10 +551,8 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
         }
     }
 
-    // Closing the channel hands the worker EOF behind every byte already queued. Wait
-    // only on this normal path: if the relay itself failed, returning must not wait on
-    // a worker that may be blocked forever in the stdout the relay is abandoning —
-    // the channel is dropped, and the process's own exit ends the detached thread.
+    // Closing the channel puts EOF behind queued bytes. Errors bypass this wait, and
+    // the process's exit ends a detached worker still blocked in abandoned stdout.
     stdout.finish()
 }
 
@@ -618,16 +607,22 @@ impl StdoutWorker {
         self.channel.as_fd()
     }
 
-    /// Closes the producer end after its queued bytes, then proves the worker delivered
-    /// them or reports why it could not.
+    /// Closes after queued bytes and waits briefly for proof they were delivered.
     fn finish(mut self) -> io::Result<()> {
-        // No more relay writes follow, so blocking here cannot stall the bidirectional
-        // pump. The worker sends its result back only after consuming this EOF and
-        // delivering everything before it.
+        // The deadline is across the whole status read; otherwise a live stdout that
+        // stops draining can keep an already-closed relay alive forever.
         self.channel.set_nonblocking(false)?;
+        self.channel.set_read_timeout(Some(STDOUT_FLUSH_TIMEOUT))?;
         drop(self.channel.shutdown(Shutdown::Write));
         let mut status = [0; size_of::<i32>()];
-        self.channel.read_exact(&mut status)?;
+        self.channel
+            .read_exact(&mut status)
+            .map_err(|err| match err.kind() {
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => {
+                    io::ErrorKind::TimedOut.into()
+                }
+                _ => err,
+            })?;
         match i32::from_ne_bytes(status) {
             0 => Ok(()),
             error if error > 0 => Err(io::Error::from_raw_os_error(error)),

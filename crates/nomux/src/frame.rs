@@ -109,18 +109,10 @@ pub struct Hello<'a> {
 
 impl Hello<'_> {
     /// Packs the boolean fields into the wire flags byte.
-    const fn flags(&self) -> u8 {
-        let mut flags = 0;
-        if self.agent_forward {
-            flags |= HELLO_AGENT_FORWARD;
-        }
-        if self.repaint_ctrl_l {
-            flags |= HELLO_REPAINT_CTRL_L;
-        }
-        if self.if_detached {
-            flags |= HELLO_IF_DETACHED;
-        }
-        flags
+    fn flags(&self) -> u8 {
+        (u8::from(self.agent_forward) * HELLO_AGENT_FORWARD)
+            | (u8::from(self.repaint_ctrl_l) * HELLO_REPAINT_CTRL_L)
+            | (u8::from(self.if_detached) * HELLO_IF_DETACHED)
     }
 }
 
@@ -153,12 +145,8 @@ impl HelloOk {
     }
 
     /// Packs the boolean fields into the wire flags byte.
-    const fn flags(&self) -> u8 {
-        let mut flags = 0;
-        if self.agent {
-            flags |= HELLOOK_AGENT;
-        }
-        flags
+    fn flags(&self) -> u8 {
+        u8::from(self.agent) * HELLOOK_AGENT
     }
 }
 

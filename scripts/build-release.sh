@@ -103,7 +103,8 @@ remap="$remap$us--remap-path-prefix=$repo=/nomux"
 # prevents is a binary with runtime dependencies on a host we know nothing about, discovered at a
 # user's shell rather than here.
 rustflags="-Clink-self-contained=yes$us-Ctarget-feature=+crt-static$us$remap"
-rustflags="$rustflags$us-Zunstable-options$us-Cpanic=immediate-abort"
+# Immediate-abort never unwinds; omit tables used only for external stack walking.
+rustflags="$rustflags$us-Zunstable-options$us-Cpanic=immediate-abort$us-Cforce-unwind-tables=no"
 
 rm -rf "$dist"
 mkdir -p "$dist"
