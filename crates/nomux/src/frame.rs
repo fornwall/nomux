@@ -4,7 +4,7 @@
 //! here allocates; `encode` copies each output byte once into the caller's buffer, which
 //! is what lets a queued `Frame::Output` outlive the ring slot it was read from.
 
-use crate::{FrameType, HEADER_LEN, ProtoError, encode_header, wire_enum};
+use crate::{FrameType, ProtoError, encode_header, wire_enum};
 
 /// Terminal dimensions, applied to the PTY master via `TIOCSWINSZ`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -272,53 +272,40 @@ impl<'a> Frame<'a> {
     ///
     /// [`ProtoError::PayloadTooLarge`] if the encoded payload exceeds
     /// [`crate::MAX_PAYLOAD`], or [`ProtoError::Malformed`] for a field too long for
-    /// its own length prefix. `out` is rewound to its original length in every case.
+    /// its own length prefix. `out` is unchanged on error.
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), ProtoError> {
         let payload_len = match *self {
-            Self::Input { data, .. } | Self::Output { data, .. } => {
-                8usize.saturating_add(data.len())
-            }
-            Self::Error { message, .. } => 2usize.saturating_add(message.len()),
-            Self::AgentData { data, .. } => 4usize.saturating_add(data.len()),
-            _ => 0,
-        };
-        if payload_len > crate::MAX_PAYLOAD as usize {
-            return Err(ProtoError::PayloadTooLarge(
-                u32::try_from(payload_len).unwrap_or(u32::MAX),
-            ));
-        }
-        // The rewind lives here, once: a caller appending frames back to back never
-        // ships half of one, whatever `encode_from` grows a new way to fail on.
-        let start = out.len();
-        self.encode_from(start, out)
-            .inspect_err(|_| out.truncate(start))
-    }
-
-    /// Appends the frame, `start` being `out`'s length on entry; free to leave a partial
-    /// frame behind on failure, [`Frame::encode`] rewinding to `start`.
-    fn encode_from(&self, start: usize, out: &mut Vec<u8>) -> Result<(), ProtoError> {
-        out.extend_from_slice(&[0; HEADER_LEN]);
-        self.encode_payload(out)?;
-
-        // Only a 4 GiB field saturates, and `encode_header` refuses it either way.
-        let payload_len = out.len() - start - HEADER_LEN;
-        let len = u32::try_from(payload_len).unwrap_or(u32::MAX);
-        let header = encode_header(self.frame_type(), len)?;
-        #[expect(
-            clippy::indexing_slicing,
-            reason = "`extend_from_slice` above reserved this slot; `encode_payload` only appends"
-        )]
-        out[start..start + HEADER_LEN].copy_from_slice(&header);
-        Ok(())
-    }
-
-    fn encode_payload(&self, out: &mut Vec<u8>) -> Result<(), ProtoError> {
-        match *self {
             Self::Hello(hello) => {
-                // Refused rather than truncated, per `IMPLEMENTATION.md` § 2.2.
                 let term_len = u16::try_from(hello.term.len())
                     .map_err(|_| ProtoError::Malformed("TERM exceeds 65535 bytes"))?;
                 checked_term(hello.term)?;
+                21 + usize::from(term_len)
+            }
+            Self::HelloOk(_) => 17,
+            Self::Input { data, .. } | Self::Output { data, .. } => {
+                8usize.saturating_add(data.len())
+            }
+            Self::InputAck { .. } | Self::Resize(_) | Self::Gap { .. } => 8,
+            Self::Exit { status, kind, .. } => {
+                checked_exit(status, kind)?;
+                9
+            }
+            Self::Detach | Self::Ping | Self::Pong => 0,
+            Self::Error { message, .. } => 2usize.saturating_add(message.len()),
+            Self::AgentOpen { .. } | Self::AgentClose { .. } => 4,
+            Self::AgentData { data, .. } => 4usize.saturating_add(data.len()),
+        };
+        let len = u32::try_from(payload_len).unwrap_or(u32::MAX);
+        let header = encode_header(self.frame_type(), len)?;
+        out.extend_from_slice(&header);
+        self.encode_payload(out);
+        Ok(())
+    }
+
+    fn encode_payload(&self, out: &mut Vec<u8>) {
+        match *self {
+            Self::Hello(hello) => {
+                let term_len = u16::try_from(hello.term.len()).unwrap_or_default();
 
                 out.extend_from_slice(&hello.protocol.to_be_bytes());
                 out.push(hello.flags());
@@ -348,7 +335,6 @@ impl<'a> Frame<'a> {
                 kind,
                 since_terminal_closed_secs,
             } => {
-                checked_exit(status, kind)?;
                 out.extend_from_slice(&status.to_be_bytes());
                 out.push(kind.as_wire());
                 out.extend_from_slice(&since_terminal_closed_secs.to_be_bytes());
@@ -366,7 +352,6 @@ impl<'a> Frame<'a> {
                 out.extend_from_slice(data);
             }
         }
-        Ok(())
     }
 
     /// Decodes a frame payload, borrowing byte and string fields from it.
@@ -553,7 +538,7 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{MAX_PAYLOAD, PROTOCOL_VERSION, decode_header};
+    use crate::{HEADER_LEN, MAX_PAYLOAD, PROTOCOL_VERSION, decode_header};
 
     fn round_trip(frame: Frame<'_>) {
         let mut buf = Vec::new();

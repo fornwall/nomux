@@ -56,7 +56,9 @@ const fn is_deceptive(ch: char) -> bool {
 pub(crate) fn sanitize_label(label: &str) -> String {
     let out = sanitize_text(label);
     let out = out.trim();
-    out[..out.floor_char_boundary(MAX_LABEL_LEN)].to_owned()
+    out[..out.floor_char_boundary(MAX_LABEL_LEN)]
+        .trim_end()
+        .to_owned()
 }
 
 /// Assembles the bounded line [`send`] writes, filtered over the whole of it rather than
@@ -112,6 +114,8 @@ mod tests {
         assert_eq!(sanitize_label("two\nlines"), "twolines");
         assert_eq!(sanitize_label("\u{1b}]0;pwned\u{7}"), "]0;pwned");
         assert_eq!(sanitize_label("\t\n"), "");
+        let truncated = "x".repeat(MAX_LABEL_LEN - 1) + " more";
+        assert_eq!(sanitize_label(&truncated), "x".repeat(MAX_LABEL_LEN - 1));
     }
 
     #[test]

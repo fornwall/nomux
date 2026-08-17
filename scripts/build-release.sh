@@ -77,11 +77,10 @@ us=$(printf '\037')
 # even though cargo already passes workspace paths relative, so a future path-dependent dependency
 # cannot quietly reintroduce the problem.
 sysroot=$(rustc --print sysroot)
-# Beside the toolchain's own `rust-lld`, so it is the same LLVM that linked and it reads every
-# target the cross builds emit: one of the two is cross-compiled, and a host binutils that cannot
-# read aarch64 is the ordinary case. `llvm-readobj` rather than `llvm-readelf`: llvm-tools ships
-# only the former, and it is the same program under another name.
-readobj="$(rustc --print target-libdir)/../bin/llvm-readobj"
+# Use the pinned toolchain's LLVM tools so the host does not need cross-binutils.
+llvm_bin="$(rustc --print target-libdir)/../bin"
+readobj="$llvm_bin/llvm-readobj"
+stripper="$llvm_bin/llvm-strip"
 # Resolved rather than taken as spelled: cargo accepts a *relative* $CARGO_TARGET_DIR and reads it
 # against this script's cwd, and both uses below need an absolute path — rustc matches a remap
 # prefix component-wise, and check_leaks greps the artifact for this literal. `pwd -P` also settles
@@ -102,7 +101,8 @@ remap="$remap$us--remap-path-prefix=$repo=/nomux"
 # this is belt and braces — but not every target this script has built did, and the failure it
 # prevents is a binary with runtime dependencies on a host we know nothing about, discovered at a
 # user's shell rather than here.
-rustflags="-Clink-self-contained=yes$us-Ctarget-feature=+crt-static$us$remap"
+# Rust does not guarantee distinct addresses for distinct functions; fold identical code.
+rustflags="-Clink-self-contained=yes$us-Ctarget-feature=+crt-static$us-Clink-arg=--icf=all$us$remap"
 # Immediate-abort never unwinds; omit tables used only for external stack walking.
 rustflags="$rustflags$us-Zunstable-options$us-Cpanic=immediate-abort$us-Cforce-unwind-tables=no"
 
@@ -237,6 +237,8 @@ for target in $targets; do
         -Zbuild-std=std,panic_abort -Zbuild-std-features=optimize_for_size \
         -Zjson-target-spec >&2
     cp "$target_root/$build_dir/release/nomux" "$dist/nomux-$target"
+    # Compiler provenance has no runtime purpose and costs bytes in every upload.
+    "$stripper" --remove-section=.comment "$dist/nomux-$target"
     check_leaks "$dist/nomux-$target"
     check_elf "$dist/nomux-$target"
 done
