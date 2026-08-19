@@ -264,10 +264,11 @@ fn as_pid(id: u32) -> i32 {
 
 /// Signals every live process still in session `sid`, individually: `kill(2)` has no
 /// session form, and the point is precisely the groups job control created that nobody
-/// is tracking. Each member is pinned before the `stat` read that establishes membership
-/// and signalled through that pidfd, or the reuse window a numeric `kill(2)` has reopens.
+/// is tracking. Each member is signalled through a pidfd that was confirmed to hold that
+/// member ([`pinned_member`]), never through the number, or the reuse window a numeric
+/// `kill(2)` has reopens.
 fn signal_session(sid: i32, signal: Signal, deadline: std::time::Instant) {
-    let _ = walk_session(sid, true, Some(deadline), |_, pinned| {
+    let _ = walk_session(Path::new(PROC), sid, true, Some(deadline), |_, pinned| {
         // A missing pidfd is ambiguity, not licence to fall back to the number:
         // signalling nothing is safer than reaching a process that inherited it. The
         // child's own process-group reach remains.
@@ -311,21 +312,51 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Walks `/proc` for the live processes in session `sid`, offering each to `visit` until
-/// it answers `false`.
+/// The process directory the walk below reads outside its own tests, which hand it one
+/// whose entries they can make fail.
+const PROC: &str = "/proc";
+
+/// What one `/proc/<pid>/stat` read said about a process's membership of a session.
+///
+/// The three are kept apart the way § 6.6 keeps `/proc`'s three answers apart for `kill`,
+/// and for the same reason: a `/proc` that lists a process and then refuses its line —
+/// `hidepid=1`, `ProtectProc=noaccess`, or a daemon that has simply run out of
+/// descriptors — must not have the members it withholds counted as members that are not
+/// there.
+enum Membership {
+    /// Live, and in the session asked about.
+    In,
+    /// Answered for and not that: another session, a zombie, or a process that had
+    /// already exited when its line was read.
+    Out,
+    /// No answer at all. Carried by the walk as incompleteness rather than as absence.
+    Unseen,
+}
+
+/// Walks `root` — `/proc`, outside the tests below — for the live processes in session
+/// `sid`, offering each to `visit` until it answers `false`.
 ///
 /// Deliberately narrow: `sid` is always a child this process forked, this process is
 /// excluded by pid whatever `/proc` says, and zombies are left out — signalling one does
 /// nothing, and counting it would spin the caller's grace loop over the child it is
-/// about to reap. With `pin` set, a pidfd is opened **before** the stat line that
-/// establishes membership, keeping check and signal about one process; a member that
+/// about to reap.
+///
+/// With `pin` set, the members and only the members are pinned, and their membership is
+/// re-read behind the pidfd before they are offered to `visit` — [`pinned_member`] has why
+/// that is as decisive as opening the descriptor first. It costs a second `stat` per
+/// member, where pinning ahead of the question cost a pidfd for every process on the host:
+/// a walk over a large process table has to finish inside [`HANGUP_GRACE`], and one that
+/// runs out of it leaves the members it had not reached yet unsignalled. A member that
 /// cannot be pinned is still visible to the emptiness check but never safe to signal.
 /// One path and one read buffer for the whole walk: [`Pty::terminate`]'s grace loop
 /// reaches here every [`HANGUP_POLL_INTERVAL`] inside [`HANGUP_GRACE`].
 ///
-/// Returns whether `/proc` was fully enumerated before `deadline`. A stopped visit is
-/// successful: the caller already learned what it asked.
+/// Returns whether the walk saw everything it looked at: `false` if `root` could not be
+/// enumerated, if `deadline` passed, or if a process in it kept its `stat` from being read
+/// ([`Membership::Unseen`]). A stopped visit is successful: the caller already learned
+/// what it asked.
 fn walk_session(
+    root: &Path,
     sid: i32,
     pin: bool,
     deadline: Option<std::time::Instant>,
@@ -334,12 +365,13 @@ fn walk_session(
     if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
         return false;
     }
-    let Ok(entries) = std::fs::read_dir("/proc") else {
+    let Ok(entries) = std::fs::read_dir(root) else {
         return false;
     };
     let self_pid = as_pid(std::process::id());
-    let mut path = PathBuf::from("/proc");
+    let mut path = root.to_path_buf();
     let mut stat = Vec::with_capacity(1024);
+    let mut complete = true;
     for entry in entries {
         if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
             return false;
@@ -354,41 +386,93 @@ fn walk_session(
         if pid == self_pid {
             continue;
         }
-        // Before the membership read below: opening it afterwards leaves the exact reuse
-        // window this descriptor exists to close. Failure is carried as `None`; only the
-        // signalling caller requires a hold, while `session_is_empty` still needs to see
-        // members on kernels without pidfds.
-        let pinned = pin
-            .then(|| Pid::from_raw(pid).and_then(|pid| pidfd_open(pid, PidfdFlags::empty()).ok()))
-            .flatten();
-        path.push(&name);
-        path.push("stat");
-        stat.clear();
-        let read = File::open(&path).and_then(|mut file| file.read_to_end(&mut stat));
-        path.pop();
-        path.pop();
-        if read.is_err() {
-            continue;
+        match membership(sid, &mut path, &name, &mut stat) {
+            Membership::In => {}
+            Membership::Out => continue,
+            // The same rule the two refusals above follow, one process down: what the walk
+            // could not look at is not something it may report the absence of.
+            Membership::Unseen => {
+                complete = false;
+                continue;
+            }
         }
-        if stat_session(&stat).is_some_and(|(session, zombie)| session == sid && !zombie)
-            && !visit(pid, pinned.as_ref())
-        {
+        // Failure is carried as `None`; only the signalling caller requires a hold, while
+        // `session_is_empty` still needs to see members on kernels without pidfds.
+        let pinned = pin
+            .then(|| pinned_member(sid, pid, &mut path, &name, &mut stat))
+            .flatten();
+        if !visit(pid, pinned.as_ref()) {
             return true;
         }
     }
-    true
+    complete
+}
+
+/// What `<path>/<name>/stat` says about that process's membership of session `sid`, with
+/// the path buffer and the read buffer borrowed from the walk and left as they were found.
+fn membership(sid: i32, path: &mut PathBuf, name: &OsStr, stat: &mut Vec<u8>) -> Membership {
+    path.push(name);
+    path.push("stat");
+    stat.clear();
+    let read = File::open(&*path).and_then(|mut file| file.read_to_end(stat));
+    path.pop();
+    path.pop();
+    match read {
+        Ok(_) => stat_session(stat).map_or(Membership::Unseen, |(session, zombie)| {
+            if session == sid && !zombie {
+                Membership::In
+            } else {
+                Membership::Out
+            }
+        }),
+        // A process that ended between the directory listing and this read is not a gap in
+        // the evidence: it is gone, which is an answer. `ESRCH` says the same thing through
+        // a `/proc` directory that outlived the task it named, and taken as anything else
+        // it would leave every walk overlapping an unrelated exit — on a busy host, most of
+        // them — reporting a session it could not settle.
+        Err(err)
+            if err.kind() == io::ErrorKind::NotFound || err.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            Membership::Out
+        }
+        Err(_) => Membership::Unseen,
+    }
+}
+
+/// A descriptor onto `pid` that has been shown to still hold a live member of session
+/// `sid`, or `None`.
+///
+/// The pidfd is what makes the second read decisive, and why asking first and pinning
+/// after closes the same window as pinning first: while the descriptor is held the kernel
+/// cannot give the number to a new process, so from that moment `<path>/<pid>` is either
+/// the pinned process or nothing at all. A pid recycled in the window before the pin
+/// therefore answers as whatever it now is and is refused, and one that still answers
+/// `sid` is a member of the very session being torn down — the session id itself cannot
+/// have been recycled underneath, since [`Pty::terminate`] holds the leader's zombie
+/// unreaped for exactly as long as it signals through that id.
+fn pinned_member(
+    sid: i32,
+    pid: i32,
+    path: &mut PathBuf,
+    name: &OsStr,
+    stat: &mut Vec<u8>,
+) -> Option<OwnedFd> {
+    let pidfd = Pid::from_raw(pid).and_then(|pid| pidfd_open(pid, PidfdFlags::empty()).ok())?;
+    matches!(membership(sid, path, name, stat), Membership::In).then_some(pidfd)
 }
 
 /// Whether nothing live is left in session `sid`.
 ///
 /// The walk stops at the first member rather than reading every remaining
 /// `/proc/<pid>/stat` to answer a question that one has already answered:
-/// [`Pty::terminate`]'s grace loop asks this every [`HANGUP_POLL_INTERVAL`]. A `/proc`
-/// enumeration failure answers false, the safe direction: it must not suppress the
-/// group reach and final child kill on evidence it never obtained.
+/// [`Pty::terminate`]'s grace loop asks this every [`HANGUP_POLL_INTERVAL`]. An
+/// incomplete walk answers false, the safe direction: it must not suppress the group reach
+/// and final child kill on evidence it never obtained — and one `stat` it was refused is
+/// that same failure at one process, which is precisely the shape a member hidden from the
+/// daemon takes.
 fn session_is_empty(sid: i32, deadline: Option<std::time::Instant>) -> bool {
     let mut empty = true;
-    let scanned = walk_session(sid, false, deadline, |_, _| {
+    let scanned = walk_session(Path::new(PROC), sid, false, deadline, |_, _| {
         empty = false;
         false
     });
@@ -532,12 +616,67 @@ mod tests {
     fn an_expired_session_walk_is_incomplete_not_empty() {
         let deadline = std::time::Instant::now();
         let mut visited = false;
-        assert!(!walk_session(0, false, Some(deadline), |_, _| {
+        let proc = Path::new(PROC);
+        assert!(!walk_session(proc, 0, false, Some(deadline), |_, _| {
             visited = true;
             true
         }));
         assert!(!visited);
         assert!(!session_is_empty(0, Some(deadline)));
+    }
+
+    /// A `stat` the walk was refused leaves the session unsettled, exactly as a `/proc` it
+    /// could not enumerate does: this answer is the only thing that can tell
+    /// [`Pty::terminate`] there is nothing left to `SIGHUP`, and the one process still
+    /// holding the session — something the user left running under `sudo`, on a `/proc`
+    /// mounted `hidepid=1` — is exactly the one whose line the daemon may not read. Taken
+    /// as absence it skips both escalations and leaves that process behind.
+    ///
+    /// The unreadable `stat` is a directory rather than a file at mode `0`, which a suite
+    /// running as root would read anyway. The readable ones around it are the other half:
+    /// a walk that answered `false` for everything would pass this on an instrument that
+    /// measures nothing.
+    #[test]
+    fn a_stat_the_walk_cannot_read_leaves_the_session_unsettled() {
+        const SID: i32 = 4242;
+        let root = crate::scratch::Scratch::new("pty-hidden-member");
+        let plant = |pid: i32, session: i32| {
+            let line = format!("{pid} (sh) S 1 {pid} {session} 34816 99 4194304 0 0");
+            std::fs::write(root.dir(&pid.to_string()).join("stat"), line)
+                .expect("plant a stat line");
+        };
+        let scan = |sid| {
+            let mut members = Vec::new();
+            let complete = walk_session(root.path(), sid, false, None, |pid, _| {
+                members.push(pid);
+                true
+            });
+            (complete, members)
+        };
+
+        plant(101, SID);
+        plant(102, 999);
+        // A process that left between the listing and the read: its directory is there and
+        // its `stat` is not, which the walk has to tell from a `stat` it was refused.
+        root.dir("103");
+        assert_eq!(
+            scan(SID),
+            (true, vec![101]),
+            "a walk that read every line it found is complete, and found the one member"
+        );
+
+        root.dir("104/stat");
+        assert_eq!(
+            scan(SID),
+            (false, vec![101]),
+            "a `stat` the walk could not read is a member it could not rule out"
+        );
+        assert_eq!(
+            scan(7),
+            (false, Vec::new()),
+            "and a session whose every visible process belongs to somebody else is still \
+             not one this may report as empty"
+        );
     }
 
     /// The case the process-group kill cannot reach, and the reason for the `/proc`
@@ -686,7 +825,7 @@ mod tests {
     /// at the first member.
     fn session_members(sid: i32) -> Vec<i32> {
         let mut members = Vec::new();
-        walk_session(sid, false, None, |pid, _| {
+        walk_session(Path::new(PROC), sid, false, None, |pid, _| {
             members.push(pid);
             true
         });

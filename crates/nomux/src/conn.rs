@@ -47,7 +47,9 @@ fn compact(buf: &mut Vec<u8>, pos: &mut usize, floor: usize) {
 }
 
 /// Longest to spend delivering a connection's last frames before abandoning them.
-const FINAL_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+/// Reachable from `daemon.rs` because the departures that must *not* spend it are
+/// tested against it there.
+pub(crate) const FINAL_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// A client connection carrying partially read and partially written frames.
 pub(crate) struct Conn {
@@ -127,15 +129,21 @@ impl Conn {
         self.rx.len() - self.rx_pos
     }
 
-    /// Queues a frame, dropping one that cannot be encoded — unreachable, every caller
-    /// here chunking to at most [`MAX_PAYLOAD`] or queueing a control frame whose size
-    /// it fixed itself.
-    pub(crate) fn send(&mut self, frame: &Frame<'_>) {
+    /// Queues a frame, answering whether it was encoded — false for one too large for
+    /// the protocol, which drops it and leaves the queue as it was. Unreachable, every
+    /// caller here chunking to at most [`MAX_PAYLOAD`] or queueing a control frame whose
+    /// size it fixed itself.
+    ///
+    /// The answer is only news to a caller that advances a stream position on it, which
+    /// is why [`Conn::send_output`] reads it and the control-frame callers do not: a
+    /// frame that vanished from under an advancing offset leaves the client contiguous
+    /// offsets with a hole inside them, § 3's one loss no client can detect.
+    pub(crate) fn send(&mut self, frame: &Frame<'_>) -> bool {
         if !self.preamble_queued {
             self.tx.extend_from_slice(SERVER_PREAMBLE);
             self.preamble_queued = true;
         }
-        let _ = frame.encode(&mut self.tx);
+        frame.encode(&mut self.tx).is_ok()
     }
 
     /// Queues raw output bytes as one or more `Output` frames, splitting at
@@ -153,7 +161,13 @@ impl Conn {
             if self.queued() >= MAX_PENDING_WRITE {
                 break;
             }
-            self.send(&Frame::Output { offset, data: part });
+            // The chunking above is what makes this unreachable. Were it ever to move,
+            // advancing here would carry `pump_output`'s `sent_through` past bytes no
+            // frame carried — and a client cannot tell that from output it has already
+            // been given, there being no `Gap` in it and nothing left to resend from.
+            if !self.send(&Frame::Output { offset, data: part }) {
+                break;
+            }
             offset += part.len() as u64;
         }
         offset
@@ -175,14 +189,21 @@ impl Conn {
     /// [`MAX_PENDING_READ`] still undecoded.
     ///
     /// `chunk` is the caller's, and is only ever written to: a buffer of its own would be
-    /// zeroed on every call, and the daemon already carries one. It must be non-empty —
-    /// `read` into a zero-length slice answers `Ok(0)`, which is taken for the peer's end
-    /// of file. Both callers hand over the daemon's whole 64 KiB read buffer.
+    /// zeroed on every call, and the daemon already carries one. An empty one reads
+    /// nothing rather than ending the connection; both callers hand over the daemon's
+    /// whole 64 KiB read buffer.
     ///
     /// # Errors
     ///
     /// Propagates read failures other than `EWOULDBLOCK` and `EINTR`.
     pub(crate) fn fill(&mut self, chunk: &mut [u8]) -> io::Result<()> {
+        if chunk.is_empty() {
+            // `read` into a zero-length slice answers `Ok(0)`, which below is the peer
+            // having closed — a session declared over with its child still alive, and
+            // nothing that reports it afterwards. Guarded here for the same reason
+            // `nbio::read_or_eof` guards it rather than requiring it of its callers.
+            return Ok(());
+        }
         if self.buffered() >= MAX_PENDING_READ {
             return Ok(());
         }
@@ -364,6 +385,48 @@ mod tests {
 
         conn.fill(&mut chunk).expect("take the next fair share");
         assert_eq!(conn.buffered(), 2 * chunk.len());
+    }
+
+    /// An empty read buffer must not end the connection: `read` answers `Ok(0)` for one,
+    /// which is the peer's close everywhere else in `fill`. The same hazard, and the same
+    /// guard, as `nbio::read_or_eof`'s.
+    #[test]
+    fn an_empty_chunk_is_not_reported_as_end_of_file() {
+        let (mut peer, mut conn) = pair();
+        peer.write_all(b"still here").expect("write to the socket");
+
+        conn.fill(&mut []).expect("a fill with nowhere to put it");
+        assert!(!conn.is_eof(), "the peer has not closed");
+        assert_eq!(conn.buffered(), 0, "an empty chunk can take nothing");
+    }
+
+    /// A frame too large to encode is dropped, and `send` has to say so: `send_output`
+    /// advances its offset on that answer, and an offset past bytes no frame carried is
+    /// a hole the client reads as contiguous output.
+    #[test]
+    fn a_frame_too_large_to_encode_is_reported_as_unsent() {
+        let (_peer, mut conn) = pair();
+        let payload = bulk(MAX_OUTPUT_DATA + 1);
+
+        assert!(
+            !conn.send(&Frame::Output {
+                offset: 0,
+                data: &payload,
+            }),
+            "a payload past the protocol maximum cannot be queued"
+        );
+        assert_eq!(
+            conn.queued(),
+            SERVER_PREAMBLE.len(),
+            "a frame that could not be encoded must leave the queue alone"
+        );
+        assert!(
+            conn.send(&Frame::Output {
+                offset: 0,
+                data: payload.get(..MAX_OUTPUT_DATA).unwrap_or_default(),
+            }),
+            "one byte less is the largest frame the protocol allows"
+        );
     }
 
     /// A payload whose every byte is a function of its position, so a compaction that

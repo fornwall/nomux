@@ -6,10 +6,8 @@
 //! The socket probe all of this is written against is [`crate::usock::liveness`], where the
 //! daemon's bind and the attach paths reach it without reading a line of a file § 6.6 froze.
 
-use std::ffi::OsString;
 use std::io::{self, Write};
 use std::os::fd::OwnedFd;
-use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -42,6 +40,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const PATH_MAX: usize = 4096;
 
 /// Bounded `/proc/<pid>/cmdline` prefix, long enough for complete `argv[0] daemon <id>`.
+///
+/// Nothing past the id is budgeted because the rule needs nothing past it:
+/// [`names_daemon_for`] takes the *first* argument left, and a daemon is started with its id
+/// ahead of the options it carries (`attach::daemon_command`).
 const MAX_CMDLINE_LEN: usize = PATH_MAX + 1 + "daemon".len() + 1 + MAX_SESSION_ID_LEN + 1;
 
 /// Prints one line per live session and collects the dead ones, as § 6.6's `list output` has
@@ -276,7 +278,7 @@ fn is_daemon_for(pid: Pid, id: &str) -> Option<bool> {
         .rposition(|byte| *byte == 0)
         .and_then(|end| body.get(..end))
         .unwrap_or(&[]);
-    if names_daemon_prefix(whole, id, body.len() == MAX_CMDLINE_LEN) {
+    if names_daemon_for(whole, id) {
         return Some(true);
     }
     // A full buffer is still a definitive "no" wherever `argv[1]` arrived whole — exactly
@@ -286,36 +288,32 @@ fn is_daemon_for(pid: Pid, id: &str) -> Option<bool> {
 
 /// Whether a NUL-separated command line is `<exe> daemon <id>`, however it was spelled.
 ///
-/// Parsed the way [`main::parse_session_args`](crate::main) parses it rather than searched,
-/// which is § 6.6's rule and its reason.
-/// If the read filled its buffer, a final bare option may have its value in the discarded
-/// tail; a valid placeholder preserves that one deliberately inconclusive case.
-fn names_daemon_prefix(whole: &[u8], id: &str, truncated: bool) -> bool {
+/// § 6.6's four steps over the argv rather than a search for the two words: caller-supplied
+/// text sits in this same argv, so searching would let a stranger's `--label "daemon sess"`
+/// name a session. An option's value is stepped over for that reason, `--lock-fd`'s as well
+/// as `--label`'s, and the id is the *first* argument left rather than any of them.
+///
+/// Every other `-` argument is stepped over rather than refused, which is what makes this
+/// rule readable across versions: the command line comes from a daemon of any version, and
+/// one carrying a private option this build never heard of — v0.4.0's `--systemd-scope=…` —
+/// is still that daemon's. Refusing what this build cannot parse would answer a live
+/// session's `kill` with a positive "that pid is not its daemon", which § 6.6 spends five
+/// run files on not saying.
+fn names_daemon_for(whole: &[u8], id: &str) -> bool {
     let mut args = whole.split(|byte| *byte == 0);
     args.next();
     if args.next() != Some(b"daemon".as_slice()) {
         return false;
     }
-    let missing = if truncated {
-        match args.clone().next_back() {
-            Some(b"--label") => Some(OsString::new()),
-            Some(b"--lock-fd") => Some(OsString::from("3")),
-            _ => None,
+    let mut session = None;
+    while let Some(arg) = args.next() {
+        if arg == b"--label" || arg == b"--lock-fd" {
+            args.next();
+        } else if !arg.starts_with(b"-") {
+            session.get_or_insert(arg);
         }
-    } else {
-        None
-    };
-    crate::parse_session_args(
-        args.map(|arg| OsString::from_vec(arg.to_vec()))
-            .chain(missing),
-        true,
-    )
-    .is_ok_and(|parsed| parsed.session.as_deref() == Some(id))
-}
-
-#[cfg(test)]
-fn names_daemon_for(whole: &[u8], id: &str) -> bool {
-    names_daemon_prefix(whole, id, false)
+    }
+    session == Some(id.as_bytes())
 }
 
 /// The shape every refusal here takes: something in the run directory said what this
@@ -722,28 +720,80 @@ mod tests {
         assert!(!names_daemon_for(&[], "one"));
     }
 
-    /// Identification must reject every daemon-like command line the actual daemon
-    /// parser rejects, or `kill` can signal a process that only shares its argv prefix.
+    /// A command line that names no id at all names no session, however daemon-shaped it
+    /// is: an argv whose only id-looking word is some option's value has not named one,
+    /// and `kill` may not signal a process on the strength of the prefix it shares.
     #[test]
-    fn malformed_daemon_command_lines_do_not_name_a_session() {
+    fn a_command_line_that_names_no_id_names_no_session() {
         for argv in [
-            vec!["nomux", "daemon", "one", "extra"],
-            vec!["nomux", "daemon", "--unknown", "one"],
             vec!["nomux", "daemon", "--label"],
-            vec!["nomux", "daemon", "--label=a", "--label=b", "one"],
-            vec!["nomux", "daemon", "--lock-fd=2", "one"],
-            vec!["nomux", "daemon", "--lock-fd=nope", "one"],
-            vec!["nomux", "daemon", "--lock-fd=7", "--lock-fd=8", "one"],
+            vec!["nomux", "daemon", "--label", "one"],
+            vec!["nomux", "daemon", "--label=one"],
+            vec!["nomux", "daemon", "--lock-fd", "one"],
+            vec!["nomux", "daemon", "--lock-fd=one"],
         ] {
             assert!(
                 !names_daemon_for(&cmdline(&argv), "one"),
-                "accepted malformed daemon argv: {argv:?}"
+                "an option's value was taken for the id nothing here named: {argv:?}"
+            );
+        }
+    }
+
+    /// Regression: an option this build does not know belongs to the daemon carrying it,
+    /// and never to nobody. A v0.4.0 daemon spells `--systemd-scope=<hex>` in its argv and
+    /// a session idles for a week (§ 6.5), so a binary upgraded over a running daemon is
+    /// ordinary rather than exotic — and answering a positive *is not* there strands it,
+    /// § 6.6's table having `kill` refuse and leave all five files while `list` prints `?`.
+    ///
+    /// The unknown option's own value is the reason the id is taken as the *first*
+    /// argument left: a value spelled apart from its option is a bare word this rule
+    /// cannot tell from an id, and every daemon is started with its id before its options.
+    #[test]
+    fn an_option_this_build_does_not_know_still_names_its_session() {
+        for argv in [
+            vec!["nomux", "daemon", "one", "--systemd-scope=6162"],
+            vec!["nomux", "daemon", "one", "--systemd-scope", "6162"],
+            vec!["nomux", "daemon", "--systemd-scope=6162", "one"],
+        ] {
+            assert!(
+                names_daemon_for(&cmdline(&argv), "one"),
+                "a private option of another version left this daemon's session unnamed: {argv:?}"
+            );
+            assert!(
+                !names_daemon_for(&cmdline(&argv), "6162"),
+                "an unknown option's value stood in for the id: {argv:?}"
             );
         }
 
-        assert!(
-            !names_daemon_for(b"nomux\0daemon\0one\0--label\0\xff", "one"),
-            "accepted an argv value the command-line parser cannot decode"
-        );
+        // v0.4.0's argv in full, which is what a binary upgraded over that daemon finds
+        // in `/proc`: the option it never heard of sits between two it does.
+        assert!(names_daemon_for(
+            &cmdline(&[
+                "nomux",
+                "daemon",
+                "one",
+                "--lock-fd",
+                "7",
+                "--systemd-scope=6162",
+                "--label",
+                "two",
+            ]),
+            "one"
+        ));
+
+        // The other direction, and why an unreadable option may not be given up on: a
+        // daemon that positively names a *different* id stays a definitive "no", which is
+        // what keeps a recycled pid from being signalled (§ 6.6).
+        assert!(!names_daemon_for(
+            &cmdline(&["nomux", "daemon", "two", "--systemd-scope=6162"]),
+            "one"
+        ));
+
+        // Argv is bytes, and only this build's parser needs UTF-8 of it. A label no
+        // parser here can decode is still a label, and the session is still `one`'s.
+        assert!(names_daemon_for(
+            b"nomux\0daemon\0one\0--label\0\xff",
+            "one"
+        ));
     }
 }

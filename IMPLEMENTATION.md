@@ -231,8 +231,12 @@ back by it, so `list` and §6.3's spawn race are unaffected; `nomux kill` is a s
 
 **A detaching client's send queue is dropped, not flushed**: everything in it is
 per-connection state a reattach recomputes from the ring (§4.2, §6.5). Only departures
-with nothing behind them block on a final flush — §6.5's shutdown, and every close that
-carries a final `Error`, §6.4's eviction among them.
+with nothing behind them block on a final flush — §6.5's shutdown, §6.4's eviction, and
+a connection refused while still pending. **Refusing an established client does not**: its
+`Error` is queued, pushed as far as one non-blocking write carries it, and the connection
+dropped. A client with a megabyte it has not read is exactly the one that would spend the
+whole budget, and the daemon would spend it not reading the terminal — the frame says why
+the connection ended and is worth no more than that.
 
 ### 4.2 Attach with `from < base()`
 
@@ -697,14 +701,26 @@ the attached client for at most 500 ms — against the whole call, not per `writ
 **Every signal goes out twice — to the child's process group, then to every live process a
 `/proc` walk finds in the child's session, in that order.** Neither alone covers it:
 `kill(2)` addresses a group and never a session, and the groups job control created are
-exactly what nothing is tracking. An exited child stays waitable until shutdown, so its zombie
-reserves the numeric pid, group and session. Every other session
-member is held by a pidfd opened before its `stat` line is read,
-and the signal goes through that descriptor rather than through the number. A member that
+exactly what nothing is tracking. An exited child stays waitable until shutdown, so its
+zombie reserves the numeric pid, group and session. Every other session member has its
+`stat` line read first, and is pinned by a pidfd only once that line names the session —
+its membership then read a second time behind the pin, and the signal sent through that
+descriptor rather than through the number. The second read is what the pin buys: a pidfd
+freezes the number, so from the moment it opens `/proc/<pid>` is the pinned process or
+nothing at all, and a pid recycled in the window answers as whatever it now is and is
+refused. Pinning before the read is equally safe and was what this did, but it costs a
+pidfd for *every* process on the host rather than one extra `stat` per member, and staying
+off that is what keeps a large process table inside the two grace periods. A member that
 cannot be pinned — on a pre-5.3 kernel, under a restrictive seccomp profile, or because it
 exited during the walk — is skipped rather than signalled ambiguously; the direct child's
-process-group reach still runs. This makes an individual signal conservative on older kernels
-instead of letting the `/proc`-to-`kill(2)` race reach an unrelated process.
+process-group reach still runs. This makes an individual signal conservative on older
+kernels instead of letting the `/proc`-to-`kill(2)` race reach an unrelated process.
+
+**What the walk could not see, it does not call empty.** A `/proc` it cannot enumerate, an
+entry it cannot read, or a `stat` it is refused — `hidepid=1`, descriptor exhaustion, an
+unparseable line — answers *not settled* rather than *empty*, because the alternative is
+skipping the escalation on evidence never obtained. Only a process the walk watched end,
+`ENOENT` or `ESRCH` on its `stat`, is read as gone.
 
 `SIGQUIT` is left at its default: a core dump is the only way to get a snapshot out of a
 wedged daemon (§ 8), and `SIGKILL` already means "go away now". The child has it restored
@@ -797,9 +813,20 @@ The `/proc` column is one question — **is that process a `nomux daemon <id>`?*
 `/proc/<pid>/cmdline` and *parsed* rather than searched: caller-supplied text sits in that
 same argv, so searching for both words would accept `--label "daemon sess"` from a stranger.
 The rule, `control::names_daemon_for`, is four steps over the NUL-separated argv: skip
-`argv[0]`; require `argv[1]` to be exactly `daemon`; skip `--label` **and the argument after
-it**, anything spelled `--label=…`, and anything else beginning with `-`; the first argument
-left is the id, which must equal `<id>`. The relay modes fail at step two.
+`argv[0]`; require `argv[1]` to be exactly `daemon`; skip `--label` and `--lock-fd` **and the
+argument after either**, anything spelled `--label=…` or `--lock-fd=…`, and anything else
+beginning with `-`; the first argument left is the id, which must equal `<id>`. The relay
+modes fail at step two.
+
+**Stepping over an unrecognised `-` argument is what makes the rule readable across
+versions**, and is not laxity: a daemon started by another release carries private options
+this build never heard of — v0.4.0 spelled `--systemd-scope=<hex>` — and a session idles for
+a week (§ 6.5), so a binary upgraded over a running daemon is the ordinary case. Refusing an
+argv this build could not itself have produced would answer *is not* about a live daemon,
+which the table above pays for by leaving all five files and printing `?`. It is the id that
+carries the weight instead, and it is the **first** argument left because a daemon is always
+started with its id ahead of its options: a value spelled apart from an option nobody here
+knows is a bare word this rule cannot tell from an id, and one of those must not become one.
 
 **Keeping its last two answers apart is load-bearing.** Refusing on *could not tell* would
 strand every session behind `hidepid`, so only a positive *is not* declines the pid. And
