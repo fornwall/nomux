@@ -535,9 +535,9 @@ impl SessionPaths {
     ///
     /// # Errors
     ///
-    /// The two failures about the *file* and the *filesystem*, still there next time: a
-    /// `<id>.lock` nothing can lock, and a run directory mounted read-only. Neither may
-    /// be answered by going ahead ([`SpawnLock`]).
+    /// The failures about the *file* and the *filesystem*, still there next time: a
+    /// `<id>.lock` nothing can lock, one that is no regular file, and a run directory
+    /// mounted read-only. None may be answered by going ahead ([`SpawnLock`]).
     pub(crate) fn try_lock_spawn_or_refuse(&self) -> io::Result<Option<SpawnLock>> {
         let path = self.lock();
         for _ in 0..LOCK_ATTEMPTS {
@@ -571,6 +571,23 @@ impl SessionPaths {
                 Err(err @ (rustix::io::Errno::ACCESS | rustix::io::Errno::PERM)) => {
                     return Err(self.unlockable(&path, err));
                 }
+                // The nodes that refuse to open at all, and so never reach the file-type
+                // check below that would have named them: `NOFOLLOW` answers a symlink
+                // with `ELOOP`, sockfs has no `open` and answers `ENXIO`, and a `<id>.lock`
+                // below something that is not a directory answers `ENOTDIR` on the create.
+                // Each describes the name as it stands rather than this instant, so
+                // `Ok(None)` would send every caller off to wait out a thing that does not
+                // pass: `daemon::start` would call it contention, `control::kill` would
+                // spin to its deadline, and the two collections would quietly do nothing.
+                Err(
+                    rustix::io::Errno::LOOP | rustix::io::Errno::NXIO | rustix::io::Errno::NOTDIR,
+                ) => return Err(self.not_a_lock_file(&path)),
+                // The opposite reading, and the same race the retry at the bottom of this
+                // loop answers from the other side: collection unlinked `<id>.lock` between
+                // the create that found it and the reopen, so the name is free now and one
+                // more pass creates it. A run directory that is gone rather than a file
+                // fails the same way twice and leaves by the `Ok(None)` below.
+                Err(rustix::io::Errno::NOENT) => continue,
                 // Everything else is about this attempt rather than about the file.
                 Err(_) => return Ok(None),
             };
@@ -1351,6 +1368,59 @@ mod tests {
             "and the spelling with nobody to report to gives the id up rather than \
              inventing a standing it does not have"
         );
+    }
+
+    /// The nodes whose `open` fails outright, which the file-type check cannot answer
+    /// because it never gets the descriptor to judge. They are as permanent as the FIFO
+    /// that check does catch, and read as a moment instead they are worse than useless:
+    /// `daemon::start` reports the id as one another process is starting, `control::kill`
+    /// spins to its grace deadline and blames contention, and the two collections remove
+    /// nothing and have nobody to say so to.
+    #[test]
+    fn a_lock_that_will_not_open_at_all_is_refused_rather_than_waited_out() {
+        fn refuses(paths: &SessionPaths, planted: &str) {
+            let err = paths
+                .try_lock_spawn_or_refuse()
+                .expect_err("a lock name that cannot be opened is not one that is busy");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{planted}: {err}");
+            assert!(
+                err.to_string().contains("session tab_7")
+                    && err.to_string().contains("tab_7.lock")
+                    && err.to_string().contains("is not a regular file"),
+                "{planted}: the refusal must name the session and the file, and say what \
+                 is wrong with it: {err}"
+            );
+            assert!(
+                paths.try_lock_spawn().is_none(),
+                "{planted}: the spelling with nobody to report to still takes no standing"
+            );
+        }
+
+        let root = Scratch::new("rundir-lock-node");
+        let paths = SessionPaths::in_dir(root.path(), "tab_7")
+            .expect("a directory of the test's own naming a session");
+
+        // `ELOOP`, from the `NOFOLLOW` that is there so a link cannot have the lock taken
+        // on its target while `removal_order` unlinks the link itself.
+        let target = root.join("elsewhere");
+        fs::write(&target, b"").unwrap();
+        std::os::unix::fs::symlink(&target, paths.lock()).unwrap();
+        refuses(&paths, "a symlink");
+        fs::remove_file(paths.lock()).unwrap();
+
+        // `ENXIO`: sockfs implements no `open`, so a socket node yields no descriptor at
+        // all rather than one `fstat` can turn away.
+        let socket = UnixListener::bind(paths.lock()).expect("plant a socket at the lock name");
+        refuses(&paths, "a socket");
+        drop(socket);
+        fs::remove_file(paths.lock()).unwrap();
+
+        // `ENOTDIR`, which arrives on the create rather than the reopen: the run
+        // directory is a plain file, so no name below it can ever resolve.
+        let file = root.join("notdir");
+        fs::write(&file, b"").unwrap();
+        let below = SessionPaths::in_dir(&file, "tab_7").expect("resolve paths below a plain file");
+        refuses(&below, "a name below a plain file");
     }
 
     /// A startup that failed gives back only the `<id>.lock` it made itself. Both callers

@@ -33,6 +33,8 @@ use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::process::{ChildStderr, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags};
@@ -71,8 +73,26 @@ const PUBLISH_POLL_INTERVAL: Duration = Duration::from_millis(1);
 /// invariant — the whole of what a [`Pump`] can be holding.
 const RELAY_CHUNK: usize = 16 * 1024;
 
-/// Maximum final wait for inherited stdout to drain after the session closes.
+/// How long the final flush waits on a stdout that has moved *nothing*.
+///
+/// Spent against the worker's last delivery rather than against the whole wait: what is
+/// still in flight when the session closes is the worker channel's kernel buffer and one
+/// [`RELAY_CHUNK`] behind it — the session's last output, and far more of it than any
+/// figure here could assume a destination takes in half a second. A pipe into a congested
+/// `sshd`, a serial console, a pager being read a page at a time: each takes all of it,
+/// none of them fast, and none of them the stopped stdout this bound is for, which moves
+/// nothing at all. The one case the two still look alike from this side is a single write
+/// that outlasts the window on its own, and that is what keeps the wait bounded rather
+/// than merely long.
 const STDOUT_FLUSH_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// How often the final flush looks up from the status read to see whether the worker has
+/// delivered anything since the last look.
+///
+/// Only granularity: it bounds how much of a window a delivery that arrives just after a
+/// look can lose, and nothing waits for it in the ordinary case, where the status itself
+/// ends the read.
+const STDOUT_PROGRESS_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Whether this invocation may bring the session into being — the whole of the
 /// distinction between the two modes (`DESIGN.md` § 5.1).
@@ -537,7 +557,15 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
         // and spin in the poll set.
         let readable = PollFlags::IN | PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL;
 
-        if stdin_events.intersects(readable) && !to_socket.fill_from(stdin_fd, &mut chunk)? {
+        // `NVAL` is the one of those three the read cannot then report: an fd `poll` says
+        // is not open answers `EBADF`, which is none of the endings [`Pump::fill_from`]
+        // folds in, so it would come back out of here as a failure of a relay whose
+        // output direction is still perfectly good. A stdin that is gone is an ending,
+        // and it ends this direction exactly as end of file does.
+        let stdin_gone = stdin_events.contains(PollFlags::NVAL);
+        if stdin_events.intersects(readable)
+            && (stdin_gone || !to_socket.fill_from(stdin_fd, &mut chunk)?)
+        {
             stdin_open = false;
             // Half-close propagation (§ 7).
             drop(stream.shutdown(Shutdown::Write));
@@ -583,31 +611,52 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
 /// without preventing the main loop from forwarding input.
 struct StdoutWorker {
     channel: UnixStream,
+    /// How many batches the worker has got into inherited stdout, which is the only sign
+    /// of life [`Self::finish`] has while the write itself is another thread's blocking
+    /// syscall. Its *value* is never used, only its changing.
+    ///
+    /// Not a byte on the channel, which would have been the obvious place for it: nothing
+    /// reads that direction until [`Self::finish`] does, so a heartbeat per batch would
+    /// accumulate in the socketpair's buffer for the whole session and eventually leave
+    /// the worker's own status write with nowhere to go — turning the stdout failure it
+    /// reports into a relay that hangs instead.
+    progress: Arc<AtomicU64>,
+}
+
+/// What [`StdoutWorker::spawn`] hands the thread it starts: `pthread_create` carries one
+/// pointer, and the worker needs both its end of the channel and the counter.
+struct Handoff {
+    channel: UnixStream,
+    progress: Arc<AtomicU64>,
 }
 
 impl StdoutWorker {
     fn spawn() -> io::Result<Self> {
         let (channel, worker_channel) = UnixStream::pair()?;
         channel.set_nonblocking(true)?;
+        let progress = Arc::new(AtomicU64::new(0));
         // A thread cannot outlive an abruptly killed relay, and the socketpair reports
         // completion. A bare pthread also keeps about 20 KiB of generic thread machinery
         // out of § 8's 400 KiB release budget; remeasure before replacing it.
-        let worker_channel = Box::into_raw(Box::new(worker_channel));
+        let handoff = Box::into_raw(Box::new(Handoff {
+            channel: worker_channel,
+            progress: Arc::clone(&progress),
+        }));
         let mut worker = MaybeUninit::uninit();
-        // SAFETY: `worker_channel` owns a valid, Send `UnixStream` allocation which the
-        // entry point takes exactly once. `worker` points at storage for pthread_t, and
-        // the default attributes remain valid for the thread's lifetime.
+        // SAFETY: `handoff` owns a valid, Send allocation which the entry point takes
+        // exactly once. `worker` points at storage for pthread_t, and the default
+        // attributes remain valid for the thread's lifetime.
         let error = unsafe {
             libc::pthread_create(
                 worker.as_mut_ptr(),
                 std::ptr::null(),
                 stdout_worker,
-                worker_channel.cast(),
+                handoff.cast(),
             )
         };
         if error != 0 {
             // SAFETY: pthread_create failed, so no thread took this allocation.
-            drop(unsafe { Box::from_raw(worker_channel) });
+            drop(unsafe { Box::from_raw(handoff) });
             return Err(io::Error::from_raw_os_error(error));
         }
         // SAFETY: a successful pthread_create initialized `worker`.
@@ -618,29 +667,69 @@ impl StdoutWorker {
         if error != 0 {
             return Err(io::Error::from_raw_os_error(error));
         }
-        Ok(Self { channel })
+        Ok(Self { channel, progress })
     }
 
     fn fd(&self) -> BorrowedFd<'_> {
         self.channel.as_fd()
     }
 
-    /// Closes after queued bytes and waits briefly for proof they were delivered.
+    /// Closes after queued bytes and waits for proof they were delivered.
+    ///
+    /// The wait ends [`STDOUT_FLUSH_TIMEOUT`] after the last thing the worker moved, so a
+    /// stdout that stops draining cannot keep an already-closed relay alive forever and a
+    /// slow one is not cut off with the session's last output still in flight. Every pass
+    /// computes the window that is left rather than handing the whole of it to the read:
+    /// `SO_RCVTIMEO` restarts per `recv` — as `conn::flush_final` has for `SO_SNDTIMEO` —
+    /// so a bound set once would be a bound per syscall, and this read takes up to four.
     fn finish(mut self) -> io::Result<()> {
-        // The deadline is across the whole status read; otherwise a live stdout that
-        // stops draining can keep an already-closed relay alive forever.
         self.channel.set_nonblocking(false)?;
-        self.channel.set_read_timeout(Some(STDOUT_FLUSH_TIMEOUT))?;
         drop(self.channel.shutdown(Shutdown::Write));
         let mut status = [0; size_of::<i32>()];
-        self.channel
-            .read_exact(&mut status)
-            .map_err(|err| match err.kind() {
-                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => {
-                    io::ErrorKind::TimedOut.into()
+        let mut filled = 0;
+        // Relaxed throughout: nothing is published *with* the counter, and a comparison
+        // against the last value seen needs no more than that this location's own writes
+        // arrive in order.
+        let mut seen = self.progress.load(Ordering::Relaxed);
+        let mut window = Instant::now() + STDOUT_FLUSH_TIMEOUT;
+        while filled < status.len() {
+            let remaining = window.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            self.channel
+                .set_read_timeout(Some(remaining.min(STDOUT_PROGRESS_INTERVAL)))?;
+            let delivered = match self
+                .channel
+                .read(status.get_mut(filled..).unwrap_or(&mut []))
+            {
+                // The worker closes its end without writing a status only if it died
+                // before it could, which is not something to report as a clean flush.
+                Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                Ok(read) => {
+                    filled += read;
+                    true
                 }
-                _ => err,
-            })?;
+                // Every one of these three is "come back and look again": the interval
+                // above expiring, a signal, and a socket that answered neither.
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::TimedOut
+                            | io::ErrorKind::WouldBlock
+                            | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    false
+                }
+                Err(err) => return Err(err),
+            };
+            let progress = self.progress.load(Ordering::Relaxed);
+            if delivered || progress != seen {
+                seen = progress;
+                window = Instant::now() + STDOUT_FLUSH_TIMEOUT;
+            }
+        }
         match i32::from_ne_bytes(status) {
             0 => Ok(()),
             error if error > 0 => Err(io::Error::from_raw_os_error(error)),
@@ -649,10 +738,14 @@ impl StdoutWorker {
     }
 }
 
-extern "C" fn stdout_worker(channel: *mut libc::c_void) -> *mut libc::c_void {
-    // SAFETY: spawn passed ownership of a Box<UnixStream> as this pointer.
-    let mut channel = unsafe { Box::from_raw(channel.cast::<UnixStream>()) };
-    let status = match copy_channel_to_stdout(&channel) {
+extern "C" fn stdout_worker(handoff: *mut libc::c_void) -> *mut libc::c_void {
+    // SAFETY: spawn passed ownership of a Box<Handoff> as this pointer.
+    let handoff = unsafe { Box::from_raw(handoff.cast::<Handoff>()) };
+    let Handoff {
+        mut channel,
+        progress,
+    } = *handoff;
+    let status = match copy_channel_to_stdout(&channel, &progress) {
         Ok(()) => 0,
         Err(error) => error.raw_os_error().filter(|raw| *raw > 0).unwrap_or(-1),
     };
@@ -667,7 +760,13 @@ extern "C" fn stdout_worker(channel: *mut libc::c_void) -> *mut libc::c_void {
 /// an inherited non-blocking stdout remains correct because `EAGAIN` goes back through
 /// `poll`. `EPIPE` is the ordinary "stdout's reader left" ending [`Pump::drain_to`]
 /// already defines.
-fn copy_channel_to_stdout(channel: &UnixStream) -> io::Result<()> {
+///
+/// `progress` counts the writes that actually moved something, which is the whole of what
+/// [`StdoutWorker::finish`] has to tell a slow stdout from a stopped one. Moved rather
+/// than merely attempted, because an inherited stdout may itself be non-blocking: a
+/// descriptor answering `POLLOUT` and then `EAGAIN` for ever is precisely the stall that
+/// wait exists to give up on.
+fn copy_channel_to_stdout(channel: &UnixStream, progress: &AtomicU64) -> io::Result<()> {
     let stdout = io::stdout();
     let stdout_fd = stdout.as_fd();
     let channel_fd = channel.as_fd();
@@ -689,8 +788,12 @@ fn copy_channel_to_stdout(channel: &UnixStream) -> io::Result<()> {
             if events.intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL) {
                 return Ok(());
             }
+            let owed = pump.owed();
             if events.contains(PollFlags::OUT) && !pump.drain_to(stdout_fd)? {
                 return Ok(());
+            }
+            if pump.owed() < owed {
+                progress.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -709,7 +812,13 @@ impl Pump {
     /// to poll that destination for writability, and — negated — the only condition under
     /// which the source is read at all, so nothing can overtake bytes already owed.
     fn has_data(&self) -> bool {
-        !self.buf.is_empty()
+        self.owed() != 0
+    }
+
+    /// How much the destination has still not taken, which a caller comparing it across a
+    /// [`Self::drain_to`] uses to tell a write that moved something from one that did not.
+    fn owed(&self) -> usize {
+        self.buf.len()
     }
 
     /// Takes one batch off `src` for the destination. `false` means `src` reached EOF.

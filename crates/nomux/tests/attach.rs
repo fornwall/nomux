@@ -1098,6 +1098,125 @@ fn a_blocked_stdout_cannot_block_relay_shutdown() {
     );
 }
 
+/// The other side of the test above: a stdout that is *slow* rather than stopped must
+/// get the whole of the session's last output, however long that takes.
+///
+/// The bounded final flush used to be an absolute half second from the moment the relay
+/// handed the worker the last byte, which cannot tell the two apart — and what is in
+/// flight at that moment is the worker channel's kernel buffer plus one `RELAY_CHUNK`, so
+/// the tail of a session that ended perfectly went missing and the exit said
+/// `post-connect` over it. A pipe into a congested `sshd`, a serial console and a pager
+/// being read a page at a time are all this, and none of them is a failure.
+///
+/// The reader takes [`SLOW_STDOUT_CHUNK`] every [`SLOW_STDOUT_PAUSE`] and never stops, so
+/// the backlog takes several times the flush bound to deliver while no single write the
+/// relay waits on comes near it — which is the distinction under test, and why the
+/// assertion is on bytes delivered rather than on how long anything took. Against the old
+/// bound this rate leaves tens of kilobytes undelivered here; both figures follow the
+/// pause, so that is the knob to turn up on a machine where either margin looks thin.
+#[test]
+fn a_slow_stdout_still_gets_the_last_of_the_session() {
+    /// More than every buffer between the session and the pipe holds, so the pipe stays
+    /// full and the backlog behind it is the real thing rather than a trickle.
+    const PUSH: usize = 320 * 1024;
+    /// What the reader asks for; the shrunk pipe is what it actually gets each time.
+    const SLOW_STDOUT_CHUNK: usize = 8 * 1024;
+    /// Four of these is one `RELAY_CHUNK` through a page-sized pipe — a single worker
+    /// write well inside the flush bound, against a whole backlog that is several times
+    /// it.
+    const SLOW_STDOUT_PAUSE: Duration = Duration::from_millis(35);
+
+    let (reader, relay_stdout, capacity) = one_page_pipe();
+    let (mut child, mut peer, _listener) = relay_onto_a_socket_over(
+        "relay_slow_stdout",
+        Stdio::null(),
+        Stdio::from(relay_stdout),
+        Stdio::piped(),
+    );
+    let deadline = Instant::now() + RELAY_PATIENCE;
+
+    // On a thread of its own, and the session's close with it: with nothing reading the
+    // far end of stdout, every buffer between the two fills and this write parks — which
+    // is the state the test wants, and would be a deadlock on the thread that has to
+    // start the reader. The session closes the moment the last of it is in.
+    let push = thread::spawn(move || {
+        peer.write_all(&vec![b'x'; PUSH])
+            .expect("write to the relay's socket");
+    });
+    // Not a byte is read before this holds, so what the relay has taken is all behind a
+    // stdout that has not moved: the pipe full, the worker asleep in a write, and the
+    // rest queued in the worker channel and the two pumps.
+    assert!(
+        poll_until(Duration::from_secs(10), || pipe_is_full(&reader, capacity)),
+        "the stdout write never filled the pipe and blocked"
+    );
+
+    let drain = thread::spawn(move || {
+        let mut reader = reader;
+        let mut got = Vec::new();
+        let mut chunk = vec![0u8; SLOW_STDOUT_CHUNK];
+        while got.len() < PUSH {
+            thread::sleep(SLOW_STDOUT_PAUSE);
+            let outcome = loop {
+                match reader.read(&mut chunk) {
+                    Err(err) if err.kind() == ErrorKind::Interrupted => {}
+                    outcome => break outcome,
+                }
+            };
+            match outcome {
+                // End of file: the relay is gone, and whatever it dropped is missing.
+                Ok(0) | Err(_) => break,
+                Ok(read) => got.extend_from_slice(&chunk[..read]),
+            }
+        }
+        got
+    });
+
+    assert!(
+        poll_by(deadline, || !child.is_running()),
+        "the relay never finished flushing a stdout that was reading all of it"
+    );
+    let finished = child
+        .into_exited()
+        .wait_with_output()
+        .expect("collect the relay");
+    join_before(push, deadline, "session output");
+    let got = join_before(drain, deadline, "slow stdout drain");
+    assert_eq!(
+        got.len(),
+        PUSH,
+        "a stdout that was reading everything, only slowly, was cut off: {:?}",
+        stderr(&finished)
+    );
+    assert!(
+        finished.status.success(),
+        "a session that ended with its output delivered is exit 0 (§ 10), got {}: {:?}",
+        finished.status,
+        stderr(&finished)
+    );
+}
+
+/// A pipe shrunk to the smallest capacity the kernel will give it, and that capacity.
+///
+/// The shrink is what keeps the backlog in the relay's hands: a pipe is buffering the
+/// worker gets to count as delivered, so a default 64 KiB one absorbs most of what this
+/// test wants left in flight when the session closes.
+fn one_page_pipe() -> (io::PipeReader, io::PipeWriter, usize) {
+    use std::os::fd::AsRawFd;
+
+    let (reader, writer) = io::pipe().expect("a pipe for relay stdout");
+    // A page is the floor rather than the request: the kernel rounds up, and what it
+    // answers is the capacity everything here is measured against.
+    // SAFETY: `fcntl` is given the live pipe descriptor held by `writer`.
+    let capacity = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) };
+    assert!(capacity > 0, "shrinking the relay's stdout pipe failed");
+    (
+        reader,
+        writer,
+        usize::try_from(capacity).expect("a positive pipe capacity fits usize"),
+    )
+}
+
 fn nearly_full_pipe() -> (io::PipeReader, io::PipeWriter, usize) {
     use std::os::fd::AsRawFd;
 

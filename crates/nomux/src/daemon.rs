@@ -920,10 +920,12 @@ impl Daemon {
             );
             return;
         }
-        // Hands the session over (§ 6.4) by the same door as any other refusal, which also
-        // drops the agent connection the arriving client knows nothing of. With nobody
-        // attached this does nothing at all.
-        self.reject(ErrorCode::Takeover, "another client attached");
+        // Hands the session over (§ 6.4), which also drops the agent connection the
+        // arriving client knows nothing of. Its own door rather than [`Daemon::reject`]'s:
+        // an incumbent that has been reading is owed the frames it was in the middle of,
+        // and the `Error` that tells it never to reconnect rides out behind them. With
+        // nobody attached this does nothing at all.
+        self.evict();
         self.client = self
             .pending
             .take()
@@ -1441,12 +1443,41 @@ impl Daemon {
         }
     }
 
-    /// The same for the attached client, which also leaves the session clientless.
+    /// The same for the attached client, which also leaves the session clientless — on
+    /// [`Daemon::drop_client`]'s terms rather than [`Conn::close_with`]'s.
+    ///
+    /// Every refusal but the takeover arrives here, and each of them is reached from the
+    /// event loop with a client free to be sitting on § 4.1's whole megabyte: a malformed
+    /// frame, an end of file behind half of one, § 3's input gap, and the two internal
+    /// failures that end the session anyway. Blocking on the final write would let a peer
+    /// that has stopped reading buy 500 ms of stopped daemon — no PTY drained, no reaping,
+    /// the child blocked on its own output — for one bad frame, as often as it cared to
+    /// reconnect and send another. The `Error` is a diagnostic rather than part of the
+    /// exchange: a queue the socket still has room for carries it out from here, and the
+    /// only peer that loses it is the one that was not reading it.
     fn reject(&mut self, code: ErrorCode, message: &'static str) {
+        if let Some(client) = self.client.as_mut() {
+            client.conn.send(&Frame::Error { code, message });
+        }
+        self.drop_client();
+    }
+
+    /// Refuses the attached client in favour of the one taking the session over (§ 6.4),
+    /// waiting up to § 6.5's 500 ms on the delivery.
+    ///
+    /// The one refusal that waits, and the departure that budget was written for. The
+    /// incumbent is losing a session it has done nothing wrong in, so what is already
+    /// queued for it is output it was reading rather than output it was ignoring, and the
+    /// `Error{TAKEOVER}` behind that output is what stops its client reconnecting into a
+    /// fight over the session. A peer that has stopped reading still costs the deadline
+    /// here — bounded, and only ever paid by an arriving `Hello`, never by a frame the
+    /// incumbent sends itself.
+    fn evict(&mut self) {
         if let Some(client) = self.client.take() {
-            client
-                .conn
-                .close_with(Some(&Frame::Error { code, message }));
+            client.conn.close_with(Some(&Frame::Error {
+                code: ErrorCode::Takeover,
+                message: "another client attached",
+            }));
             self.on_detached();
         }
     }
@@ -1457,6 +1488,7 @@ impl Daemon {
     /// [`Conn::close_with`] goes blocking for up to 500 ms and this loop is the only thing
     /// draining the PTY, so flushing a detach from a peer that has stopped reading — the
     /// departure this project exists to survive — would stop the user's child dead for it.
+    /// [`Daemon::reject`] comes through here for that same reason, carrying its `Error`.
     fn drop_client(&mut self) {
         if let Some(mut client) = self.client.take() {
             drop(client.conn.flush_some());
@@ -1484,8 +1516,10 @@ impl Daemon {
     fn shutdown(&mut self) {
         // The one *departure* [`Daemon::drop_client`]'s argument does not reach: nothing
         // survives this to replay from, the ring going with the process, so what the client
-        // is owed is owed now. § 6.5's 500 ms is spent here and in the eviction `reject`
-        // closes with and nowhere else, inside `nomux kill`'s two seconds.
+        // is owed is owed now. § 6.5's 500 ms is spent here, in [`Daemon::evict`], and on
+        // the lone frame [`Daemon::reject_pending`] sends a connection that never attached
+        // and so has nothing queued behind it — nowhere else, and inside `nomux kill`'s
+        // two seconds.
         if let Some(client) = self.client.take() {
             client.conn.close_with(None);
             self.on_detached();
@@ -1506,6 +1540,7 @@ mod tests {
 
     use super::*;
 
+    use crate::conn::FINAL_FLUSH_TIMEOUT;
     use crate::scratch::Scratch;
 
     thread_local! {
@@ -1891,6 +1926,83 @@ mod tests {
                 expected
             },
             "the peer must learn that its half-close was not a clean input EOF"
+        );
+    }
+
+    /// Regression: a refusal must not be a lever a client can stop the daemon with.
+    /// Every refusal but the takeover is reached from the event loop, so one that blocked
+    /// on its final write would sell half a second of frozen session — no PTY drained,
+    /// the child stopped on its own output — for the price of one bad frame, again on
+    /// every reconnect. What it costs instead is the flush the departure would have done
+    /// anyway. The second half then asks the same daemon for the `Error` itself: losing
+    /// the diagnostic is the unread queue's price, and nobody else pays it.
+    #[test]
+    fn a_refusal_costs_the_session_no_more_than_a_departure() {
+        let root = Scratch::new("refusal-cost");
+        let mut daemon = blank(&root, "refusal");
+        let mut peer = attach_peer(|conn| {
+            daemon.client = Some(Attached::greeting(conn));
+        });
+
+        // § 4.1's whole allowance queued for a peer that reads none of it, then pushed at
+        // the socket until the kernel's buffer stops taking any — arrived at the way
+        // `pump_output` and a silent client arrive at it, and bounded because the size of
+        // that buffer is the host's to choose and not this test's.
+        let payload = vec![b'x'; nomux_protocol::MAX_OUTPUT_DATA];
+        {
+            let client = daemon.client.as_mut().expect("the attached client");
+            for _ in 0..64 {
+                while client.conn.queued() < MAX_PENDING_WRITE {
+                    client.conn.send(&Frame::Output {
+                        offset: 0,
+                        data: &payload,
+                    });
+                }
+                drop(client.conn.flush_some());
+                if client.conn.queued() > 0 {
+                    break;
+                }
+            }
+            assert!(
+                client.conn.queued() > 0,
+                "the socket has to be refusing writes, or the blocking path this is about \
+                 would have finished on its own and the timing below would prove nothing"
+            );
+        }
+
+        let mut read_buf = vec![0u8; 64 * 1024];
+        deliver(&mut peer, &Frame::Pong);
+        let started = Instant::now();
+        daemon.read_client(&mut read_buf, &mut Vec::new());
+        let elapsed = started.elapsed();
+
+        assert!(daemon.client.is_none(), "the refused client kept the slot");
+        assert!(
+            elapsed < FINAL_FLUSH_TIMEOUT / 2,
+            "the refusal held the loop for {elapsed:?} against a peer that had stopped \
+             reading, which is a stall the peer chose"
+        );
+
+        // The same refusal with room in the queue, which is how a client that has done
+        // nothing worse than send one bad frame is told what was wrong with it.
+        let mut listening = attach_peer(|conn| {
+            daemon.client = Some(Attached::greeting(conn));
+        });
+        deliver(&mut listening, &Frame::Pong);
+        daemon.read_client(&mut read_buf, &mut Vec::new());
+        assert_eq!(
+            collect(&mut listening),
+            {
+                let mut expected = nomux_protocol::SERVER_PREAMBLE.to_vec();
+                Frame::Error {
+                    code: ErrorCode::Protocol,
+                    message: "frame is not valid from a client",
+                }
+                .encode(&mut expected)
+                .expect("a valid frame");
+                expected
+            },
+            "a queue the socket still has room for must carry the diagnostic out"
         );
     }
 
