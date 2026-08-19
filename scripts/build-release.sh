@@ -218,6 +218,20 @@ check_elf() {
     '; then
         die "FAIL: ${1##*/} has a writable and executable load segment."
     fi
+
+    # What the page-size flag above was for, asserted on the artifact rather than on the request:
+    # 16 KiB is the largest page anything we ship onto runs with, and it is the figure both such a
+    # kernel and Android's asset packaging read out of this field. Block by block again, Alignment
+    # being printed for every program header and not only for the loads.
+    if ! printf '%s\n' "$elf" | awk '
+        /Type: PT_LOAD/ { in_load = 1; loads++ }
+        in_load && /Alignment:/ { if ($2 < 16384) small = 1; checked++ }
+        in_load && /^  }/ { in_load = 0 }
+        END { exit small || !loads || checked != loads }
+    '; then
+        die "FAIL: ${1##*/} has a load segment aligned below 16 KiB;" \
+            "      it cannot be mapped where pages are that large."
+    fi
 }
 
 for target in $targets; do
@@ -226,6 +240,16 @@ for target in $targets; do
     build_target=$target
     build_dir=$target
     case "$target" in
+    x86_64-*)
+        # A kernel with pages larger than a segment's alignment cannot map the binary at all, and
+        # Android's packaging check rejects a bundled ELF for the same reason. lld defaults to
+        # 4 KiB here; AArch64's own default is 64 KiB and already clears every case, and lowering
+        # that target to this figure would make it unmappable on the 64 KiB-page kernels some
+        # distributions ship. Segments stay congruent modulo the larger figure, so no padding is
+        # added to the file: the two `-Clink-arg`s are one `-z max-page-size=N` that rust-lld,
+        # invoked directly rather than through a compiler driver, has to receive as two words.
+        target_rustflags="$target_rustflags$us-Clink-arg=-z$us-Clink-arg=max-page-size=16384"
+        ;;
     aarch64-*)
         build_target=$aarch_pie_spec
         build_dir=$aarch_build
