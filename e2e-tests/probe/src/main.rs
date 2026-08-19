@@ -28,6 +28,12 @@ use nomux_protocol::{
 /// login shell is still starting.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Longest to wait for a relay after asking it to detach.
+const RELAY_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Poll cadence while waiting for a relay to exit.
+const RELAY_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 /// Exit status meaning "the session is not there". Distinct from 1, so the matrix runner
 /// can tell a session that died from a probe that broke.
 const EXIT_ABSENT: i32 = 20;
@@ -93,7 +99,7 @@ fn create(id: &str) -> Result<String, String> {
     // Detach rather than close: the session goes on without a client, which is the state
     // the logout is about to test.
     relay.send(&Frame::Detach)?;
-    let daemon = relay.finish();
+    let daemon = relay.finish()?;
 
     Ok(format!(
         "CREATED id={id} agent={} in_applied={} daemon_relay_exit={daemon}",
@@ -117,8 +123,7 @@ fn check(id: &str) -> Result<String, String> {
                 let bytes = payload.get(8..).unwrap_or_default();
                 replayed.push_str(&String::from_utf8_lossy(bytes));
                 if replayed.contains(&wanted) {
-                    relay.send(&Frame::Detach).ok();
-                    let exit = relay.finish();
+                    let exit = relay.finish()?;
                     return Ok(format!(
                         "SURVIVED id={id} resume_from={} replayed_bytes={} relay_exit={exit}",
                         ok.resume_from,
@@ -129,7 +134,7 @@ fn check(id: &str) -> Result<String, String> {
             // The session is there but its transcript ended — the child was killed while
             // the daemon lived. Worth telling apart from both other answers.
             Ok((FrameType::Exit, _)) => {
-                relay.finish();
+                let _ = relay.finish();
                 return Err(format!(
                     "SHELL-GONE id={id}: the daemon answered but its terminal stream had \
                      already ended, so the session outlived the logout and the child did not"
@@ -137,12 +142,12 @@ fn check(id: &str) -> Result<String, String> {
             }
             Ok(_) => {}
             Err(err) => {
-                relay.finish();
+                let _ = relay.finish();
                 return Err(format!("id={id}: {err}"));
             }
         }
     }
-    relay.finish();
+    let _ = relay.finish();
     Err(format!(
         "NO-MARKER id={id}: attached, but {wanted:?} was not in the {} replayed bytes — \
          the id answers and is not the session this matrix created",
@@ -318,14 +323,35 @@ impl Relay {
             .unwrap_or_default()
     }
 
-    /// Closes the conversation and reports how the relay exited.
-    fn finish(mut self) -> String {
+    /// Detaches, closes the conversation and reports how the relay exited.
+    fn finish(mut self) -> Result<String, String> {
+        // Closing stdin alone is only a half-close: the daemon deliberately keeps that
+        // connection attached so it can finish delivering output. Ask it to detach on
+        // every path, including a failed check, or the wait below can last for the
+        // session's remaining lifetime.
+        let _ = self.send(&Frame::Detach);
         drop(self.stdin);
-        match self.child.wait() {
-            Ok(status) => status
-                .code()
-                .map_or_else(|| "signalled".to_owned(), |code| code.to_string()),
-            Err(err) => format!("unwaitable: {err}"),
+        let deadline = Instant::now() + RELAY_EXIT_TIMEOUT;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    return Ok(status
+                        .code()
+                        .map_or_else(|| "signalled".to_owned(), |code| code.to_string()));
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(RELAY_EXIT_POLL_INTERVAL);
+                }
+                Ok(None) => {
+                    drop(self.child.kill());
+                    drop(self.child.wait());
+                    return Err(format!(
+                        "the relay did not exit within {} seconds after detach",
+                        RELAY_EXIT_TIMEOUT.as_secs()
+                    ));
+                }
+                Err(err) => return Err(format!("could not wait for the relay: {err}")),
+            }
         }
     }
 }

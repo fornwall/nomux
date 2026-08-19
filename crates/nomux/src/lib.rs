@@ -177,8 +177,8 @@ impl core::fmt::Display for ProtoError {
     }
 }
 
-/// Encodes a frame header. Reached only through [`Frame::encode`], which patches one in
-/// behind the payload it has already written.
+/// Encodes a frame header. Reached only through [`Frame::encode`], after that function
+/// has computed and validated the payload length.
 ///
 /// # Errors
 ///
