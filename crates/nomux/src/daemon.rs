@@ -33,7 +33,7 @@ use crate::usock::{Liveness, liveness};
 
 /// Default ring capacity: how long a disconnect can last before scrollback is lost
 /// (`IMPLEMENTATION.md` § 4).
-const DEFAULT_RING_CAPACITY: usize = 4 << 20;
+const DEFAULT_RING_CAPACITY: usize = 16 << 20;
 
 /// Environment override for the ring capacity, in bytes.
 const RING_BYTES_ENV: &str = "NOMUX_RING_BYTES";

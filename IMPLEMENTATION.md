@@ -183,7 +183,7 @@ which is what the resend above is for.
 
 Fixed capacity, allocated once, with `Ring::base()` the oldest offset still retained and
 `Ring::end()` one **past** the newest byte written — the total ever written, and the open
-end of every range below. Capacity defaults to 4 MiB, overridable per daemon with
+end of every range below. Capacity defaults to 16 MiB, overridable per daemon with
 `NOMUX_RING_BYTES` (§1): an unparseable or zero value falls back to the default instead of
 refusing to start, and one past 1 GiB is clamped there. The whole allocation is attempted
 before the socket, pidfile or daemon process is published; allocator refusal is a normal
