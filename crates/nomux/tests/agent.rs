@@ -294,12 +294,7 @@ fn a_second_agent_connection_waits_for_the_one_being_served() {
 fn a_stalled_agent_channel_is_given_up_so_the_next_peer_gets_its_turn() {
     /// `agent::AGENT_IDLE_TIMEOUT`, private to the daemon, mirrored here, and the two
     /// must move together.
-    #[expect(
-        clippy::duration_suboptimal_units,
-        reason = "Duration::from_mins is unstable on the pinned toolchain, as it is \
-                  where the daemon writes this same figure"
-    )]
-    const AGENT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+    const AGENT_IDLE_TIMEOUT: Duration = Duration::from_mins(1);
 
     let (session, mut client, ok) = Session::attached_with("agent_idle", true, false);
     client.make_ready("-echo", None, ok.resume_from);

@@ -28,11 +28,7 @@ const MAX_CHANNEL_QUEUE: usize = 256 * 1024;
 ///
 /// One slot makes later peers wait this long in series. A minute still leaves room for
 /// a human or hardware key to answer a live signing request.
-#[expect(
-    clippy::duration_suboptimal_units,
-    reason = "Duration::from_mins is unstable on the pinned toolchain"
-)]
-const AGENT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const AGENT_IDLE_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Outcome of one attempt to take a connection off the agent socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
