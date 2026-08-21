@@ -1,12 +1,3 @@
-# nomux
-
-A single static Linux binary that runs on an SSH server and keeps a terminal
-session alive across the loss of the SSH connection that created it.
-
-Persistence without a multiplexer: no prefix key, no panes, no status bar, no
-rewritten `TERM`. Byte-exact passthrough, so sixel, OSC 52, hyperlinks, mouse
-reporting and scrollback all work unchanged.
-
 > [!WARNING]
 > **There is nothing to run yet, and none of it has seen real world usage.** This
 > repository is the server half; the SSH client and terminal emulator that drive it are a
@@ -19,6 +10,15 @@ reporting and scrollback all work unchanged.
 > fixed ([DESIGN.md § 10](DESIGN.md#10-rejected-alternatives)). The logout matrix is
 > exercised in containers ([e2e-tests/](e2e-tests/README.md)) but not yet on a real host.
 > AI-generated, and experimental.
+
+# nomux
+
+A single static Linux binary that runs on an SSH server and keeps a terminal
+session alive across the loss of the SSH connection that created it.
+
+Persistence without a multiplexer: no prefix key, no panes, no status bar, no
+rewritten `TERM`. Byte-exact passthrough, so sixel, OSC 52, hyperlinks, mouse
+reporting and scrollback all work unchanged.
 
 `nomux <mode> [session-id]`. The binary-protocol modes are `daemon`, `spawn` and
 `attach`; `--label` is accepted only when creating through `daemon` or `spawn`.
