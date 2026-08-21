@@ -93,6 +93,11 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 /// the descriptor readable, and leaving the set is the only way to stand back from that.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
+/// How long the loop waits before re-offering the PTY a `TIOCSWINSZ` it refused. A
+/// backoff rather than an immediate retry, for [`ACCEPT_BACKOFF`]'s reason: a size the
+/// kernel will not take is one this would otherwise spin on for the life of the session.
+const RESIZE_RETRY: Duration = Duration::from_millis(100);
+
 /// How long a connection that has not said `Hello` keeps the one pending slot: a peer
 /// that connects and then says nothing would otherwise hold every later attach off for
 /// the life of the session. Generous against a relayed `Hello`'s round trip (§ 7).
@@ -123,7 +128,6 @@ const PENDING_INPUT_RETAINED: usize = 4096;
 ///
 /// One `Option` rather than four fields on the daemon: each belongs to a *particular*
 /// client, so an arrival or a departure resets them by moving the whole thing.
-#[derive(Debug)]
 struct Attached {
     conn: Conn,
     /// Whether this connection has been told the terminal transcript ended. Per
@@ -163,7 +167,8 @@ struct Daemon {
     child_pipe: OwnedFd,
     /// Why this session is ending, once anything has decided it should: a stop signal,
     /// or something it could not do without having failed. The loop leaves on its next
-    /// pass (§ 6.5), and until then nothing new is accepted.
+    /// pass (§ 6.5), and until then nothing new is accepted. Spelled as the syslog line
+    /// it becomes, for the reason [`Daemon::stop_reason`] gives.
     stop: Option<&'static str>,
     ring: crate::ring::Ring,
     pty: Option<Pty>,
@@ -244,13 +249,12 @@ fn start(session_id: &str, label: Option<&str>, inherited_lock_fd: Option<i32>) 
     // leave two live daemons owning one id.
     let publishing = match inherited_lock_fd {
         Some(raw) => paths.inherit_spawn_lock(raw)?,
+        // The id is not interpolated: this `Err` reaches a caller that just typed it on
+        // its own command line, and the syslog copy `run` makes carries it in the tag.
         None => paths.try_lock_spawn_or_refuse()?.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::ResourceBusy,
-                format!(
-                    "session {} is being started or removed by another process",
-                    paths.id()
-                ),
+                "this session is being started or removed by another process",
             )
         })?,
     };
@@ -330,8 +334,10 @@ fn start(session_id: &str, label: Option<&str>, inherited_lock_fd: Option<i32>) 
     let result = daemon.event_loop();
     // `None` where the loop ended for a reason that is not one of its stop
     // conditions, which is `event_loop` returning on a failed `poll`.
-    let reason = daemon.stop_reason().unwrap_or("the event loop ended");
-    crate::sanitize::info(session_id, &format!("exiting: {reason}"));
+    let reason = daemon
+        .stop_reason()
+        .unwrap_or("exiting: the event loop ended");
+    crate::sanitize::info(session_id, reason);
     daemon.shutdown();
     result
 }
@@ -374,10 +380,11 @@ fn publish(paths: &SessionPaths, label: Option<&str>) -> io::Result<(OwnedFd, Ow
 fn bind_socket(paths: &SessionPaths) -> io::Result<UnixListener> {
     let path = paths.socket();
     match liveness(&path, PROBE_TIMEOUT) {
+        // Bare of the id for [`start`]'s reason: whoever reads this asked for it by name.
         Liveness::Alive(_) => {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
-                format!("session {} is already running", paths.id()),
+                "this session is already running",
             ));
         }
         // Only the refused half leaves a socket file behind to replace; an absent name
@@ -415,7 +422,7 @@ fn bind_socket(paths: &SessionPaths) -> io::Result<UnixListener> {
 /// The discriminant is also the slot in the readiness array [`Daemon::wait`] hands back,
 /// which is why nothing indexes that array without a `get`: a variant added here and not
 /// to [`SINGLE_SOURCES`] sits past its end, and must read as "nothing ready" and not trap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 enum Source {
     /// The session socket, where clients arrive.
     Listener,
@@ -516,16 +523,18 @@ impl Daemon {
     }
 
     /// Why the daemon should stop, if it should — `None` is "keep going". The string is
-    /// what goes to syslog, the run files being gone by the time anyone reads it.
+    /// the whole syslog line [`start`] leaves behind, the run files being gone by the
+    /// time anyone reads it, which is why every one of them carries the `exiting: `
+    /// prefix rather than having it interpolated on at the one place they are printed.
     fn stop_reason(&self) -> Option<&'static str> {
         self.stop.or_else(|| {
             self.detach_deadline()
                 .is_some_and(|at| Instant::now() >= at)
                 .then(|| {
                     if self.pty.is_none() {
-                        "no client ever attached"
+                        "exiting: no client ever attached"
                     } else {
-                        "idle with no client"
+                        "exiting: idle with no client"
                     }
                 })
         })
@@ -712,7 +721,7 @@ impl Daemon {
             // Never over a reason already recorded: a session that has just lost its
             // shell says so, and the signal is what it was going to do anyway.
             if self.stop.is_none() {
-                self.stop = Some("signalled");
+                self.stop = Some("exiting: signalled");
             }
         }
         // Emptied, where the pipe just above deliberately is not: this session goes on, and
@@ -740,8 +749,10 @@ impl Daemon {
             self.read_client(read_buf, scratch);
         }
         // Reading is not an answer to `HUP` while input is held back: nothing consumes what
-        // is left, so `fill` never reaches the zero-length read that would notice.
-        if client_events.intersects(PollFlags::HUP | PollFlags::ERR) && self.client.is_some() {
+        // is left, so `fill` never reaches the zero-length read that would notice. No test
+        // for a client first: an unregistered source reports nothing, and `drop_client`
+        // takes an `Option` that a second guard here could only restate.
+        if client_events.intersects(PollFlags::HUP | PollFlags::ERR) {
             self.drop_client();
         }
         // Nothing arriving now can be served: a takeover here would spend a second 500 ms
@@ -797,8 +808,8 @@ impl Daemon {
             at.saturating_duration_since(Instant::now()).min(IDLE_TICK)
         });
         // A listener out of the poll set, a pending connection that says nothing, an agent
-        // connection gone quiet, and an unknown outcome § 6.5 is about to report have no
-        // other wakeup behind them.
+        // connection gone quiet, an unknown outcome § 6.5 is about to report, and a size
+        // the master would not take have no other wakeup behind them.
         if let Some(at) = [
             self.accept_retry,
             self.agent_accept_retry,
@@ -807,6 +818,22 @@ impl Daemon {
             self.terminal_closed_at
                 .filter(|_| self.outcome.is_none())
                 .map(|closed_at| closed_at + OUTCOME_GRACE),
+            // [`Daemon::apply_win`] and [`Daemon::repaint`] both answer a refused
+            // `TIOCSWINSZ` by forgetting the size rather than recording one that was
+            // never reached, "so the next pass tries again" — and on a quiet session
+            // there is no next pass until somebody types. Not a stored deadline but a
+            // ceiling recomputed from the state it retries: the term disappears of its
+            // own accord on the pass where the ioctl finally takes.
+            //
+            // Both of the gates are what keeps this off an idle session. With no client
+            // nobody is looking at the size, and every `Hello` clears `applied_win`
+            // anyway, so a reattach re-issues it without help from here; past end of
+            // file there is no child left to redraw at any size.
+            (self.pty.is_some()
+                && self.client.is_some()
+                && self.terminal_closed_at.is_none()
+                && self.applied_win != Some(self.win))
+            .then(|| Instant::now() + RESIZE_RETRY),
         ]
         .into_iter()
         .flatten()
@@ -954,7 +981,7 @@ impl Daemon {
                 crate::sanitize::error(self.paths.id(), "PTY read failed");
                 self.reject(ErrorCode::Internal, "terminal read failed");
                 if self.stop.is_none() {
-                    self.stop = Some("the terminal failed");
+                    self.stop = Some("exiting: the terminal failed");
                 }
             }
         }
@@ -1095,7 +1122,15 @@ impl Daemon {
             let frame = match Frame::decode(ty, scratch) {
                 Ok(frame) => frame,
                 Err(err) => {
-                    crate::sanitize::error(self.paths.id(), &format!("client {ty:?}: {err}"));
+                    // `as_wire` rather than `{ty:?}`: this is the only place a shipping
+                    // build would ask `FrameType` to format itself, and the derive on a
+                    // fifteen-variant enum is a name table and a `Debug::fmt` body that
+                    // nothing else pays for. The discriminant is also the more faithful
+                    // report — it is what the peer actually put on the wire.
+                    crate::sanitize::error(
+                        self.paths.id(),
+                        &format!("client frame {:#04x}: {err}", ty.as_wire()),
+                    );
                     self.reject(ErrorCode::Protocol, "unparseable frame payload");
                     return;
                 }
@@ -1177,7 +1212,7 @@ impl Daemon {
             Err(err) => {
                 self.reject(ErrorCode::Internal, "failed to start the session shell");
                 crate::sanitize::error(self.paths.id(), &format!("session shell: {err}"));
-                self.stop = Some("the session shell could not be started");
+                self.stop = Some("exiting: the session shell could not be started");
             }
         }
     }
@@ -1194,7 +1229,8 @@ impl Daemon {
         if let Some(pty) = self.pty.as_ref() {
             // Recorded only where the ioctl took. A failed one leaves the size unknown
             // rather than applied, so the next pass tries again instead of reading its
-            // own record back as agreement.
+            // own record back as agreement — and [`RESIZE_RETRY`] is what arranges that
+            // next pass on a session where nothing else is due.
             self.applied_win = pty.resize(self.win).is_ok().then_some(self.win);
         }
     }
@@ -1263,7 +1299,8 @@ impl Daemon {
         } else if let Some(pty) = self.pty.as_ref() {
             // Two resizes, and a failure between them leaves the master a column narrow
             // with nothing to say so: forget the size rather than record one that was
-            // never reached, and the next pass sets it again.
+            // never reached, and the next pass — [`RESIZE_RETRY`]'s, if the client has
+            // gone quiet — sets it again.
             if pty.nudge_repaint(self.win).is_err() {
                 self.applied_win = None;
             }
@@ -2175,6 +2212,63 @@ mod tests {
             "the loop slept {}s, past the deadline that is the only thing able to give \
              the slot back",
             timeout.tv_sec
+        );
+    }
+
+    /// Regression: `apply_win` and `repaint` both answer a `TIOCSWINSZ` the master
+    /// refused by clearing `applied_win`, "so the next pass tries again" — but
+    /// `poll_timeout` listed no term for one, and on an attached but quiet session there
+    /// is no next pass until the user types or [`IDLE_TICK`] comes round an hour later.
+    /// The gates are half the invariant: the retry must not arm on a session that owes
+    /// its master nothing, or on one nobody is attached to.
+    #[test]
+    fn a_window_size_the_master_refused_is_the_only_thing_the_next_wakeup_waits_for() {
+        let root = Scratch::new("resize-retry");
+        let mut daemon = blank(&root, "resize");
+        // Attached, and with a terminal, so neither `detach_deadline` nor the
+        // first-attach one is what the timeouts below are measuring.
+        let _peer = attach_peer(|conn| daemon.client = Some(Attached::greeting(conn)));
+        daemon.pty = Some(shell("resize-retry"));
+        daemon.win = WinSize {
+            cols: 100,
+            rows: 40,
+            xpixel: 0,
+            ypixel: 0,
+        };
+        daemon.applied_win = Some(daemon.win);
+        assert!(
+            daemon.poll_timeout().tv_sec > 0,
+            "a master already holding the size it was asked for is owed no wakeup at all"
+        );
+
+        // What a refused resize leaves behind, and what `repaint` writes when the second
+        // half of `nudge_repaint` fails: a size owed, with no record of having reached it.
+        daemon.applied_win = None;
+        let owed = daemon.poll_timeout();
+        assert_eq!(
+            owed.tv_sec, 0,
+            "the loop must not sleep past a resize it still owes the master"
+        );
+        assert!(
+            owed.tv_nsec > 0
+                && owed.tv_nsec <= i64::try_from(RESIZE_RETRY.as_nanos()).unwrap_or(i64::MAX),
+            "a retry nothing else wakes up for needs a wakeup of its own, not {}ns",
+            owed.tv_nsec
+        );
+
+        // And neither gate arms it on its own: an unwatched terminal is re-sized by the
+        // next `Hello`, and a child that has exited has nothing left to redraw.
+        daemon.client = None;
+        assert!(
+            daemon.poll_timeout().tv_sec > 0,
+            "a detached session must not spend seven days waking ten times a second"
+        );
+        let _peer = attach_peer(|conn| daemon.client = Some(Attached::greeting(conn)));
+        daemon.terminal_closed_at = Some(Instant::now());
+        daemon.outcome = Some((0, ExitKind::Exited));
+        assert!(
+            daemon.poll_timeout().tv_sec > 0,
+            "past end of file the size is owed to nobody"
         );
     }
 

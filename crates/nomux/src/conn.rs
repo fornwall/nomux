@@ -23,6 +23,16 @@ const _: () = assert!(
     "MAX_PENDING_READ must have room for a whole frame, or take_frame never completes one"
 );
 
+/// The daemon's event-loop read buffer, which is the whole of what [`Conn::send_agent_data`]
+/// is ever handed. Restated here rather than reached for: `daemon.rs` sizes it inline, and
+/// an assertion that quietly tracked whatever that became would assert nothing.
+const AGENT_READ_BUF: usize = 64 * 1024;
+
+const _: () = assert!(
+    MAX_AGENT_DATA >= AGENT_READ_BUF,
+    "one agent read must fit one AgentData frame, or send_agent_data drops its tail"
+);
+
 /// Capacity an emptied *send* queue keeps rather than hold one paste's peak for a week.
 /// Above one PTY read and its framing — `daemon.rs` reads 64 KiB a pass — or a busy
 /// session reallocates the queue down and back up on every pass.
@@ -173,16 +183,18 @@ impl Conn {
         offset
     }
 
-    /// Queues agent bytes as one or more `AgentData` frames for `generation`, splitting
-    /// at [`MAX_AGENT_DATA`]: a chunk past it is one `send` drops — a silent hole in a
-    /// stream nothing here can resend.
+    /// Queues agent bytes as one `AgentData` frame for `generation`.
+    ///
+    /// One frame and no chunking loop. `data` is always a prefix of the event loop's
+    /// 64 KiB read buffer, which [`MAX_AGENT_DATA`] has four times the room for — the
+    /// `const` assertion beside [`MAX_PENDING_READ`]'s at the top of this file is where
+    /// that premise is pinned, and it is strictly stronger than the loop it replaces: a
+    /// loop that can only ever run once quietly keeps working when the premise moves,
+    /// where the assertion fails the build. What it is protecting against is a payload
+    /// past the cap being one [`Conn::send`] silently drops — a hole in a stream with no
+    /// `Gap` in it and nothing here able to resend from.
     pub(crate) fn send_agent_data(&mut self, generation: u32, data: &[u8]) {
-        for part in data.chunks(MAX_AGENT_DATA) {
-            self.send(&Frame::AgentData {
-                generation,
-                data: part,
-            });
-        }
+        self.send(&Frame::AgentData { generation, data });
     }
 
     /// Reads one fair share from the socket into the receive buffer, up to
@@ -275,9 +287,11 @@ impl Conn {
                 Err(err) => return Err(err),
             }
         }
-        self.tx.clear();
-        self.tx_pos = 0;
-        self.stream.flush()
+        // Nothing follows, deliberately. Clearing the queue and calling `flush` here was
+        // theatre: this is private and reached only from [`Conn::close_with`], which drops
+        // `self` on the next statement, and `Write::flush` for a `UnixStream` is a no-op
+        // that answers `Ok(())`. Three statements of state nothing could ever read back.
+        Ok(())
     }
 
     /// Closes, delivering `frame` as the last thing this connection will ever carry — or,

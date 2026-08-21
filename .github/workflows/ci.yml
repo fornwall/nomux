@@ -119,6 +119,30 @@ jobs:
           tar -xzf "$tarball" -C "$HOME/.local/bin" actionlint
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
+      # Every gate below reaches CI through .pre-commit-config.yaml and nothing else: fmt over
+      # all three workspaces, clippy, `cargo deny check bans licenses sources` over two of them,
+      # actionlint, shellcheck and scripts/check-references.sh are invoked by no step of this
+      # workflow independently. A hook id deleted or renamed would take its gate with it and
+      # nothing would report the loss — and `--skip cargo-nextest` below is the same hazard in
+      # miniature, since prek skips a name that no longer exists without a word. This is the
+      # manifest that says so out loud, the way check-references.sh refuses "no files to scan",
+      # e2e-tests/run.sh refuses a measured count that is not the expected one, and
+      # scripts/build-release.sh refuses NO BASELINE. Removing a hook on purpose is meant to
+      # fail here until its name comes off this list too.
+      - name: Every gate this job delegates is still a hook
+        if: github.event_name != 'schedule'
+        run: |
+          missing=''
+          for id in section-references-resolve actionlint shellcheck \
+              cargo-fmt cargo-fmt-fuzz cargo-fmt-e2e-probe \
+              cargo-clippy cargo-nextest cargo-deny cargo-deny-fuzz; do
+            grep -qE "^ +- id: $id\$" .pre-commit-config.yaml || missing="$missing $id"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::.pre-commit-config.yaml no longer defines:$missing" >&2
+            exit 1
+          fi
+
       # The gate itself, from .pre-commit-config.yaml. `--skip cargo-nextest`: the step below runs
       # a strict superset of that hook, and the session suite is too slow to run twice.
       - if: github.event_name != 'schedule'

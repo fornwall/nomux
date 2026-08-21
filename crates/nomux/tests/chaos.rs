@@ -36,7 +36,8 @@ use std::time::{Duration, Instant};
 use nomux_protocol::{MAX_PAYLOAD, RESUME_FROM_START};
 
 use harness::{
-    MAX_PENDING_WRITE, Rng, Session, StreamModel, poll_by, reconnect_until_gap, socket_capacity,
+    MAX_PENDING_WRITE, Rng, Session, StreamModel, poll_by, position, reconnect_until_gap,
+    socket_capacity,
 };
 
 /// How long a chaos test waits for its workload before calling it stalled.
@@ -156,12 +157,22 @@ fn replayed_input_across_random_disconnects_is_applied_once() {
     let mut rng = Rng::new(chaos_seed);
     let line = b"printf M\n";
     let rounds = 12usize;
-    let mut applied = intended.len() as u64;
+    // Two variables and not one, exactly as the repaint sibling below keeps them apart.
+    // `confirmed` is the last position the *daemon* said it had applied, which is what
+    // the monotonicity assertion has to be made against; `resend_from` is that figure
+    // pulled back so the resend overlaps into bytes already applied. Compared against
+    // the reduced figure instead, the assertion would permit `in_applied` to fall by up
+    // to five bytes a round — which is the `end > in_applied` rewind that
+    // `session.rs`'s `replayed_input_is_applied_exactly_once` exists to catch, and § 9's
+    // "no duplicated input, ever" is the invariant this randomised test is here to hold
+    // across disconnects.
+    let mut confirmed = intended.len() as u64;
+    let mut resend_from = confirmed;
 
     for round in 0..rounds {
         intended.extend_from_slice(line);
-        let from = usize::try_from(applied).expect("offset fits");
-        client.input(applied, &intended[from..]);
+        let from = usize::try_from(resend_from).expect("offset fits");
+        client.input(resend_from, &intended[from..]);
 
         drop(client);
         client = session.connect_by(deadline);
@@ -171,20 +182,21 @@ fn replayed_input_across_random_disconnects_is_applied_once() {
             "round {round}: the daemon applied input the client never sent (seed {chaos_seed:#x})"
         );
         assert!(
-            resumed.in_applied >= applied,
+            resumed.in_applied >= confirmed,
             "round {round}: applied input must never go backwards (seed {chaos_seed:#x})"
         );
+        confirmed = resumed.in_applied;
         offset = resumed.resume_from;
 
         // Slightly before what the daemon reports, so the overlap has to be trimmed
         // rather than run a second time.
-        applied = resumed.in_applied.saturating_sub(rng.below(6));
+        resend_from = confirmed.saturating_sub(rng.below(6));
     }
 
     // A fence proves everything before it has been through the PTY.
     intended.extend_from_slice(b"printf FENCE\n");
-    let from = usize::try_from(applied).expect("offset fits");
-    client.input(applied, &intended[from..]);
+    let from = usize::try_from(resend_from).expect("offset fits");
+    client.input(resend_from, &intended[from..]);
     let (seen, _) = client.read_until("FENCE", offset);
     let marks = seen.matches('M').count();
     assert_eq!(
@@ -204,10 +216,7 @@ fn assert_repaints_preserved_input(
     rounds: usize,
     chaos_seed: u64,
 ) {
-    let fence = recorded
-        .windows(REPAINT_FENCE.len())
-        .position(|window| window == REPAINT_FENCE)
-        .expect("the fence the wait above returned for");
+    let fence = position(recorded, REPAINT_FENCE).expect("the fence the wait above returned for");
     let through_fence = recorded
         .get(..fence + REPAINT_FENCE.len())
         .expect("the located fence fits in the record");
@@ -355,10 +364,7 @@ fn ctrl_l_repaints_interleaved_with_resends_do_not_change_input() {
     client.input(resend_from, &intended[from..]);
     assert!(
         poll_by(deadline, || {
-            fs::read(&record).is_ok_and(|seen| {
-                seen.windows(REPAINT_FENCE.len())
-                    .any(|window| window == REPAINT_FENCE)
-            })
+            fs::read(&record).is_ok_and(|seen| position(&seen, REPAINT_FENCE).is_some())
         }),
         "the final resend never reached the raw child (seed {chaos_seed:#x})"
     );
@@ -958,11 +964,18 @@ fn a_full_screen_stream_is_byte_exact_across_gaps_that_cut_its_escape_sequences(
         "every byte the child wrote must be accounted for, dropped behind a gap or \
          delivered (seed {chaos_seed:#x})"
     );
+    // A guard on the *plan* rather than on the daemon, and worded so that it is not
+    // read as one: both counters behind it are incremented by this file alone, once per
+    // `Round::Interrupted` cut and once per reattaching round, so nothing the daemon
+    // could do moves either. What it catches is `workload` drifting into a shape where
+    // the rounds this test reasons about no longer happen — unlike the gap and straddle
+    // assertions below, which depend on where the daemon cut the stream.
     assert_eq!(
         replay.reattaches,
         3 + DISCONNECTS,
-        "the plan comes back on a fresh connection three times at a round boundary and \
-         {DISCONNECTS} times inside one (seed {chaos_seed:#x})"
+        "the generated plan no longer has the shape the rest of this test reasons \
+         about: it must come back on a fresh connection three times at a round boundary \
+         and {DISCONNECTS} times inside one (seed {chaos_seed:#x})"
     );
     assert_eq!(
         replay.gaps.len(),

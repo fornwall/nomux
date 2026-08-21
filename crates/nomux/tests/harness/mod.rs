@@ -667,6 +667,11 @@ pub(crate) fn collect(command: &mut Command) -> Output {
 /// run instead of failing it, and the runner's own kill (`.config/nextest.toml`) reports
 /// a slow test rather than which call never returned. The deadline is the caller's, per
 /// [`poll_by`].
+///
+/// The `Command` is the caller's too, and stays that way: a caller whose mode could reach
+/// a shell has to hand one over ([`nomux_with_shell`]), and the modes that must not reach
+/// a shell may not be handed anything `IMPLEMENTATION.md` § 6.6 does not give them — so
+/// what a run is told is not this function's to decide.
 pub(crate) fn collect_by(command: &mut Command, deadline: Instant) -> Option<Output> {
     let mut running = Spawned::spawn(
         command
@@ -905,6 +910,13 @@ impl Drop for HeldLock {
 #[derive(Clone, Copy)]
 pub(crate) enum Flock {
     /// Still queued behind somebody else's lock on the same file.
+    ///
+    /// Nothing in this design can be caught in it: `rundir`'s acquirers poll `try_lock`
+    /// non-blockingly and back off, so a request that cannot be granted returns rather
+    /// than waiting in the kernel where `/proc/locks` would show it with a `->`. Kept
+    /// because the state is what makes [`wait_until_flock`]'s `state` argument mean
+    /// anything — a one-variant enum there would be a parameter nobody could get wrong
+    /// — and because a future acquirer that *does* block is what this would name.
     Queued,
     /// Granted, and held until whoever took it lets go.
     Granted,
@@ -1389,12 +1401,27 @@ fn out_of_time(awaiting: &str, context: &str) -> ! {
 
 /// Asks the session for a marker no shell that failed to run the line could produce,
 /// and waits for it. The arithmetic is the assertion — see [`READY_MARKER`].
-pub(crate) fn still_serving(client: &mut Client, tag: &str) {
+///
+/// Hands back one past the last input byte it sent, for the caller that has to say what
+/// the session's input position should be afterwards: the line this writes is this
+/// function's to compose, so a test that compared against a length of its own would be
+/// asserting on a string it does not hold. Ignored everywhere else.
+pub(crate) fn still_serving(client: &mut Client, tag: &str) -> u64 {
     client.input(
         client.in_offset,
         format!("echo {tag}-$((6*7))\n").as_bytes(),
     );
     client.read_until(&format!("{tag}-42"), client.out_offset);
+    client.in_offset
+}
+
+/// Where `needle` starts in `haystack`. `[u8]` has no `find`, and the records these
+/// tests read are bytes rather than text: the daemon's repaint keystroke is `0x0c`, and
+/// a PTY transcript is not obliged to be UTF-8 at all.
+pub(crate) fn position(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 /// Asserts that a frame the daemon sent is an `Error` carrying `code`, and — where the

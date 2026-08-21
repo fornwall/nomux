@@ -25,6 +25,24 @@ const SOCKET: &str = "/dev/log";
 /// have explained the refusal.
 const MAX_LINE_LEN: usize = 2048;
 
+/// Longest session id a line carries, in bytes, before it is elided.
+///
+/// The id sits ahead of the message and is not always a validated one — `daemon::run`
+/// reports a startup failure before anything has looked at its argument, and
+/// `rundir::SessionPaths::in_dir` refusing the id *is* such a failure. Without a budget of
+/// its own an argv-sized id spends the whole of [`MAX_LINE_LEN`] on itself and the tail cut
+/// takes the message with it, which loses exactly the line that bound exists to deliver.
+///
+/// 64 because a valid id is 1..=64 bytes of `[A-Za-z0-9_-]` (`rundir::is_valid_session_id`):
+/// every id the daemon ever accepted is shown in full, and only one it refused is ever cut.
+const MAX_ID_IN_LINE: usize = 64;
+
+/// U+2026 HORIZONTAL ELLIPSIS, written in place of what an over-long id lost, so a reader is
+/// not handed the first [`MAX_ID_IN_LINE`] bytes of somebody's id as though that were the
+/// whole of it. One visible cell, and no character [`is_deceptive`] takes, so it survives
+/// the filter run over the assembled line.
+const ELIDED: char = '\u{2026}';
+
 /// Drops every character that would let text say one thing and mean another once a terminal
 /// draws it.
 ///
@@ -35,15 +53,21 @@ pub(crate) fn sanitize_text(text: &str) -> String {
     text.chars().filter(|ch| !is_deceptive(*ch)).collect()
 }
 
-/// Whether `ch` can forge terminal layout or render invisibly. This covers Unicode 17's
-/// default-ignorable code points except ZWJ and ZWNJ, which ordinary emoji and Indic text use.
+/// Whether `ch` can forge terminal layout or occupy no width at all once a terminal draws
+/// it — the two ways text can say one thing and mean another.
+///
+/// That is every control character, and Unicode 17's default-ignorable code points except
+/// ZWJ and ZWNJ, which ordinary emoji and Indic text use. Plus U+2800 BRAILLE PATTERN BLANK,
+/// which is none of those things — `General_Category=So`, not default-ignorable, not
+/// `White_Space`, so nothing else here takes it and `trim` leaves it — yet the blank braille
+/// cell draws as empty in every terminal font, which is the whole of what this list is for.
 const fn is_deceptive(ch: char) -> bool {
     ch.is_control()
         || matches!(ch,
             '\u{ad}' | '\u{34f}' | '\u{61c}' | '\u{115f}'..='\u{1160}'
             | '\u{17b4}'..='\u{17b5}' | '\u{180b}'..='\u{180f}' | '\u{200b}'
             | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{206f}'
-            | '\u{3164}' | '\u{fe00}'..='\u{fe0f}' | '\u{feff}' | '\u{ffa0}'
+            | '\u{2800}' | '\u{3164}' | '\u{fe00}'..='\u{fe0f}' | '\u{feff}' | '\u{ffa0}'
             | '\u{fff0}'..='\u{fff8}' | '\u{1bca0}'..='\u{1bca3}'
             | '\u{1d173}'..='\u{1d17a}' | '\u{e0000}'..='\u{e0fff}')
 }
@@ -66,8 +90,18 @@ pub(crate) fn sanitize_label(label: &str) -> String {
 /// carrying a run directory somebody else chose, and the id is not always validated either
 /// — `daemon::run` reports a startup failure before anything has looked at its argument.
 fn format_line(priority: u8, session_id: &str, message: &str) -> String {
+    // The id is given its own budget before the line is assembled, because the tail cut
+    // below cannot give it one: the id is printed ahead of the message, so an unbounded one
+    // buys its bytes with the ones that say what went wrong. Filtered first and cut second,
+    // on the same grounds as the whole line — the other order spends the budget on
+    // characters that are about to be dropped anyway.
+    let mut id = sanitize_text(session_id);
+    if id.len() > MAX_ID_IN_LINE {
+        id.truncate(id.floor_char_boundary(MAX_ID_IN_LINE));
+        id.push(ELIDED);
+    }
     let mut line = sanitize_text(&format!(
-        "<{priority}>nomux[{pid}]: session {session_id}: {message}",
+        "<{priority}>nomux[{pid}]: session {id}: {message}",
         pid = std::process::id(),
     ));
     line.truncate(line.floor_char_boundary(MAX_LINE_LEN));
@@ -208,6 +242,14 @@ mod tests {
             ""
         );
         assert_eq!(sanitize_label("build\u{3164}"), sanitize_label("build"));
+
+        // A braille blank is neither a control, nor default-ignorable, nor whitespace, so
+        // it is here on the strength of what it draws alone: nothing.
+        assert_eq!(sanitize_label("\u{2800}\u{2800}\u{2800}"), "");
+        assert_eq!(
+            sanitize_label("build\u{2800}\u{2800}"),
+            sanitize_label("build")
+        );
     }
 
     /// Truncation must not split a character, or `list` would print a replacement
@@ -280,6 +322,10 @@ mod tests {
     /// `MAX_ARG_STRLEN` assembles twice its own size. Unbounded that is a datagram past
     /// `wmem_default`, refused with `EMSGSIZE` and swallowed like every other failure here,
     /// which loses the one line that would have said why the daemon declined to start.
+    ///
+    /// A line of the right length is not enough, which is why the message is asserted too:
+    /// with the id cut only off the tail, this refusal reached the journal as 2048 bytes of
+    /// the operator's own argument and nothing whatever about why it was refused.
     #[test]
     fn an_argv_sized_session_id_still_fits_one_datagram() {
         let huge = "x".repeat(128 * 1024);
@@ -289,20 +335,60 @@ mod tests {
             line.starts_with(&framing()),
             "the framing must survive the cut"
         );
+        assert!(
+            line.contains(&format!("{ELIDED}: invalid session id ")),
+            "the id is cut where it stands, so what it precedes is still there: {line}"
+        );
+    }
+
+    /// The budget's own edge, pinned here because it is the whole of what keeps a message
+    /// in the line: the longest id `rundir::is_valid_session_id` accepts is printed whole,
+    /// and one byte past it is cut and *says* it was cut, so nobody reads a prefix of an id
+    /// as the id itself.
+    #[test]
+    fn a_session_id_is_shown_whole_up_to_the_longest_valid_one() {
+        let longest = "x".repeat(MAX_ID_IN_LINE);
+        assert_eq!(
+            format_line(11, &longest, "started"),
+            format!("{}{longest}: started", framing()),
+            "an id the daemon would accept must never be elided"
+        );
+        assert_eq!(
+            format_line(11, &format!("{longest}x"), "started"),
+            format!("{}{longest}{ELIDED}: started", framing()),
+            "one byte past the budget is one byte too many"
+        );
+
+        // The id budget is a byte count over text somebody else chose, so the same walk
+        // back off a split character the line's own bound takes applies here.
+        let wide = "€".repeat(MAX_ID_IN_LINE);
+        assert_eq!(
+            format_line(11, &wide, "started"),
+            format!(
+                "{}{}{ELIDED}: started",
+                framing(),
+                "€".repeat(MAX_ID_IN_LINE / 3)
+            ),
+            "the id cut lands on a character boundary"
+        );
     }
 
     /// `String::truncate` panics on a split codepoint rather than yielding invalid UTF-8, so
     /// what can be shown is the cut walking back off one: with a three-byte character laid
     /// across the bound, the line lands short by exactly the bytes of it that were inside.
+    ///
+    /// Overflowed from the message, because that is now the only thing that can overflow a
+    /// line: [`MAX_ID_IN_LINE`] takes the id's own length out of the question first.
     #[test]
     fn the_bound_is_taken_on_a_character_boundary() {
+        let head = format!("{}x: ", framing());
         for (inside, len, last) in [
             (3, MAX_LINE_LEN, '€'),
             (2, MAX_LINE_LEN - 2, 'x'),
             (1, MAX_LINE_LEN - 1, 'x'),
         ] {
-            let id = "x".repeat(MAX_LINE_LEN - framing().len() - inside) + &"€".repeat(4);
-            let line = format_line(11, &id, "started");
+            let message = "x".repeat(MAX_LINE_LEN - head.len() - inside) + &"€".repeat(4);
+            let line = format_line(11, "x", &message);
             assert_eq!(line.len(), len, "{inside} of three bytes inside the bound");
             assert_eq!(
                 line.chars().next_back(),
@@ -315,7 +401,9 @@ mod tests {
     /// Filtered first and cut second, which is the only order that leaves the bound
     /// measuring what a receiver will actually see: the other spends the budget on
     /// characters that are about to be dropped anyway, and drops the tail that says what
-    /// went wrong to pay for them.
+    /// went wrong to pay for them. The id's budget is taken in that order too, which this
+    /// covers as it stands: filtered second, the id here would be [`MAX_ID_IN_LINE`] control
+    /// characters and the name would be gone.
     #[test]
     fn the_line_is_filtered_before_it_is_cut() {
         let id = format!("{}build", "\u{7}".repeat(MAX_LINE_LEN));

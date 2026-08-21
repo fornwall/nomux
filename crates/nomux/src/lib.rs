@@ -100,7 +100,7 @@ wire_enum! {
     ///
     /// Exhaustive on purpose: both endpoints are built from this repository, so an
     /// unrecognised variant is a bug rather than a forward-compatibility case.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     FrameType: u8,
     /// Client opens a session, carrying its resume offsets and window size.
     Hello = 0x01,

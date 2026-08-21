@@ -8,10 +8,9 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
 use std::io::Read;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
-use std::os::unix::process::CommandExt;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 
 use nomux_protocol::WinSize;
 use rustix::fs::{Mode, OFlags};
@@ -20,6 +19,8 @@ use rustix::process::{
 };
 use rustix::pty::{OpenptFlags, openpt, ptsname, unlockpt};
 use rustix::termios::{Winsize, tcsetwinsize};
+
+use crate::exec::{self, Program};
 
 /// What the session's child needs to know at spawn.
 #[derive(Debug)]
@@ -45,14 +46,16 @@ const HANGUP_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 const HANGUP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// A running session: the PTY master plus the child holding its slave.
+///
+/// The child is a bare pid and not a `std::process::Child`, `crate::exec` having the
+/// argument. Nothing here reaps it: the zombie is what reserves the numeric session id for
+/// as long as [`Pty::terminate`] signals through it, and § 6.5 leaves it to init.
 #[derive(Debug)]
 pub(crate) struct Pty {
     master: OwnedFd,
-    child: Child,
+    child: Pid,
     /// Whether the child's outcome has been read without collecting it.
     observed: bool,
-    /// Whether shutdown has collected the child.
-    reaped: bool,
 }
 
 impl Pty {
@@ -63,14 +66,25 @@ impl Pty {
     /// Propagates the PTY allocation, the slave `open` and the spawn.
     pub(crate) fn spawn(config: &Spawn<'_>) -> io::Result<Self> {
         // `CLOEXEC` on both ends, and what it keeps out of the child: § 6.1.
-        let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC)?;
+        //
+        // `NONBLOCK` is folded into the same open (the non-blocking master of § 6.1)
+        // rather than set with an `fcntl` pair afterwards, which is two more syscalls and
+        // two more error paths on the session-creation path. It leans on something
+        // rustix does not document: on Linux `openpt` is a plain
+        // `open("/dev/ptmx", flags)` and `OpenptFlags` carries a catch-all bit, so an
+        // `O_*` it does not name reaches the kernel unchanged. A rustix bump could
+        // silently drop the flag and leave the daemon blocking inside a PTY write, so
+        // `a_pty_master_is_non_blocking_as_it_is_opened` reads the flag back rather than
+        // trusting this. The slave is a separate open and stays blocking, as the child
+        // expects of its stdio.
+        let master = openpt(
+            OpenptFlags::RDWR
+                | OpenptFlags::NOCTTY
+                | OpenptFlags::CLOEXEC
+                | OpenptFlags::from_bits_retain(OFlags::NONBLOCK.bits()),
+        )?;
         unlockpt(&master)?;
         let slave_path = ptsname(&master, Vec::new())?;
-
-        // Non-blocking master (§ 6.1). The slave is a separate open and stays blocking,
-        // as the child expects of its stdio.
-        let flags = rustix::fs::fcntl_getfl(&master)?;
-        rustix::fs::fcntl_setfl(&master, flags | OFlags::NONBLOCK)?;
 
         // As the `CString` `ptsname` returned: going through `OsStr` would strip the
         // terminator and have rustix copy the path back into a buffer to re-append it.
@@ -79,37 +93,38 @@ impl Pty {
             OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
             Mode::empty(),
         )?;
-        let slave = File::from(slave);
-
         // Before the child can observe it, so its first prompt is laid out right.
         tcsetwinsize(&master, to_winsize(config.win))?;
 
+        // Everything the child will need, rendered here in the parent: between the fork
+        // and the `execve` it may not allocate, and `crate::exec` has why that is stricter
+        // than what `Command`'s `pre_exec` used to ask of the `setup` closure below.
         let (shell, argv0) = login_shell();
-        let mut command = Command::new(&shell);
-        command
-            .arg0(&argv0)
-            .current_dir(config.cwd)
-            .stdin(Stdio::from(slave.try_clone()?))
-            .stdout(Stdio::from(slave.try_clone()?))
-            .stderr(Stdio::from(slave.try_clone()?))
-            .env("TERM", config.term)
-            .env("NOMUX_SESSION", config.session_id);
+        let mut program = Program::new(&shell, argv0.as_bytes())?;
+        // The daemon has moved to `/` (§ 6.2), so the child's directory is passed rather
+        // than inherited or the shell would start there.
+        program.current_dir(config.cwd)?;
+        program.env("TERM", config.term.as_bytes())?;
+        program.env("NOMUX_SESSION", config.session_id.as_bytes())?;
         if let Some(sock) = config.agent_sock {
             // Overwrites whatever sshd forwarded, deliberately (§ 6.7).
-            command.env("SSH_AUTH_SOCK", sock);
+            program.env("SSH_AUTH_SOCK", sock.as_os_str().as_bytes())?;
         }
 
-        // Valid between fork and exec: `slave` outlives `spawn` in this frame, and
-        // CLOEXEC only takes effect at exec.
-        let slave_fd = slave.as_raw_fd();
-        // Bound out here rather than written inside the `unsafe` block below, and
-        // load-bearing for it: unsafe context reaches lexically into a closure body, so
-        // the calls in here would need no block of their own for the lint to fire on.
+        // Read out here rather than in the child below, and load-bearing for it:
+        // `SIGRTMAX()` is a libc *function* — on glibc one that consults a value the
+        // runtime initialises — and the child may call nothing that is not
+        // async-signal-safe. The loop it bounds runs there; the question is answered here.
         let max_signal = libc::SIGRTMAX();
-        let pre_exec = move || {
+        // The three descriptors the child is handed are all the slave, which
+        // `crate::exec::spawn` places on 0, 1 and 2 for it. `CLOEXEC` on both ends of the
+        // PTY (§ 6.1) is what keeps the master out of the child; these three cross because
+        // `dup2` clears the flag on the copies it makes and on nothing else.
+        let child = exec::spawn(&program, [slave.as_fd(); 3], &mut |[input, _, _]| {
             rustix::process::setsid()?;
-            // SAFETY: `slave_fd` is open in the child, inherited across fork.
-            let slave = unsafe { BorrowedFd::borrow_raw(slave_fd) };
+            // SAFETY: `input` is this child's copy of the slave — open across the fork,
+            // and already raised clear of the three numbers it is about to be placed on.
+            let slave = unsafe { BorrowedFd::borrow_raw(input) };
             rustix::process::ioctl_tiocsctty(slave)?;
             // Exec preserves ignored dispositions. Give the login shell defaults rather
             // than a launcher's signal policy; skip the two uncatchable signals.
@@ -120,28 +135,16 @@ impl Pty {
                 }
             }
             Ok(())
-        };
-        // SAFETY: the closure runs in the forked child before exec and must be
-        // async-signal-safe. Every call in it is: POSIX lists `setsid` and `signal`
-        // outright, and `ioctl` is a bare syscall — it has no userspace half to be
-        // half-way through. Nothing here allocates, takes a lock, or touches the Rust
-        // runtime.
-        unsafe {
-            command.pre_exec(pre_exec);
-        }
-
-        let child = command.spawn()?;
-        // Both the copy in this frame and the three `Stdio::from` took: std only
-        // *borrows* an owned descriptor for the child, so `Command` holds all three
-        // until it is itself dropped. § 6.1 has what a copy outliving this function
-        // would cost.
-        drop(command);
+        })?;
+        // The daemon's own copy, let go of the moment the child holds one of its own —
+        // § 6.1 has what one outliving this function would cost. `Command` used to keep
+        // three of them until it was itself dropped, which is what the `drop` here
+        // replaces.
         drop(slave);
         Ok(Self {
             master,
             child,
             observed: false,
-            reaped: false,
         })
     }
 
@@ -177,16 +180,12 @@ impl Pty {
 
     /// Observes the child's outcome without releasing its process identity.
     pub(crate) fn try_outcome(&mut self) -> io::Result<Option<(i32, nomux_protocol::ExitKind)>> {
-        if self.observed || self.reaped {
+        if self.observed {
             return Ok(None);
         }
-        let raw = as_pid(self.child.id());
-        let Some(pid) = Pid::from_raw(raw) else {
-            return Err(io::Error::other("child pid is invalid"));
-        };
         let options = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
         let status = loop {
-            match waitid(WaitId::Pid(pid), options) {
+            match waitid(WaitId::Pid(self.child), options) {
                 Err(err) if err == rustix::io::Errno::INTR => {}
                 outcome => break outcome?,
             }
@@ -209,49 +208,79 @@ impl Pty {
     }
 
     /// Terminates the child's process group and everything else in its session.
+    ///
+    /// Called exactly once, from `Daemon::shutdown`, which drops the `Pty` on the very
+    /// next line — so this is deliberately *not* idempotent and guards against neither a
+    /// second call nor a [`Pty::try_outcome`] after it. Nothing collects the child
+    /// either: the daemon exits behind this, leaving the zombie to init, and the tests
+    /// that hold a `Pty` past a `terminate` do their own `wait`.
+    #[expect(
+        clippy::needless_pass_by_ref_mut,
+        reason = "nothing here mutates the `Pty` now that the child is a bare pid, but \
+                  every caller holds one by value and `let Some(mut pty) = …` would be an \
+                  unused `mut` the moment this took `&self`"
+    )]
     pub(crate) fn terminate(&mut self) {
-        let raw = as_pid(self.child.id());
-        if let Some(pid) = Pid::from_raw(raw)
-            && !self.reaped
-        {
-            let mut group_alive = rustix::process::test_kill_process_group(pid).is_ok();
-            let deadline = std::time::Instant::now() + HANGUP_GRACE;
-            let mut settled = session_is_empty(raw, Some(deadline));
-            if !settled {
-                if group_alive {
-                    reach(Reach::Group(pid), Signal::HUP);
-                }
-                signal_session(raw, Signal::HUP, deadline);
+        let pid = self.child;
+        let raw = Pid::as_raw(Some(pid));
+        let mut group_alive = rustix::process::test_kill_process_group(pid).is_ok();
+        // A budget of the probe's own, and then a fresh one for the hangup phase
+        // below, exactly as the `SIGKILL` phase takes for itself. Sharing one across
+        // the three would spend the shell's grace on finding out whether it is owed
+        // any: this probe is a whole `/proc` walk — three syscalls for every entry
+        // ahead of the child in readdir order, tens of milliseconds on a busy host —
+        // and one that used the budget up leaves [`walk_session`] bailing at its
+        // first deadline check, so the `SIGHUP` walk below reaches nobody and every
+        // session member in a process group of its own goes straight to `SIGKILL`.
+        let mut settled = session_is_empty(raw, Some(std::time::Instant::now() + HANGUP_GRACE));
+        let deadline = std::time::Instant::now() + HANGUP_GRACE;
+        if !settled {
+            if group_alive {
+                reach(Reach::Group(pid), Signal::HUP);
+                reach(Reach::Group(pid), Signal::CONT);
+            }
+            signal_session(raw, Signal::HUP, deadline);
+            // `SIGCONT` behind every `SIGHUP`, as sshd and tmux both send it. A
+            // stopped task is only woken by a signal whose *default* action is fatal,
+            // so a job the user suspended with `Ctrl-Z` that installed a `SIGHUP`
+            // handler — `vim`, `less`, `emacs -nw`, an inner shell — leaves the
+            // signal merely queued and stays in state `T`: it counts as a live member
+            // for the whole grace below and is then `SIGKILL`ed with its hangup path
+            // never run, which for `vim` is the swapfile left orphaned. To anything
+            // that was not stopped this is a no-op. The `SIGKILL` phase needs no
+            // counterpart, `SIGKILL` being fatal by default and so waking a stopped
+            // task itself.
+            signal_session(raw, Signal::CONT, deadline);
 
-                while std::time::Instant::now() < deadline {
-                    group_alive = rustix::process::test_kill_process_group(pid).is_ok();
-                    if session_is_empty(raw, Some(deadline)) {
-                        settled = true;
-                        break;
-                    }
-                    std::thread::sleep(HANGUP_POLL_INTERVAL);
+            while std::time::Instant::now() < deadline {
+                group_alive = rustix::process::test_kill_process_group(pid).is_ok();
+                if session_is_empty(raw, Some(deadline)) {
+                    settled = true;
+                    break;
                 }
-            }
-            if !settled {
-                if group_alive {
-                    reach(Reach::Group(pid), Signal::KILL);
-                }
-                let deadline = std::time::Instant::now() + HANGUP_GRACE;
-                loop {
-                    signal_session(raw, Signal::KILL, deadline);
-                    if session_is_empty(raw, Some(deadline))
-                        || std::time::Instant::now() >= deadline
-                    {
-                        break;
-                    }
-                    std::thread::sleep(HANGUP_POLL_INTERVAL);
-                }
+                std::thread::sleep(HANGUP_POLL_INTERVAL);
             }
         }
-        if !self.reaped {
-            drop(self.child.kill());
-            self.reaped = self.child.try_wait().is_ok_and(|status| status.is_some());
+        if !settled {
+            if group_alive {
+                reach(Reach::Group(pid), Signal::KILL);
+            }
+            let deadline = std::time::Instant::now() + HANGUP_GRACE;
+            loop {
+                signal_session(raw, Signal::KILL, deadline);
+                if session_is_empty(raw, Some(deadline)) || std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(HANGUP_POLL_INTERVAL);
+            }
         }
+        // The direct child, last and unconditionally, and deliberately not through
+        // [`reach`]: `reach` is the door every *session* signal goes through so the tests
+        // below can assert on what a settled session was sent, and this one is owed
+        // whatever the walk concluded — a `SIGKILL` to a process that has already exited
+        // is the `ESRCH` those tests must not see recorded. Safe against pid reuse for the
+        // reason [`pinned_member`] gives: nothing has reaped this child.
+        let _ = rustix::process::kill_process(pid, Signal::KILL);
     }
 }
 
@@ -268,15 +297,21 @@ fn as_pid(id: u32) -> i32 {
 /// member ([`pinned_member`]), never through the number, or the reuse window a numeric
 /// `kill(2)` has reopens.
 fn signal_session(sid: i32, signal: Signal, deadline: std::time::Instant) {
-    let _ = walk_session(Path::new(PROC), sid, true, Some(deadline), |_, pinned| {
-        // A missing pidfd is ambiguity, not licence to fall back to the number:
-        // signalling nothing is safer than reaching a process that inherited it. The
-        // child's own process-group reach remains.
-        if let Some(pidfd) = pinned {
-            reach(Reach::Pinned(pidfd), signal);
-        }
-        true
-    });
+    let _ = walk_session(
+        Path::new(PROC),
+        sid,
+        true,
+        Some(deadline),
+        &mut |_, pinned| {
+            // A missing pidfd is ambiguity, not licence to fall back to the number:
+            // signalling nothing is safer than reaching a process that inherited it. The
+            // child's own process-group reach remains.
+            if let Some(pidfd) = pinned {
+                reach(Reach::Pinned(pidfd), signal);
+            }
+            true
+        },
+    );
 }
 
 /// One stable destination for a signal this module sends.
@@ -355,12 +390,18 @@ enum Membership {
 /// enumerated, if `deadline` passed, or if a process in it kept its `stat` from being read
 /// ([`Membership::Unseen`]). A stopped visit is successful: the caller already learned
 /// what it asked.
+///
+/// `visit` is taken as a trait object rather than by `impl FnMut`, which would give each
+/// of the two callers a full copy of a body that reads a directory, pushes and pops a
+/// `PathBuf` per entry and calls [`membership`] and [`pinned_member`]. This is the cold
+/// teardown path — it runs once per session, against syscalls — so an indirect call per
+/// process costs nothing measurable against the `.text` two copies cost.
 fn walk_session(
     root: &Path,
     sid: i32,
     pin: bool,
     deadline: Option<std::time::Instant>,
-    mut visit: impl FnMut(i32, Option<&OwnedFd>) -> bool,
+    visit: &mut dyn FnMut(i32, Option<&OwnedFd>) -> bool,
 ) -> bool {
     if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
         return false;
@@ -472,7 +513,7 @@ fn pinned_member(
 /// daemon takes.
 fn session_is_empty(sid: i32, deadline: Option<std::time::Instant>) -> bool {
     let mut empty = true;
-    let scanned = walk_session(Path::new(PROC), sid, false, deadline, |_, _| {
+    let scanned = walk_session(Path::new(PROC), sid, false, deadline, &mut |_, _| {
         empty = false;
         false
     });
@@ -517,11 +558,32 @@ fn login_shell() -> (PathBuf, String) {
 
 /// The choice behind [`login_shell`], with the environment lifted out so it is testable
 /// without mutating it — as [`pick_dir`] is for [`child_dir`]. Absolute rather than
-/// merely non-empty: a program with no `/` sends `Command` looking down `PATH`, so a
-/// `SHELL=bash` would run whatever a writable `~/.local/bin` resolves it to.
+/// merely non-empty: `crate::exec` searches no `PATH` (its module doc has why), so a
+/// program with no `/` is left to `execve` to resolve against the child's working
+/// directory — and that directory is the user's own `$HOME`, which the child `chdir`s to
+/// in the same breath. A `SHELL=bash` would run whatever `~/bash` happens to be.
 fn pick_shell(shell: Option<PathBuf>) -> (PathBuf, String) {
     let shell = shell
-        .filter(|value| value.is_absolute())
+        // Executable, not merely named, and for the reason [`pick_dir`] probes its
+        // directory: an absolute `$SHELL` naming a binary that is gone or is not
+        // executable propagates `ENOENT`/`EACCES` out of `execve`, and `daemon.rs`
+        // answers a failed spawn with `ErrorCode::Internal` and stops — so a stale
+        // `$SHELL` costs the user the session outright where § 6.1.1's precedence says
+        // it should cost them nothing but `/bin/sh`. `access(2)` asks with the real ids,
+        // which for this unprivileged, never-setuid daemon are the effective ones.
+        //
+        // `is_file` as well, because `access(X_OK)` alone is not the question being
+        // asked: on a *directory* the execute bit means search permission, and it is set
+        // on every directory this daemon can enter — so a `SHELL=/tmp` passes an `X_OK`
+        // probe, reaches `execve`, and comes back `EACCES`, costing the session exactly
+        // what the rest of this filter exists to prevent. `is_file` is `stat(2)` and
+        // follows symlinks, and it answers *no* where the `stat` itself failed, which is
+        // the fallback a `$SHELL` pointing at a dangling link deserves anyway.
+        .filter(|value| {
+            value.is_absolute()
+                && value.is_file()
+                && rustix::fs::access(value, rustix::fs::Access::EXEC_OK).is_ok()
+        })
         .unwrap_or_else(|| PathBuf::from("/bin/sh"));
     let base = shell
         .file_name()
@@ -550,14 +612,30 @@ fn pick_dir(home: Option<&Path>, fallback: Option<&Path>) -> PathBuf {
     [home, fallback]
         .into_iter()
         .flatten()
-        .find(|dir| dir.is_absolute() && dir.is_dir())
+        // `is_dir` is `stat(2)`, which answers for a mode-`0000` directory as long as its
+        // parent is searchable, while `chdir(2)` needs search permission on the directory
+        // itself. Without the probe such a `$HOME` — one on an autofs or NFS mount
+        // answering `EACCES`, one whose mode was tightened — reaches
+        // `exec::Program::current_dir`, fails at the `chdir` the forked child issues just
+        // before its `execve`, and comes back down that child's errno pipe as an `EACCES`
+        // that `daemon.rs` answers with `ErrorCode::Internal`: the session
+        // refuses to start rather than falling through to the next step of the
+        // precedence, which is worse than `ssh`, and worse than the `/` this documents.
+        .find(|dir| {
+            dir.is_absolute()
+                && dir.is_dir()
+                && rustix::fs::access(*dir, rustix::fs::Access::EXEC_OK).is_ok()
+        })
         .map_or_else(|| PathBuf::from("/"), Path::to_path_buf)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
     use crate::nbio::{ReadOutcome, read_or_eof};
+    use crate::scratch::Scratch;
 
     #[test]
     fn a_stat_line_parses_past_a_hostile_process_name() {
@@ -617,10 +695,16 @@ mod tests {
         let deadline = std::time::Instant::now();
         let mut visited = false;
         let proc = Path::new(PROC);
-        assert!(!walk_session(proc, 0, false, Some(deadline), |_, _| {
-            visited = true;
-            true
-        }));
+        assert!(!walk_session(
+            proc,
+            0,
+            false,
+            Some(deadline),
+            &mut |_, _| {
+                visited = true;
+                true
+            }
+        ));
         assert!(!visited);
         assert!(!session_is_empty(0, Some(deadline)));
     }
@@ -639,7 +723,7 @@ mod tests {
     #[test]
     fn a_stat_the_walk_cannot_read_leaves_the_session_unsettled() {
         const SID: i32 = 4242;
-        let root = crate::scratch::Scratch::new("pty-hidden-member");
+        let root = Scratch::new("pty-hidden-member");
         let plant = |pid: i32, session: i32| {
             let line = format!("{pid} (sh) S 1 {pid} {session} 34816 99 4194304 0 0");
             std::fs::write(root.dir(&pid.to_string()).join("stat"), line)
@@ -647,7 +731,7 @@ mod tests {
         };
         let scan = |sid| {
             let mut members = Vec::new();
-            let complete = walk_session(root.path(), sid, false, None, |pid, _| {
+            let complete = walk_session(root.path(), sid, false, None, &mut |pid, _| {
                 members.push(pid);
                 true
             });
@@ -721,7 +805,7 @@ mod tests {
         let script = "set -m\n(trap '' HUP; sleep 30) &\necho NOMUX-JOB=$!\nexit\nexit\n";
         rustix::io::write(pty.master(), script.as_bytes()).expect("write the script");
         let job = read_marker(&pty, "NOMUX-JOB=").expect("the shell reported its job pid");
-        let shell = as_pid(pty.child.id());
+        let shell = Pid::as_raw(Some(pty.child));
 
         assert!(outcome_within(&mut pty), "the shell never exited");
         assert!(
@@ -763,7 +847,7 @@ mod tests {
         let mut pty = shell("terminate_reaped");
         rustix::io::write(pty.master(), b"exit\n").expect("ask the shell to leave");
         assert!(outcome_within(&mut pty), "the shell never exited");
-        let raw = as_pid(pty.child.id());
+        let raw = Pid::as_raw(Some(pty.child));
         assert!(
             std::fs::read(format!("/proc/{raw}/stat"))
                 .ok()
@@ -789,7 +873,7 @@ mod tests {
     #[test]
     fn terminate_ends_a_settled_session_without_reaching_for_sigkill() {
         let mut pty = shell("terminate_quiet");
-        let raw = as_pid(pty.child.id());
+        let raw = Pid::as_raw(Some(pty.child));
         let pid = Pid::from_raw(raw).expect("the child's pid");
         rustix::io::write(pty.master(), b"exit\n").expect("ask the shell to leave");
 
@@ -825,7 +909,7 @@ mod tests {
     /// at the first member.
     fn session_members(sid: i32) -> Vec<i32> {
         let mut members = Vec::new();
-        walk_session(Path::new(PROC), sid, false, None, |pid, _| {
+        walk_session(Path::new(PROC), sid, false, None, &mut |pid, _| {
             members.push(pid);
             true
         });
@@ -880,8 +964,11 @@ mod tests {
     impl Drop for Owned {
         fn drop(&mut self) {
             if let Some(pty) = self.0.as_mut() {
-                drop(pty.child.kill());
-                drop(pty.child.wait());
+                let _ = rustix::process::kill_process(pty.child, Signal::KILL);
+                let _ = rustix::process::waitpid(
+                    Some(pty.child),
+                    rustix::process::WaitOptions::empty(),
+                );
             }
         }
     }
@@ -937,19 +1024,51 @@ mod tests {
         None
     }
 
-    /// § 6.1.1's precedence, now that it is two steps: an absolute `$SHELL`, and `/bin/sh`
-    /// for everything else. The refusals are the point rather than the happy path, and
-    /// [`pick_shell`] has what a relative one would cost.
+    /// § 6.1.1's precedence, now that it is two steps: an absolute `$SHELL` this may
+    /// hand to `execve`, and `/bin/sh` for everything else. The refusals are the point
+    /// rather than the happy path, and [`pick_shell`] has what a relative one would cost.
+    ///
+    /// The shell that *is* taken is planted here rather than named off the host —
+    /// `/usr/bin/zsh` is not on every builder, and against a choice that now probes for
+    /// executability an absent one would quietly test the fallback twice over.
     #[test]
-    fn login_shell_takes_an_absolute_path_and_falls_back_to_bin_sh() {
+    fn login_shell_takes_an_absolute_executable_and_falls_back_to_bin_sh() {
+        let root = Scratch::new("pty-shell");
+        let zsh = root.join("zsh");
+        std::fs::write(&zsh, b"#!/bin/sh\n").expect("plant a shell");
+        std::fs::set_permissions(&zsh, std::fs::Permissions::from_mode(0o755))
+            .expect("make the planted shell executable");
         assert_eq!(
-            pick_shell(Some(PathBuf::from("/usr/bin/zsh"))),
-            (PathBuf::from("/usr/bin/zsh"), "-zsh".to_owned()),
+            pick_shell(Some(zsh.clone())),
+            (zsh, "-zsh".to_owned()),
             "an absolute shell is run as a login shell of its own name"
         );
-        for refused in ["bash", "", "./sh", "bin/../sh"] {
+
+        // A `$SHELL` naming a file with no exec bit. Refused for a suite running as root
+        // too: `X_OK` is the one access check root is not simply granted, needing some
+        // execute bit to be set.
+        let bare = root.join("bare");
+        std::fs::write(&bare, b"#!/bin/sh\n").expect("plant a second shell");
+        std::fs::set_permissions(&bare, std::fs::Permissions::from_mode(0o644))
+            .expect("without an exec bit");
+
+        let refusals = [
+            PathBuf::from("bash"),
+            PathBuf::new(),
+            PathBuf::from("./sh"),
+            PathBuf::from("bin/../sh"),
+            // The three § 6.1.1's precedence used to lose the whole session over: an
+            // absolute path is not a promise that `execve` will take it.
+            root.join("no-such-shell"),
+            bare,
+            // A directory, which is the case `access(X_OK)` says *yes* to — its execute
+            // bit is search permission — and which `execve` then refuses `EACCES`. The
+            // one refusal here that the access check alone does not make.
+            root.dir("a-directory"),
+        ];
+        for refused in refusals {
             assert_eq!(
-                pick_shell(Some(PathBuf::from(refused))),
+                pick_shell(Some(refused.clone())),
                 (PathBuf::from("/bin/sh"), "-sh".to_owned()),
                 "{refused:?} is not a path this may hand to `execve`"
             );
@@ -973,5 +1092,124 @@ mod tests {
         assert_eq!(pick_dir(Some(Path::new(".")), Some(home)), home);
         assert_eq!(pick_dir(None, Some(home)), home);
         assert_eq!(pick_dir(None, None), Path::new("/"));
+    }
+
+    /// A `$HOME` that `stat` answers for and `chdir` would refuse falls through, rather
+    /// than reaching the child's own `chdir` and costing the session altogether: the whole
+    /// point of the fallback chain is a home that cannot be used, and an unenterable one
+    /// is exactly that.
+    #[test]
+    fn child_dir_falls_through_a_home_it_could_not_enter() {
+        let root = Scratch::new("pty-shut-home");
+        let shut = root.dir("shut");
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000))
+            .expect("shut the home directory");
+        assert!(
+            shut.is_dir(),
+            "`stat` must still answer for it, or this measures nothing: it is the gap \
+             between `stat` and `chdir` that is the trap"
+        );
+
+        if rustix::process::getuid().is_root() {
+            // Root is granted search on every directory, so the trap cannot be laid for
+            // a suite running as one — and a home it can enter is a home it should take.
+            assert_eq!(pick_dir(Some(&shut), Some(Path::new("/tmp"))), shut);
+            return;
+        }
+        assert_eq!(
+            pick_dir(Some(&shut), Some(Path::new("/tmp"))),
+            Path::new("/tmp"),
+            "a home that cannot be entered must fall through to the connection's own \
+             directory"
+        );
+        assert_eq!(
+            pick_dir(Some(&shut), None),
+            Path::new("/"),
+            "and to `/` where there is nothing else, which is § 6.1.1's last step"
+        );
+    }
+
+    /// The master's `O_NONBLOCK` is folded into the `openpt` rather than set afterwards,
+    /// which leans on `OpenptFlags` passing an `O_*` bit it does not name straight
+    /// through to Linux's `open("/dev/ptmx")`. That is not part of rustix's documented
+    /// surface, so it is read back here: without it a rustix bump could leave the daemon
+    /// blocking inside a write to a PTY whose reader has stopped, with nothing else in
+    /// the suite failing.
+    #[test]
+    fn a_pty_master_is_non_blocking_as_it_is_opened() {
+        let pty = shell("pty_nonblocking");
+        let flags = rustix::fs::fcntl_getfl(pty.master()).expect("the master's status flags");
+        assert!(
+            flags.contains(OFlags::NONBLOCK),
+            "the PTY master came back blocking: {flags:?}"
+        );
+    }
+
+    /// Regression: a stopped job that *handles* `SIGHUP` must be woken to receive it.
+    ///
+    /// A `TASK_STOPPED` task is woken only by a signal whose *default* action is fatal, so
+    /// a `SIGHUP` a process installed a handler for is merely queued against one the user
+    /// suspended with `Ctrl-Z` — it stays in state `T`, counts as a live session member
+    /// for the whole of [`HANGUP_GRACE`], and is then `SIGKILL`ed with its handler never
+    /// run. The `SIGCONT` behind each `SIGHUP` is what closes that, and the marker file is
+    /// how this test tells a handler that ran from a process that was killed.
+    ///
+    /// The job stops itself and is waited for, rather than being stopped from here: a
+    /// `terminate` that arrived before the `kill -STOP` would pass on the ordinary path
+    /// and prove nothing.
+    #[test]
+    fn terminate_wakes_a_stopped_job_so_its_hangup_handler_runs() {
+        let root = Scratch::new("pty-stopped-hup");
+        let marker = root.join("hung-up");
+        let mut pty = shell("terminate_stopped");
+
+        // `sh -c` rather than a subshell, so `$$` inside names the job itself and the
+        // `kill` cannot reach the login shell.
+        //
+        // `set +m` — the job in the login shell's *own* process group — is what makes this
+        // measure anything. POSIX has the kernel send `SIGHUP` *and `SIGCONT`* to a
+        // process group that a process's exit leaves newly orphaned with a stopped member,
+        // so a job in a group of its own is woken by the login shell dying whatever this
+        // module does. The session leader's group is orphaned from birth, its parent being
+        // this daemon in another session, so it never becomes *newly* orphaned and the
+        // kernel never rescues it. Job control puts a `Ctrl-Z`ed job in a group of its own,
+        // but only while the shell that owns it lives: a shell that handles `SIGHUP`
+        // itself, or a nested one, leaves the real case looking exactly like this.
+        let script = format!(
+            "set +m\n/bin/sh -c 'trap \"echo hung-up > {marker}; exit 0\" HUP; \
+             kill -STOP $$; sleep 30' &\necho NOMUX-JOB=$!\n",
+            marker = marker.display()
+        );
+        rustix::io::write(pty.master(), script.as_bytes()).expect("write the script");
+        let job = read_marker(&pty, "NOMUX-JOB=").expect("the shell reported its job pid");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline && !stopped(job) {
+            std::thread::sleep(HANGUP_POLL_INTERVAL);
+        }
+        assert!(
+            stopped(job),
+            "the job never reached state `T`, so this test never met the case it is about"
+        );
+
+        pty.terminate();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && !marker.exists() {
+            std::thread::sleep(HANGUP_POLL_INTERVAL);
+        }
+        assert!(
+            marker.exists(),
+            "a stopped job that handles `SIGHUP` was killed rather than hung up: the \
+             handler never ran"
+        );
+    }
+
+    /// Whether `pid` is stopped — state `T`, the state a `SIGHUP` alone cannot leave.
+    fn stopped(pid: i32) -> bool {
+        let Ok(stat) = std::fs::read(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        stat_tail(&stat).and_then(|mut fields| fields.next()) == Some("T")
     }
 }

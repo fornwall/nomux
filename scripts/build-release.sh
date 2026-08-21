@@ -81,6 +81,7 @@ sysroot=$(rustc --print sysroot)
 llvm_bin="$(rustc --print target-libdir)/../bin"
 readobj="$llvm_bin/llvm-readobj"
 stripper="$llvm_bin/llvm-strip"
+objcopy="$llvm_bin/llvm-objcopy"
 # Resolved rather than taken as spelled: cargo accepts a *relative* $CARGO_TARGET_DIR and reads it
 # against this script's cwd, and both uses below need an absolute path — rustc matches a remap
 # prefix component-wise, and check_leaks greps the artifact for this literal. `pwd -P` also settles
@@ -105,6 +106,13 @@ remap="$remap$us--remap-path-prefix=$repo=/nomux"
 rustflags="-Clink-self-contained=yes$us-Ctarget-feature=+crt-static$us-Clink-arg=--icf=all$us$remap"
 # Immediate-abort never unwinds; omit tables used only for external stack walking.
 rustflags="$rustflags$us-Zunstable-options$us-Cpanic=immediate-abort$us-Cforce-unwind-tables=no"
+# A static PIE relocates itself, and almost every entry it walks is a bare `R_*_RELATIVE` — a
+# 24-byte `Elf_Rela` apiece in `.rela.dyn`, for an address and nothing else. `DT_RELR` encodes the
+# same set as a bitmap: 4776 bytes become 64 on x86-64, 2728 become 56 on AArch64. Applied by the
+# bundled musl `rcrt1.o`, and a self-relocator that did not understand the format would fault on
+# the first instruction — which `--version` in CI's native smoke job on each architecture catches
+# before anything is published.
+rustflags="$rustflags$us-Clink-arg=--pack-dyn-relocs=relr"
 
 rm -rf "$dist"
 mkdir -p "$dist"
@@ -263,6 +271,12 @@ for target in $targets; do
     cp "$target_root/$build_dir/release/nomux" "$dist/nomux-$target"
     # Compiler provenance has no runtime purpose and costs bytes in every upload.
     "$stripper" --remove-section=.comment "$dist/nomux-$target"
+    # Nothing maps a static PIE through its section headers — the program headers carry everything
+    # the loader and the self-relocator read — so the section header table and the `.shstrtab`
+    # behind it are some 1.6 KiB paid on every cold upload for a table only a disassembler opens.
+    # Dropped here rather than after the gates below, so what they assert on is the artifact that
+    # ships: both read the program headers and the dynamic table, and neither needs a section.
+    "$objcopy" --strip-sections "$dist/nomux-$target"
     check_leaks "$dist/nomux-$target"
     check_elf "$dist/nomux-$target"
 done

@@ -23,22 +23,22 @@
 //! wedged daemon rather than an absent one, and why the third is not an accepted
 //! connection at all.
 
-use std::collections::VecDeque;
 use std::env;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::mem::{MaybeUninit, size_of};
 use std::net::Shutdown;
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
-use std::process::{ChildStderr, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags};
+use rustix::process::Pid;
 
+use crate::exec::{self, Program};
 use crate::rundir::{
     MAX_PID_LEN, SessionPaths, check_run_dir, ensure_run_dir, parse_pid, read_prefix,
 };
@@ -69,8 +69,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// of every session creation.
 const PUBLISH_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
-/// Largest transfer either direction makes in one call, and — by [`Pump::has_data`]'s
-/// invariant — the whole of what a [`Pump`] can be holding.
+/// Largest transfer either direction makes in one call, which is also a [`Pump`]'s whole
+/// storage: it reads one of these straight off the source and owes the destination at most
+/// what is left of it.
 const RELAY_CHUNK: usize = 16 * 1024;
 
 /// How long the final flush waits on a stdout that has moved *nothing*.
@@ -373,12 +374,21 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> Result<UnixStream, Failu
         Liveness::Stale(_) => {}
         Liveness::Unknown(err) => return Err(may_be_running(paths, &err)),
     }
+    // Neither refusal above calls `release_lock_name`, unlike the spawn failure below, and
+    // the asymmetry is the point rather than an omission. `Alive` needs no call: a daemon
+    // drops its lock before its event loop (§ 6.2) and leaves the name behind, so the
+    // acquisition above opened one it did not make and `created_name` is already false.
+    // `Unknown` is the deliberate one — it establishes nothing, so it is not licence to
+    // touch a run file of an id something may still be holding (§ 6.6), and where nothing
+    // is holding it the `<id>.lock` left beside a socket that would not answer is the only
+    // mark on this host that the id is claimed at all. Collection reaps it either way
+    // through `SessionPaths::removal_order`, which makes that hygiene and not a leak.
+    // `tests/attach.rs`'s `spawn_refuses_a_wedged_session_without_unlinking_the_lock_it_took`
+    // is the regression this replaced: the release used to be keyed on the probe's error kind
+    // alone, so one that had established nothing unlinked a live session's lock.
 
-    let complaint = match daemon_command(paths.id(), label, spawn_lock.raw_fd())
-        .and_then(|mut command| command.spawn())
-        .map(|mut child| child.stderr.take())
-    {
-        Ok(complaint) => complaint,
+    let (started, complaint) = match spawn_daemon(paths.id(), label, spawn_lock.raw_fd()) {
+        Ok(daemon) => daemon,
         // The one failure with nothing of anyone's behind it: no daemon was started, and
         // the probe above has just said nobody else is serving the id either, so the
         // name is this call's own to give back — where this acquisition is what made it,
@@ -393,13 +403,24 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> Result<UnixStream, Failu
         match liveness(&socket, CONNECT_TIMEOUT) {
             Liveness::Alive(stream) => {
                 if await_publication(paths, deadline) {
+                    // The daemon is up and has published, so whatever `started` names has
+                    // finished being interesting — and on the ordinary path it is not the
+                    // daemon at all: § 6.2's detachment double-forks, the process this
+                    // relay launched `_exit(0)`s, and its child carries on as the daemon.
+                    // `exec::reap_if_exited` is what keeps that intermediate from sitting
+                    // `<defunct>` under a relay that lives as long as the SSH session
+                    // does, and what leaves a daemon that never needed the fork running.
+                    // Only here: on either failure below the process may still be starting
+                    // up, and a `waitpid` then would collect a daemon this call is about to
+                    // report as unfinished.
+                    exec::reap_if_exited(started);
                     return Ok(stream);
                 }
-                return Err(start_timed_out(paths, complaint));
+                return Err(start_timed_out(paths, &complaint));
             }
             Liveness::Stale(_) => {
                 if Instant::now() >= deadline {
-                    return Err(start_timed_out(paths, complaint));
+                    return Err(start_timed_out(paths, &complaint));
                 }
                 std::thread::sleep(SPAWN_POLL_INTERVAL);
             }
@@ -412,7 +433,7 @@ fn create(paths: &SessionPaths, label: Option<&str>) -> Result<UnixStream, Failu
 }
 
 /// A daemon that did not finish publishing before the spawn deadline.
-fn start_timed_out(paths: &SessionPaths, complaint: Option<ChildStderr>) -> Failure {
+fn start_timed_out(paths: &SessionPaths, complaint: &OwnedFd) -> Failure {
     let id = paths.id();
     let complaint = daemon_complaint(complaint).map_or_else(
         || format!("daemon for session {id} did not finish starting"),
@@ -460,8 +481,7 @@ fn await_publication(paths: &SessionPaths, deadline: Instant) -> bool {
 /// its deadline, and one that is wedged with its stderr still open must not take the
 /// relay down with it — a blocking read here would turn a five-second timeout into a
 /// hang.
-fn daemon_complaint(stderr: Option<ChildStderr>) -> Option<String> {
-    let stderr = stderr?;
+fn daemon_complaint(stderr: &OwnedFd) -> Option<String> {
     let fd = stderr.as_fd();
     // Added to what is there rather than assigned over it: `fcntl_setfl` replaces the
     // whole status word, and every other site in the tree does the `getfl`-then-or.
@@ -477,11 +497,20 @@ fn daemon_complaint(stderr: Option<ChildStderr>) -> Option<String> {
     // The daemon reached this through `main`'s reporter, which prefixes the binary's
     // own name. Keeping it would render as `nomux: ... : nomux: ...`.
     let line = line.strip_prefix("nomux: ").unwrap_or(line);
-    // Escaped, like the pidfile bodies `control` quotes with `{:?}` and for the same
-    // reason: this is another process's stderr on its way to a terminal, where the
-    // `lines` above stops a second line being forged but not an `ESC ]0;` retitling
-    // the window of whoever ran the attach.
-    Some(line.escape_debug().collect())
+    // Filtered, not escaped. This is another process's stderr on its way to a terminal,
+    // where the `lines` cut above stops a second line being forged but not an `ESC ]0;`
+    // retitling the window of whoever ran the attach — and § 11's `sanitize_text` is the
+    // one filter this tree runs over text somebody else chose, the same one the label
+    // forty lines below goes through. Escaping here instead would be a second policy
+    // *and* a doubled one: every `Failure` out of `run` reaches the operator through
+    // `main`'s `report_relay`, which escapes the whole sentence again, so an escape at
+    // this end renders `ESC ]0;` as `\\u{1b}]0;` rather than as anything readable.
+    // Dropped rather than escaped also means nothing supplied here occupies width at all.
+    //
+    // The `lines` cut stays load-bearing *because* this drops: `\n` is a control
+    // character, so without it a forged second line would merge into the first rather
+    // than be refused.
+    Some(crate::sanitize::sanitize_text(line))
 }
 
 /// Moves bytes between stdio and the socket until either side closes.
@@ -489,18 +518,21 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
     // A blocking socket could park one direction while leaving the other unserved.
     stream.set_nonblocking(true)?;
 
-    let stdin = io::stdin();
     // stdout may share its open-file description with the caller's shell, so a worker
     // owns its blocking writes behind a bounded, non-blocking socketpair (§ 7).
     let stdout = StdoutWorker::spawn()?;
-    let stdin_fd = stdin.as_fd();
+    // `rustix::stdio`, as `startup.rs` takes the same descriptors, and not `io::stdin()`:
+    // nothing here ever reads or writes through std's handles — every transfer below goes
+    // to the raw descriptor — while merely constructing one initialises the global behind
+    // it. That is an 8 KiB heap `BufReader` under a `OnceLock` for stdin, and this is the
+    // whole crate's only reach for it, so the entire `Stdin` machinery would be linked in
+    // for one `as_fd()`.
+    let stdin_fd = rustix::stdio::stdin();
     let stdout_fd = stdout.fd();
     let sock_fd = stream.as_fd();
 
     let mut to_socket = Pump::default();
     let mut to_stdout = Pump::default();
-    // Neither direction transfers during the other's call, so one buffer serves both.
-    let mut chunk = [0u8; RELAY_CHUNK];
     let mut stdin_open = true;
     let mut socket_open = true;
     // Unlike the other two, this describes a destination.
@@ -564,7 +596,7 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
         // and it ends this direction exactly as end of file does.
         let stdin_gone = stdin_events.contains(PollFlags::NVAL);
         if stdin_events.intersects(readable)
-            && (stdin_gone || !to_socket.fill_from(stdin_fd, &mut chunk)?)
+            && (stdin_gone || !to_socket.fill_from(stdin_fd)? || spinning(stdin_events, &to_socket))
         {
             stdin_open = false;
             // Half-close propagation (§ 7).
@@ -574,7 +606,7 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
         // without the emptiness check that would read a second chunk into a full pump.
         if socket_events.intersects(readable)
             && !to_stdout.has_data()
-            && !to_stdout.fill_from(sock_fd, &mut chunk)?
+            && (!to_stdout.fill_from(sock_fd)? || spinning(socket_events, &to_stdout))
         {
             socket_open = false;
         }
@@ -600,6 +632,27 @@ fn relay(stream: &UnixStream) -> io::Result<()> {
     // Closing the channel puts EOF behind queued bytes. Errors bypass this wait, and
     // the process's exit ends a detached worker still blocked in abandoned stdout.
     stdout.finish()
+}
+
+/// Whether a source that reported `POLLERR` then had nothing to hand over — the one shape
+/// of that event [`relay`] cannot leave open.
+///
+/// [`Pump::fill_from`] folds `EAGAIN` into "the peer is still there with nothing to say",
+/// which is right for a descriptor that merely has no input yet. It is wrong for one that
+/// has *latched* `POLLERR` and answers `EAGAIN` for ever: the direction stays open, its
+/// mask is rebuilt unchanged next pass, and `poll` returns instantly — a relay burning a
+/// core with nothing moving. `NVAL` has its own escape above and `copy_channel_to_stdout`
+/// returns on `ERR` outright; these two sources had neither.
+///
+/// Asked *after* the read and never instead of it. On an `AF_UNIX` socket a pending
+/// `sk_err` raises `POLLERR` alongside `POLLIN` with the peer's last bytes still queued,
+/// and those bytes are the ordinary end of a session (§ 4.1) carrying the `Exit` frame § 10
+/// takes the status from — refusing to read them to save a spin would trade a hang nobody
+/// has reproduced for a truncation on every close. Nobody has reproduced the spin either:
+/// it is not constructible here on a pipe, a tty or an `AF_UNIX` socket, which is the
+/// reason this carries an explanation rather than being read later as dead code.
+const fn spinning(events: PollFlags, pump: &Pump) -> bool {
+    events.contains(PollFlags::ERR) && !pump.has_data()
 }
 
 /// The blocking half of the relay's stdout boundary.
@@ -767,14 +820,23 @@ extern "C" fn stdout_worker(handoff: *mut libc::c_void) -> *mut libc::c_void {
 /// descriptor answering `POLLOUT` and then `EAGAIN` for ever is precisely the stall that
 /// wait exists to give up on.
 fn copy_channel_to_stdout(channel: &UnixStream, progress: &AtomicU64) -> io::Result<()> {
-    let stdout = io::stdout();
-    let stdout_fd = stdout.as_fd();
+    // `rustix::stdio` for [`relay`]'s reason, and more sharply here: `io::stdout()`
+    // initialises a `OnceLock<ReentrantLock<RefCell<LineWriter<StdoutRaw>>>>` and
+    // registers its exit-time flush, and this call is on the detached worker thread —
+    // started from bare `pthread_create` with default attributes, so its stack is the C
+    // library's default rather than std's 8 MiB, and 128 KiB on musl. The thread with the
+    // least room to spare was the one paying for a handle nothing ever writes through.
+    let stdout_fd = rustix::stdio::stdout();
     let channel_fd = channel.as_fd();
-    let mut pump = Pump::default();
-    let mut chunk = [0u8; RELAY_CHUNK];
+    // Boxed, unlike [`relay`]'s two: a [`Pump`] is one [`RELAY_CHUNK`] of inline storage,
+    // and 16 KiB is an eighth of the stack this thread gets on musl. `relay`'s pair sit on
+    // the main thread's 8 MiB, where 32 KiB is nothing.
+    let mut pump = Box::new(Pump::default());
 
     loop {
-        if !pump.has_data() && !pump.fill_from(channel_fd, &mut chunk)? {
+        // Reached only with an empty pump: the inner loop below ends on `has_data` going
+        // false and `return`s on every other exit, so there is nothing here to overwrite.
+        if !pump.fill_from(channel_fd)? {
             return Ok(());
         }
         while pump.has_data() {
@@ -801,29 +863,52 @@ fn copy_channel_to_stdout(channel: &UnixStream, progress: &AtomicU64) -> io::Res
 
 /// One direction of the relay, whose whole state is whatever the destination would not
 /// take yet: which of the two ends the poll set wants is that and its negation.
-#[derive(Debug, Default)]
+///
+/// Fill-from-empty, drain-from-front, and never both at once — every caller reads only an
+/// empty pump, which is what lets the storage be one flat [`RELAY_CHUNK`] with a cursor
+/// rather than a queue. That is also the point: the source now reads *straight into* this
+/// buffer and the destination is handed one contiguous slice of it, where a `VecDeque`
+/// obliged the caller to own a staging chunk and cost a second `memcpy` of up to a whole
+/// batch on the way in.
+#[derive(Debug)]
 struct Pump {
-    /// Bytes the destination would not take yet, never more than one [`RELAY_CHUNK`].
-    buf: VecDeque<u8>,
+    /// One batch, of which `[pos, len)` is what the destination has not taken yet.
+    buf: [u8; RELAY_CHUNK],
+    pos: usize,
+    len: usize,
+}
+
+impl Default for Pump {
+    fn default() -> Self {
+        Self {
+            buf: [0; RELAY_CHUNK],
+            pos: 0,
+            len: 0,
+        }
+    }
 }
 
 impl Pump {
     /// Whether anything is still held in userspace for the destination: the only reason
     /// to poll that destination for writability, and — negated — the only condition under
     /// which the source is read at all, so nothing can overtake bytes already owed.
-    fn has_data(&self) -> bool {
+    const fn has_data(&self) -> bool {
         self.owed() != 0
     }
 
     /// How much the destination has still not taken, which a caller comparing it across a
     /// [`Self::drain_to`] uses to tell a write that moved something from one that did not.
-    fn owed(&self) -> usize {
-        self.buf.len()
+    const fn owed(&self) -> usize {
+        self.len.saturating_sub(self.pos)
     }
 
     /// Takes one batch off `src` for the destination. `false` means `src` reached EOF.
-    fn fill_from(&mut self, src: BorrowedFd<'_>, chunk: &mut [u8]) -> io::Result<bool> {
-        match crate::nbio::read(src, chunk) {
+    ///
+    /// Called only on an empty pump, which is the invariant the flat buffer rests on: a
+    /// short read here resets the window outright rather than appending to what is owed,
+    /// so filling a pump that still held bytes would drop them.
+    fn fill_from(&mut self, src: BorrowedFd<'_>) -> io::Result<bool> {
+        match crate::nbio::read(src, &mut self.buf) {
             // Four shapes of one ending. A PTY-backed peer reports end of session as `EIO`
             // rather than 0; a socket peer that closed with bytes of *ours* still unread
             // hands over the last of its own and then answers `ECONNRESET` — the ordinary
@@ -835,10 +920,12 @@ impl Pump {
                 rustix::io::Errno::IO | rustix::io::Errno::CONNRESET | rustix::io::Errno::NOTCONN,
             ) => Ok(false),
             Ok(n) => {
-                self.buf.extend(chunk.get(..n).unwrap_or(&[]));
+                self.pos = 0;
+                self.len = n;
                 Ok(true)
             }
             // Nothing pending is not EOF: the peer is still there with nothing to say.
+            // [`spinning`] has the one case where that reading is not enough on its own.
             Err(rustix::io::Errno::AGAIN) => Ok(true),
             Err(err) => Err(err.into()),
         }
@@ -846,75 +933,127 @@ impl Pump {
 
     /// Hands the destination whatever is owed it. `false` means the destination has
     /// stopped reading.
+    ///
+    /// One `write` and not a loop to `EAGAIN`, which is `nbio::drain_to`'s rule and is
+    /// load-bearing for both callers: `relay`'s destinations each get one fair share of a
+    /// pass, and the stdout worker makes no second blocking write `poll` never promised.
     fn drain_to(&mut self, fd: BorrowedFd<'_>) -> io::Result<bool> {
-        match crate::nbio::drain_to(&mut self.buf, fd) {
-            // `EPIPE` is `nbio`'s to report and each caller's to interpret: here it is
-            // the destination's reader having gone — an ordinary ending rather than a
+        if !self.has_data() {
+            return Ok(true);
+        }
+        // `EINTR` says a signal arrived and nothing about the descriptor, so it is never
+        // news to a caller — `nbio::read`'s rule, on the write side.
+        let written = loop {
+            match rustix::io::write(fd, self.buf.get(self.pos..self.len).unwrap_or(&[])) {
+                Err(rustix::io::Errno::INTR) => {}
+                outcome => break outcome,
+            }
+        };
+        match written {
+            Ok(0) => Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => {
+                self.pos = self.len.min(self.pos.saturating_add(n));
+                Ok(true)
+            }
+            Err(rustix::io::Errno::AGAIN) => Ok(true),
+            // The destination's reader having gone — an ordinary ending rather than a
             // failure — so what was owed it is dropped and the answer comes back as
-            // `false`. Which direction that ends is `relay`'s to say, not this
-            // method's, and only one of the two stops the loop.
-            Err(err) if err.kind() == io::ErrorKind::BrokenPipe => {
-                self.buf.clear();
+            // `false`. Which direction that ends is the caller's to say, not this
+            // method's, and only one of `relay`'s two stops the loop.
+            Err(rustix::io::Errno::PIPE) => {
+                self.pos = self.len;
                 Ok(false)
             }
-            outcome => outcome.map(|()| true),
+            Err(err) => Err(err.into()),
         }
     }
 }
 
-/// The daemon [`create`] starts, up to the `fork`.
+/// The daemon [`create`] starts: the pid this relay forked, and the read end of the pipe
+/// its stderr goes down.
+///
+/// The pid is not necessarily the daemon's — [`create`] has the double-fork — and nothing
+/// here waits for it. What the caller is owed is the descriptor: [`daemon_complaint`] reads
+/// it only once publication has already missed its deadline, so it stays open and unread
+/// for the whole of an ordinary startup.
+///
+/// # Errors
+///
+/// The `/dev/null` open, the pipe, and the fork and `execve` behind [`exec::spawn`] — the
+/// last of which is why the child's own failure is worth carrying back at all: [`create`]
+/// answers it with a [`FailureClass::StartupFailure`] and gives the lock name back.
+fn spawn_daemon(session_id: &str, label: Option<&str>, lock_fd: i32) -> io::Result<(Pid, OwnedFd)> {
+    let program = daemon_program(session_id, label, lock_fd)?;
+    // The daemon's own stdin and stdout, which § 6.2 would point at `/dev/null` itself the
+    // moment it starts: handed over already silenced so that nothing it inherits from a
+    // relay — a terminal, a pipe the user's shell is on the other end of — is writable for
+    // even the length of its startup.
+    let null = crate::startup::open_null_device()?;
+    // `CLOEXEC` on both ends: the write end reaches the child as descriptor 2 through the
+    // `dup2` that clears the flag, and this copy is gone by then.
+    let (complaint, diagnostics) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
+
+    let started = exec::spawn(
+        &program,
+        [null.as_fd(), null.as_fd(), diagnostics.as_fd()],
+        &mut |_| {
+            // A session of the daemon's own before it is one, so a hangup on the channel
+            // this relay is on cannot reach it. § 6.2 has the rest, including the fork this
+            // `setsid` usually makes unnecessary and sometimes does not.
+            rustix::process::setsid()?;
+            // `SpawnLock` opens `CLOEXEC`. Clear it only in the forked child, so the
+            // descriptor survives the exec. The daemon validates it against the current
+            // lock path and restores `CLOEXEC` before the shell — and closes every other
+            // descriptor it inherited (`startup::close_inherited_descriptors`), which is
+            // what covers anything this relay held without `CLOEXEC` of its own.
+            //
+            // SAFETY: `lock_fd` belongs to the lock the caller holds across this call, so
+            // it is open in the parent at the fork and therefore in this child.
+            let lock = unsafe { BorrowedFd::borrow_raw(lock_fd) };
+            rustix::io::fcntl_setfd(lock, rustix::io::FdFlags::empty())?;
+            Ok(())
+        },
+    )?;
+    Ok((started, complaint))
+}
+
+/// The daemon's command line, up to the `fork`.
 ///
 /// Execs the exact inode this relay is already running rather than whatever the install
 /// path names by the time the child gets there — between the two loads that path decides
-/// what the daemon *is*. `arg0` puts the ordinary name back on the command line, so what
+/// what the daemon *is*. `argv[0]` puts the ordinary name back on the command line, so what
 /// `ps` shows is the program rather than the link it was reached through.
-fn daemon_command(session_id: &str, label: Option<&str>, lock_fd: i32) -> io::Result<Command> {
-    let mut command = Command::new("/proc/self/exe");
-    command
-        .arg0(env::current_exe()?)
-        .arg("daemon")
-        .arg(session_id)
-        .arg("--lock-fd")
-        .arg(lock_fd.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        // The caller reads this pipe only if publication misses its deadline.
-        .stderr(Stdio::piped());
+fn daemon_program(session_id: &str, label: Option<&str>, lock_fd: i32) -> io::Result<Program> {
+    let argv0 = env::current_exe()?;
+    let mut program = Program::new(
+        std::path::Path::new("/proc/self/exe"),
+        argv0.as_os_str().as_bytes(),
+    )?;
+    program.arg("daemon")?;
+    program.arg(session_id)?;
+    program.arg("--lock-fd")?;
+    program.arg(&lock_fd.to_string())?;
     // Cut and escaped on this side of the exec: the daemon records the label it is given
     // (§ 6.6), so the bound is this side's to spend.
     let label = label
         .map(crate::sanitize::sanitize_label)
         .filter(|label| !label.is_empty());
     if let Some(label) = label.as_deref() {
-        command.arg("--label").arg(label);
+        program.arg("--label")?;
+        program.arg(label)?;
     }
-    let pre_exec = move || -> io::Result<()> {
-        rustix::process::setsid()?;
-        // `SpawnLock` opens `CLOEXEC`. Clear it only in the forked child, so the descriptor
-        // survives the exec. The daemon validates it against the current lock path and
-        // restores `CLOEXEC` before the shell.
-        // SAFETY: `lock_fd` belongs to the lock held across `Command::spawn` by the caller.
-        let lock = unsafe { BorrowedFd::borrow_raw(lock_fd) };
-        rustix::io::fcntl_setfd(lock, rustix::io::FdFlags::empty())?;
-        Ok(())
-    };
-    // SAFETY: the closure runs after fork and calls only async-signal-safe operations.
-    unsafe {
-        command.pre_exec(pre_exec);
-    }
-    Ok(command)
+    Ok(program)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
     use std::fs::{self, File};
     use std::io::{self, Write as _};
     use std::time::Instant;
 
     use super::{
-        ChildStderr, FailureClass, SessionPaths, await_publication, daemon_command,
-        daemon_complaint, resume_probe_class, unattachable,
+        FailureClass, SessionPaths, await_publication, daemon_complaint, daemon_program,
+        resume_probe_class, unattachable,
     };
     use crate::scratch::Scratch;
     use crate::usock::Foreign;
@@ -929,22 +1068,33 @@ mod tests {
         assert!(expected.len() <= crate::sanitize::MAX_LABEL_LEN);
         assert!(label.len() > crate::sanitize::MAX_LABEL_LEN, "cut nothing");
 
-        let direct = daemon_command("session", Some(&label), 19).unwrap();
+        let direct = daemon_program("session", Some(&label), 19).unwrap();
         assert_eq!(
-            direct.get_args().last().and_then(OsStr::to_str),
-            Some(&*expected)
+            direct.args().last().map(|arg| arg.to_bytes()),
+            Some(expected.as_bytes())
         );
     }
 
+    /// `argv[0]` is the resolved binary and the rest is the command line, which is the
+    /// whole of what the daemon is told: the program itself is `/proc/self/exe`, so the
+    /// name here is only what `ps` will show.
     #[test]
     fn the_daemon_command_line_carries_the_lock_and_the_raw_label() {
-        let command = daemon_command("session", Some("cost $5"), 23).unwrap();
-        let args: Vec<_> = command
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
+        let program = daemon_program("session", Some("cost $5"), 23).unwrap();
+        let mut args = program
+            .args()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned());
         assert_eq!(
-            args,
+            args.next(),
+            std::env::current_exe()
+                .ok()
+                .map(|exe| exe.to_string_lossy().into_owned()),
+            "argv[0] must be the ordinary name and not the `/proc/self/exe` it is loaded \
+             through"
+        );
+        assert_eq!(
+            args.collect::<Vec<_>>(),
             ["daemon", "session", "--lock-fd", "23", "--label", "cost $5"]
         );
     }
@@ -1046,16 +1196,17 @@ mod tests {
     fn complaint_of(bytes: &[u8]) -> Option<String> {
         let (read, write) = rustix::pipe::pipe().unwrap();
         File::from(write).write_all(bytes).unwrap();
-        daemon_complaint(Some(ChildStderr::from(read)))
+        daemon_complaint(&read)
     }
 
     #[test]
     fn a_complaint_cannot_drive_the_terminal_it_is_printed_to() {
         assert_eq!(
             complaint_of(b"nomux: \x1b]0;pwned\x07boom\nsecond line").as_deref(),
-            Some("\\u{1b}]0;pwned\\u{7}boom"),
-            "this reaches `main`'s `eprintln!` verbatim, so it must carry no escape \
-             sequence — nor the daemon's own `nomux: `, nor a second line"
+            Some("]0;pwnedboom"),
+            "a daemon's stderr must reach the operator with no character a terminal acts \
+             on — dropped and not escaped, `main`'s reporter escaping the sentence again \
+             — nor the daemon's own `nomux: `, nor a second line"
         );
     }
 

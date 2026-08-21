@@ -5,10 +5,11 @@
 //! build can manage a daemon of any version. Filenames and permissions here may
 //! never change.
 
+use std::fmt;
 use std::io::{self, Write as _};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileTypeExt as _, MetadataExt};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -34,24 +35,70 @@ const FILE_MODE: u32 = 0o600;
 /// How many times an acquirer takes the lock before giving up — the first attempt and
 /// one re-take, for finding that the file it locked is no longer the file at the path.
 const LOCK_ATTEMPTS: usize = 2;
+
+/// How many nodes one acquirer clears out of `<id>.lock` before refusing it: one.
+///
+/// A budget of its own rather than a larger [`LOCK_ATTEMPTS`], so clearing a planted node
+/// can never cost the re-take that the replaced-file race needs. A *second* node at the
+/// same name inside one call is somebody planting them faster than this loop removes them,
+/// which is not a lock to be had and must not be spun on — `control::kill`'s escape hatch
+/// and both collections run this loop, and none of them may be held inside it at another
+/// process's pleasure.
+const LOCK_REPAIRS: usize = 1;
+
+/// Passes [`SessionPaths::try_lock_spawn_or_refuse`] makes in all: every take plus every
+/// repair, a repair being a pass that removes a name and creates nothing, so that it has
+/// to be followed by one.
+const LOCK_PASSES: usize = LOCK_ATTEMPTS + LOCK_REPAIRS;
+
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-/// Runs `f` with the umask suppressed, so a node created at `mode` gets exactly `mode`.
+/// Suppresses the umask for as long as it is alive, so a node created at `mode` gets
+/// exactly `mode`.
 ///
 /// `mkdir(2)`, `bind(2)` and `open(2)` subtract the caller's umask, making their mode
 /// argument an upper bound rather than a request — and every mode in this module is exact.
 /// Creating and then `chmod`ing would narrow the window rather than close it, on a path
-/// that is being raced.
+/// that is being raced. The mask is `0o777 & !mode` and not `!mode` because `bind(2)`
+/// subtracts it from the socket inode's `S_IRWXUGO` alone: bits above those nine are ones
+/// no caller here can be masked against, and asking for them would be a claim about
+/// `mkdir` and `open` that is not true of the third.
 ///
-/// The umask is process-wide; no shipped caller is multi-threaded or spawns while it is in
-/// effect, and `scratch::umask_lock` closes that for `cargo test`, which is.
-fn with_umask<T>(mode: u32, f: impl FnOnce() -> T) -> T {
+/// A guard rather than a `previous = umask(); f(); umask(previous)` sandwich, because that
+/// third statement is not reached by an unwind: `cargo test` builds with unwind and shares
+/// one process across every test, so a panic inside the creating call left the process
+/// masked at `0o177` and silently changed the mode of every file every later test created.
+///
+/// The umask is process-wide; no shipped caller is multi-threaded or spawns while one of
+/// these is alive, and `scratch::umask_lock` — which this owns, so that it is held for
+/// exactly as long as the mask is — closes that for `cargo test`, which is.
+struct Umask {
+    /// The mask to put back. Restored by the [`Drop`] impl below, which runs before the
+    /// fields are dropped and so before the test-only guard beside it lets the next
+    /// thread in.
+    previous: Mode,
+    /// Serialises the process-wide mask against the other tests in this binary.
     #[cfg(test)]
-    let _umask = crate::scratch::umask_lock();
-    let previous = rustix::process::umask(Mode::from_bits_truncate(0o777 & !mode));
-    let result = f();
-    rustix::process::umask(previous);
-    result
+    _serialised: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Umask {
+    /// Suppresses everything outside `mode`, until the returned guard is dropped.
+    fn suppressing(mode: u32) -> Self {
+        #[cfg(test)]
+        let serialised = crate::scratch::umask_lock();
+        Self {
+            previous: rustix::process::umask(Mode::from_bits_truncate(0o777 & !mode)),
+            #[cfg(test)]
+            _serialised: serialised,
+        }
+    }
+}
+
+impl Drop for Umask {
+    fn drop(&mut self) {
+        rustix::process::umask(self.previous);
+    }
 }
 
 /// Replaces `path` with `body`, at exactly [`FILE_MODE`].
@@ -62,19 +109,23 @@ fn with_umask<T>(mode: u32, f: impl FnOnce() -> T) -> T {
 /// so a body cut short is a failure and not a success that left a prefix ([`parse_pid`]).
 fn write_private(path: &Path, body: &[u8]) -> io::Result<()> {
     drop(fs::remove_file(path));
-    let file = with_umask(FILE_MODE, || {
+    let file = {
+        let _umask = Umask::suppressing(FILE_MODE);
         rustix::fs::open(
             path,
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
             Mode::from_bits_truncate(FILE_MODE),
         )
-    })?;
+    }?;
     fs::File::from(file).write_all(body)
 }
 
 /// Binds a non-blocking unix socket at exactly [`SOCKET_MODE`].
 pub(crate) fn bind_socket_private(path: &Path) -> io::Result<UnixListener> {
-    let listener = with_umask(SOCKET_MODE, || UnixListener::bind(path))?;
+    let listener = {
+        let _umask = Umask::suppressing(SOCKET_MODE);
+        UnixListener::bind(path)
+    }?;
     if let Err(err) = listener.set_nonblocking(true) {
         drop(listener);
         drop(fs::remove_file(path));
@@ -135,15 +186,16 @@ pub(crate) fn ensure_run_dir(dir: &Path) -> io::Result<()> {
     if check_run_dir(dir)? {
         return Ok(());
     }
-    // [`with_umask`] for the parents `recursive` creates along the way as much as for the
+    // [`Umask`] for the parents `recursive` creates along the way as much as for the
     // directory itself: under a `umask 0500` this would otherwise make a run directory
     // its owner cannot open, and the check below would refuse what it had just made.
-    with_umask(DIR_MODE, || {
+    {
+        let _umask = Umask::suppressing(DIR_MODE);
         fs::DirBuilder::new()
             .recursive(true)
             .mode(DIR_MODE)
             .create(dir)
-    })?;
+    }?;
     // Checked again rather than trusted: `recursive` reports an existing directory as
     // success, and is willing to walk whatever appeared at a missing ancestor between
     // the two checks.
@@ -153,7 +205,7 @@ pub(crate) fn ensure_run_dir(dir: &Path) -> io::Result<()> {
     Err(refuse(
         dir,
         io::ErrorKind::NotFound,
-        "it was removed as it was created",
+        format_args!("it was removed as it was created"),
     ))
 }
 
@@ -178,7 +230,7 @@ fn check_trusted_ancestors(dir: &Path) -> io::Result<()> {
                     return Err(refuse(
                         path,
                         io::ErrorKind::NotADirectory,
-                        "an ancestor is not a real directory",
+                        format_args!("an ancestor is not a real directory"),
                     ));
                 }
                 let owner = metadata.uid();
@@ -186,7 +238,7 @@ fn check_trusted_ancestors(dir: &Path) -> io::Result<()> {
                     return Err(refuse(
                         path,
                         io::ErrorKind::PermissionDenied,
-                        &format!("ancestor owner uid {owner} is neither this user nor root"),
+                        format_args!("ancestor owner uid {owner} is neither this user nor root"),
                     ));
                 }
                 let mode = metadata.mode();
@@ -202,7 +254,7 @@ fn check_trusted_ancestors(dir: &Path) -> io::Result<()> {
                     return Err(refuse(
                         path,
                         io::ErrorKind::PermissionDenied,
-                        &format!(
+                        format_args!(
                             "ancestor mode {:o} lets other users redirect the run directory",
                             mode & 0o7777
                         ),
@@ -255,7 +307,7 @@ pub(crate) fn check_run_dir(dir: &Path) -> io::Result<bool> {
         return Err(refuse(
             dir,
             io::ErrorKind::PermissionDenied,
-            &format!("it belongs to uid {}", stat.st_uid),
+            format_args!("it belongs to uid {}", stat.st_uid),
         ));
     }
 
@@ -268,7 +320,7 @@ pub(crate) fn check_run_dir(dir: &Path) -> io::Result<bool> {
         return Err(refuse(
             dir,
             io::ErrorKind::PermissionDenied,
-            &format!("mode {:o} lets other users create files in it", mode.bits()),
+            format_args!("mode {:o} lets other users create files in it", mode.bits()),
         ));
     }
     if mode != Mode::from_bits_truncate(DIR_MODE) {
@@ -285,15 +337,15 @@ pub(crate) fn check_run_dir(dir: &Path) -> io::Result<bool> {
 /// than `ELOOP`, and the symlink is the redirect worth naming (§ 6.3).
 fn refuse_unopenable(dir: &Path, err: rustix::io::Errno) -> io::Error {
     match err {
-        rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP => refuse(
-            dir,
-            io::ErrorKind::NotADirectory,
-            if fs::symlink_metadata(dir).is_ok_and(|meta| meta.file_type().is_symlink()) {
-                "it is a symlink"
-            } else {
-                "it is not a directory"
-            },
-        ),
+        rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP => {
+            let problem =
+                if fs::symlink_metadata(dir).is_ok_and(|meta| meta.file_type().is_symlink()) {
+                    "it is a symlink"
+                } else {
+                    "it is not a directory"
+                };
+            refuse(dir, io::ErrorKind::NotADirectory, format_args!("{problem}"))
+        }
         other => refuse_errno(dir, other, "it could not be opened"),
     }
 }
@@ -301,7 +353,7 @@ fn refuse_unopenable(dir: &Path, err: rustix::io::Errno) -> io::Error {
 /// A refusal in the terms the user needs. It reaches them as `nomux: ...` on stderr and is
 /// the whole account they get, so it names the path even where the errno beneath names
 /// nothing.
-fn refuse(dir: &Path, kind: io::ErrorKind, problem: &str) -> io::Error {
+fn refuse(dir: &Path, kind: io::ErrorKind, problem: fmt::Arguments<'_>) -> io::Error {
     io::Error::new(
         kind,
         format!(
@@ -316,7 +368,7 @@ fn refuse(dir: &Path, kind: io::ErrorKind, problem: &str) -> io::Error {
 fn refuse_errno(dir: &Path, err: rustix::io::Errno, problem: &str) -> io::Error {
     let err = io::Error::from(err);
     let kind = err.kind();
-    refuse(dir, kind, &format!("{problem}: {err}"))
+    refuse(dir, kind, format_args!("{problem}: {err}"))
 }
 
 /// Returns whether `id` is usable as a session id.
@@ -349,7 +401,7 @@ fn split_run_name(path: &Path) -> Option<(&str, &[u8])> {
 ///
 /// Validated before it is handed back ([`is_valid_session_id`], § 6.3): every caller derives
 /// a path, a probe or a signal from it, and these bytes came out of a directory.
-pub(crate) fn session_id_of(path: &Path) -> Option<&str> {
+fn session_id_of(path: &Path) -> Option<&str> {
     split_run_name(path)
         .map(|(id, _)| id)
         .filter(|id| is_valid_session_id(id))
@@ -437,8 +489,26 @@ impl SessionPaths {
         &self.dir
     }
 
+    /// `<dir>/<id>.<extension>`, built into one exactly sized buffer.
+    ///
+    /// Not `join(format!(...))`: that allocates the stem as a `String` and then copies it
+    /// into a second allocation, and instantiates `format!`'s machinery for an argument
+    /// shape nothing else here uses. [`Self::removal_order`] builds five of these in a row
+    /// and `attach`'s poll loop hoists one out of the loop to dodge the cost, which is the
+    /// measure of how often this is called.
     fn with_extension(&self, extension: &str) -> PathBuf {
-        self.dir.join(format!("{}.{extension}", self.id))
+        let mut path = PathBuf::with_capacity(
+            self.dir.as_os_str().len() + "/".len() + self.id.len() + ".".len() + extension.len(),
+        );
+        path.push(&self.dir);
+        // `push` for the id, which [`is_valid_session_id`] has already established is a
+        // single relative component, and then straight into the buffer for the extension:
+        // a second `push` would read `.sock` as a component of its own.
+        path.push(&self.id);
+        let name = path.as_mut_os_string();
+        name.push(".");
+        name.push(extension);
+        path
     }
 
     /// Unix socket the daemon listens on.
@@ -536,18 +606,40 @@ impl SessionPaths {
     /// # Errors
     ///
     /// The failures about the *file* and the *filesystem*, still there next time: a
-    /// `<id>.lock` nothing can lock, one that is no regular file, and a run directory
-    /// mounted read-only. None may be answered by going ahead ([`SpawnLock`]).
+    /// `<id>.lock` nothing can lock, one that is no regular file and could not be cleared
+    /// either, and a run directory mounted read-only. None may be answered by going ahead
+    /// ([`SpawnLock`]).
     pub(crate) fn try_lock_spawn_or_refuse(&self) -> io::Result<Option<SpawnLock>> {
         let path = self.lock();
-        for _ in 0..LOCK_ATTEMPTS {
+        // Clears a node somebody left at `<id>.lock` so that the next pass can create the
+        // lock, answering `false` where the budget is spent or the node will not go.
+        //
+        // This is [`remove_node`]'s argument reaching the one name it could not otherwise
+        // reach: nothing this layout writes at `<id>.lock` is anything but a regular file,
+        // so what is there is nobody's mutex — and *every* unlink path in this module
+        // demands a `&SpawnLock`, so a node here that is only ever refused strands the id
+        // on this host for good. `control::kill` fails on it at every attempt, both
+        // collections skip the session in silence, and `daemon::start` and `attach::create`
+        // call the host unsafe, until the user notices and runs `rm` by hand. The same
+        // asymmetry it removes: a directory planted at `<id>.sock` is collected, one at
+        // `<id>.lock` was not.
+        let mut repairs = LOCK_REPAIRS;
+        let mut repair = |path: &Path| {
+            if repairs == 0 {
+                return false;
+            }
+            repairs -= 1;
+            remove_node(path).is_ok()
+        };
+        for _ in 0..LOCK_PASSES {
             // `RDONLY`: `flock(2)` needs no access mode, and asking for write would refuse
             // a `<id>.lock` left at 0400 by a second § 6.6 implementation. `NOFOLLOW`: a
             // symlink here would lock its target while `removal_order` unlinked the link.
             // `NONBLOCK`: a FIFO planted at the name must not park the open awaiting a
             // writer.
             let reading = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK;
-            let opened = with_umask(FILE_MODE, || {
+            let opened = {
+                let _umask = Umask::suppressing(FILE_MODE);
                 match rustix::fs::open(
                     &path,
                     OFlags::CREATE | OFlags::EXCL | reading,
@@ -561,7 +653,7 @@ impl SessionPaths {
                     }
                     Err(err) => Err(err),
                 }
-            });
+            };
             let (fd, created_name) = match opened {
                 Ok(opened) => opened,
                 // `EROFS` means the name is absent and the mount will not create it — a
@@ -571,13 +663,57 @@ impl SessionPaths {
                 Err(err @ (rustix::io::Errno::ACCESS | rustix::io::Errno::PERM)) => {
                     return Err(self.unlockable(&path, err));
                 }
+                // A symlink *at the name*, which the `NOFOLLOW` above answers with
+                // `ELOOP` — the one node that never reaches the file-type check and is
+                // still proven to be one this layout did not write, so it is cleared like
+                // the rest. `symlink_metadata` is what proves it: it stops at the final
+                // component, so it answers `Ok` for a link here and an error for the other
+                // `ELOOP`, a symlink loop somewhere *above* this name, which is a fact
+                // about the run directory that removing this entry could not repair.
+                Err(rustix::io::Errno::LOOP)
+                    if fs::symlink_metadata(&path)
+                        .is_ok_and(|meta| meta.file_type().is_symlink()) =>
+                {
+                    if !repair(&path) {
+                        return Err(self.not_a_lock_file(&path));
+                    }
+                    continue;
+                }
+                // A unix socket *at the name*, the second node whose `open` fails before
+                // there is any descriptor to `fstat`: sockfs implements no `open` at all
+                // and answers `ENXIO`, so the file-type check below never sees it. Proven
+                // exactly as the symlink above is, and by the same call for the same
+                // reason — `symlink_metadata` stops at the final component, so an `Ok`
+                // whose type is a socket is a fact about *this entry* and not about
+                // anything the path led through. A socket is no more something this layout
+                // writes at `<id>.lock` than a directory or a FIFO is, so it earns the same
+                // repair: while this arm refused, `<id>.lock` stayed strandable by exactly
+                // one node type — `nomux kill` could never take that id back, which is the
+                // whole defect the repair exists to end, left standing for sockets alone.
+                Err(rustix::io::Errno::NXIO)
+                    if fs::symlink_metadata(&path)
+                        .is_ok_and(|meta| meta.file_type().is_socket()) =>
+                {
+                    if !repair(&path) {
+                        return Err(self.not_a_lock_file(&path));
+                    }
+                    continue;
+                }
                 // The nodes that refuse to open at all, and so never reach the file-type
-                // check below that would have named them: `NOFOLLOW` answers a symlink
-                // with `ELOOP`, sockfs has no `open` and answers `ENXIO`, and a `<id>.lock`
-                // below something that is not a directory answers `ENOTDIR` on the create.
-                // Each describes the name as it stands rather than this instant, so
-                // `Ok(None)` would send every caller off to wait out a thing that does not
-                // pass: `daemon::start` would call it contention, `control::kill` would
+                // check below that would have named them, and that nothing here has
+                // established anything about either — the two arms above claim the ones
+                // `symlink_metadata` settles, and what is left is unproven. A `<id>.lock`
+                // below something that is not a directory answers `ENOTDIR` on the create,
+                // which describes the run *directory* rather than this name and so is
+                // nothing an unlink of this name could put right; the `ELOOP` the symlink
+                // arm did not claim is that same thing wearing a link, a loop somewhere
+                // above this entry; and the `ENXIO` the socket arm did not claim is a
+                // device special file with no driver behind it, or an `lstat` that would
+                // not answer at all. Removing on a guess is not repair — it is this module
+                // deleting a name it cannot describe — so these are refused. Each describes
+                // the name as it stands rather than this instant,
+                // so `Ok(None)` would send every caller off to wait out a thing that does
+                // not pass: `daemon::start` would call it contention, `control::kill` would
                 // spin to its deadline, and the two collections would quietly do nothing.
                 Err(
                     rustix::io::Errno::LOOP | rustix::io::Errno::NXIO | rustix::io::Errno::NOTDIR,
@@ -595,24 +731,34 @@ impl SessionPaths {
             if rustix::fs::FileType::from_raw_mode(stat.st_mode)
                 != rustix::fs::FileType::RegularFile
             {
-                return Err(self.not_a_lock_file(&path));
-            }
-            loop {
-                match rustix::fs::flock(&fd, FlockOperation::NonBlockingLockExclusive) {
-                    // A signal landing on a blocking `flock` is not an answer; ask again.
-                    Err(rustix::io::Errno::INTR) => {}
-                    Ok(()) => break,
-                    // `ENOLCK` (out of lock records) is a moment; settled toward the
-                    // reading that claims nothing and costs one more attempt.
-                    Err(rustix::io::Errno::WOULDBLOCK | rustix::io::Errno::NOLCK) => {
-                        return Ok(None);
-                    }
-                    // No `flock` on this filesystem: the unopenable-file verdict.
-                    Err(err @ rustix::io::Errno::OPNOTSUPP) => {
-                        return Err(self.unlockable(&path, err));
-                    }
-                    Err(_) => return Ok(None),
+                // A directory or a FIFO, proven through the descriptor rather than guessed
+                // at from a name: cleared, and the next pass creates the lock with `O_EXCL`.
+                // Closed first, so the last name for that inode does not go while this
+                // still holds it open.
+                drop(fd);
+                if !repair(&path) {
+                    return Err(self.not_a_lock_file(&path));
                 }
+                continue;
+            }
+            match rustix::fs::flock(&fd, FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => {}
+                // `ENOLCK` (out of lock records) is a moment; settled toward the
+                // reading that claims nothing and costs one more attempt.
+                Err(rustix::io::Errno::WOULDBLOCK | rustix::io::Errno::NOLCK) => {
+                    return Ok(None);
+                }
+                // No `flock` on this filesystem: the unopenable-file verdict.
+                Err(err @ rustix::io::Errno::OPNOTSUPP) => {
+                    return Err(self.unlockable(&path, err));
+                }
+                // `EINTR` among these, and it is *not* retried: `sys_flock` reaches the
+                // interruptible wait only under `FL_SLEEP`, which `LOCK_NB` clears, so a
+                // non-blocking `flock` cannot be interrupted. The arm that used to ask
+                // again described a blocking call this has never been; the waiting this
+                // design does is [`Self::lock_spawn_until`]'s sleep. Anything else here is
+                // about this attempt rather than about the file, and the caller asks again.
+                Err(_) => return Ok(None),
             }
             let lock = SpawnLock { fd, created_name };
             if lock.locks_the_file_at(&path) {
@@ -658,9 +804,17 @@ impl SessionPaths {
         )
     }
 
-    /// Refuses a directory node that cannot serve as the spawn mutex.
+    /// Refuses a node at `<id>.lock` that cannot serve as the spawn mutex and could not be
+    /// cleared away either.
     ///
-    /// Opened non-blocking before this check, so a FIFO, device or socket cannot turn
+    /// The repair in [`Self::try_lock_spawn_or_refuse`] runs first, so what reaches here is
+    /// a name that is still no regular file after it: one nothing proved anything about —
+    /// an `ENOTDIR` that is about the run directory rather than this name, an `ELOOP` above
+    /// it, an `ENXIO` no `lstat` settled — one that would not go, a non-empty directory
+    /// being the plainest ([`remove_node`]), or one somebody is planting faster than a
+    /// single acquirer clears it ([`LOCK_REPAIRS`]).
+    ///
+    /// Opened non-blocking before that check, so a FIFO, device or socket cannot turn
     /// `spawn` and the `kill` escape hatch into an unbounded syscall.
     fn not_a_lock_file(&self, path: &Path) -> io::Error {
         io::Error::new(
@@ -874,6 +1028,11 @@ fn remove_node(path: &Path) -> io::Result<()> {
 #[derive(Debug)]
 pub(crate) struct SpawnLock {
     /// The locked descriptor: `close(2)` on it releases the lock, so it is held for that.
+    ///
+    /// Deliberately *not* an explicit `LOCK_UN` in a `Drop`: `startup.rs`'s parent leaves
+    /// by `_exit(0)` and runs no destructor, and the lock the daemon inherited lives on the
+    /// same open file description, which the kernel drops only once every descriptor on it
+    /// is closed. Releasing here would be a release the exit path could not make.
     fd: OwnedFd,
     /// Whether this acquisition created the directory entry it locked, established
     /// atomically with `O_EXCL`: a startup failure may remove the name only then —
@@ -1370,12 +1529,22 @@ mod tests {
         );
     }
 
-    /// The nodes whose `open` fails outright, which the file-type check cannot answer
-    /// because it never gets the descriptor to judge. They are as permanent as the FIFO
-    /// that check does catch, and read as a moment instead they are worse than useless:
-    /// `daemon::start` reports the id as one another process is starting, `control::kill`
-    /// spins to its grace deadline and blames contention, and the two collections remove
-    /// nothing and have nobody to say so to.
+    /// The nodes whose `open` fails outright *and* that nothing has established anything
+    /// about, so the repair below has nothing it may act on. Both remaining ones are facts
+    /// about the run *directory* wearing this entry's errno: a name below a plain file,
+    /// whose `ENOTDIR` arrives on the create, and a name below a symlink loop, whose
+    /// `ELOOP` is the one the symlink arm does *not* claim — `symlink_metadata` refuses to
+    /// answer for either, which is exactly what separates them from the link, socket, FIFO
+    /// and directory that are cleared. Neither is a name an unlink of this entry could put
+    /// right, so removing on the guess would be this module deleting what it cannot
+    /// describe. They are permanent, and read as a moment instead they are worse than
+    /// useless: `daemon::start` reports the id as one another process is starting,
+    /// `control::kill` spins to its grace deadline and blames contention, and the two
+    /// collections remove nothing and have nobody to say so to.
+    ///
+    /// The socket this used to lead with has moved to
+    /// [`a_node_planted_at_the_spawn_lock_is_cleared_and_the_lock_is_then_taken`]: `lstat`
+    /// settles it, so it is cleared rather than refused.
     #[test]
     fn a_lock_that_will_not_open_at_all_is_refused_rather_than_waited_out() {
         fn refuses(paths: &SessionPaths, planted: &str) {
@@ -1396,24 +1565,10 @@ mod tests {
             );
         }
 
+        // Both fixtures are *beside* the scratch directory rather than in it: what is
+        // wrong here is the run directory each `SessionPaths` names, so neither case has
+        // a well-formed one to be built on.
         let root = Scratch::new("rundir-lock-node");
-        let paths = SessionPaths::in_dir(root.path(), "tab_7")
-            .expect("a directory of the test's own naming a session");
-
-        // `ELOOP`, from the `NOFOLLOW` that is there so a link cannot have the lock taken
-        // on its target while `removal_order` unlinks the link itself.
-        let target = root.join("elsewhere");
-        fs::write(&target, b"").unwrap();
-        std::os::unix::fs::symlink(&target, paths.lock()).unwrap();
-        refuses(&paths, "a symlink");
-        fs::remove_file(paths.lock()).unwrap();
-
-        // `ENXIO`: sockfs implements no `open`, so a socket node yields no descriptor at
-        // all rather than one `fstat` can turn away.
-        let socket = UnixListener::bind(paths.lock()).expect("plant a socket at the lock name");
-        refuses(&paths, "a socket");
-        drop(socket);
-        fs::remove_file(paths.lock()).unwrap();
 
         // `ENOTDIR`, which arrives on the create rather than the reopen: the run
         // directory is a plain file, so no name below it can ever resolve.
@@ -1421,6 +1576,154 @@ mod tests {
         fs::write(&file, b"").unwrap();
         let below = SessionPaths::in_dir(&file, "tab_7").expect("resolve paths below a plain file");
         refuses(&below, "a name below a plain file");
+
+        // The other `ELOOP`: a symlink pointing at itself *as the run directory*, so the
+        // loop is above `<id>.lock` rather than at it. The open fails identically to a
+        // symlink planted at the name, and only `symlink_metadata` tells the two apart —
+        // it stops at the final component, and here it never reaches one, so it errors
+        // where the planted link answers `Ok`. Unlinking `<id>.lock` would clear nothing:
+        // the entry does not exist and could not be reached if it did.
+        let looping = root.join("loop");
+        std::os::unix::fs::symlink(&looping, &looping).unwrap();
+        let inside = SessionPaths::in_dir(&looping, "tab_7")
+            .expect("resolve paths below a self-referential symlink");
+        assert!(
+            fs::symlink_metadata(inside.lock()).is_err(),
+            "the fixture must be a loop the stat cannot see through, or this asserts the \
+             planted-symlink case over again"
+        );
+        refuses(&inside, "a name below a symlink loop");
+    }
+
+    /// `<id>.lock` is the one name in this layout that a planted node could strand for
+    /// good: every unlink path here demands a `&SpawnLock`, so a node that is only refused
+    /// leaves nothing able to take it away. `control::kill` then fails on the id at every
+    /// attempt, `control::collect` and the daemon's own exit skip it in silence, and
+    /// `daemon::start` and `attach::create` call the host unsafe — until the user runs `rm`.
+    /// Nothing this layout writes at that name is anything but a regular file, so what is
+    /// there is nobody's mutex and clearing it is [`remove_node`]'s repair, which
+    /// `<id>.sock` and the other four names have had all along.
+    #[test]
+    fn a_node_planted_at_the_spawn_lock_is_cleared_and_the_lock_is_then_taken() {
+        let root = Scratch::new("rundir-lock-repair");
+        let paths = SessionPaths::in_dir(root.path(), "tab_7")
+            .expect("a directory of the test's own naming a session");
+        // The symlink's target, and the assertion that only the *name* is cleared: a
+        // repair that resolved the link would take away a file of the user's instead.
+        let target = root.join("elsewhere");
+        fs::write(&target, b"planted").unwrap();
+
+        // What each planted node has to end at: the name cleared, a real lock created in
+        // its place and held, and nothing outside the run directory touched.
+        let cleared = |planted: &str| {
+            let lock = paths
+                .try_lock_spawn_or_refuse()
+                .unwrap_or_else(|err| panic!("{planted} at the spawn lock is no refusal: {err}"))
+                .unwrap_or_else(|| panic!("{planted}: and the lock must then be taken"));
+            assert!(
+                fs::symlink_metadata(paths.lock())
+                    .expect("stat what replaced it")
+                    .file_type()
+                    .is_file(),
+                "{planted}: the name is a regular file once the acquirer has it"
+            );
+            assert_eq!(
+                mode_of(&paths.lock()),
+                FILE_MODE,
+                "{planted}: created at the frozen mode like any other lock"
+            );
+            assert_eq!(
+                fs::read(&target).expect("read the symlink's target"),
+                b"planted",
+                "{planted}: only the name in the run directory is cleared, never what a \
+                 link at it pointed to"
+            );
+            // This acquisition created the name, so it is also the one that may take it
+            // away — which is how the next plant starts from an empty directory.
+            paths.release_lock_name(&lock);
+            drop(lock);
+            assert!(
+                !paths.lock().exists(),
+                "{planted}: the fixture must be clear for the next node"
+            );
+        };
+
+        fs::create_dir(paths.lock()).expect("plant a directory");
+        cleared("a directory");
+
+        std::os::unix::fs::symlink(&target, paths.lock()).expect("plant a symlink");
+        cleared("a symlink");
+
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            paths.lock(),
+            rustix::fs::FileType::Fifo,
+            Mode::from_bits_truncate(FILE_MODE),
+            0,
+        )
+        .expect("plant a FIFO");
+        cleared("a FIFO");
+
+        // The socket last, because it is the one that reaches the repair by a route of its
+        // own: sockfs implements no `open`, so the `ENXIO` comes back before there is a
+        // descriptor for the file-type check to turn away, and `lstat` is the whole of the
+        // proof. Refused rather than cleared, it left `<id>.lock` strandable by one node
+        // type after the other three were fixed — the same permanent 126 and the same
+        // `rm`-by-hand, for a socket.
+        let planted = UnixListener::bind(paths.lock()).expect("plant a socket");
+        cleared("a socket");
+        // After the clear: the listener holds the inode, not the name, and dropping it
+        // unlinks nothing — so this is only the test letting go of a descriptor.
+        drop(planted);
+    }
+
+    /// The repair is bounded, because the node it clears can be put straight back.
+    ///
+    /// One acquirer removes [`LOCK_REPAIRS`] of them and then refuses: without that bound a
+    /// process replanting `<id>.lock` in a tight loop would hold `control::kill`'s escape
+    /// hatch and both collections inside `try_lock_spawn_or_refuse` for as long as it cared
+    /// to, which is the one thing worse than the strand the repair is there to end. The
+    /// outcome is whichever of the two the race lands on; what is pinned is that the call
+    /// comes back at all, and that the only refusal it can earn is still the one that names
+    /// the file.
+    #[test]
+    fn clearing_a_replanted_spawn_lock_gives_up_rather_than_spinning() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let root = Scratch::new("rundir-lock-replant");
+        let paths = SessionPaths::in_dir(root.path(), "tab_7")
+            .expect("a directory of the test's own naming a session");
+        let stop = Arc::new(AtomicBool::new(false));
+        let replanting = std::thread::spawn({
+            let stop = Arc::clone(&stop);
+            let lock = paths.lock();
+            move || {
+                while !stop.load(Ordering::Relaxed) {
+                    drop(remove_node(&lock));
+                    drop(fs::create_dir(&lock));
+                }
+            }
+        });
+
+        let started = Instant::now();
+        let outcome = paths.try_lock_spawn_or_refuse();
+        let elapsed = started.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        replanting.join().expect("the replanting thread");
+        drop(remove_node(&paths.lock()));
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the acquire loop is bounded by its own budget and not by the planter losing              interest: it took {elapsed:?}"
+        );
+        if let Err(err) = outcome {
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::InvalidData,
+                "a name being replanted is no lock file, and no other refusal: {err}"
+            );
+        }
     }
 
     /// A startup that failed gives back only the `<id>.lock` it made itself. Both callers

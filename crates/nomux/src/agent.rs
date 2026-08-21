@@ -19,7 +19,9 @@ use crate::nbio::ReadOutcome;
 ///
 /// An agent exchange is a few hundred bytes, so this is already three orders of
 /// magnitude past anything legitimate; what it bounds is the peer that has stopped
-/// reading altogether, at a sixteenth of the default ring rather than beside it.
+/// reading altogether. Stated absolutely, as § 6.7 states it, and deliberately *not* as a
+/// fraction of the session ring: the two are unrelated budgets, and the ratio this
+/// comment used to quote went stale the moment the ring default moved.
 const MAX_CHANNEL_QUEUE: usize = 256 * 1024;
 
 /// How long the served connection may move no byte in either direction before the
@@ -29,6 +31,17 @@ const MAX_CHANNEL_QUEUE: usize = 256 * 1024;
 /// One slot makes later peers wait this long in series. A minute still leaves room for
 /// a human or hardware key to answer a live signing request.
 const AGENT_IDLE_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// How long a connection the *client* closed may go on trying to hand the last of its
+/// queue to a local peer that has stopped reading — [`Agent::close_from_client`] has why
+/// this is not the minute above.
+///
+/// Long enough for a peer that is merely a scheduling slice behind; short enough that the
+/// next peer is served rather than left waiting. Nothing more can be sent down a
+/// connection the client has closed, so what this window buys is one already-sent reply
+/// and nothing else, where [`AGENT_IDLE_TIMEOUT`] is priced for a live exchange in front
+/// of a human reaching for a hardware key.
+const AGENT_ABANDON_GRACE: Duration = Duration::from_secs(1);
 
 /// Outcome of one attempt to take a connection off the agent socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,7 +84,9 @@ struct Channel {
     /// The client closed its end; drop once `pending` has drained.
     closing: bool,
     /// When this connection is given up as stalled: [`AGENT_IDLE_TIMEOUT`] past the
-    /// last byte that moved in either direction.
+    /// last byte that moved in either direction, or the shorter
+    /// [`AGENT_ABANDON_GRACE`] once the client has closed it against a peer that will
+    /// not take the rest.
     idle_deadline: Instant,
 }
 
@@ -323,7 +338,9 @@ impl Agent {
     }
 
     /// Marks the served connection closed by the client. Its queue is flushed first, so
-    /// a reply the client has already sent still reaches the waiting process.
+    /// a reply the client has already sent still reaches the waiting process — and a
+    /// queue the flush could not place keeps the connection only for
+    /// [`AGENT_ABANDON_GRACE`], the argument for which is below.
     ///
     /// A close for a generation this is no longer serving does nothing at all. The
     /// client sent it for a peer that had already gone, and honouring it would kill the
@@ -345,6 +362,24 @@ impl Agent {
         drop(chan.stream.shutdown(std::net::Shutdown::Read));
         if self.flush() != Flush::Open {
             let _ = self.forget();
+        } else if let Some(chan) = self.channel.as_mut() {
+            // What is left is a queue with nowhere to go — the flush above placed none of
+            // it — down a connection nothing can be sent on any more, so it gets
+            // [`AGENT_ABANDON_GRACE`] rather than the rest of [`AGENT_IDLE_TIMEOUT`].
+            //
+            // The slot is why. `daemon.rs`'s `on_detached` reaches here when the client
+            // *leaves*, and § 6.7 promises that while detached "connections are accepted
+            // and closed immediately, so a `git push` with no client attached fails
+            // fast". [`Agent::accept`] can only deliver that with the slot free: while
+            // this channel holds it, `daemon`'s `watch_for` keeps the listener out of the
+            // poll set, and every later peer sits in the listen backlog with its
+            // `connect(2)` already returned and nothing whatever answering it — a minute
+            // of silence and then a timeout, where the promise was an immediate refusal.
+            //
+            // `min`, never a plain assignment: the daemon may reach here twice for one
+            // connection — an `AgentClose` from the client and then the `Detach` behind
+            // it — and a fuse that could be relit is not a fuse.
+            chan.idle_deadline = chan.idle_deadline.min(Instant::now() + AGENT_ABANDON_GRACE);
         }
     }
 
@@ -645,6 +680,80 @@ mod tests {
             Some(due),
             "nor does the attempt to write it, which moved no byte"
         );
+    }
+
+    /// A connection the client closed against a peer that has stopped reading must not
+    /// hold the one slot for the idle minute.
+    ///
+    /// § 6.7 promises a detached session refuses agent connections at once, and
+    /// [`Agent::accept`] can only do that with the slot free — until it is, a `git push`
+    /// gets a `connect(2)` that succeeds and then a minute of silence. The `min` is the
+    /// other half: the daemon reaches `close_from_client` twice for one connection when an
+    /// `AgentClose` and the `Detach` behind it arrive in the same pass.
+    #[test]
+    fn a_close_the_peer_will_not_take_gives_the_slot_up_on_a_short_fuse() {
+        let root = Scratch::new("agent-abandon");
+        let mut agent = bind_in(&root, "a.agent");
+        let (_peer, live) = open(&mut agent);
+
+        let accepted_at = agent
+            .deadline()
+            .expect("a served connection has a deadline");
+        stall(&mut agent, live);
+        agent.close_from_client(live);
+        assert!(
+            agent.is_serving(),
+            "a queue that cannot drain still holds the slot, which is the point"
+        );
+
+        let fused = agent.deadline().expect("and so still has a deadline");
+        assert!(
+            fused < accepted_at,
+            "the fuse must be shorter than the idle minute: {fused:?} against {accepted_at:?}"
+        );
+        assert!(
+            fused <= Instant::now() + AGENT_ABANDON_GRACE,
+            "and no longer than the abandon grace"
+        );
+
+        agent.close_from_client(live);
+        assert_eq!(
+            agent.deadline(),
+            Some(fused),
+            "a second close for the same connection must not relight the fuse"
+        );
+
+        assert!(
+            agent.close_if_idle(fused).is_none(),
+            "the slot comes back with nothing said about it, the client having closed \
+             this itself"
+        );
+        assert!(!agent.is_serving(), "and it does come back");
+    }
+
+    /// The fuse is for a connection the *client* closed. One it is still using keeps the
+    /// full window, which is what § 6.7 prices for a human reaching for a hardware key.
+    #[test]
+    fn the_short_fuse_never_reaches_a_connection_the_client_still_holds() {
+        let root = Scratch::new("agent-abandon-live");
+        let mut agent = bind_in(&root, "l.agent");
+        let (_peer, live) = open(&mut agent);
+
+        stall(&mut agent, live);
+        let due = agent
+            .deadline()
+            .expect("a served connection has a deadline");
+        assert!(
+            due > Instant::now() + AGENT_ABANDON_GRACE,
+            "a peer that stopped reading is not on its own a reason to shorten anything"
+        );
+        assert!(
+            agent
+                .close_if_idle(Instant::now() + AGENT_ABANDON_GRACE)
+                .is_none(),
+            "and the short fuse must not be what closes it"
+        );
+        assert!(agent.is_serving(), "it is still the client's to hold");
     }
 
     /// An empty backlog must not be reported as the failure that takes the socket out

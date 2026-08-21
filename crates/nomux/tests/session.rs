@@ -16,6 +16,7 @@
 mod harness;
 
 use std::io::{ErrorKind, Write};
+use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -30,8 +31,8 @@ use nomux_protocol::{
 
 use harness::{
     Client, DEFAULT_TEST_RING, FRAME_PATIENCE, Rng, Session, Spawned, StreamModel, hello_frame,
-    nomux_with_shell, poll_by, poll_until, read_uninterrupted, reconnect_until_gap, run_root,
-    still_serving,
+    nomux_with_shell, poll_by, poll_until, position, read_uninterrupted, reconnect_until_gap,
+    run_root, still_serving,
 };
 
 /// `daemon::PENDING_HELLO_TIMEOUT`: how long a connection that has not said `Hello`
@@ -65,6 +66,14 @@ fn a_connection_that_never_greets_gives_the_pending_slot_back() {
 
     // By hand rather than through a `Client`, which has no way to say nothing: what is
     // under test is a peer that never reaches the protocol at all.
+    // Sampled *before* the `connect` below, and that is the whole of what makes the
+    // deadline assertion at the foot of this test correct rather than a race: the
+    // daemon's own five-second clock starts at its `accept`, which this `connect` is
+    // what triggers, so anything read after it — the `connect_by` behind it included —
+    // is time already on the daemon's clock and not on this one. Taken afterwards, every
+    // microsecond the test thread was descheduled for came off the measured elapse and
+    // the assertion fired on a daemon that had waited the whole five seconds.
+    let connected = Instant::now();
     let mut silent = UnixStream::connect(&session.socket).expect("connect without greeting");
     silent
         .set_read_timeout(Some(Duration::from_millis(100)))
@@ -75,7 +84,6 @@ fn a_connection_that_never_greets_gives_the_pending_slot_back() {
     // backlog is ordered — nothing can serve this one before the silent one is dealt with.
     let mut waiting = session.connect_by(deadline);
 
-    let connected = Instant::now();
     let mut chunk = [0u8; 64];
     let closed = poll_by(deadline, || {
         match read_uninterrupted(&mut silent, &mut chunk) {
@@ -95,10 +103,10 @@ fn a_connection_that_never_greets_gives_the_pending_slot_back() {
          slot, so every attach after it — this test's own included — waits for the life \
          of the session"
     );
-    // Measured from before the `connect`, so it is under whatever the daemon's own clock
-    // started at accept: a close inside this is the daemon refusing ungreeted connections
-    // rather than deadlining them, which would cost § 6.6 the probe it identifies a live
-    // session with.
+    // Measured from before the `connect` that provokes the daemon's `accept`, so this
+    // elapse is never shorter than the one the daemon's own clock ran: a close inside
+    // this is the daemon refusing ungreeted connections rather than deadlining them,
+    // which would cost § 6.6 the probe it identifies a live session with.
     assert!(
         connected.elapsed() >= PENDING_HELLO_TIMEOUT,
         "the ungreeted connection was closed after {:?}, inside the {PENDING_HELLO_TIMEOUT:?} \
@@ -108,9 +116,12 @@ fn a_connection_that_never_greets_gives_the_pending_slot_back() {
 
     // And the slot came back to the peer that had been waiting in it since before the
     // deadline fired — greeted, and driving the shell rather than merely acknowledged.
-    let ok = waiting.hello(RESUME_FROM_START);
-    waiting.input(ok.in_applied, b"echo NOMUX-AFTER-PENDING\n");
-    waiting.read_until("NOMUX-AFTER-PENDING", ok.resume_from);
+    // Through `harness::still_serving`, whose marker is arithmetic: the session is at
+    // the PTY's default `ECHO|ICANON`, so the line discipline puts the command line back
+    // on the master before any shell has read it, and a marker written out whole would
+    // be satisfied by that echo rather than by the child.
+    waiting.hello(RESUME_FROM_START);
+    still_serving(&mut waiting, "NOMUX-AFTER-PENDING");
 }
 
 /// A client claiming output the session never produced is clamped down to the end of
@@ -534,7 +545,7 @@ fn a_second_client_takes_over_and_the_first_is_told_why() {
     let (session, mut first, _) = Session::attached("takeover");
 
     let mut second = session.connect();
-    let ok = second.hello(RESUME_FROM_START);
+    second.hello(RESUME_FROM_START);
 
     first.expect_error(
         ErrorCode::Takeover,
@@ -546,10 +557,14 @@ fn a_second_client_takes_over_and_the_first_is_told_why() {
     first.expect_eof("an Error{TAKEOVER}");
 
     // And the session is the newcomer's, which is the half the eviction exists for: a
-    // round trip through the child, so what is asserted is a client that can drive the
-    // shell rather than one that merely got a `HelloOk`.
-    second.input(ok.in_applied, b"echo NOMUX-TOOK-OVER\n");
-    second.read_until("NOMUX-TOOK-OVER", ok.resume_from);
+    // round trip through the *child*, so what is asserted is a client that can drive the
+    // shell rather than one that merely got a `HelloOk`. That is what
+    // `harness::still_serving` buys and a marker of this test's own would not: nothing
+    // here ever called `make_ready`, so the PTY is at its default `ECHO|ICANON` and the
+    // line discipline echoes the command line back on the master before the shell is
+    // scheduled — a literal marker is found in the echo of the request for it, and the
+    // takeover would read as proven by bytes that never reached the child.
+    still_serving(&mut second, "NOMUX-TOOK-OVER");
 }
 
 /// The opt-in opposite of takeover: the newcomer learns that the slot is occupied,
@@ -564,7 +579,7 @@ fn a_second_client_takes_over_and_the_first_is_told_why() {
 /// conditional attach.
 #[test]
 fn a_conditional_attach_refuses_to_displace_but_succeeds_after_detach() {
-    let (session, mut incumbent, ok) = Session::attached("if_detached");
+    let (session, mut incumbent, _) = Session::attached("if_detached");
 
     let mut refused = session.connect();
     refused.send(&Frame::Hello(Hello {
@@ -582,9 +597,13 @@ fn a_conditional_attach_refuses_to_displace_but_succeeds_after_detach() {
     );
     refused.expect_eof("an Error{ALREADY_ATTACHED}");
 
-    let before = b"echo NOMUX-STILL-ATTACHED\n";
-    incumbent.input(ok.in_applied, before);
-    incumbent.read_until("NOMUX-STILL-ATTACHED", ok.resume_from);
+    // The incumbent is still the one driving the shell, asked for in the arithmetic
+    // `harness::still_serving` sends: this session was never made ready, so its line
+    // discipline echoes whatever is written at it and a literal marker would come back
+    // whether or not a shell ever ran the line. What it returns is the input position
+    // the daemon must report below — the line is `still_serving`'s to compose, so a
+    // length written out here would be a guess at somebody else's string.
+    let sent = still_serving(&mut incumbent, "NOMUX-STILL-ATTACHED");
 
     incumbent.send(&Frame::Detach);
     incumbent.expect_eof("a Detach after a refused conditional attach");
@@ -593,12 +612,10 @@ fn a_conditional_attach_refuses_to_displace_but_succeeds_after_detach() {
     let mut resumed = session.connect();
     let accepted = resumed.hello_if_detached(RESUME_FROM_START);
     assert_eq!(
-        accepted.in_applied,
-        before.len() as u64,
+        accepted.in_applied, sent,
         "the refusal and detach changed the session's input position"
     );
-    resumed.input(accepted.in_applied, b"echo NOMUX-CONDITIONALLY-ATTACHED\n");
-    resumed.read_until("NOMUX-CONDITIONALLY-ATTACHED", accepted.resume_from);
+    still_serving(&mut resumed, "NOMUX-CONDITIONALLY-ATTACHED");
 }
 
 /// The refusals a connection can earn against a session that is already serving, and
@@ -835,12 +852,33 @@ fn refusals_a_connection_can_earn() -> [Refused; 9] {
 /// single failure that can happen *after* a client has been accepted and before it has a
 /// session, `Pty::spawn` failing. A client that gets silence there waits out its own
 /// attach deadline instead of reporting a host whose `$SHELL` is wrong, and `DESIGN.md`
-/// § 6.4 has the client treat `INTERNAL` and `PROTOCOL` differently. A directory rather
-/// than a missing file, so the failure is `execve` refusing what it was handed:
-/// `login_shell` falls back through the password database only when it is *absent*.
+/// § 6.4 has the client treat `INTERNAL` and `PROTOCOL` differently.
+///
+/// Getting `Pty::spawn` to fail at all takes a `$SHELL` the filesystem cannot tell from a
+/// shell and the kernel can. Everything `pty::pick_shell` is able to recognise — a
+/// relative path, a name that is gone, a file with no exec bit, a directory — it falls
+/// back to `/bin/sh` for, which is § 6.1.1's precedence and costs the user nothing; what
+/// is planted here passes all three of its probes (absolute, regular, `X_OK`) and is
+/// still not a program. Its contents are neither an ELF header nor a `#!` line and no
+/// `binfmt_misc` handler claims them, so the child's `execve` refuses it `ENOEXEC` and
+/// that errno comes back up `crate::exec`'s failure pipe as the `io::Error` from
+/// `Pty::spawn` that the daemon turns into this frame. Nothing else in the suite reaches
+/// that arm.
 #[test]
 fn a_session_whose_shell_cannot_be_started_is_refused_as_an_internal_failure() {
-    let session = Session::start_with("shell_broken", &DEFAULT_TEST_RING.to_string(), "/tmp");
+    // In a run root of its own: the one `Session::start_with` is about to take is wiped
+    // as it is handed out, which would take the planted shell with it.
+    let planted = run_root("shell_broken_bin").join("not-a-program");
+    fs::write(&planted, b"nomux: neither an ELF image nor a `#!` line\n")
+        .expect("plant a shell that is not a program");
+    fs::set_permissions(&planted, fs::Permissions::from_mode(0o755))
+        .expect("make the planted shell pass an X_OK probe");
+
+    let session = Session::start_with(
+        "shell_broken",
+        &DEFAULT_TEST_RING.to_string(),
+        planted.to_str().expect("a run root that is UTF-8"),
+    );
     let mut client = session.connect();
 
     // By hand: `Client::hello` panics on anything but a `HelloOk`, and the refusal is
@@ -1164,14 +1202,6 @@ fn a_sustained_overflow_repaints_when_the_client_catches_up_rather_than_per_gap(
     );
 }
 
-/// Where `needle` starts in `haystack`. `[u8]` has no `find`, and the record this
-/// reads is bytes rather than text: the daemon's repaint keystroke is `0x0c`.
-fn position(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
 /// Regression: a reconnect racing with in-flight input must not discard it.
 ///
 /// One `poll` can report a readable client and a `Hello` from its replacement together.
@@ -1233,13 +1263,14 @@ fn a_takeover_never_discards_input_already_delivered() {
 /// quiet and stayed quiet over a connection attempt that was refused.
 #[test]
 fn a_version_mismatch_refuses_the_newcomer_without_evicting_the_client() {
-    let (session, mut client, ok) = Session::attached("skew");
+    let (session, mut client, _) = Session::attached("skew");
 
     // The incumbent is serving before the newcomer knocks, or the assertion below
-    // that it still is would be about nothing.
-    let first = b"echo NOMUX-FIRST\n";
-    client.input(0, first);
-    let (_, from) = client.read_until("NOMUX-FIRST", ok.resume_from);
+    // that it still is would be about nothing. Both are `harness::still_serving`, whose
+    // marker is arithmetic the line discipline's echo of the command line cannot
+    // produce — this session is at the PTY's default `ECHO|ICANON`, so a literal marker
+    // would come back off the master before the shell had read a byte of it.
+    still_serving(&mut client, "NOMUX-FIRST");
 
     let mut newcomer = session.connect();
     newcomer.send(&Frame::Hello(Hello {
@@ -1257,9 +1288,10 @@ fn a_version_mismatch_refuses_the_newcomer_without_evicting_the_client() {
     );
 
     // The incumbent kept the session: it never saw a takeover, and its input stream
-    // carries on from where it was rather than restarting.
-    client.input(first.len() as u64, b"echo NOMUX-STILL-HERE\n");
-    client.read_until("NOMUX-STILL-HERE", from);
+    // carries on from where it was rather than restarting — `still_serving` sends from
+    // the position this client has reached, so a session that rewound it would fail on
+    // the offset before the marker was ever looked for.
+    still_serving(&mut client, "NOMUX-STILL-HERE");
 }
 
 /// Regression: a client vanishing must never take the session with it.
@@ -1293,8 +1325,10 @@ fn an_abrupt_client_disconnect_does_not_kill_the_session() {
         "session lost its input state after an abrupt disconnect"
     );
 
-    client.input(ok.in_applied, b"echo NOMUX-STILL-HERE\n");
-    client.read_until("NOMUX-STILL-HERE", ok.resume_from);
+    // And it is a shell that answers rather than the line discipline: this session was
+    // never made ready, so `harness::still_serving`'s arithmetic marker is what
+    // separates the child's reply from the echo of the request for it.
+    still_serving(&mut client, "NOMUX-STILL-HERE");
 }
 
 /// A daemon started with the standard descriptors closed still serves its session.

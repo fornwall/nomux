@@ -34,13 +34,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use nomux_protocol::PROTOCOL_VERSION;
+use nomux_protocol::{PROTOCOL_VERSION, RESUME_FROM_START};
 
 use harness::{
-    Flock, HeldLock, Reaper, Session, Spawned, collect, control, control_with_shell, daemon_reaper,
-    entries, leads_a_process_group, nomux, nomux_with_shell, poll_by, poll_until, process_alive,
-    run_root, stderr, stdout, succeeded, wait_for, wait_until_flock, wedge_socket,
-    while_nothing_forks,
+    Flock, HeldLock, Reaper, Session, Spawned, collect, collect_by, control, control_with_shell,
+    daemon_reaper, entries, leads_a_process_group, nomux, nomux_with_shell, poll_by, poll_until,
+    process_alive, run_root, stderr, stdout, still_serving, succeeded, wait_for, wait_until_flock,
+    wedge_socket, while_nothing_forks,
 };
 
 /// Asserts the one versioned relay record without parsing the human diagnostic beside it.
@@ -168,7 +168,7 @@ fn nothing_parks_on_a_socket_whose_backlog_is_full() {
     let session = StaleSession::empty("lk24");
     let _wedged = wedge_socket(&session.socket());
     let ran = |args: &[&str]| {
-        ran_by(&mut nomux(&session.root, args), deadline).unwrap_or_else(|| {
+        collect_by(&mut nomux(&session.root, args), deadline).unwrap_or_else(|| {
             panic!("`nomux {args:?}` parked on a session socket whose backlog is full")
         })
     };
@@ -874,6 +874,194 @@ fn kill_reports_an_unprobeable_socket_over_a_pidfile_that_names_no_daemon() {
     );
 }
 
+/// A `kill` that cannot pin the process it would signal refuses and leaves the whole
+/// session standing — the postcondition on a host whose kernel has no `pidfd_open`.
+///
+/// `control::pin` has no fallback by design (§ 6.6). The number in `<id>.pid` is reusable,
+/// so the only thing `kill` may signal is a descriptor that follows the process it was
+/// opened on; where the kernel will not hand one over there is nothing it may signal at
+/// all, and the honest answer is a non-zero exit with every file left where it is. The
+/// alternative — falling back to `kill(2)` on the bare number — is how the escape hatch
+/// terminates an unrelated process of the user's, which is the whole reason the descriptor
+/// is taken before `/proc` is even consulted.
+///
+/// The unit test beside `pin` reaches the same state by building a `Chosen` with a
+/// `reach: Err(Errno::MFILE)` of its own, which pins the *sentence* the refusal is worded
+/// in. What a fabricated struct cannot say is what the mode around it then does with the
+/// run directory, and that is the half this test is here for: the files are still on disk
+/// afterwards and the daemon is still serving the shell that was already running behind
+/// them. A `kill` that signalled nothing and unlinked anyway would take a live session's
+/// socket away without stopping it — the user's work still running, behind an id that
+/// appears in no listing and that a second daemon is free to bind over (§ 6.6).
+///
+/// The injection is a seccomp filter ([`without_pidfd_open`]) rather than a shortage of
+/// descriptors. `RLIMIT_NOFILE` cannot reach this path: `pin` needs exactly one free
+/// descriptor and so does the liveness probe two statements ahead of it, so every limit low
+/// enough to fail the pin fails that `socket` call first — measured, and what comes back
+/// then is § 6.6's `unprobeable` about a socket, which says nothing about pinning at all.
+/// `ENOSYS` is the truer errno besides: this is the old-kernel case rather than a busy one.
+#[test]
+fn kill_refuses_and_keeps_the_session_when_the_kernel_will_not_pin_its_process() {
+    // One figure for the test, per [`PATIENCE`]: the `kill` below sits out both of § 6.6's
+    // graces — the socket answers throughout and neither signal ever lands — and the two
+    // clients after it each wait on a shell.
+    let deadline = Instant::now() + PATIENCE;
+    let (session, mut client, _) = Session::attached("nopidfd");
+    // Before anything is killed, so "still serving" below is a claim about the same daemon
+    // driving the same shell rather than about one that never had either.
+    still_serving(&mut client, "NOMUX-BEFORE-KILL");
+    let dir = session.root.join("nomux/run");
+    let before = entries(&dir);
+    // The number `kill` will actually act on, read the way `kill` reads it — asserting on
+    // the child's pid instead would pass a refusal that named some other process.
+    let pid = fs::read_to_string(session.pid_file()).expect("read the published pid");
+    let pid = pid.trim().to_owned();
+
+    let mut command = nomux(&session.root, &["kill", &session.id]);
+    without_pidfd_open(&mut command);
+    // Bounded rather than waited on ([`collect_by`], [`PATIENCE`]): a refusal that
+    // regressed into a wait for a process that will never be signalled would otherwise
+    // hang the run instead of failing it.
+    let killed = collect_by(&mut command, deadline)
+        .expect("`nomux kill` never came back on a host with no pidfds");
+    let said = stderr(&killed);
+
+    assert_eq!(
+        killed.status.code(),
+        Some(1),
+        "a kill that sent no signal at all must not report the session gone: {said:?}"
+    );
+    // Every clause, because each is a separate claim: which session, that it is answering
+    // still, that *neither* signal was sent, which pid went unsignalled, and the errno that
+    // says why. The errno is also the evidence that the filter reached `pin` rather than
+    // something failing ahead of it — an unprobeable socket or a pidfile that named no
+    // daemon are refusals of their own, and neither says any of this.
+    for clause in [
+        format!("session {} is still answering", session.id),
+        format!("neither SIGTERM nor SIGKILL was sent to pid {pid}"),
+        "(os error 38)".to_owned(),
+    ] {
+        assert!(
+            said.contains(&clause),
+            "the refusal must say that nothing was signalled and why, missing {clause:?}: \
+             {said:?}"
+        );
+    }
+
+    assert_eq!(
+        entries(&dir),
+        before,
+        "not one of the files was a kill that signalled nothing to remove"
+    );
+    // The files are not the whole of it: a daemon torn halfway down would leave all five
+    // names in place and still be gone. So the session is driven again through the client
+    // that was already attached, and then through one that attaches from scratch — a
+    // daemon that survived but no longer accepts is no more use to the user than one that
+    // exited. The first is let go of before the second greets, `Hello` being an
+    // unconditional takeover.
+    still_serving(&mut client, "NOMUX-AFTER-REFUSED-KILL");
+    drop(client);
+    let mut reattached = session.connect();
+    reattached.hello(RESUME_FROM_START);
+    still_serving(&mut reattached, "NOMUX-AFTER-REATTACH");
+
+    // And the other mode still finds it by the same files, which is what a user looking for
+    // the session they were told could not be killed would do next.
+    let listed = stdout(&control(&session.root, &["list"]));
+    assert!(
+        listed.contains(&session.id) && listed.contains(&pid),
+        "list must still report the session kill declined to collect: {listed:?}"
+    );
+    assert!(
+        Instant::now() < deadline,
+        "the test ran past its own deadline, so what it asserted last was decided by \
+         nextest's kill rather than by an assertion"
+    );
+    // The daemon is a child of this process and `Session`'s drop kills it, so refusing to
+    // collect it here leaks nothing into the next run.
+}
+
+/// Makes `pidfd_open` fail with `ENOSYS` in whatever `command` starts: the whole of what a
+/// kernel from before pidfds looks like to `control::pin`.
+///
+/// A seccomp filter rather than any of the resource shortages the rest of this suite
+/// injects, because it is the only one that reaches `pin` *alone*. Every other syscall the
+/// mode makes — the `connect` that probes the socket, the `open` that reads the pidfile,
+/// the `flock` that holds the id — is left working, so the refusal that comes back is the
+/// failure to pin rather than something the mode met earlier and reported instead.
+///
+/// `PR_SET_NO_NEW_PRIVS` first, which an unprivileged `PR_SET_SECCOMP` requires; both
+/// survive the `execve` into `nomux`, and the filter is inherited by anything the child
+/// starts — which `kill` never does.
+fn without_pidfd_open(command: &mut Command) {
+    /// Offset of `seccomp_data.nr`, the syscall number, which is the first word of it.
+    const NR_OFFSET: u32 = 0;
+
+    // Assembled here rather than inside the closure: everything between `fork` and `exec`
+    // has to be async-signal-safe, and a `try_from` that reports its own failure is a panic
+    // path. The array is moved into the closure, so the program the child registers points
+    // at the child's own copy of it.
+    let load = u16::try_from(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS).expect("a BPF opcode");
+    let jump = u16::try_from(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K).expect("a BPF opcode");
+    let ret = u16::try_from(libc::BPF_RET | libc::BPF_K).expect("a BPF opcode");
+    let call = u32::try_from(libc::SYS_pidfd_open).expect("a syscall number fits a BPF constant");
+    let refused = libc::SECCOMP_RET_ERRNO | u32::try_from(libc::ENOSYS).expect("ENOSYS is 38");
+    let filter = [
+        libc::sock_filter {
+            code: load,
+            jt: 0,
+            jf: 0,
+            k: NR_OFFSET,
+        },
+        // On a match, fall through to the refusal; otherwise skip it for the `allow`.
+        libc::sock_filter {
+            code: jump,
+            jt: 0,
+            jf: 1,
+            k: call,
+        },
+        libc::sock_filter {
+            code: ret,
+            jt: 0,
+            jf: 0,
+            k: refused,
+        },
+        libc::sock_filter {
+            code: ret,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ALLOW,
+        },
+    ];
+    let len = u16::try_from(filter.len()).expect("four instructions fit a filter length");
+
+    // SAFETY: the closure runs in the forked child before `exec`, so it must be
+    // async-signal-safe. `prctl` is, and nothing here allocates or takes a lock. Both calls
+    // read only through pointers this frame and the closure own: `program` lives on the
+    // child's stack across the call that registers it, and the array it points at is the
+    // closure's own capture, which outlives every `pre_exec` invocation.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let program = libc::sock_fprog {
+                len,
+                filter: filter.as_ptr().cast_mut(),
+            };
+            if libc::prctl(
+                libc::PR_SET_SECCOMP,
+                libc::SECCOMP_MODE_FILTER,
+                &raw const program,
+            ) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 /// Direct and older daemons can still carry arguments past `MAX_CMDLINE_LEN`. Once the
 /// complete `daemon <id>` prefix is present, trailing bytes must not prevent `list` or
 /// `kill` from identifying the process.
@@ -978,39 +1166,136 @@ fn kill_signals_what_the_pidfile_names_even_when_another_daemon_answers_on_the_s
     );
 }
 
-/// Regression: no run file can park the control surface in a syscall.
+/// Regression: no run file can park the control surface in a syscall — and the spawn
+/// lock's repair does not buy that at the price of the refusal it replaced.
 ///
-/// The spawn lock is opened on every creation and collection path, so it needs the
-/// same nonblocking file-type boundary as the pidfile and label below. A FIFO at this
-/// name used to park before `flock` was even attempted: `open(O_RDONLY)` waits for a
-/// writer forever, outside every lock deadline. `list` may conservatively leave an
-/// entry it cannot serialise; `kill` and `spawn` must report the malformed lock.
+/// **The park** is the oldest half and the one this test is named for. The spawn lock is
+/// opened on every creation and collection path, and `open(O_RDONLY)` on a FIFO waits for
+/// a writer for ever — before `flock` is even attempted, so outside every lock deadline
+/// there is. A FIFO at `<id>.lock` therefore stopped `kill` and `spawn` dead where no
+/// timeout could reach them, which is why that open carries `O_NONBLOCK` and why every
+/// run below is bounded rather than waited on ([`collect_by`], [`PATIENCE`]).
+///
+/// **The repair** is what those two modes do with the FIFO now, and it is a deliberate
+/// change of contract from the refusal this test used to assert. Nothing § 6.6's layout
+/// writes at `<id>.lock` is anything but a regular file, so what is there is nobody's
+/// mutex — and every unlink path in `rundir` demands a `&SpawnLock`, which made this the
+/// one run name a planted node stranded for good: `kill` failing on the id at every
+/// attempt, both collections skipping it in silence and `spawn` calling the host unsafe,
+/// until the user noticed and ran `rm`. So the node is cleared, a real lock is created at
+/// § 6.3's frozen `0600` in its place, and the session comes up.
+///
+/// **The refusal** has to survive that, or the reporting path loses its only test. A node
+/// the repair *cannot* clear is still named rather than proceeded past, and a non-empty
+/// directory is the durable way to be one: `rundir::remove_node` promotes the failed
+/// `remove_file` to a `remove_dir`, which refuses a directory with anything in it. No
+/// budget and no race is involved, unlike the other survivor — a name replanted faster
+/// than one acquirer clears it — so this is the shape that can be asserted exactly.
+///
+/// `list` is the third mode and owes less than the other two in either half: it may
+/// conservatively leave an entry it cannot serialise (§ 6.6), so all that is pinned for it
+/// is that it comes back and exits 0.
 #[test]
-fn no_mode_parks_on_a_spawn_lock_that_is_a_fifo() {
+fn no_mode_parks_on_a_planted_spawn_lock_which_is_cleared_where_it_can_be_and_reported_where_it_cannot()
+ {
     let deadline = Instant::now() + PATIENCE;
-    let root = run_root("lock_fifo");
+    let root = run_root("lock_plant");
     let dir = root.join("nomux/run");
     fs::create_dir_all(&dir).expect("create the run directory");
-    let lock = dir.join("fifo_lock.lock");
-    plant_fifo(&lock);
+    let lock = dir.join("lk_plant.lock");
 
+    // With a shell throughout, because `spawn` below now reaches one: while the FIFO was
+    // refused it never could. `list` and `kill` are handed the same command so that no
+    // mode here is told something another is not.
     let run = |args: &[&str]| {
-        ran_by(&mut nomux(&root, args), deadline)
-            .unwrap_or_else(|| panic!("`nomux {args:?}` parked on a FIFO spawn lock"))
+        collect_by(&mut nomux_with_shell(&root, args), deadline)
+            .unwrap_or_else(|| panic!("`nomux {args:?}` parked on a planted spawn lock"))
     };
-    let listed = run(&["list"]);
-    let killed = run(&["kill", "fifo_lock"]);
-    let spawned = run(&["spawn", "fifo_lock"]);
+    // Re-planted in front of each mode rather than once: `list`'s sweep takes the lock
+    // too, so it may clear the FIFO on its way past — the same repair, but not the one the
+    // mode after it is supposed to be making. Each has to meet the node itself.
+    let replant = || {
+        drop(fs::remove_file(&lock));
+        plant_fifo(&lock);
+    };
+
+    replant();
+    succeeded(
+        &run(&["list"]),
+        "list failed instead of collecting the entry or conservatively skipping it",
+    );
+
+    // `kill` against nothing but the FIFO: it clears the name, finds no socket and no pid,
+    // and so already has its postcondition — a session that is gone is not an error
+    // (§ 10). The zero *is* the repair; the old answer was exit 1 with the id stranded.
+    replant();
+    let killed = run(&["kill", "lk_plant"]);
+    succeeded(&killed, "kill did not clear a FIFO at the spawn lock");
+    assert!(
+        entries(&dir).is_empty(),
+        "kill held the lock, so every name under the id was its to remove: {:?}",
+        entries(&dir)
+    );
+
+    // The half `kill` cannot show: a startup that goes through the planted node. What the
+    // daemon ends up holding has to be a regular file this acquirer created, not whatever
+    // was at the name — a FIFO adopted as the mutex would serialise nothing.
+    replant();
+    succeeded(
+        &run(&["spawn", "lk_plant"]),
+        "spawn did not clear a FIFO at the spawn lock",
+    );
+    // Taken before the assertions, so a failure in any of them still collects the daemon:
+    // `spawn` leaves it `setsid`ed away where no `Spawned` covers it, and the version of
+    // this test that asserted a refusal instead leaked one on every full-suite run.
+    let (_pid, _reaper) = daemon_reaper(&root, "lk_plant");
+    assert!(
+        fs::symlink_metadata(&lock)
+            .expect("stat what stands at the spawn lock")
+            .file_type()
+            .is_file(),
+        "the FIFO is gone and a regular file stands where it was: {:?}",
+        entries(&dir)
+    );
+    assert_eq!(
+        fs::metadata(&lock)
+            .expect("stat the lock")
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o600,
+        "the replacement carries § 6.3's frozen mode rather than the planted node's"
+    );
+
+    // Stopped here rather than left to the reaper, because the refusal half below reuses
+    // the id: a daemon still holding it would answer the probe and change what `kill` and
+    // `spawn` are being asked.
+    succeeded(
+        &run(&["kill", "lk_plant"]),
+        "kill failed on the session spawn brought up over the cleared lock",
+    );
+    assert!(
+        entries(&dir).is_empty(),
+        "and it took the session's files with it: {:?}",
+        entries(&dir)
+    );
+
+    // What the repair cannot clear is still reported, in the same terms it always was.
+    fs::create_dir(&lock).expect("plant a directory at the spawn lock");
+    let occupant = lock.join("occupied");
+    fs::write(&occupant, b"").expect("make it one `remove_dir` will not take");
 
     succeeded(
-        &listed,
+        &run(&["list"]),
         "list failed instead of conservatively skipping the entry",
     );
+    let killed = run(&["kill", "lk_plant"]);
+    let spawned = run(&["spawn", "lk_plant"]);
     for (mode, expected, output) in [("kill", 1, killed), ("spawn", 126, spawned)] {
         assert_eq!(
             output.status.code(),
             Some(expected),
-            "{mode} accepted a FIFO as a spawn lock: {:?}",
+            "{mode} accepted a spawn lock it could neither hold nor clear: {:?}",
             stderr(&output)
         );
         assert!(
@@ -1019,12 +1304,13 @@ fn no_mode_parks_on_a_spawn_lock_that_is_a_fifo() {
             stderr(&output)
         );
         if mode == "spawn" {
-            has_relay_class(&output, "unsafe-host", "spawn with a FIFO lock");
+            has_relay_class(&output, "unsafe-host", "spawn with an unclearable lock");
         }
     }
     assert!(
-        lock.exists(),
-        "a mode unlinked the malformed lock without owning it"
+        occupant.exists(),
+        "no mode may empty out a node it never took the lock on: {:?}",
+        entries(&lock)
     );
 }
 
@@ -1050,8 +1336,8 @@ fn the_control_surface_does_not_park_on_a_run_file_that_is_a_fifo() {
 
     // Backgrounded against a deadline: the defect is a wait with no end, and a test
     // that waits for it is one that never fails. Both share it ([`PATIENCE`]).
-    let listed = ran_by(&mut nomux(&session.run.root, &["list"]), deadline);
-    let killed = ran_by(&mut nomux(&session.run.root, &["kill", "lk13"]), deadline);
+    let listed = collect_by(&mut nomux(&session.run.root, &["list"]), deadline);
+    let killed = collect_by(&mut nomux(&session.run.root, &["kill", "lk13"]), deadline);
 
     // Before the assertions, so a failure cannot leave a session behind. The pid goes
     // back where the daemon published it, since a FIFO is no pidfile and the pidfile
@@ -1118,31 +1404,6 @@ fn a_runtime_error_cannot_drive_the_terminal_it_is_printed_to() {
         complaint.contains("line\\n\\u{1b}]0;forged-title\\u{7}"),
         "the escaped refusal no longer identifies the failing path: {complaint:?}"
     );
-}
-
-/// Runs `command` against a deadline, and hands back `None` if it never came back.
-///
-/// For the defects that are a wait with no end: a test that simply waits for the
-/// process is one that hangs instead of failing, and nextest's own timeout kills the
-/// runner without saying which call never returned. The deadline is the caller's
-/// rather than a bound per run, per [`PATIENCE`].
-///
-/// The `Command` is the caller's too, because [`PlantedRunDir::run`] needs a `SHELL`
-/// on modes that could reach one and the rest must not be handed anything § 6.6 does
-/// not give them.
-fn ran_by(command: &mut Command, deadline: Instant) -> Option<Output> {
-    let mut running = Spawned::spawn(
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
-    );
-    poll_by(deadline, || !running.is_running()).then(|| {
-        running
-            .into_exited()
-            .wait_with_output()
-            .expect("collect what it said")
-    })
 }
 
 /// The frozen control surface reaches a live session through the files on disk
@@ -1879,7 +2140,7 @@ impl PlantedRunDir {
     /// should find a predictable `/bin/sh` rather than whatever the developer logs in
     /// with.
     ///
-    /// The deadline is the caller's, per [`ran_by`] and [`PATIENCE`]: the caller below
+    /// The deadline is the caller's, per [`collect_by`] and [`PATIENCE`]: the caller below
     /// makes five of these calls, and a fresh bound each would let one test spend five
     /// times it — past the runner's own kill, which reports no assertion at all.
     fn run(&self, args: &[&str], deadline: Instant) -> Output {
@@ -1887,7 +2148,7 @@ impl PlantedRunDir {
         // This fixture specifically tests the runtime fallback; the general harness
         // pins persistent XDG state so a later HOME for the child cannot move it.
         command.env_remove("XDG_STATE_HOME").env_remove("HOME");
-        ran_by(&mut command, deadline).unwrap_or_else(|| {
+        collect_by(&mut command, deadline).unwrap_or_else(|| {
             panic!(
                 "`nomux {args:?}` never returned, so it is still relaying to a \
                      socket somebody else planted"

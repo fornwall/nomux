@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use rustix::io::Errno;
 use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal, test_kill_process};
 
 use crate::rundir::{
@@ -42,8 +43,12 @@ const PATH_MAX: usize = 4096;
 /// Bounded `/proc/<pid>/cmdline` prefix, long enough for complete `argv[0] daemon <id>`.
 ///
 /// Nothing past the id is budgeted because the rule needs nothing past it:
-/// [`names_daemon_for`] takes the *first* argument left, and a daemon is started with its id
+/// [`session_named`] takes the *first* argument left, and a daemon is started with its id
 /// ahead of the options it carries (`attach::daemon_command`).
+///
+/// The budget holds for that spelling and not for every spelling § 6.6 accepts, which is why
+/// [`daemon_verdict`] weighs a read that filled the buffer before any id could appear as
+/// "could not tell" rather than as a positive "is not".
 const MAX_CMDLINE_LEN: usize = PATH_MAX + 1 + "daemon".len() + 1 + MAX_SESSION_ID_LEN + 1;
 
 /// Prints one line per live session and collects the dead ones, as § 6.6's `list output` has
@@ -88,12 +93,21 @@ pub(crate) fn list() -> io::Result<()> {
         }
         let mut buf = [0u8; MAX_PID_LEN];
         let (filed, _) = pidfile(&paths.pid(), &mut buf).unwrap_or_default();
-        let pid = identified(&paths, filed)
-            .map_or_else(|| "?".to_owned(), |pid| pid.as_raw_nonzero().to_string());
         // Sanitised on read as well as on write (§ 6.6): the daemon that wrote it may
         // be any version.
         let label = read_label(&paths.label());
-        match writeln!(out, "{id}\t{pid}\t{label}") {
+        // Two `writeln!`s over one that interpolates a `String` either branch built: the
+        // number is formatted straight into the line, and § 6.6's `?` is a literal. The
+        // shape is the same either way (`<id>\t<pid>\t<label>\n`); what goes is a
+        // per-row allocation and the `ToString` glue behind it.
+        let written = match identified(&paths, filed) {
+            Some(pid) => writeln!(out, "{id}\t{pid}\t{label}", pid = pid.as_raw_nonzero()),
+            None => writeln!(out, "{id}\t?\t{label}"),
+        };
+        // Per row, and that is what makes it enough: stdout is a `LineWriter` and every
+        // row ends in `\n`, so a reader that went away surfaces here rather than at a
+        // flush nothing checks. The sweep above goes on with `listening = false` (§ 6.6).
+        match written {
             Err(err) if err.kind() == io::ErrorKind::BrokenPipe => listening = false,
             outcome => outcome?,
         }
@@ -192,9 +206,16 @@ fn resolve(paths: &SessionPaths) -> io::Result<Option<Chosen>> {
                 // [`chosen`] identifies a *process*, by a route the socket has no part in, so
                 // a mode or a descriptor limit keeping this process off the socket is no
                 // reason to stop signalling a daemon this one has positively named.
+                //
+                // [`unresolved`]'s decision spelled out rather than called, because here it
+                // comes first: a failed probe earns [`unprobeable`] whatever the pidfile
+                // said, so building the sentence before asking would quote and escape a
+                // pidfile body no refusal is going to print.
                 return chosen(paths, filed).map(Some).ok_or_else(|| {
-                    let problem = unidentified(paths.id(), filed, body);
-                    unresolved(paths, unprobed.as_ref(), &problem)
+                    unprobed.as_ref().map_or_else(
+                        || running_but(paths, &unidentified(paths.id(), filed, body)),
+                        |err| unprobeable(paths, err),
+                    )
                 });
             }
             // The same publish window one syscall later, so it is waited out too:
@@ -229,27 +250,31 @@ fn pidfile<'a>(path: &Path, buf: &'a mut [u8; MAX_PID_LEN]) -> io::Result<(Optio
 }
 
 /// The pidfile number and a hold on the process it named before [`GRACE`] elapsed.
+///
+/// The failure is kept as the bare [`Errno`] rather than as an [`io::Error`], because
+/// [`Self::signal`] has only `&self` to read it out of and an `io::Error` cannot be copied
+/// out of a borrow: rebuilding one from its own `Display` put a `String` allocation and the
+/// boxed-`Custom` constructor on the path every `kill` takes to send `SIGTERM`. An `Errno`
+/// is `Copy`, and `io::Error::from` recovers the same text where a refusal prints it
+/// ([`still_answering`]).
 #[derive(Debug)]
 struct Chosen {
     pid: Pid,
-    reach: io::Result<OwnedFd>,
+    reach: Result<OwnedFd, Errno>,
 }
 
 impl Chosen {
     /// Signals through the pidfd; the later socket probe settles the outcome, while the
     /// result is retained so a refusal never claims a syscall that failed was sent.
     fn signal(&self, sig: Signal) -> io::Result<()> {
-        let pidfd = self
-            .reach
-            .as_ref()
-            .map_err(|err| io::Error::new(err.kind(), err.to_string()))?;
+        let pidfd = self.reach.as_ref().map_err(|err| io::Error::from(*err))?;
         pidfd_send_signal(pidfd, sig).map_err(Into::into)
     }
 }
 
 /// Pins a pid before validation; failure never falls back to the reusable bare number.
-fn pin(pid: Pid) -> io::Result<OwnedFd> {
-    pidfd_open(pid, PidfdFlags::empty()).map_err(io::Error::from)
+fn pin(pid: Pid) -> Result<OwnedFd, Errno> {
+    pidfd_open(pid, PidfdFlags::empty())
 }
 
 /// The published pid, unless `/proc` establishes it belongs to another process.
@@ -271,6 +296,12 @@ fn is_daemon_for(pid: Pid, id: &str) -> Option<bool> {
     let mut buf = [0u8; MAX_CMDLINE_LEN];
     let cmdline = PathBuf::from(format!("/proc/{}/cmdline", pid.as_raw_nonzero()));
     let body = read_prefix(&cmdline, &mut buf).ok()?;
+    daemon_verdict(body, id)
+}
+
+/// [`is_daemon_for`] over the bytes, so the three answers truncation can produce are
+/// reachable from a test without a process whose `argv[0]` is a kilobyte long.
+fn daemon_verdict(body: &[u8], id: &str) -> Option<bool> {
     // Every argv element is NUL-*terminated*, so everything up to the last NUL is
     // arguments this read saw the end of, and comparing the tail is comparing half a word.
     let whole = body
@@ -278,15 +309,40 @@ fn is_daemon_for(pid: Pid, id: &str) -> Option<bool> {
         .rposition(|byte| *byte == 0)
         .and_then(|end| body.get(..end))
         .unwrap_or(&[]);
-    if names_daemon_for(whole, id) {
+    let named = session_named(whole);
+    if named == Some(id.as_bytes()) {
         return Some(true);
     }
-    // A full buffer is still a definitive "no" wherever `argv[1]` arrived whole — exactly
-    // when `whole` holds a NUL (§ 6.6).
-    (body.len() < MAX_CMDLINE_LEN || whole.contains(&0)).then_some(false)
+    // A read the file ended before the buffer did is the whole command line, so the failure
+    // to match above is the answer.
+    if body.len() < MAX_CMDLINE_LEN {
+        return Some(false);
+    }
+    // Truncated from here down, where § 6.6 lets only what was actually read decide.
+    //
+    // `argv[1]` that never arrived — no NUL inside `whole` — says nothing at all, and
+    // `argv[1]` that arrived as something other than `daemon` is a positive "is not"
+    // however much of a `java -cp <20 KiB of classpath>` went unread.
+    //
+    // Between those sits the case [`MAX_CMDLINE_LEN`]'s budget does not cover: `daemon`
+    // with no bare word after it. The bound is `PATH_MAX` plus `daemon` plus one id, which
+    // holds only while the id is `argv[2]`, where `attach::daemon_command` puts it. The
+    // hand-typed `nomux daemon --lock-fd 7 <id>` § 6.2 documents puts it 20 bytes later and
+    // a 256-byte `--label` value ahead of it further still, so an install path near
+    // `PATH_MAX` can leave the id past the cut — and answering "is not" there strands a
+    // healthy session, § 6.6's table having `kill` refuse and leave all five files while
+    // `list` prints `?`. A daemon command line that positively named a *different* id is
+    // still definitive: the rule takes the first bare word, and `whole` holds only
+    // arguments read whole, so a later one could not have displaced it.
+    let cut_before_the_id =
+        named.is_none() && whole.split(|byte| *byte == 0).nth(1) == Some(b"daemon".as_slice());
+    (whole.contains(&0) && !cut_before_the_id).then_some(false)
 }
 
-/// Whether a NUL-separated command line is `<exe> daemon <id>`, however it was spelled.
+/// The session a NUL-separated command line names, where it is a daemon's at all.
+///
+/// `None` covers both "`argv[1]` is not `daemon`" and "a daemon command line that named no
+/// id", which read alike everywhere but in [`daemon_verdict`]'s truncated case.
 ///
 /// § 6.6's four steps over the argv rather than a search for the two words: caller-supplied
 /// text sits in this same argv, so searching would let a stranger's `--label "daemon sess"`
@@ -299,11 +355,11 @@ fn is_daemon_for(pid: Pid, id: &str) -> Option<bool> {
 /// is still that daemon's. Refusing what this build cannot parse would answer a live
 /// session's `kill` with a positive "that pid is not its daemon", which § 6.6 spends five
 /// run files on not saying.
-fn names_daemon_for(whole: &[u8], id: &str) -> bool {
+fn session_named(whole: &[u8]) -> Option<&[u8]> {
     let mut args = whole.split(|byte| *byte == 0);
     args.next();
     if args.next() != Some(b"daemon".as_slice()) {
-        return false;
+        return None;
     }
     let mut session = None;
     while let Some(arg) = args.next() {
@@ -313,7 +369,7 @@ fn names_daemon_for(whole: &[u8], id: &str) -> bool {
             session.get_or_insert(arg);
         }
     }
-    session == Some(id.as_bytes())
+    session
 }
 
 /// The shape every refusal here takes: something in the run directory said what this
@@ -336,6 +392,10 @@ fn running_but(paths: &SessionPaths, problem: &str) -> io::Error {
 /// by the probe rather than by the pidfile: only an accepted connection establishes the
 /// "is running" that [`running_but`] opens with (§ 6.3), so a failed probe earns
 /// [`unprobeable`] instead.
+///
+/// Its callers are the ones whose `problem` costs nothing to have ready. [`resolve`]'s
+/// identified-pid branch spells the same two arms out instead, because its sentence is a
+/// `format!` over a quoted pidfile body that the [`unprobeable`] arm would throw away.
 fn unresolved(paths: &SessionPaths, unprobed: Option<&io::Error>, problem: &str) -> io::Error {
     unprobed.map_or_else(
         || running_but(paths, problem),
@@ -450,7 +510,8 @@ mod tests {
     use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open};
 
     use super::{
-        Chosen, MAX_CMDLINE_LEN, bound_since, is_daemon_for, names_daemon_for, pin, still_answering,
+        Chosen, MAX_CMDLINE_LEN, bound_since, daemon_verdict, is_daemon_for, pin, session_named,
+        still_answering,
     };
     use crate::rundir::SessionPaths;
 
@@ -458,6 +519,15 @@ mod tests {
     /// that [`is_daemon_for`](super::is_daemon_for) has already trimmed.
     fn cmdline(args: &[&str]) -> Vec<u8> {
         args.join("\0").into_bytes()
+    }
+
+    /// Whether a NUL-separated command line is `<exe> daemon <id>`, however it was
+    /// spelled — the question these tests put to
+    /// [`session_named`](super::session_named), which answers with the id it found
+    /// because [`daemon_verdict`](super::daemon_verdict) has to tell "named another
+    /// session" from "named none".
+    fn names_daemon_for(whole: &[u8], id: &str) -> bool {
+        session_named(whole) == Some(id.as_bytes())
     }
 
     /// Whether this host has `pidfd_open` at all, asked of the syscall rather than
@@ -528,7 +598,7 @@ mod tests {
         let pid = Pid::from_raw(999_999_999).expect("a positive number is a pid");
         let unheld = Chosen {
             pid,
-            reach: Err(Errno::MFILE.into()),
+            reach: Err(Errno::MFILE),
         };
         let term = unheld.signal(Signal::TERM);
         let kill = unheld.signal(Signal::KILL);
@@ -639,6 +709,61 @@ mod tests {
             Some(false),
             "a command line whose `argv[1]` was read in full and is not `daemon` is a \
              positive `it is not`, whatever the read could not reach past it"
+        );
+    }
+
+    /// A command line cut *before* the id could appear is "could not tell", where one cut
+    /// after anything the rule reads stays a positive "is not" (§ 6.6).
+    ///
+    /// [`MAX_CMDLINE_LEN`](super::MAX_CMDLINE_LEN) budgets the id at `argv[2]`, which is
+    /// where `attach::daemon_command` puts it — but § 6.2's hand-typed
+    /// `nomux daemon --lock-fd 7 <id>` puts it 20 bytes later, and a 256-byte `--label`
+    /// value ahead of it further still. With an install path near `PATH_MAX` the id then
+    /// falls past the cut, and answering "is not" there strands a *healthy* session: § 6.6
+    /// has `kill` refuse and leave all five files while `list` prints `?`.
+    ///
+    /// Put to [`daemon_verdict`](super::daemon_verdict) rather than to
+    /// [`is_daemon_for`](super::is_daemon_for), since the fixture is a process whose
+    /// `argv[0]` is four kilobytes of path that has to exist.
+    #[test]
+    fn a_daemon_command_line_cut_before_its_id_is_unknown_rather_than_a_denial() {
+        /// A command line of exactly the buffer's length, so the read that produced it
+        /// stopped for the bound rather than for the file's end.
+        fn cut(tail: &[u8]) -> Vec<u8> {
+            let mut body = vec![b'x'; MAX_CMDLINE_LEN - tail.len()];
+            body.extend_from_slice(tail);
+            body
+        }
+
+        assert_eq!(
+            daemon_verdict(&cut(b"\0daemon\0--label\0"), "one"),
+            None,
+            "`daemon` arrived and no bare word did, so the id may be one byte past the \
+             cut — which is not the same as this pid belonging to something else"
+        );
+        assert_eq!(
+            daemon_verdict(&cut(b"\0daemon\0two\0"), "one"),
+            Some(false),
+            "the first bare word left is the id whatever follows it, so a daemon that \
+             named `two` is a definitive `not one's` — the answer that keeps a recycled \
+             pid from being signalled"
+        );
+        assert_eq!(
+            daemon_verdict(&cut(b"\0-cp\0"), "one"),
+            Some(false),
+            "`argv[1]` arrived whole and is not `daemon`, which is the `java -cp <20 KiB \
+             of classpath>` case truncation may not turn into `could not tell`"
+        );
+        assert_eq!(
+            daemon_verdict(&cut(b"x"), "one"),
+            None,
+            "the read stopped inside `argv[0]`, so nothing the rule looks at arrived"
+        );
+        assert_eq!(
+            daemon_verdict(b"nomux\0daemon\0--label\0", "one"),
+            Some(false),
+            "a command line the read reached the end of named no id, and no truncation \
+             can be blamed for it"
         );
     }
 

@@ -684,8 +684,8 @@ mod vectors {
     use std::{cell::Cell, fmt::Debug};
 
     use nomux_protocol::{
-        ErrorCode, ExitKind, Frame, FrameType, HEADER_LEN, Hello, HelloOk, MAX_PAYLOAD,
-        PROTOCOL_VERSION, RESUME_FROM_START, SERVER_PREAMBLE, WinSize,
+        ErrorCode, ExitKind, Frame, FrameType, HEADER_LEN, Hello, HelloOk, MAX_AGENT_DATA,
+        MAX_PAYLOAD, PROTOCOL_VERSION, ProtoError, RESUME_FROM_START, SERVER_PREAMBLE, WinSize,
     };
 
     const FIXTURE: &str = include_str!("wire-vectors.txt");
@@ -1645,6 +1645,63 @@ mod vectors {
         }
     }
 
+    /// `AgentData` carries the most bytes of any frame, and the boundary is asserted
+    /// from both sides.
+    ///
+    /// [`the_frozen_numbers_are_the_ones_the_document_gives`] holds the constant against
+    /// § 2.1 and § 2.2; this holds the *encoder* against the constant, which is the half
+    /// a derived figure needs. A cap computed one way in `frame.rs` and another in the
+    /// encoder would leave `MAX_AGENT_DATA` a number the code agrees with itself about
+    /// and the wire does not — and `conn.rs`'s `AGENT_READ_BUF` is sized against this
+    /// constant, so the frame that carries a full agent read is exactly the one at issue.
+    ///
+    /// One byte past it is refused rather than truncated, and refused naming the whole
+    /// payload — the generation included — since that is the length § 2.1 caps.
+    #[test]
+    fn agent_data_encodes_at_the_cap_and_is_refused_one_byte_past_it() {
+        let at_cap = vec![0xa5; MAX_AGENT_DATA];
+        let frame = Frame::AgentData {
+            generation: 0x0102_0304,
+            data: &at_cap,
+        };
+        let mut buf = Vec::new();
+        frame
+            .encode(&mut buf)
+            .expect("an AgentData at the cap encodes");
+        assert_eq!(
+            buf[..HEADER_LEN],
+            // 0x0e AgentData, and a u24 length of MAX_PAYLOAD: the generation and the
+            // data fill the payload exactly.
+            [0x0e, 0x04, 0x00, 0x00],
+            "an AgentData carrying MAX_AGENT_DATA bytes does not declare the payload \
+             § 2.1 caps"
+        );
+        assert_eq!(
+            Frame::decode(FrameType::AgentData, &buf[HEADER_LEN..]),
+            Ok(frame),
+            "an AgentData at the cap does not decode back"
+        );
+
+        let past_cap = vec![0xa5; MAX_AGENT_DATA + 1];
+        let mut refused = b"previous frame".to_vec();
+        let before = refused.len();
+        assert_eq!(
+            Frame::AgentData {
+                generation: 0x0102_0304,
+                data: &past_cap,
+            }
+            .encode(&mut refused),
+            Err(ProtoError::PayloadTooLarge(MAX_PAYLOAD + 1)),
+            "one byte past the cap must be refused, and reported as the whole payload \
+             rather than as the data alone"
+        );
+        assert_eq!(
+            refused.len(),
+            before,
+            "a refused encode must not leave partial data"
+        );
+    }
+
     /// Every number this wire freezes, written out by hand with the section it was read
     /// from, so a failure here is the code moving away from the document.
     ///
@@ -1687,6 +1744,19 @@ mod vectors {
                 u64::from(MAX_PAYLOAD),
                 262_144,
                 "§ 2.1 caps a payload at 256 KiB",
+            ),
+            // Derived in `frame.rs` as `MAX_PAYLOAD - 4` and so free to move with a
+            // change to the `AgentData` header that § 2.2 was never told about — the
+            // generation is four bytes and the data has the rest. `MAX_OUTPUT_DATA` is
+            // pinned twice over (here, and by the `u24` length test above, which encodes
+            // an `Output` at exactly `MAX_PAYLOAD - 8`); this one was pinned by nothing
+            // at all, in either workspace.
+            (
+                "MAX_AGENT_DATA",
+                MAX_AGENT_DATA as u64,
+                262_140,
+                "§ 2.2 gives AgentData a u32 generation ahead of its bytes, inside \
+                 § 2.1's 256 KiB payload",
             ),
         ] {
             assert_eq!(

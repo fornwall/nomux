@@ -1,5 +1,5 @@
 # Per-target size baseline for scripts/build-release.sh, which says what it is for.
-# Measured on 2026-08-17 by:
-#   rustc 1.100.0-nightly (34baba539 2026-08-16)
-x86_64-unknown-linux-musl             155088
-aarch64-unknown-linux-musl            150072
+# Measured on 2026-08-21 by:
+#   rustc 1.100.0-nightly (f7d782a3b 2026-08-19)
+x86_64-unknown-linux-musl             125048
+aarch64-unknown-linux-musl            126352

@@ -384,25 +384,38 @@ only the warm channel; the exec relay remains available.
 
 `Pty::spawn` allocates the master, hands the slave to the child as all three stdio
 descriptors, and sets `TIOCSWINSZ` from `Hello` before the child can observe it.
-`Command::spawn` forks; its `pre_exec` closure calls `setsid`, takes the slave as
-controlling terminal, and restores **`SIGHUP`, `SIGQUIT`, `SIGTSTP`, `SIGTTIN` and
-`SIGTTOU`** to `SIG_DFL` — *every disposition this process may be ignoring*, not the one it
-chose. `exec` resets a handled signal and preserves an ignored one, so § 6.2's own `SIGHUP`
-would be shrugged off by the child § 6.5 sends it to, and an ignore this daemon never chose
-arrives the same way: POSIX has a non-interactive shell set `SIGINT` and `SIGQUIT` to
-`SIG_IGN` around a background job, so without the other four `nomux spawn work &` in a
-script hands the user a shell — and everything that shell runs — ignoring `Ctrl-\` and
-`Ctrl-Z` for the session's life. `SIGINT`, `SIGTERM` and `SIGCHLD` are absent: § 6.2
-*handles* all three by then, and `exec` resets a handler — `SIGCHLD` being handled for the
-child's sake rather than the daemon's, which is § 6.2's argument.
+`exec::spawn` forks; between the fork and the `execve` the child calls `setsid`, takes the
+slave as controlling terminal, and restores **every signal from `1` to `SIGRTMAX()` bar the
+two that cannot be set** to `SIG_DFL` — *every disposition this process may be ignoring*,
+and not only the ones it chose. `exec` resets a handled signal and preserves an ignored one,
+so § 6.2's own `SIGHUP` would be shrugged off by the child § 6.5 sends it to, and an ignore
+this daemon never chose arrives the same way: POSIX has a non-interactive shell set `SIGINT`
+and `SIGQUIT` to `SIG_IGN` around a background job, so without this reset `nomux spawn work &`
+in a script hands the user a shell — and everything that shell runs — ignoring `Ctrl-\` and
+`Ctrl-Z` for the session's life. A blanket loop rather than a list of the four or five that
+matter, because any list is a guess about what started this daemon: it costs one `signal(2)`
+per number in a process that is about to `exec`, and `SIGKILL` and `SIGSTOP` are skipped only
+because they cannot be set. `SIGINT`, `SIGTERM` and `SIGCHLD` are in the loop and would be no
+different if they were not: § 6.2 *handles* all three by then, and `exec` resets a handler —
+`SIGCHLD` being handled for the child's sake rather than the daemon's, which is § 6.2's
+argument. The blocked-signal set is emptied in the same window, which `execve` carries into
+the new program.
+
+**Everything the child needs is built before the fork.** The path, the argument vector and
+the environment block are rendered in the parent, so between `fork` and `execve` the child
+allocates nothing, takes no lock and calls nothing that is not async-signal-safe — the rule
+`fork` in a process that may have threads actually requires, rather than the weaker one a
+`pre_exec` closure invites. A failed `execve` still reaches the parent as an ordinary error:
+the child writes its `errno` to a `CLOEXEC` pipe and `_exit`s, and end of file on that pipe
+is how the parent learns the `exec` took.
 
 **Both ends are opened `O_CLOEXEC`**, so the only descriptors that cross the `exec` are the
 three the child is handed deliberately. What that keeps out is the master: a copy of it in
 the child would hold the session's read end open for as long as the child lives, and end of
 file on that read end is the whole of how § 6.5 learns the child let go of the terminal.
-The slave is dropped in the spawning frame for the same reason — `std` only *borrows* the
-descriptor for each `Stdio`, so `Command` holds all three until it is itself dropped, and a
-copy outliving that would keep a terminal open with nobody on it.
+The slave is dropped in the spawning frame for the same reason: `exec::spawn` only *borrows*
+the three descriptors it places, so the caller still owns the slave when the fork returns, and
+a copy outliving that frame would keep a terminal open with nobody on it.
 
 **The SSH channel must not request a PTY.** nomux allocates its own; two stacked line
 disciplines give double echo, doubled `\r\n` translation and broken raw mode. That is also
@@ -423,7 +436,7 @@ Whatever a plain `ssh host` would have run, since nomux starts *already inside* 
 session: PAM has run, and `HOME`, `USER`, `PATH` and `SSH_*` are already set.
 
 - **Login shell, dash-prefixed**: `execv(shell, ["-bash", ...])`, not `["bash", ...]`. That leading `-` is what sshd does for an interactive session and what causes `/etc/profile` and `~/.bash_profile` to be sourced.
-- **Shell selection**: `$SHELL` where it names an **absolute** path, else `/bin/sh`. There is no password-database step. Absolute and not merely non-empty: a `SHELL=bash` would send `Command` looking down `PATH` — a pair std documents as ambiguous once a working directory is set too — and run whatever a writable `~/.local/bin` resolves it to. The cost is a session started by something that scrubbed the environment getting `/bin/sh` rather than the user's shell.
+- **Shell selection**: `$SHELL` where it names an **absolute** path, else `/bin/sh`. There is no password-database step. Absolute and not merely non-empty: a `SHELL=bash` would be resolved down `PATH` — against a working directory this daemon has also just changed — and run whatever a writable `~/.local/bin` turned it into. It must also be a regular file this uid may execute, checked before the fork: `access(X_OK)` alone answers yes for a *directory*, and a `$SHELL` that only fails at `execve` takes the whole session down instead of falling through to `/bin/sh`. The cost is a session started by something that scrubbed the environment getting `/bin/sh` rather than the user's shell.
 - **Working directory**: `$HOME`, else the directory the attaching connection was in, else `/`. Set explicitly, since the daemon has moved to `/` (§ 6.2).
 - **Environment**: inherited wholesale, then `TERM` from `Hello`, `NOMUX_SESSION=<id>` and — with agent forwarding on — `SSH_AUTH_SOCK=$RUNDIR/<id>.agent` (§ 6.7) are set. **Nothing is scrubbed**, which leaves `NOMUX_RING_BYTES` (§ 1) visible to a child whose daemon was started with it.
 - **No PAM.** It already ran for the SSH login, and the daemon is unprivileged.
@@ -560,7 +573,12 @@ Every mode checks the run directory — opened `O_NOFOLLOW`, a real directory, o
 uid — before it resolves the first name in it. A wrong mode on it is `fchmod`ed back to
 `0700` rather than refused, from `list` and `kill` too — the one thing those modes mutate —
 **except** a group or other write bit, which is refused: tightening now does not un-plant
-whatever somebody left inside. Every ancestor must also be a real directory, owned by this
+whatever somebody left inside. The repair goes through the descriptor, so it reaches only a mode
+that still allowed the `O_NOFOLLOW` open: a run directory left without its owner execute bit —
+`0000`, `0400`, `0600` — fails that open with `EACCES` and is **refused, not repaired**, by every
+mode including `list` and `kill`. A path-based `chmod` fallback would reopen the symlink hole
+`O_NOFOLLOW` closes, and Linux does not implement `AT_SYMLINK_NOFOLLOW` for `fchmodat`, so there
+is no safe spelling; the refusal names the expected mode and `chmod 700` is the repair. Every ancestor must also be a real directory, owned by this
 uid or root and not group- or other-writable; a sticky shared directory such as `/tmp` is
 accepted only where the child entry belongs to this uid or root, which is the condition
 under which the kernel forbids another uid to rename it. The later bind and unlink
@@ -585,12 +603,13 @@ second implementation of `list` or `kill` must obey, in the order the rules bind
 - **The daemon owns it before probing for a stale socket.** A direct `daemon` start takes it nonblocking and refuses a held id. `spawn` clears `FD_CLOEXEC` on its already locked descriptor for the child only, passes its number as the private `--lock-fd` capability, and the daemon validates that descriptor against the current path before doing anything. This closes the fork/exec handoff without a second, necessarily failing `flock` attempt and without treating failure as permission to proceed.
 - **`spawn` and its daemon hold the same open-file-description lock past the successful `connect`, until `<id>.pid` exists**, since the daemon binds before it writes that file (§ 6.2) and a `kill` landing in that window would find a live daemon and no pid. Bounded by the spawn timeout, never fatal.
 - **The daemon drops it once `<id>.pid` and the label are written.** One still holding it at `kill`'s 2 s deadline (§ 6.6) would be one nothing could stop.
-- **Every acquirer confirms that what it locked is still the file at that path** — `fstat` against `stat`, device and inode — and re-takes it if not, `LOCK_ATTEMPTS` times in all: the take plus one re-take. Out of attempts it refuses and never proceeds unlocked.
-- **The name must resolve to a regular file and is opened nonblocking.** In particular, a FIFO at `<id>.lock` is rejected rather than parking the process inside `open(2)` before any lock deadline can apply.
+- **Every acquirer confirms that what it locked is still the file at that path** — `fstat` against `stat`, device and inode — and re-takes it if not, `LOCK_ATTEMPTS` times in all: the take plus one re-take. Out of attempts it refuses and never proceeds unlocked. Clearing a planted node (next bullet) creates nothing and so spends `LOCK_REPAIRS` — a budget of its own, never one of the takes, so a repair cannot consume the re-take the replaced-file race needs. A name replanted inside one call is refused rather than spun on.
+- **The name must resolve to a regular file, and what provably is not one is cleared rather than refused.** A directory, a symlink at the name, a FIFO or a unix socket is unlinked and the lock created in its place, at most `LOCK_REPAIRS` per acquirer. Nothing this layout writes at that name is anything but a regular file, so what is there is nobody's mutex — and every unlink in § 6.6 demands a `&SpawnLock` first, so `<id>.lock` is the one run name a refusal strands *permanently*: with it planted, every `kill`, every collection and every `spawn` for that id fails on every command on the host until a human runs `rm`. The open is separately **nonblocking**, for a reason that survives the above: a FIFO must not park the process inside `open(2)`, where no lock deadline can reach it.
 - **`<id>.lock` is unlinked last**, after every other `<id>.*` name and not merely the four the layout freezes: once its name is gone the lock guards nothing, so a later unlink lands on somebody else's new session.
-- **A lock nobody could hold is a refusal, never licence to go on.** Acquiring answers in three ways, and the last two are not one: *held*; *not held right now* — `EWOULDBLOCK`, `ENOLCK`, `EMFILE`, `ELOOP`, or the file replaced under it — which makes a caller wait, skip or retry and claims nothing; and *there is no lock to be had here*, which is an **error** and refuses the id. Two errnos reach that third answer and they are reported apart, because the repairs are nothing alike:
+- **A lock nobody could hold is a refusal, never licence to go on.** Acquiring answers in three ways, and the last two are not one: *held*; *not held right now* — `EWOULDBLOCK`, `ENOLCK`, `EMFILE`, or the file replaced under it — which makes a caller wait, skip or retry and claims nothing; and *there is no lock to be had here*, which is an **error** and refuses the id. `ELOOP` is on neither list: at the name it is a planted symlink and a repair, above the name it is a refusal. Three classes reach that third answer and they are reported apart, because the repairs are nothing alike:
   - `EACCES`/`EPERM` opening `<id>.lock`, or `ENOTSUP` from `flock`: **this filesystem cannot serialise session startup.** Going ahead unlocked is how two daemons come to claim one id and unlink each other's live sessions. A mode is one `chmod` away; a filesystem with no `flock` is a run directory to point elsewhere with `XDG_RUNTIME_DIR`.
   - `EROFS` opening `<id>.lock` (kind `ReadOnlyFilesystem`): **the run directory is read-only, so there is no session here to start and none to remove.** A fact about the mount and not about locking.
+  - The name is no regular file and could not be cleared (kind `InvalidData`, `is not a regular file`): **this name is not a spawn mutex and could not be made one.** Reached by `ENOTDIR`, an `ELOOP` above the name, an `ENXIO` no `lstat` settles, a node that will not go — a non-empty directory — or a name replanted past `LOCK_REPAIRS`. Unlike the other two this one has no setting to change: the repair is `rm` by hand.
 - **A caller with nobody to report to gives up the standing rather than the work only where no new session can be exposed**: daemon exit and `list`'s sweep skip cleanup they cannot serialise. Startup has no such arm; a daemon that does not own the lock refuses the id before probing or binding. Whoever the user is actually waiting on — `spawn`, `attach`, `kill` — turns that refusal into a message and an exit code (§ 10).
 
 The daemon holds no session-count limit: how many sessions a host runs is wholly the
@@ -833,7 +852,9 @@ strand every session behind `hidepid`, so only a positive *is not* declines the 
 **truncation decides almost nothing**: a match inside a truncated read is authoritative, and
 so is a *failure* to match wherever `argv[1]` arrived whole — the rule gives up on the mode
 before the truncation could reach anything it reads, so a full buffer is still a definitive
-*is not*. Only a read that stopped inside `argv[0]` or `argv[1]` says nothing at all. That
+*is not*. A read that stopped inside `argv[0]` or `argv[1]` says nothing at all, and neither does
+one that reached `daemon` but ran out before any bare word — the bound budgets the id at
+`argv[2]`, which the hand-typed spelling and a long `--label` value both push it past. That
 narrowness is the point: a recycled pid running `java -cp <20 KiB of classpath>` fills the
 buffer, and read as *could not tell* it would be signalled.
 
@@ -903,7 +924,7 @@ key store. Why it owns the socket instead of borrowing sshd's:
 - **One connection at a time.** A second peer waits in the listen backlog, neither accepted nor refused, and is greeted when the slot frees. An `ssh-agent` client sends a request and waits for the reply, so serialising costs a wait bounded per connection — and only per connection, which the idle-timeout bullet below prices.
 - **Each connection is named**, by the `u32` generation § 2.2 governs. The daemon accepts local peers out of band from the client's stream, so the connections holding the one slot in turn are ambiguous in *time*: unnamed, frames still in flight for a peer that ended reach whoever took the slot next. Only the client→daemon direction strictly needs it, and a frame type has one layout in both.
 - `AgentOpen` carries only that generation and is not redundant even so: it is the boundary between one peer's exchange and the next, which is what the client opens its own upstream connection on and what tells it what to stamp. Without it a peer that connects and closes without writing crosses the wire as nothing. Optimistic — no ack; a client that cannot serve replies `AgentClose`.
-- **Idle connections are given up after 60 s** with no byte moving in *either* direction, measured from the last byte and not the accept, since `ssh(1)` holds one connection across a whole authentication. The client is told with an `AgentClose` — **unless it had already closed that connection itself**, in which case the slot returns silently and the undeliverable rest of the queue is dropped. A generous minute because the daemon parses no agent protocol and the client may be putting a signature in front of a human who is reaching for a hardware key: no shorter figure survives a live FIDO touch-to-sign. **The minute bounds one connection, not one peer's wait.** § 6.3's blocking `connect` puts a peer standing behind *n* stalled ones at *n* × 60 s — `git submodule update --jobs 8` behind one stalled connection is eight of these in series. Spending a slot nothing else can use is the cheaper thing.
+- **Idle connections are given up after 60 s** with no byte moving in *either* direction, measured from the last byte and not the accept, since `ssh(1)` holds one connection across a whole authentication. The client is told with an `AgentClose` — **unless it had already closed that connection itself**, in which case the slot returns silently and the undeliverable rest of the queue is dropped. **That case does not wait out the minute**: a connection the client has closed is one no reply is owed to, so once a flush leaves bytes the local peer will not take, the slot is given up a second later rather than sixty. The minute is priced below for a live exchange, not for a queue nobody is reading — holding the slot for it is what makes the *next* `git push` in the session park in the listen backlog instead of failing fast. A generous minute because the daemon parses no agent protocol and the client may be putting a signature in front of a human who is reaching for a hardware key: no shorter figure survives a live FIDO touch-to-sign. **The minute bounds one connection, not one peer's wait.** § 6.3's blocking `connect` puts a peer standing behind *n* stalled ones at *n* × 60 s — `git submodule update --jobs 8` behind one stalled connection is eight of these in series. Spending a slot nothing else can use is the cheaper thing.
 - **A half-close is a close, and this is a known limitation.** `read() == 0` on the agent peer folds to end of file and the daemon ends the channel, so a peer that shuts down its own write side after sending a request and waits for the reply — the idiomatic Go `io.Copy` plus `CloseWrite` shape — is dropped rather than answered. `AgentClose` has no half-close spelling on the wire (§ 2.2), so there is nothing the daemon could report in its place. It has never cost anything because `ssh-agent` clients hold the connection open for the reply.
 - Payloads are opaque, which is what puts `session-bind@openssh.com` on the client ([DESIGN.md § 5.4](DESIGN.md#54-agent-forwarding)): a byte pipe cannot know which SSH hop the session is on.
 - **While detached, connections are accepted and closed immediately**, so a `git push` with no client attached fails fast with the same error as a missing agent instead of hanging until reattach. Likewise the moment a client leaves or is taken over.

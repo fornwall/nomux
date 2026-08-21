@@ -61,20 +61,32 @@ const PROBE_RETRY: Duration = Duration::from_millis(10);
 /// # Errors
 ///
 /// Propagates the `connect`, so [`nothing_is_listening`] still divides a dead daemon from
-/// everything else, and reports [`io::ErrorKind::TimedOut`] for a backlog that never
-/// drained — neither death nor an answer, and licence for no unlink.
+/// everything else, and reports [`io::ErrorKind::TimedOut`] where the deadline ran out on a
+/// backlog that never drained or on a call a signal kept from happening — neither death nor
+/// an answer, and licence for no unlink. Which of the two it was is *in* that message,
+/// because `kill` prints it back at a user as the whole of what is known (§ 6.6).
 fn connect_within(path: &Path, within: Duration) -> io::Result<UnixStream> {
     let addr = unix_address(path)?;
     let deadline = Instant::now() + within;
     loop {
-        match connect_once(&addr) {
-            // `EAGAIN` is the full backlog and `EINTR` a call that has not happened yet:
-            // the two outcomes that say nothing about the listener.
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                ) => {}
+        // `EAGAIN` is the full backlog and `EINTR` a call that has not happened yet: the
+        // two outcomes that say nothing about the listener, retried alike and carried
+        // apart, because the timeout below reports a *state* and the two are different
+        // ones. With `control`'s `LIST_PROBE` at zero there is exactly one attempt, so a
+        // lone `EINTR` would otherwise be reported as a backlog nobody observed — which
+        // `list` keeps a session on and `kill` quotes back inside its refusal. Only the
+        // last outcome is kept, that being the one that ran the clock out.
+        let unsettled = match connect_once(&addr) {
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                "its backlog is full, so whoever bound it has stopped accepting"
+            }
+            // Retried on the same deadline rather than for free: a signal storm would
+            // otherwise spin here without a bound, and `list` probes with no deadline at
+            // all to spend.
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+                "the last attempt was interrupted by a signal before the kernel answered \
+                 it, so nothing here reached whoever bound it"
+            }
             // This caller has a user to answer, so the refusal is returned rather than
             // logged, and [`liveness`] reads it as [`Liveness::Unknown`]: a socket with an
             // owner is not a dead one, so it licenses no unlink.
@@ -85,16 +97,15 @@ fn connect_within(path: &Path, within: Duration) -> io::Result<UnixStream> {
                 return Ok(stream);
             }
             Err(err) => return Err(err),
-        }
+        };
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             let ms = u64::try_from(within.as_millis()).unwrap_or(u64::MAX);
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
-                    "{} did not accept a connection within {ms}ms: its backlog is full, \
-                     so whoever bound it has stopped accepting",
-                    path.display(),
+                    "{path} did not accept a connection within {ms}ms: {unsettled}",
+                    path = path.display(),
                 ),
             ));
         }
@@ -236,7 +247,7 @@ impl Foreign {
 /// modes do not hold. Nothing is ever sent back to the refused peer.
 /// uid 0 is turned away with everyone else: root has `/proc`, `setuid` and `ptrace`
 /// whatever this answers.
-pub(crate) fn foreign_peer(peer: BorrowedFd<'_>) -> Option<Foreign> {
+fn foreign_peer(peer: BorrowedFd<'_>) -> Option<Foreign> {
     // The `getuid` § 6.3's run-directory check is written against, so that "this uid"
     // means one thing across the tree; nothing here is ever setuid, so the real uid it
     // answers with is also the one that owns the socket.
