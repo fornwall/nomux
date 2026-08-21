@@ -164,7 +164,21 @@ fn reconnecting_does_not_raise_the_input_ceiling() {
             );
             let stopped = applied == resume;
             resume = applied;
-            if stopped || Instant::now() >= deadline {
+            // The deadline is a backstop for a daemon that never stops taking, and it
+            // has to say so itself. Breaking on it instead leaves `applied` short of the
+            // ceiling through no fault of the daemon's — round 0 would then seed
+            // `ceiling` with a partial figure, or a later round come back under one, and
+            // the equality below would report a timeout as "round N took the input queue
+            // past the ceiling". Every other exhausted deadline in this suite names
+            // itself as one (`harness::out_of_time`), and this is the same courtesy.
+            assert!(
+                stopped || Instant::now() < deadline,
+                "round {round}: the {FRAME_PATIENCE:?} this test spends across all its \
+                 waits ran out with the daemon still taking input — it was through \
+                 {applied} of the input stream and had just taken {pushed} more, so \
+                 what this round measured is the deadline rather than a ceiling"
+            );
+            if stopped {
                 break applied;
             }
         };

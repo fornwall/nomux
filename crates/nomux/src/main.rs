@@ -8,6 +8,7 @@ mod attach;
 mod conn;
 mod control;
 mod daemon;
+mod exec;
 mod nbio;
 mod pty;
 mod ring;
@@ -64,13 +65,13 @@ fn main() -> ExitCode {
         Some(word @ ("--help" | "-h")) => {
             only(args, word, || write_stdout(format_args!("{USAGE}")))
         }
-        Some(word @ "daemon") => with_session(word, args, true, |session, label, lock_fd| {
+        Some(word @ "daemon") => with_session(word, &mut args, true, &|session, label, lock_fd| {
             report(daemon::run(session, label, lock_fd))
         }),
-        Some(word @ "spawn") => with_session(word, args, false, |session, label, _| {
+        Some(word @ "spawn") => with_session(word, &mut args, false, &|session, label, _| {
             report_relay(attach::run(session, attach::Intent::Create(label)))
         }),
-        Some(word @ "attach") => with_session(word, args, false, |session, label, _| {
+        Some(word @ "attach") => with_session(word, &mut args, false, &|session, label, _| {
             if label.is_some() {
                 return usage_error(Some(
                     "`attach` takes no `--label`: a label is recorded when the session \
@@ -79,7 +80,7 @@ fn main() -> ExitCode {
             }
             report_relay(attach::run(session, attach::Intent::Resume))
         }),
-        Some(word @ "kill") => with_session(word, args, false, |session, label, _| {
+        Some(word @ "kill") => with_session(word, &mut args, false, &|session, label, _| {
             if label.is_some() {
                 return usage_error(Some(
                     "`kill` takes no `--label`: labels are recorded only when a session is created",
@@ -132,11 +133,22 @@ fn write_stderr(arguments: std::fmt::Arguments<'_>) {
     drop(stderr.lock().write_fmt(arguments));
 }
 
+/// What a session mode does once its arguments are parsed: session id, the optional label,
+/// and the private lock descriptor `spawn` hands `daemon`. Named because it is spelled
+/// `dyn`, and a bare `&dyn Fn(..)` of this width is what `clippy::type_complexity` is for.
+type SessionRun = dyn Fn(&str, Option<&str>, Option<i32>) -> ExitCode;
+
+/// Parses a session mode's arguments and hands them to `run`.
+///
+/// `dyn` on both, against the four modes below instantiating this and
+/// [`parse_session_args`] with it once each: argument handling is a cold path that runs
+/// once per process, before a PTY or a socket exists, so an indirect call through it costs
+/// nothing measurable and four copies of it in `.text` cost every process that starts.
 fn with_session(
     word: &str,
-    args: impl Iterator<Item = OsString>,
+    args: &mut dyn Iterator<Item = OsString>,
     private_options_ok: bool,
-    run: impl FnOnce(&str, Option<&str>, Option<i32>) -> ExitCode,
+    run: &SessionRun,
 ) -> ExitCode {
     let SessionArgs {
         session,
@@ -162,7 +174,7 @@ struct SessionArgs {
 
 /// Parses the deliberately minimal, client-generated session command line.
 fn parse_session_args(
-    mut args: impl Iterator<Item = OsString>,
+    args: &mut dyn Iterator<Item = OsString>,
     private_options_ok: bool,
 ) -> Result<SessionArgs, String> {
     let mut session = None;
@@ -270,7 +282,7 @@ mod tests {
 
     fn session_args(args: &[&str], private_options_ok: bool) -> Result<SessionArgs, String> {
         parse_session_args(
-            args.iter().map(|argument| OsString::from(*argument)),
+            &mut args.iter().map(|argument| OsString::from(*argument)),
             private_options_ok,
         )
     }

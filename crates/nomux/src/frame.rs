@@ -274,9 +274,13 @@ impl<'a> Frame<'a> {
     /// [`crate::MAX_PAYLOAD`], or [`ProtoError::Malformed`] for a field too long for
     /// its own length prefix. `out` is unchanged on error.
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), ProtoError> {
+        // Carried out of the match rather than recomputed below, so the length prefix the
+        // payload writes is the one refused here if it does not fit: a second conversion
+        // would need a fallback, and a fallback is a length invented instead of refused.
+        let mut term_len = 0;
         let payload_len = match *self {
             Self::Hello(hello) => {
-                let term_len = u16::try_from(hello.term.len())
+                term_len = u16::try_from(hello.term.len())
                     .map_err(|_| ProtoError::Malformed("TERM exceeds 65535 bytes"))?;
                 checked_term(hello.term)?;
                 21 + usize::from(term_len)
@@ -298,15 +302,17 @@ impl<'a> Frame<'a> {
         let len = u32::try_from(payload_len).unwrap_or(u32::MAX);
         let header = encode_header(self.frame_type(), len)?;
         out.extend_from_slice(&header);
-        self.encode_payload(out);
+        self.encode_payload(out, term_len);
         Ok(())
     }
 
-    fn encode_payload(&self, out: &mut Vec<u8>) {
+    /// Appends the payload alone, `term_len` being the TERM length [`Self::encode`] has
+    /// already validated. Passed in because nothing here can refuse anything: the header is
+    /// on `out` by now, so a length this side could not encode would have to be invented.
+    /// Ignored by every frame that carries no TERM.
+    fn encode_payload(&self, out: &mut Vec<u8>, term_len: u16) {
         match *self {
             Self::Hello(hello) => {
-                let term_len = u16::try_from(hello.term.len()).unwrap_or_default();
-
                 out.extend_from_slice(&hello.protocol.to_be_bytes());
                 out.push(hello.flags());
                 out.extend_from_slice(&hello.out_offset.to_be_bytes());

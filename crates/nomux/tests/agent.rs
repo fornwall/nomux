@@ -11,14 +11,15 @@ mod harness;
 
 use std::fs;
 use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-use nomux_protocol::{Frame, FrameType, RESUME_FROM_START};
+use nomux_protocol::{ErrorCode, Frame, FrameType, RESUME_FROM_START};
 
 use harness::{
-    Client, FRAME_PATIENCE, SPIN_WINDOW, Session, cpu_ticks, read_uninterrupted, socket_capacity,
-    still_serving,
+    Client, FRAME_PATIENCE, SPIN_WINDOW, Session, control, cpu_ticks, read_uninterrupted,
+    socket_capacity, still_serving, succeeded,
 };
 
 /// Waits for the next `AgentOpen` or `AgentClose`, ignoring the session's own chatter,
@@ -76,6 +77,23 @@ fn agent_forwarding_proxies_a_connection_in_both_directions() {
     let expected = format!("sock={}", session.agent_socket().display());
     assert!(seen.contains(&expected), "child environment: {seen:?}");
 
+    // Owner-only, and asserted here because nowhere else asserts it: `control.rs`'s
+    // mode test covers `<id>.lock` and `<id>.pid`, and this is the one name in the run
+    // directory that reaches the user's key store. `rundir::bind_socket_private`
+    // suppresses the umask to get exactly `SOCKET_MODE`, so a login under a permissive
+    // umask must not widen it — a group-readable socket here is every process in the
+    // user's groups able to sign with keys the user never offered them.
+    let mode = fs::metadata(session.agent_socket())
+        .expect("stat the agent socket")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "the agent socket was bound at {mode:o} rather than the 600 § 6.7 fixes, so \
+         somebody other than its owner can reach the client's keys through it"
+    );
+
     let mut agent = session.connect_agent();
     let generation = expect_agent(
         &mut client,
@@ -114,6 +132,23 @@ fn agent_forwarding_proxies_a_connection_in_both_directions() {
         ),
         generation,
         "and the close names the channel that ended"
+    );
+
+    // The socket lives exactly as long as the session (§ 6.7), which is the half no
+    // test reached: `rundir`'s own coverage is over *paths*, and `control.rs`'s
+    // five-file case plants an empty regular file at `<id>.agent` on a session that
+    // never asked for forwarding. This is a socket the daemon really bound, removed by
+    // the real `unlink_all` behind a real `kill` — a name left behind is one the next
+    // `connect` to this id reaches and nothing answers.
+    drop(client);
+    succeeded(
+        &control(&session.root, &["kill", &session.id]),
+        "kill the session the agent socket belongs to",
+    );
+    assert!(
+        !session.agent_socket().exists(),
+        "the session is gone and its agent socket is still on disk at {}",
+        session.agent_socket().display()
     );
 }
 
@@ -194,6 +229,92 @@ fn agent_connections_fail_fast_while_detached() {
         0,
         "a detached session must close agent connections immediately"
     );
+}
+
+/// The other half of § 6.7's "the channel dies the moment a client leaves or is taken
+/// over": the half where the client does not leave but is *displaced*.
+///
+/// Every other test in this file has one client, so only the leaving half was ever
+/// asserted — and the two reach the agent by different routes. A departure comes through
+/// `daemon::drop_client`; a takeover comes through `daemon::evict`, and both end in
+/// `on_detached`, which calls `Agent::close_from_client` rather than `Agent::forget` so
+/// that a reply already queued for the local peer is still handed over. Nothing pinned
+/// what that route does to the socket the *newcomer* then owns.
+///
+/// Two things have to hold, and the second is the one a defect would leave standing. The
+/// peer whose exchange the takeover interrupted must learn now, so an `ssh-add` behind it
+/// fails as it would against a dead agent rather than hanging on a socket nobody is left
+/// to answer for. And the slot must come *back*: with the queue empty,
+/// `close_from_client`'s flush has nothing it could not place, so the connection is
+/// forgotten on the spot rather than keeping the slot for `agent::AGENT_ABANDON_GRACE` —
+/// the short fuse that bounds the other case, where a queue has nowhere to go. A slot
+/// still held is a listener `daemon`'s `watch_for` keeps out of the poll set, and every
+/// later `ssh-add` then sits in the listen backlog with its `connect(2)` already returned
+/// and nothing whatever answering it.
+#[test]
+fn a_takeover_ends_the_served_agent_connection_and_serves_the_newcomer_the_next_one() {
+    let (session, mut evicted, ok) = Session::attached_with("agent_takeover", true, false);
+    assert!(ok.agent, "the session must be serving an agent socket");
+
+    // Established before the takeover, or the read below could be answered by a
+    // connection the daemon had not yet accepted rather than by one it closed.
+    let mut interrupted = session.connect_agent();
+    expect_agent(
+        &mut evicted,
+        FrameType::AgentOpen,
+        "the peer is being served before the newcomer arrives",
+    );
+
+    // Forwarding belongs to the session rather than to this client: § 5.3 fixes
+    // `SSH_AUTH_SOCK` in the child's environment when the session is created, so the
+    // newcomer asks for nothing and is served the socket that is already there.
+    let mut successor = session.connect();
+    let resumed = successor.hello(RESUME_FROM_START);
+    assert!(
+        resumed.agent,
+        "the newcomer was told the session it just took over serves no agent socket"
+    );
+    evicted.expect_error(
+        ErrorCode::Takeover,
+        "the displaced client must learn it was a takeover",
+    );
+    drop(evicted);
+
+    // Through the harness rather than `Read::read`: these sockets carry a receive
+    // timeout, so a signal ends the call with `EINTR` rather than the kernel restarting
+    // it, and a raw read would report that as the connection having failed.
+    let mut buf = [0u8; 1];
+    assert_eq!(
+        read_uninterrupted(&mut interrupted, &mut buf).expect("read from the served connection"),
+        0,
+        "the connection being served when the client was taken over must be closed, not \
+         held: the client that could have answered it is gone, and the process waiting \
+         on the socket has nobody left to hear from"
+    );
+
+    // And the slot came back with it. Both directions, because an announcement alone
+    // would be satisfied by a daemon that accepted the connection and had no way left to
+    // carry a byte across it.
+    let mut fresh = session.connect_agent();
+    let generation = expect_agent(
+        &mut successor,
+        FrameType::AgentOpen,
+        "the slot the takeover freed is one the client that took over can be served on",
+    );
+    fresh
+        .write_all(b"\0\0\0\x01\x0b")
+        .expect("write from the peer served after the takeover");
+    let payload = successor.next_of(FrameType::AgentData);
+    assert_eq!(
+        Frame::decode(FrameType::AgentData, &payload).expect("decode"),
+        Frame::AgentData {
+            generation,
+            data: b"\0\0\0\x01\x0b",
+        },
+        "the newcomer is served the connection under the channel it was opened as"
+    );
+
+    still_serving(&mut successor, "NOMUX-STILL-SERVING");
 }
 
 /// One connection at a time (§ 6.7), and the rest **wait**: a second peer arriving
@@ -515,31 +636,35 @@ fn an_agent_connection_whose_queue_outgrows_the_cap_is_closed_alone() {
         sent += filler.len();
     }
 
-    expect_agent(
-        &mut client,
-        FrameType::AgentClose,
-        &format!(
-            "a queue that passed {CAP} bytes must cost the connection: {sent} bytes \
-             were pushed at a peer that read none of them"
+    assert_eq!(
+        expect_agent(
+            &mut client,
+            FrameType::AgentClose,
+            &format!(
+                "a queue that passed {CAP} bytes must cost the connection: {sent} bytes \
+                 were pushed at a peer that read none of them"
+            ),
         ),
+        drowned,
+        "the overflow closed some channel other than the one it was queued against, \
+         which is the whole of what `_alone` in this test's name claims"
     );
     // And the process on the other end learns now rather than blocking on a socket
     // nothing will write to again — § 6.7's argument for closing over holding, reached
-    // by the queue rather than by the client going away.
-    let mut delivered = 0usize;
+    // by the queue rather than by the client going away. The read returning end of file
+    // is the assertion; *how much* it was handed first is not one, and no figure drawn
+    // from it could be: a peer that reads nothing takes `capacity` bytes into its socket
+    // buffer and not one more, cap or no cap, so `delivered < sent` holds by
+    // construction. What the close was is settled by the frame above and by the fresh
+    // channel below.
     let mut chunk = vec![0u8; 64 * 1024];
     loop {
         match read_uninterrupted(&mut drowned_peer, &mut chunk) {
             Ok(0) => break,
-            Ok(read) => delivered += read,
+            Ok(_) => {}
             Err(err) => panic!("reading from the connection the daemon closed: {err}"),
         }
     }
-    assert!(
-        delivered < sent,
-        "the daemon delivered all {sent} bytes, so nothing was ever queued and the \
-         close above was not the cap firing"
-    );
 
     // The socket is still the session's to serve: the slot the overflow freed is one
     // the next connection can have, and bytes cross it in the direction the daemon has

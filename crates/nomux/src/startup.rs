@@ -138,9 +138,20 @@ pub(crate) fn arm_stop_signals() -> io::Result<OwnedFd> {
     // ordering rule. A pipe failure returns before this point, leaving a pending stop
     // signal blocked until startup has cleaned up what it published.
     //
-    // Cleared whole rather than [`STOP_SIGNALS`] alone: `std` does not reset the mask across
-    // `Command::spawn`, so whatever is blocked here is blocked in the session's login shell
-    // for its whole life — a parent's `SIGTSTP` costs the child `Ctrl-Z` (`pty.rs`).
+    // Cleared whole rather than [`STOP_SIGNALS`] alone. The set this daemon inherited is
+    // whatever the thing that started it happened to be holding — a relay's, an sshd's, a
+    // shell that blocked something around the command — and none of it was chosen with a
+    // process that idles for a week (§ 6.5) in mind. A blocked `SIGHUP` or `SIGQUIT` left
+    // in place is one more signal that reaches the daemon as a pending bit nobody ever
+    // reads, so the mask is emptied rather than trimmed to the signals this module knows
+    // it wants.
+    //
+    // This is *this* process's mask and no child's. `crate::exec`'s child half issues the
+    // same `sigemptyset`/`sigprocmask` pair of its own between its `fork` and its `execve`,
+    // which is the complementary clear rather than a substitute for this one: that one
+    // decides what the session's login shell starts life under, this one what the daemon
+    // itself runs under from here to its shutdown — and every signal armed above is
+    // delivered here.
     //
     // SAFETY: `sigemptyset` initialises the set this frame owns, which `sigprocmask` is then
     // handed along with a null pointer for the old mask it is not being asked for.
@@ -230,11 +241,8 @@ pub(crate) fn detach_from_controlling_terminal() -> io::Result<()> {
 }
 
 /// Whether this process has a controlling terminal. `O_NOCTTY` so that asking never
-/// acquires one.
-///
-/// `ENXIO` is the only definite no — § 6.2 delegates the argument here. Anything else, such
-/// as no `/dev/tty` node in a stripped container, is taken as yes: being wrong that way costs
-/// one `fork`, and being wrong the other way costs a session a keystroke can end.
+/// acquires one — § 6.2 delegates the argument to [`terminal_behind`], which weighs the
+/// errno a refused open came back with.
 fn has_controlling_terminal() -> bool {
     match rustix::fs::open(
         "/dev/tty",
@@ -242,8 +250,47 @@ fn has_controlling_terminal() -> bool {
         Mode::empty(),
     ) {
         Ok(_) => true,
-        Err(err) => err != rustix::io::Errno::NXIO,
+        Err(err) => terminal_behind(err),
     }
+}
+
+/// Whether a `/dev/tty` open that failed with `err` leaves a controlling terminal this
+/// daemon might still be holding.
+///
+/// Three errnos settle it as a definite *no* and everything else stays conservative:
+///
+/// - `ENXIO` is the kernel's own answer for a process that has no controlling terminal,
+///   which is what `/dev/tty` is a handle on.
+/// - `ENOENT` is no such node, and `ENODEV` a `/dev` that carries no driver behind it: a
+///   stripped container image or a hand-built chroot. `/dev/tty` is the *only* name for
+///   the controlling terminal as such, so where it does not resolve there is nothing this
+///   process could be holding by it and nothing a `setsid` here could hand back.
+/// - Everything else — `EACCES` and `EPERM` from a restrictive device cgroup, `EMFILE`,
+///   `EIO` — describes the asking rather than the answer, and stays *yes*.
+///
+/// The two missing-node errnos used to answer *yes* on the same "one wasted `fork`"
+/// reasoning as the rest, and that reasoning was wrong about the cost. On the `spawn` path
+/// the daemon has already been through `setsid` — `attach::spawn_daemon` issues one in the
+/// `setup` closure `crate::exec::spawn` runs between its `fork` and its `execve` — so it
+/// leads its session: the early return above is the only exit that avoids a `fork`, the
+/// `setsid` below it fails `EPERM` for a process that already leads a *group*, and the
+/// `fork` therefore happens on every single `spawn`. Its parent `_exit(0)`s, leaving a
+/// process somebody has to collect: `attach::create` calls `crate::exec::reap_if_exited`
+/// once publication is confirmed, which is a second guard and not a reason to fork anyway —
+/// before it existed each session left one `<defunct>` process parented to a relay that
+/// lives as long as the SSH session it serves, hours to days, accumulating towards
+/// `RLIMIT_NPROC`. The grandchild daemon publishes its pidfile as usual, so `list` and
+/// `kill` see nothing wrong either way.
+///
+/// Being wrong in the other direction still costs a session a keystroke can end, and the
+/// host it would take is one that has a controlling terminal and no `/dev/tty` node naming
+/// it — a `/dev` assembled by hand around a pty, where the `SIGHUP` ignored above is the
+/// remaining guard.
+const fn terminal_behind(err: rustix::io::Errno) -> bool {
+    !matches!(
+        err,
+        rustix::io::Errno::NXIO | rustix::io::Errno::NOENT | rustix::io::Errno::NODEV
+    )
 }
 
 /// Lets go of the directory the daemon inherited (§ 6.2), which would otherwise keep a
@@ -317,5 +364,52 @@ mod tests {
                 .raw_os_error(),
             Some(libc::EBADF)
         );
+    }
+
+    /// Regression: a `/dev/tty` that is not there at all is not a controlling terminal.
+    ///
+    /// Put to [`terminal_behind`](super::terminal_behind) rather than to
+    /// [`has_controlling_terminal`](super::has_controlling_terminal), which answers about
+    /// *this* process on *this* host: the suite runs where `/dev/tty` exists, and no test
+    /// may unmount it out from under the machine it is running on.
+    ///
+    /// Read as "yes" — which is what a missing node used to be — every `spawn` on such a
+    /// host forks and leaves the `_exit(0)`ed intermediate unreaped by
+    /// `attach::create`, one zombie per session for the relay's whole life.
+    #[test]
+    fn only_an_errno_that_settles_the_question_denies_a_controlling_terminal() {
+        for (err, describing) in [
+            (
+                rustix::io::Errno::NXIO,
+                "this process has no controlling terminal",
+            ),
+            (
+                rustix::io::Errno::NOENT,
+                "there is no `/dev/tty` node to hold one by",
+            ),
+            (
+                rustix::io::Errno::NODEV,
+                "`/dev` carries no driver behind that name",
+            ),
+        ] {
+            assert!(
+                !terminal_behind(err),
+                "{err} says {describing}, so there is nothing here to detach from and \
+                 nothing to fork for"
+            );
+        }
+        for (err, describing) in [
+            (rustix::io::Errno::ACCESS, "a device cgroup"),
+            (rustix::io::Errno::PERM, "a device cgroup"),
+            (rustix::io::Errno::MFILE, "a descriptor limit"),
+            (rustix::io::Errno::IO, "a driver that failed the open"),
+        ] {
+            assert!(
+                terminal_behind(err),
+                "{err} is {describing} refusing the *asking*, which establishes nothing \
+                 about the terminal — and being wrong that way costs one `fork`, where \
+                 being wrong the other way costs a session a keystroke can end"
+            );
+        }
     }
 }
